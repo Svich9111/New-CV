@@ -10,9 +10,10 @@
 import argparse
 import asyncio
 import logging
+import sys
 from urllib.parse import urlsplit
 
-from app.bot.client import BotApi
+from app.bot.client import BotApi, BotApiError
 from app.config import check_bot_config, get_settings
 from app.core.logging import install_log_redaction
 
@@ -74,9 +75,17 @@ async def _main(webhook_url: str | None) -> None:
         await api.aclose()
 
 
+def describe_error(err: BotApiError) -> str:
+    """Текст для оператора: метод, код и описание от Telegram (без токена)."""
+    return f"{err}: {err.description}" if err.description else str(err)
+
+
 if __name__ == "__main__":
     install_log_redaction()
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description="Настройка Telegram-бота «Чувства AI»")
     parser.add_argument("--webhook-url", default=None, help="https-адрес вебхука сервера")
-    asyncio.run(_main(parser.parse_args().webhook_url))
+    try:
+        asyncio.run(_main(parser.parse_args().webhook_url))
+    except BotApiError as err:
+        sys.exit(describe_error(err))

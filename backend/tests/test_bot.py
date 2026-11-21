@@ -146,7 +146,7 @@ async def test_webhook_empty_header_is_rejected(
     client: httpx.AsyncClient, fake: FakeTelegram
 ) -> None:
     resp = await client.post(URL, json=_message("/start"), headers=_hdr(""))
-    assert resp.status_code in (401, 403)
+    assert resp.status_code == 403  # заголовок есть, но не совпадает (ревью 1.4 m7)
     assert fake.calls == []
 
 
@@ -311,6 +311,131 @@ async def test_permanent_bot_api_error_is_not_redelivered(
     assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
     assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
     assert len(fake.calls) == 1
+
+
+async def test_429_through_webhook_is_503_and_redelivery_answered(
+    client: httpx.AsyncClient, fake: FakeTelegram
+) -> None:
+    """Ревью 1.4 m8: 429 с долгим retry_after — 503, отметка снята, повтор получает ответ."""
+    update = _message("/start")
+    fake.responses = [
+        httpx.Response(
+            429, json={"ok": False, "error_code": 429, "parameters": {"retry_after": 3600}}
+        )
+    ]
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 503
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
+    assert len(fake.sent()) == 2
+
+
+async def test_connect_error_through_webhook_is_transient(
+    client: httpx.AsyncClient, fake: FakeTelegram, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    update = _message("/start")
+    fake.responses = [httpx.ConnectError(f"connect https://api.telegram.org/bot{TOKEN}/x")]
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 503
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
+    assert len(fake.sent()) == 2
+    assert TOKEN not in caplog.text
+
+
+async def test_unexpected_handler_error_is_200_without_text_or_traceback(
+    client: httpx.AsyncClient,
+    fake: FakeTelegram,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ревью 1.4 m8: ветка except Exception — 200, отметка остаётся, в журнале нет текста
+    исключения и трассировки."""
+    caplog.set_level(logging.DEBUG)
+    calls: list[int] = []
+
+    async def boom(api: BotApi, update: dict[str, Any], webapp_url: str) -> str:
+        calls.append(update["update_id"])
+        raise RuntimeError("ЛИЧНОЕ_В_ИСКЛЮЧЕНИИ_Rt5")
+
+    monkeypatch.setattr(webhook_module, "handle_update", boom)
+    update = _message("/start")
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
+    assert len(calls) == 1  # повтор — дубль, обработчик не вызывается снова
+    assert "ЛИЧНОЕ_В_ИСКЛЮЧЕНИИ_Rt5" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert all(r.exc_info is None for r in caplog.records)
+    assert "handler failed" in caplog.text
+
+
+async def test_redelivery_while_first_in_progress_waits_for_outcome(
+    client: httpx.AsyncClient, fake: FakeTelegram, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A8 D-2 / ревью m2: повтор во время первой доставки не подтверждается, пока та не
+    завершена (по сроку — 503), а после её завершения — 200 без второго ответа."""
+    monkeypatch.setattr(webhook_module, "HANDLE_DEADLINE_S", 0.05)
+    updates: UpdateDeduplicator = app.state.bot_updates
+    update = _message("/start")
+    uid = update["update_id"]
+    assert updates.claim(uid)  # первая доставка «в работе»
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 503
+    assert updates.in_progress(uid)  # повтор не снял чужую отметку
+    updates.complete(uid)
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
+    assert fake.sent() == []
+
+
+async def test_waiting_duplicate_mirrors_first_outcome() -> None:
+    import asyncio
+
+    d = UpdateDeduplicator()
+    assert d.claim(1) and d.claim(2)
+
+    async def finish() -> None:
+        await asyncio.sleep(0.01)
+        d.complete(1)
+        d.release(2)
+
+    ok, failed, _ = await asyncio.gather(d.wait_outcome(1), d.wait_outcome(2), finish())
+    assert ok is True
+    assert failed is False
+    assert await d.wait_outcome(3) is False  # неизвестное — не подтверждается
+
+
+async def test_processing_deadline_gives_503_and_allows_redelivery(
+    client: httpx.AsyncClient, fake: FakeTelegram, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ревью m2: общий срок обработки ограничен; по истечении — 503, отметка снята."""
+    import asyncio
+
+    hang = asyncio.Event()
+
+    async def slow(api: BotApi, update: dict[str, Any], webapp_url: str) -> str:
+        await hang.wait()
+        return "start"
+
+    monkeypatch.setattr(webhook_module, "HANDLE_DEADLINE_S", 0.05)
+    monkeypatch.setattr(webhook_module, "handle_update", slow)
+    update = _message("/start")
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 503
+    assert not app.state.bot_updates.in_progress(update["update_id"])
+    monkeypatch.undo()
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
+    assert len(fake.sent()) == 1
+
+
+def test_deadline_is_well_below_telegram_wait() -> None:
+    assert 0 < webhook_module.HANDLE_DEADLINE_S <= 30
+
+
+def test_deduplicator_tracks_progress() -> None:
+    d = UpdateDeduplicator()
+    assert d.claim(1)
+    assert d.in_progress(1)
+    d.complete(1)
+    assert not d.in_progress(1)
+    assert not d.claim(1)
+    d.complete(99)  # неизвестный — без ошибки и без записи
+    assert len(d) == 1
 
 
 def test_deduplicator_is_bounded() -> None:
@@ -492,6 +617,25 @@ async def test_service_starts_with_bot_settings_and_creates_client(
         app.state.sessionmaker, app.state.bot_api = saved
 
 
+async def test_lifespan_closes_resources_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью 1.4 m9: при аварийном выходе клиент Bot API закрывается."""
+    from app.main import lifespan
+
+    _set_env(monkeypatch)
+    saved = app.state.sessionmaker, app.state.bot_api
+    app.state.sessionmaker = None
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError):
+            async with lifespan(app):
+                api = app.state.bot_api
+                raise RuntimeError("авария")
+        assert api._http.is_closed
+    finally:
+        get_settings.cache_clear()
+        app.state.sessionmaker, app.state.bot_api = saved
+
+
 def test_env_example_lists_bot_settings() -> None:
     from pathlib import Path
 
@@ -600,6 +744,34 @@ async def test_httpx_request_log_does_not_contain_token(
     assert "HTTP Request" in caplog.text
     assert TOKEN not in caplog.text
     assert "123456:" not in caplog.text
+
+
+async def test_client_error_keeps_description_separately(fake: FakeTelegram) -> None:
+    """Ревью 1.4 m6: описание Telegram — отдельным полем (без токена), не в str()."""
+    fake.responses = [
+        httpx.Response(
+            400,
+            json={
+                "ok": False,
+                "error_code": 400,
+                "description": f"Bad Request: bad webhook: IP address is reserved {TOKEN}",
+            },
+        )
+    ]
+    api = _api(fake)
+    with pytest.raises(BotApiError) as exc:
+        await api.call("setWebhook", {"url": "https://x.example.test/"})
+    await api.aclose()
+    err = exc.value
+    assert err.description is not None
+    assert "IP address is reserved" in err.description
+    assert TOKEN not in err.description
+    assert "IP address" not in str(err)
+    from app.bot.setup import describe_error
+
+    shown = describe_error(err)
+    assert "setWebhook" in shown and "IP address is reserved" in shown
+    assert TOKEN not in shown
 
 
 def test_client_repr_hides_token() -> None:
