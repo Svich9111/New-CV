@@ -7,6 +7,8 @@ tags: [деньги, кредит]
 checks: [level, meaning, mark_and_original]
 owner: {name: Олег, age: 39, partner_name: Ирина}
 relationship: В браке десять лет, кредит за машину
+owner_memory:
+  - Олег стыдится, что его зарплаты не хватает на платёж по кредиту, и скрывает это от Ирины
 owner_turns:
   - Мы каждый день ругаемся из-за кредита за машину.
   - Она кричит, я кричу, уже не можем спокойно сидеть за одним столом.
@@ -17,9 +19,11 @@ partner_message:
   expected_delivery: adapted
   meaning:
     facts: [Пара ссорится из-за кредита за машину, Машину покупали по желанию Ирины, Олег чувствует себя виноватым во всём]
-    request: Перестать упрекать Олега кредитом
+    request: Хватит меня пилить из-за кредита
+    implied_need: null
   must_keep: [кредит, машин]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+  must_not_contain: [зарплат, стыд, скрыва, не хватает]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: deescalate_live_talk
   draft: optional

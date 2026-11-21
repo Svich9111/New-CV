@@ -17,9 +17,10 @@ partner_message:
   expected_delivery: as_is
   meaning:
     facts: [После гостей осталась посуда, Денису рано на работу]
-    request: Помыть кастрюли сегодня
+    request: Помой, пожалуйста, хотя бы кастрюли сегодня
+    implied_need: null
   must_keep: [посуд, кастрюл]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: listen_and_request
   draft: optional

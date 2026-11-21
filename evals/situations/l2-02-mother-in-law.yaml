@@ -17,9 +17,10 @@ partner_message:
   expected_delivery: adapted
   meaning:
     facts: [Мама Бориса приехала без звонка, Переставила вещи на кухне, Нине кажется, что Борис её не поддерживает]
-    request: Поговорить с мамой, чтобы она предупреждала о приезде заранее
+    request: Поговори с ней, пусть звонит заранее
+    implied_need: null
   must_keep: [мам, без звонка, заранее]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: find_need_prepare_message
   draft: optional

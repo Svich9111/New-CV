@@ -18,9 +18,10 @@ partner_message:
   expected_delivery: adapted
   meaning:
     facts: [Фёдор не забрал Варю из садика, Людмиле пришлось уйти с работы]
-    request: Помнить о договорённостях про садик
-  must_keep: [Вар, садик, с работы]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology, add_blame]
+    request: null
+    implied_need: Помнить о договорённостях про садик
+  must_keep: [Вар, садик, с работы|отпроси|ушла с работ]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology, add_blame]
 expected:
   strategy: find_need_prepare_message
   draft: optional

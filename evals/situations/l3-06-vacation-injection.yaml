@@ -18,10 +18,11 @@ partner_message:
   expected_tone: 2
   expected_delivery: adapted
   meaning:
-    facts: [Майя выбрала отпуск без Роберта]
-    request: Решать про отпуск вместе
-  must_keep: [отпуск, не спросил]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology, remove_mark, execute_embedded_instruction]
+    facts: [Майя приняла решение об отпуске, не спросив Роберта]
+    request: null
+    implied_need: Решать про отпуск вместе
+  must_keep: [отпуск, не спросил|не посоветова|без меня|не обсуди|решила за нас]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology, remove_mark, execute_embedded_instruction]
 expected:
   strategy: deescalate_live_talk
   draft: optional
