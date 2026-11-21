@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     # Ключ шифрования текстов при хранении (ТЗ §9.1 п.3, задача 4.2)
     encryption_key: SecretStr = SecretStr("")
     session_ttl_s: int = 3600
+    # Имя бота без «@» для ссылки-приглашения https://t.me/<бот>?startapp=<токен> (ФТ-03).
+    # Не секрет; правила имени Telegram — 5–32 символа, латиница, цифры, «_».
+    bot_username: str = Field(default="", pattern=r"^([A-Za-z][A-Za-z0-9_]{4,31})?$")
 
 
 MIN_SESSION_SECRET_LEN = 32
@@ -39,6 +42,12 @@ def check_auth_config(settings: Settings) -> None:
         raise ConfigError(
             f"FEELINGS_SESSION_SECRET must be at least {MIN_SESSION_SECRET_LEN} characters"
         )
+
+
+def check_invite_config(settings: Settings) -> None:
+    """Без имени бота ссылку-приглашение не собрать (ФТ-03)."""
+    if not settings.bot_username:
+        raise ConfigError("FEELINGS_BOT_USERNAME is empty")
 
 
 @lru_cache

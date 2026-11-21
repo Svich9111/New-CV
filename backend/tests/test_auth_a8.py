@@ -704,6 +704,8 @@ async def test_service_starts_with_good_keys(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setenv("FEELINGS_TELEGRAM_BOT_TOKEN", BOT_TOKEN)
     monkeypatch.setenv("FEELINGS_SESSION_SECRET", SECRET)
+    # Задача 1.3: без имени бота сервис тоже не стартует (ссылки-приглашения).
+    monkeypatch.setenv("FEELINGS_BOT_USERNAME", "FeelingsTestBot")
     saved = app.state.sessionmaker
     app.state.sessionmaker = None
     get_settings.cache_clear()

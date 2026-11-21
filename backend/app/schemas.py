@@ -2,9 +2,10 @@
 
 import unicodedata
 import uuid
+from datetime import datetime
 from functools import cache
 from importlib import resources
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     AfterValidator,
@@ -103,3 +104,28 @@ class OnboardingRequest(BaseModel):
     consent_data: Consent
     consent_sensitive: Consent
     age_confirmed: StrictBool
+
+
+class CoupleMember(BaseModel):
+    role: Literal["initiator", "partner"]
+    name: str | None
+    is_me: bool
+
+
+class Couple(BaseModel):
+    id: uuid.UUID
+    status: Literal["pending", "active", "dissolved"]
+    members: list[CoupleMember] = Field(max_length=2)
+
+
+class InviteCreated(BaseModel):
+    couple_id: uuid.UUID
+    link: str
+    expires_at: datetime
+
+
+class InvitePreview(BaseModel):
+    """GET /invites/{token}: только имя пригласившего и срок — ни пары, ни участников."""
+
+    inviter_name: str | None
+    expires_at: datetime
