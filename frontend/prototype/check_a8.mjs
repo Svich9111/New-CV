@@ -29,7 +29,7 @@ function ck(cond, crit, name, detail = "") {
   if (!quietPrefix || !ok) console.log("  " + (ok ? "✓" : "✗") + " " + crit + " " + fullName + (detail && !ok ? " — " + detail : ""));
 }
 const ONLY = process.env.A8_ONLY ? process.env.A8_ONLY.split(",") : null; // напр. A8_ONLY=1,7 — только разделы 1 и 7
-// Известные дефекты (см. docs/reviews/0.6-test.md; раунд 2: D-3, N-1, N-2, N-3) — аналог xfail(strict=True):
+// Известные дефекты (см. docs/reviews/0.6-test.md; раунд 2: D-3, N-2; раунд 3: N-4; N-1 и N-3 исправлены в 5aab67b, отметки сняты в раунде 3) — аналог xfail(strict=True):
 // пока дефект воспроизводится, проверка не роняет прогон; если он исправлен — XPASS считается провалом,
 // отметку нужно снять. A8_RUNXFAIL=1 — считать их обычными проверками.
 function xf(defect, cond, crit, name, detail = "") {
@@ -852,7 +852,13 @@ await section("9. Негатив: разметка и «инструкции» �
   ck((await p.evaluate(() => window.__pwn)) === undefined, "N", "обработчик onerror из текста не сработал");
   ck(!ANNA_PRIVATE.some((s) => txt.includes(s)), "N", "«инструкция» в тексте не раскрыла личный чат Ани");
   const mem = await (async () => { await jump(p, "Память"); return mainText(p); })();
-  ck(!/onerror|<img/.test(mem), "N", "в память Игоря не попала разметка из сообщения");
+  // Раунд 3 (N-1): неизвестный текст кладётся в память дословно — как данные, а не разметка и не инструкция (§6.3, §9.2 п.3)
+  const memItems = mainArea(p).locator("[data-mem]");
+  const memEntryTxt = (await memItems.evaluateAll((els) => els.map((e) => e.innerText))).find((t) => t.includes("дословно")) || "";
+  ck(memEntryTxt.startsWith("Аня написала (дословно): «" + evil + "»"), "N", "в память Игоря попал дословный одобренный текст Ани (§6.3 — из одобренного сообщения)", memEntryTxt);
+  ck((await memItems.locator("img, b, [onerror]").count()) === 0 && (await p.evaluate(() => window.__pwn)) === undefined, "N", "в памяти Игоря разметка из сообщения показана текстом: нет элементов img/b, onerror не сработал");
+  ck((await memItems.evaluateAll((els) => els.some((e) => e.innerHTML.includes("&lt;img")))), "N", "в памяти Игоря разметка экранирована (&lt;img), а не вставлена как HTML");
+  ck(!ANNA_PRIVATE.some((s) => mem.includes(s)), "N", "«инструкция» в тексте не вытащила в память Игоря личный чат Ани");
   // Агент Игоря пересказывает только то, что Аня действительно отправила (§9.2 п.2)
   await jump(p, "Сообщения пары");
   await mainArea(p).getByRole("article").first().getByRole("button", { name: "Ответить с агентом" }).click();
@@ -1047,7 +1053,7 @@ await section("13. Двойное касание: «Подготовить со�
 
 // ---------- 14. M1: смягчение меняет форму, не смысл (§2 п.3, §6.2 п.5–6) ----------
 await section("14. Адаптация не трогает факты, отрицания, просьбы и «люблю» (§2 п.3, §6.2 п.5, M1)", async () => {
-  const p = await openPage({ label: "m1" });
+  let p = await openPage({ label: "m1" });
   await pairUp(p);
   const UNCHANGED = [
     "Ты никогда не предупреждаешь заранее. Я всегда тебя жду и всегда тебя люблю. Тебе плевать на меня.",
@@ -1083,7 +1089,26 @@ await section("14. Адаптация не трогает факты, отриц
   ck(/адаптировано/.test(mi.card) && mi.delivered.includes("Я тебя люблю.") && !/важна|сказала|написала/.test(mi.delivered), "N", "текст Игоря: смягчено без женского рода, «люблю» на месте", mi.delivered);
   await mainArea(p).getByRole("article").last().getByRole("button", { name: "Ответить с агентом" }).click();
   const recap = await mainArea(p).getByText(/прислал тебе сообщение/).last().innerText();
-  ck(/он пишет, что, как ему кажется/.test(recap) && !/она пишет|ей кажется/.test(recap), "N", "пересказ для Анны о сообщении Игоря — в мужском роде", recap);
+  // Раунд 3 (N-1): «Я тебя люблю.» — не фраза SOFTEN, текст не совпадает с вариантом → без пересказа, в мужском роде
+  ck(/^Игорь прислал тебе сообщение\. Пересказывать его своими словами не буду — лучше прочитай его слова\. Если хочешь, вместе разберёмся, что для него важно/.test(recap) && !/прислала|она пишет|её слова|для неё|ей кажется/.test(recap), "N", "пересказ для Анны о правленом сообщении Игоря — нейтральный, без домыслов, в мужском роде (N-1, §9.2 п.2)", recap);
+  // N-4 (раунд 3): второе входящее от Игоря → «Ответить с агентом» → агент Анны пересказывает именно его.
+  // replyContext не сбрасывается, нового пересказа нет — в чате остаётся пересказ прошлого сообщения.
+  const sentIgor2 = await sendAs(p, "Игорь", { text: "Давай в субботу сходим в кино?" });
+  await lastIncoming(p, "Анна");
+  const nRecaps = await mainArea(p).getByRole("article").count();
+  await mainArea(p).getByRole("article").last().getByRole("button", { name: "Ответить с агентом" }).click();
+  await p.waitForTimeout(1500);
+  const recapsNow = await mainArea(p).getByText(/прислал тебе сообщение/).count();
+  xf("N-4", recapsNow >= 2, "N", "второе входящее → «Ответить с агентом» → агент Анны откликается на новое сообщение, а не на прошлое (§4.4, §6.2)", "отправлено «" + sentIgor2 + "», карточек " + nRecaps + ", пересказов в чате " + recapsNow + " — нового нет");
+  await p.context().close();
+  // Вариант Игоря + только фраза из SOFTEN (первое входящее) → пересказ варианта и пояснение замены, в мужском роде (M1)
+  p = await openPage({ label: "род-SOFTEN" });
+  await pairUp(p);
+  const sentIgor3 = await sendAs(p, "Игорь", { variant: 0, append: " Ты вечно всё отменяешь в последний момент." });
+  await lastIncoming(p, "Анна");
+  await mainArea(p).getByRole("article").last().getByRole("button", { name: "Ответить с агентом" }).click();
+  const recap2 = await mainArea(p).getByText(/прислал тебе сообщение/).last().innerText();
+  ck(/он пишет, что, как ему кажется/.test(recap2) && !/она пишет|ей кажется|прислала|Пересказывать/.test(recap2), "N", "пересказ для Анны о варианте Игоря с фразой SOFTEN — пересказ варианта, в мужском роде (M1, N-1)", "отправлено: «" + sentIgor3 + "» → " + recap2);
   await p.context().close();
 });
 
@@ -1115,7 +1140,9 @@ await section("15. Игорь не видит исповеди и памяти �
   await sendAs(p, "Анна", { variant: 0, append: retract });
   const seen = await igorSees(p);
   const memEntry = (seen.memory.split("Из сообщений партнёра")[1] || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
-  xf("N-1", !/просит предупреждать/.test(seen.recap) && !/просит предупреждать/.test(memEntry), "N", "к варианту дописан отказ от просьбы → пересказ и память Игоря не приписывают Ане эту просьбу (§9.2 п.2, §6.3)", "пересказ: «…" + (seen.recap.match(/Она просит[^.]*\./) || [""])[0] + "»; память: «" + memEntry + "»");
+  ck(!/просит предупреждать/.test(seen.recap) && !/просит предупреждать/.test(memEntry), "N", "N-1: к варианту дописан отказ от просьбы → пересказ и память Игоря не приписывают Ане эту просьбу (§9.2 п.2, §6.3)", "пересказ: «…" + (seen.recap.match(/Она просит[^.]*\./) || [""])[0] + "»; память: «" + memEntry + "»");
+  ck(memEntry.startsWith("Аня написала (дословно): «") && memEntry.includes(retract.trim()), "N", "N-1: в память Игоря — дословный отправленный текст вместе с отказом от просьбы (§6.3)", memEntry);
+  ck(/Пересказывать его своими словами не буду — лучше прочитай её слова/.test(seen.recap), "N", "N-1: пересказ правленого варианта — нейтральное «прочитай её слова» (§9.2 п.2)", seen.recap);
   await p.context().close();
 });
 
@@ -1136,7 +1163,7 @@ await section("16. MINOR раунда 1: память, помощь из чат�
   const helpLink = mainArea(p).getByRole("button", { name: /Помощь/ });
   ck((await helpLink.count()) === 1, "N", "m4: в чате есть вход в «Помощь»");
   const inView = await helpLink.evaluate((el) => { const r = el.getBoundingClientRect(); const m = document.querySelector("main").getBoundingClientRect(); return r.bottom > m.top && r.top < m.bottom; });
-  xf("N-3", inView, "N", "m4: после разговора вход в «Помощь» виден без прокрутки (§9.3 — в один шаг)", "ссылка в начале ленты чата и уезжает вверх вместе с перепиской");
+  ck(inView, "N", "N-3/m4: после разговора вход в «Помощь» виден без прокрутки (§9.3 — в один шаг)", "ссылка вне видимой области чата");
   await helpLink.click();
   ck((await title(p)) === "Помощь", "N", "m4: из чата → «Помощь»");
   const tels = await mainArea(p).getByRole("link").evaluateAll((as) => as.map((a) => a.getAttribute("href")));
@@ -1163,7 +1190,11 @@ await section("16. MINOR раунда 1: память, помощь из чат�
   await persona(p, "Анна"); await jump(p, "Память");
   const mem = await mainText(p);
   const entry = (mem.split("Из сообщений партнёра")[1] || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
-  ck(/Игорь прислал сообщение/.test(entry) && !/ей важно|время вместе|просил/.test(entry), "N", "m1: запись памяти из неизвестного текста нейтральна и в мужском роде", entry);
+  // Раунд 3 (N-1): неизвестный текст — дословно, без пересказа и домыслов, род автора верный
+  ck(entry === "Игорь написал (дословно): «Мне тоже плевать, всё нормально.»" && !/написала|ей важно|время вместе|просил/.test(entry), "N", "m1/N-1: запись памяти Анны из неизвестного текста — дословная цитата, без домыслов, в мужском роде", entry);
+  ck(/одобренное сообщение Игоря/.test(mem), "N", "m1: у записи указан источник — одобренное сообщение Игоря (§6.3)");
+  const delBtn = mainArea(p).getByRole("button", { name: "Удалить запись: " + entry });
+  ck((await delBtn.count()) === 1, "N", "m1: дословную запись можно удалить (§2 п.6, ФТ-14)");
   await p.context().close();
 });
 

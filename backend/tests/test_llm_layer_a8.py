@@ -619,7 +619,7 @@ def test_adapter_failure_is_failed_situation_not_pass(
             assert answered == len(calls)
             assert m["input_tokens"] == 10 * len(calls) and m["output_tokens"] == 5 * len(calls)
             assert m["cost_usd"] > 0
-            assert m["cost_usd"] == pytest.approx(len(calls) * cost_usd(OPUS, Usage(10, 5)))
+            assert m["cost_usd"] == pytest.approx(len(calls) * (cost_usd(OPUS, Usage(10, 5)) or 0))
 
 
 def test_adapter_metrics_sum_owner_and_recipient(situations: list[dict[str, Any]]) -> None:
