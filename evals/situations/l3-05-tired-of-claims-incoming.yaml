@@ -1,0 +1,33 @@
+id: l3-05-tired-of-claims-incoming
+title: Входящее — «ты достала со своими претензиями»
+status: draft
+review_note: Черновик A3 — ждёт утверждения психологом (Д5)
+level: 3
+tags: [контроль времени, входящее]
+checks: [level, meaning, mark_and_original]
+owner: {name: Мила, age: 25, partner_name: Дима}
+relationship: Вместе год, живут вместе
+owner_memory:
+  - Мила болезненно реагирует, когда её называют контролирующей
+owner_turns:
+  - Дима мне такое написал... Мы уже неделю огрызаемся друг на друга.
+partner_message:
+  direction: incoming
+  original: Ты достала со своими претензиями! Я тоже человек, мне надо отдыхать, а не отчитываться за каждый шаг!
+  expected_tone: 3
+  expected_delivery: adapted
+  meaning:
+    facts: [Диме тяжело от претензий, Дима не хочет отчитываться за каждый шаг]
+    request: Дать Диме время на отдых без отчётов
+  must_keep: [отдыха, отчитыва]
+  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology, devalue_feelings]
+expected:
+  strategy: deescalate_live_talk
+  draft: optional
+  agent_should:
+    - Показать адаптацию с пометкой «адаптировано», оригинал — по запросу Милы
+    - Помочь Миле понять потребность Димы в отдыхе, не обесценивая её собственную потребность
+    - Предложить живой разговор, когда накал спадёт
+  agent_must_not:
+    - Убирать из адаптации просьбу Димы
+    - Подталкивать Милу ответить резкостью

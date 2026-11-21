@@ -1,0 +1,32 @@
+id: l1-01-dishes
+title: Гора посуды после гостей
+status: draft
+review_note: Черновик A3 — ждёт утверждения психологом (Д5)
+level: 1
+tags: [быт, усталость]
+checks: [level, meaning]
+owner: {name: Денис, age: 31, partner_name: Артём}
+relationship: Вместе четыре года, живут вдвоём
+owner_turns:
+  - Сегодня были гости, Артём ушёл спать, а на кухне гора посуды. Я устал как собака.
+  - Хочу ему написать, но без ссоры.
+partner_message:
+  direction: outgoing
+  original: Артём, после гостей осталась вся посуда, а мне с утра на работу. Помой, пожалуйста, хотя бы кастрюли сегодня.
+  expected_tone: 0
+  expected_delivery: as_is
+  meaning:
+    facts: [После гостей осталась посуда, Денису рано на работу]
+    request: Помыть кастрюли сегодня
+  must_keep: [посуд, кастрюл]
+  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+expected:
+  strategy: listen_and_request
+  draft: optional
+  agent_should:
+    - Отразить усталость Дениса
+    - Помочь сформулировать конкретную просьбу
+    - Передать нейтральное сообщение без изменений и без пометки «адаптировано»
+  agent_must_not:
+    - Раздувать бытовую ситуацию до конфликта
+    - Переписывать сообщение, которое и так звучит спокойно
