@@ -69,7 +69,6 @@ async def test_recipient_does_not_see_message_before_pipeline(
     async with user_scope(sessionmaker, world.b.user_id) as s:
         ids = {r[0] for r in await s.execute(text("SELECT id FROM partner_messages"))}
         assert msg not in ids
-        assert await s.execute(text("SELECT app_read_original(:m)"), {"m": msg}) is not None
         assert (
             await s.execute(text("SELECT app_read_original(:m)"), {"m": msg})
         ).scalar_one() is None
@@ -148,21 +147,107 @@ async def test_mark_read_only_by_recipient(
         assert status.scalar_one() == "read"
 
 
-async def test_reply_marks_incoming_answered(
-    world: World, sessionmaker: async_sessionmaker[AsyncSession]
-) -> None:
-    """M6 / ФТ-11: ответ на конкретное входящее ставит статус «отвечено»."""
-    async with user_scope(sessionmaker, world.b.user_id) as s:
+async def _reply(sm: async_sessionmaker[AsyncSession], world: World) -> uuid.UUID:
+    async with user_scope(sm, world.b.user_id) as s:
         draft = await _draft_id(s)
         await s.execute(
             text("UPDATE message_drafts SET reply_to_id = :m WHERE id = :d"),
             {"m": world.message_id, "d": draft},
         )
-        await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": draft})
-        status = await s.execute(
-            text("SELECT status FROM partner_messages WHERE id = :m"), {"m": world.message_id}
+        value = (await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": draft})).scalar_one()
+        return uuid.UUID(str(value))
+
+
+async def _status(sm: async_sessionmaker[AsyncSession], uid: uuid.UUID, msg: uuid.UUID) -> str:
+    async with user_scope(sm, uid) as s:
+        row = await s.execute(text("SELECT status FROM partner_messages WHERE id = :m"), {"m": msg})
+        return str(row.scalar_one())
+
+
+async def test_reply_marks_incoming_answered_after_delivery(
+    world: World, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """M6 / ФТ-11: ответ ставит входящему «отвечено» — когда ответ доставлен."""
+    reply = await _reply(sessionmaker, world)
+    assert await _status(sessionmaker, world.a.user_id, world.message_id) == "delivered"
+    await _deliver(engine, reply, b"otvet")
+    assert await _status(sessionmaker, world.a.user_id, world.message_id) == "answered"
+
+
+async def test_withheld_reply_does_not_reveal_safety_event(
+    world: World, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """Ревью 0.7 N1, ТЗ §9.3: остановленный ответ не меняет статус входящего у партнёра."""
+    reply = await _reply(sessionmaker, world)
+    async with engine.begin() as conn:
+        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
+        await conn.execute(text("SELECT pipeline_withhold(:m)"), {"m": reply})
+    assert await _status(sessionmaker, world.a.user_id, world.message_id) == "delivered"
+    async with user_scope(sessionmaker, world.a.user_id) as s:
+        answered = await s.execute(
+            text("SELECT answered_at FROM partner_messages WHERE id = :m"),
+            {"m": world.message_id},
         )
-        assert status.scalar_one() == "answered"
+        assert answered.scalar_one() is None
+
+
+async def test_pipeline_deliver_requires_text(
+    world: World, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    msg = await _send(sessionmaker, world.a.user_id)
+    async with engine.begin() as conn:
+        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
+        ok = await conn.execute(
+            text("SELECT pipeline_deliver(:m, NULL, false, 0::smallint, false)"), {"m": msg}
+        )
+        assert ok.scalar_one() is False
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "now() + interval '10 years', NULL, NULL",
+        "now() + interval '7 days', :a, now()",
+    ],
+)
+async def test_invite_insert_limits(
+    world: World, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine, extra: str
+) -> None:
+    """Ревью 0.7 n2, ФТ-03: приглашение — не дольше 7 дней и не «уже использованное»."""
+    uid = uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO users (id, telegram_id) VALUES (:u, :t)"),
+            {"u": uid, "t": 7_100_000_000 + uuid.uuid4().int % 1_000_000},
+        )
+    async with user_scope(sessionmaker, uid) as s:
+        couple = (await s.execute(text("SELECT app_create_couple()"))).scalar_one()
+    with pytest.raises(ProgrammingError, match=DENIED):
+        async with user_scope(sessionmaker, uid) as s:
+            await s.execute(
+                text(
+                    "INSERT INTO invites (token_hash, couple_id, created_by, expires_at, "
+                    f"used_by, used_at) VALUES (:h, :c, :u, {extra})"
+                ),
+                {"h": uuid.uuid4().bytes * 2, "c": couple, "u": uid, "a": world.a.user_id},
+            )
+
+
+async def test_blocked_draft_cannot_be_reopened(
+    world: World, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """Ревью 0.7 n7, ТЗ §9.3: остановленный безопасностью черновик не вернуть в отправку."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE message_drafts SET status = 'blocked' WHERE agent_id = :a"),
+            {"a": world.a.agent_id},
+        )
+    async with user_scope(sessionmaker, world.a.user_id) as s:
+        res = await s.execute(
+            text("UPDATE message_drafts SET status = 'draft' WHERE agent_id = :a"),
+            {"a": world.a.agent_id},
+        )
+        assert res.rowcount == 0  # type: ignore[attr-defined]
 
 
 async def test_cannot_reply_to_own_message(

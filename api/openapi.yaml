@@ -745,7 +745,7 @@ components:
         text: { type: string }
         is_adapted: { type: boolean, description: "Пометка «адаптировано» (ФТ-09)" }
         harsh_tone_warning: { type: boolean, description: "ТЗ §6.2 п.6" }
-        status: { type: string, enum: [processing, delivered, read, answered], description: "Получателю приходят только delivered/read/answered; withheld (остановлено безопасностью) клиенту не отдаётся" }
+        status: { type: string, enum: [processing, withheld, delivered, read, answered], description: "Получателю — только delivered/read/answered. processing и withheld (остановлено безопасностью, ТЗ §9.3) видит только автор" }
         reply_to_id: { type: [string, "null"], format: uuid }
         sent_at: { type: string, format: date-time }
         read_at: { type: [string, "null"], format: date-time }

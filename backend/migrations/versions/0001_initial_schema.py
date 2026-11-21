@@ -804,14 +804,13 @@ CREATE FUNCTION app_send_draft(p_draft uuid, p_expected_version integer) RETURNS
         IF v_couple IS NULL OR v_recipient IS NULL THEN
             RAISE EXCEPTION 'no active couple' USING ERRCODE = 'FA003';
         END IF;
-        IF d.reply_to_id IS NOT NULL THEN
-            UPDATE public.partner_messages
-               SET status = 'answered', answered_at = now()
+        -- Статус «отвечено» ставит конвейер при доставке ответа (pipeline_deliver), а не здесь:
+        -- иначе остановленный безопасностью ответ выдал бы срабатывание партнёру (ТЗ §9.3).
+        IF d.reply_to_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM public.partner_messages
              WHERE id = d.reply_to_id AND recipient_id = v_uid AND couple_id = v_couple
-               AND status IN ('delivered', 'read', 'answered');
-            IF NOT FOUND THEN
-                RAISE EXCEPTION 'bad reply target' USING ERRCODE = 'FA004';
-            END IF;
+               AND status IN ('delivered', 'read', 'answered')) THEN
+            RAISE EXCEPTION 'bad reply target' USING ERRCODE = 'FA004';
         END IF;
         INSERT INTO public.partner_messages
             (couple_id, author_id, recipient_id, reply_to_id, draft_id, original_enc, status)
@@ -823,12 +822,12 @@ CREATE FUNCTION app_send_draft(p_draft uuid, p_expected_version integer) RETURNS
 
 -- Лента пары (ФТ-11): автору — его оригинал, получателю — версия для получателя.
 CREATE FUNCTION app_couple_feed(p_limit integer, p_before timestamptz)
-    RETURNS TABLE (id uuid, outgoing boolean, text_enc bytea, is_adapted boolean,
+    RETURNS TABLE (id uuid, couple_id uuid, outgoing boolean, text_enc bytea, is_adapted boolean,
                    harsh_tone_warning boolean, status partner_message_status,
                    reply_to_id uuid, sent_at timestamptz, read_at timestamptz)
     LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
     AS $f$
-    SELECT m.id, m.author_id = public.app_uid(),
+    SELECT m.id, m.couple_id, m.author_id = public.app_uid(),
            CASE WHEN m.author_id = public.app_uid() THEN m.original_enc ELSE m.adapted_enc END,
            m.is_adapted, m.harsh_tone_warning, m.status, m.reply_to_id, m.sent_at, m.read_at
     FROM public.partner_messages m
@@ -883,7 +882,11 @@ CREATE FUNCTION pipeline_deliver(p_message uuid, p_for_recipient bytea, p_is_ada
         UPDATE public.partner_messages
            SET adapted_enc = p_for_recipient, is_adapted = p_is_adapted, tone_score = p_tone,
                harsh_tone_warning = p_harsh, status = 'delivered', delivered_at = now()
-         WHERE id = p_message AND status = 'processing'
+         WHERE id = p_message AND status = 'processing' AND p_for_recipient IS NOT NULL
+        RETURNING reply_to_id),
+    answered AS (
+        UPDATE public.partner_messages m SET status = 'answered', answered_at = now()
+          FROM u WHERE m.id = u.reply_to_id AND m.status IN ('delivered', 'read')
         RETURNING 1)
     SELECT EXISTS (SELECT 1 FROM u) $f$;
 
@@ -963,7 +966,9 @@ CREATE POLICY members_leave ON couple_members FOR UPDATE TO feelings_app
 CREATE POLICY invites_select ON invites FOR SELECT TO feelings_app
     USING (created_by = app_uid());
 CREATE POLICY invites_insert ON invites FOR INSERT TO feelings_app
-    WITH CHECK (created_by = app_uid() AND status = 'active' AND app_is_active_member(couple_id)
+    WITH CHECK (created_by = app_uid() AND status = 'active' AND used_by IS NULL
+                AND used_at IS NULL AND expires_at <= now() + interval '7 days'
+                AND app_is_active_member(couple_id)
                 AND EXISTS (SELECT 1 FROM couples c WHERE c.id = couple_id
                             AND c.status = 'pending'));
 CREATE POLICY invites_revoke ON invites FOR UPDATE TO feelings_app
@@ -981,13 +986,15 @@ CREATE POLICY conv_messages_owner ON conversation_messages FOR ALL TO feelings_a
 CREATE POLICY memory_owner ON memory_items FOR ALL TO feelings_app
     USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id))
     WITH CHECK (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id));
--- Черновик: отправленный не меняется; статус sent ставит только app_send_draft.
+-- Черновик: отправленный и остановленный безопасностью (blocked) не меняются (ТЗ §9.3);
+-- статус sent ставит только app_send_draft.
 CREATE POLICY drafts_select ON message_drafts FOR SELECT TO feelings_app
     USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id));
 CREATE POLICY drafts_insert ON message_drafts FOR INSERT TO feelings_app
     WITH CHECK (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id) AND status = 'draft');
 CREATE POLICY drafts_update ON message_drafts FOR UPDATE TO feelings_app
-    USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id) AND status <> 'sent')
+    USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id)
+           AND status NOT IN ('sent', 'blocked'))
     WITH CHECK (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id) AND status <> 'sent');
 CREATE POLICY drafts_delete ON message_drafts FOR DELETE TO feelings_app
     USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id));
