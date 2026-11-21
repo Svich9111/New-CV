@@ -369,14 +369,25 @@ async def test_members_cannot_write_subscriptions(
 
 
 async def test_former_member_cannot_invite(
-    world: World, sessionmaker: async_sessionmaker[AsyncSession]
+    world: World, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    """D-4: после выхода из пары приглашать в неё нельзя (ТЗ §4.5 п.2)."""
-    async with user_scope(sessionmaker, world.a.user_id) as s:
-        await s.execute(
-            text("UPDATE couple_members SET active = false WHERE user_id = :a"),
+    """D-4: после выхода из пары приглашать в неё нельзя (ТЗ §4.5 п.2): прямой INSERT
+    отклоняется (с 0004 — правами, Б-13), функция выдачи — FB007."""
+    async with engine.begin() as conn:  # онбординг пройден: отказ именно из-за выхода
+        await conn.execute(
+            text(
+                "UPDATE users SET consent_terms_at = now(), consent_data_at = now(), "
+                "consent_sensitive_at = now(), age_confirmed_at = now() WHERE id = :a"
+            ),
             {"a": world.a.user_id},
         )
+    async with user_scope(sessionmaker, world.a.user_id) as s:
+        await s.execute(text("SELECT app_leave_couple()"))
+    with pytest.raises(DBAPIError, match="no active membership"):
+        async with user_scope(sessionmaker, world.a.user_id) as s:
+            await s.execute(
+                text("SELECT app_issue_invite(:h)"), {"h": uuid.uuid4().bytes + uuid.uuid4().bytes}
+            )
     with pytest.raises(ProgrammingError, match=DENIED):
         async with user_scope(sessionmaker, world.a.user_id) as s:
             await s.execute(
