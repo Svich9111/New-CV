@@ -1,0 +1,13 @@
+/* Палитра — ТЗ, раздел 8. Красный — только акцент главного действия и близости, не ошибки. */
+:root {
+  --bg: #ffffff;
+  --bg-secondary: #f5f3f1;
+  --text: #111111;
+  --accent: #e11d2e;
+  --radius: 16px;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #000000; --bg-secondary: #1a1a1a; --text: #ffffff; }
+}
+body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; }
+.screen { padding: 24px 16px; }
