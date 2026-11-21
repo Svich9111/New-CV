@@ -651,7 +651,7 @@ components:
       properties:
         code:
           type: string
-          examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, already_in_couple, invite_expired,
+          examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, underage, already_in_couple, invite_expired,
                      invite_used, couple_not_active, version_conflict, blocked_by_safety,
                      subscription_required, rate_limited, llm_unavailable]
         message: { type: string, description: Понятное пользователю сообщение на русском }

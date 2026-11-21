@@ -1,4 +1,5 @@
-"""ФТ-01: вход через Telegram по initData; GET /me — профиль текущего пользователя."""
+"""ФТ-01: вход через Telegram по initData; GET /me — профиль текущего пользователя;
+ФТ-02: PUT /me/onboarding — онбординг, согласия, 18+."""
 
 from fastapi import APIRouter
 
@@ -8,7 +9,7 @@ from app.core.session import issue_token
 from app.core.telegram import InitDataError, validate_init_data
 from app.errors import AppError
 from app.repositories import users
-from app.schemas import Me, Session, TelegramAuthRequest
+from app.schemas import Me, OnboardingRequest, Session, TelegramAuthRequest
 
 router = APIRouter()
 
@@ -43,6 +44,19 @@ async def auth_telegram(
 
 @router.get("/me", tags=["profile"])
 async def get_me(user_id: CurrentUser, sm: SessionMaker) -> Me:
+    me = await users.get_me(sm, user_id)
+    if me is None:
+        raise unauthorized()
+    return me
+
+
+@router.put("/me/onboarding", tags=["profile"])
+async def put_onboarding(body: OnboardingRequest, user_id: CurrentUser, sm: SessionMaker) -> Me:
+    if not body.age_confirmed:
+        await users.record_underage(sm, user_id)
+        raise AppError(403, "underage", "Сервис доступен только с 18 лет")
+    if not await users.complete_onboarding(sm, user_id, body):
+        raise unauthorized()
     me = await users.get_me(sm, user_id)
     if me is None:
         raise unauthorized()

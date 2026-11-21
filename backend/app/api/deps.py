@@ -41,6 +41,17 @@ async def current_user_id(
     return user_id
 
 
+async def onboarded_user_id(
+    request: Request, user_id: Annotated[uuid.UUID, Depends(current_user_id)]
+) -> uuid.UUID:
+    """Для эндпоинтов, требующих завершённого онбординга (ФТ-02): без трёх согласий и 18+ —
+    403 onboarding_required."""
+    if not await users.is_onboarded(get_sessionmaker(request), user_id):
+        raise AppError(403, "onboarding_required", "Сначала завершите знакомство с сервисом")
+    return user_id
+
+
 SessionMaker = Annotated[async_sessionmaker[AsyncSession], Depends(get_sessionmaker)]
 CurrentUser = Annotated[uuid.UUID, Depends(current_user_id)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
+OnboardedUser = Annotated[uuid.UUID, Depends(onboarded_user_id)]
