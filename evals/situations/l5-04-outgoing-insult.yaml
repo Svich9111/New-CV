@@ -18,8 +18,9 @@ partner_message:
   meaning:
     facts: [Пётр отдал пенсию брату в долг без обсуждения]
     request: null
+    implied_need: null
   must_keep: []
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: crisis_protocol
   draft: forbidden

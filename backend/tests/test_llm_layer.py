@@ -427,6 +427,16 @@ def _is_recipient(body: dict[str, Any]) -> bool:
     return "safety" in body["output_config"]["format"]["schema"]["properties"]
 
 
+OWNER_ECHO = {
+    "level": 2,
+    "strategy": "find_need_prepare_message",
+    "reply": "Слышу тебя. Что задело сильнее всего?",
+    "draft": "Мне грустно. Давай обсудим?",
+    "crisis_type": None,
+    "crisis_actions": [],
+}
+
+
 def echo_handler(bodies: list[dict[str, Any]]) -> Handler:
     """Модель-«эхо»: агент получателя возвращает в adapted ровно то, что получил."""
 
@@ -435,25 +445,19 @@ def echo_handler(bodies: list[dict[str, Any]]) -> Handler:
         bodies.append(body)
         if _is_recipient(body):
             echoed = body["messages"][0]["content"]
-            return ok(OPUS, {"safety": "none", "tone": 3, "adapted": echoed}, (50, 10))
-        return ok(
-            OPUS,
-            {
-                "level": 2,
-                "strategy": "find_need_prepare_message",
-                "reply": "Слышу тебя. Что задело сильнее всего?",
-                "draft": "Мне грустно. Давай обсудим?",
-                "crisis_type": None,
-                "crisis_actions": [],
-            },
-            (200, 40),
-        )
+            data = {"safety": "none", "tone": 3, "adapted": echoed, "reply_hint": "Ответь мягко."}
+            return ok(OPUS, data, (50, 10))
+        return ok(OPUS, OWNER_ECHO, (200, 40))
 
     return handler
 
 
 def _adapter(handler: Handler) -> adapter.ClaudeAdapter:
     return adapter.Opus(provider=ClaudeProvider(OPUS, client=make_client(handler)))
+
+
+def _dialog_turns(situations: list[dict[str, Any]]) -> int:
+    return sum(len(s["owner_turns"]) for s in situations if s.get("dialog"))
 
 
 def test_recipient_call_gets_only_original() -> None:
@@ -468,7 +472,7 @@ def test_recipient_call_gets_only_original() -> None:
     with_message = [s for s in situations if "partner_message" in s]
     recipient = [b for b in bodies if _is_recipient(b)]
     owner = [b for b in bodies if not _is_recipient(b)]
-    assert len(owner) == len(situations)
+    assert len(owner) == len(situations) + _dialog_turns(situations)
     assert len(recipient) == len(with_message)
 
     for s, body in zip(with_message, recipient, strict=True):
@@ -496,18 +500,21 @@ def test_recipient_call_gets_only_original() -> None:
         resp = results[s["id"]]["response"]
         assert resp["delivery"] == "adapted"
         assert json.loads(resp["adapted"]) == {"original": s["partner_message"]["original"]}
+        assert resp["reply_hint"] == "Ответь мягко."
+        assert "adapted_no_author_context" not in results[s["id"]]["checks"]  # отдельный шаг
 
 
 def test_owner_call_gets_only_owner_data() -> None:
     """§6.1, §9.2 п.1: агент владельца — имена, отношения, память, реплики и одобренное
-    сообщение пары; чужой личный контекст, ожидания и id ситуации не передаются."""
-    situations = run.load_situations()
-    bodies: list[dict[str, Any]] = []
-    model = _adapter(echo_handler(bodies))
-    run.run_suite(situations, model)
-    model.close()
-    owner = [b for b in bodies if not _is_recipient(b)]
-    for s, body in zip(situations, owner, strict=True):
+    сообщение пары; чужой личный контекст, ожидания и id ситуации не передаются. respond —
+    ровно один вызов, без доставки."""
+    for s in run.load_situations():
+        bodies: list[dict[str, Any]] = []
+        model = _adapter(echo_handler(bodies))
+        model.respond(run.build_request(s))
+        model.close()
+        assert len(bodies) == 1 and not _is_recipient(bodies[0])
+        body = bodies[0]
         payload = json.loads(body["messages"][0]["content"])
         pm = s.get("partner_message")
         assert payload == {
@@ -524,6 +531,23 @@ def test_owner_call_gets_only_owner_data() -> None:
         for secret in s.get("partner_private_context", []):
             assert json.dumps(secret, ensure_ascii=False)[1:-1] not in dumped, s["id"]
         assert s["id"] not in dumped and str(s["owner"]["age"]) not in payload.values()
+
+
+def test_converse_is_multiturn_with_own_history() -> None:
+    """Ключевой сценарий по шагам (ревью 0.3 MAJOR-2): после первой реплики модель видит только
+    её; дальше — свои прошлые ответы и следующую реплику."""
+    s = next(x for x in run.load_situations() if x["id"] == "l2-01-anna-igor-key")
+    bodies: list[dict[str, Any]] = []
+    model = _adapter(echo_handler(bodies))
+    steps = model.converse(run.build_request(s))
+    model.close()
+    assert len(steps) == len(s["owner_turns"]) == len(bodies)
+    first = json.loads(bodies[0]["messages"][0]["content"])
+    assert first["owner_turns"] == s["owner_turns"][:1]
+    second = bodies[1]["messages"]
+    assert [m["role"] for m in second] == ["user", "assistant", "user"]
+    assert json.loads(second[1]["content"]) == OWNER_ECHO
+    assert json.loads(second[2]["content"]) == {"owner_turn": s["owner_turns"][1]}
 
 
 def test_injection_text_stays_data() -> None:
@@ -552,21 +576,14 @@ def test_injection_text_stays_data() -> None:
 
 def test_delivery_decided_by_code_and_safety_not_invented() -> None:
     """Ревью 0.3 MAJOR-3: адаптер не выставляет safety_event сам — только по ответу модели."""
-    assert adapter.decide_delivery("x", {"safety": "threat_or_insult", "tone": 3, "adapted": "y"})[
-        0
-    ] == ("withheld")
-    assert adapter.decide_delivery("x", {"safety": "none", "tone": 3, "adapted": "мягче"}) == (
-        "adapted",
-        "мягче",
-    )
-    assert adapter.decide_delivery("x", {"safety": "none", "tone": 2, "adapted": "x"}) == (
-        "original_with_warning",
-        None,
-    )
-    assert adapter.decide_delivery("x", {"safety": "none", "tone": 1, "adapted": "y"}) == (
-        "as_is",
-        None,
-    )
+    threat = {"safety": "threat_or_insult", "tone": 3, "adapted": "y"}
+    assert adapter.decide_delivery("x", threat) == ("withheld", None)
+    soft = {"safety": "none", "tone": 3, "adapted": "мягче"}
+    assert adapter.decide_delivery("x", soft) == ("adapted", "мягче")
+    same = {"safety": "none", "tone": 2, "adapted": "x"}
+    assert adapter.decide_delivery("x", same) == ("original_with_warning", None)
+    calm = {"safety": "none", "tone": 1, "adapted": "y"}
+    assert adapter.decide_delivery("x", calm) == ("as_is", None)
 
     sit = next(s for s in run.load_situations() if s["id"] == "l5-01-pushed-violence")
     bodies: list[dict[str, Any]] = []
@@ -578,8 +595,27 @@ def test_delivery_decided_by_code_and_safety_not_invented() -> None:
     assert resp.partner_notified is False
 
 
+def test_withheld_message_has_no_text_for_partner() -> None:
+    """§9.3 стр. 2: при флаге безопасности адаптации и подсказки нет, событие — флаг модели."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        data = {"safety": "threat_or_insult", "tone": 3, "adapted": "смягчено", "reply_hint": "x"}
+        return ok(OPUS, data)
+
+    model = _adapter(handler)
+    resp = model.deliver(run.DeliveryRequest(original="Пожалеешь."))
+    model.close()
+    assert (resp.delivery, resp.adapted, resp.reply_hint, resp.safety_flag) == (
+        "withheld",
+        None,
+        None,
+        True,
+    )
+
+
 def test_refusal_and_outage_mark_situation_failed_with_metrics() -> None:
-    """Отказ/недоступность модели: ситуация не проходит, ничего не выдумано, прогон идёт."""
+    """Отказ/недоступность модели: ситуация не проходит с причиной, ничего не выдумано, прогон
+    идёт (§10, A8 D-4)."""
     situations = [s for s in run.load_situations() if s["id"].startswith("l1-")]
 
     def handler(request: httpx2.Request) -> httpx2.Response:
@@ -590,21 +626,23 @@ def test_refusal_and_outage_mark_situation_failed_with_metrics() -> None:
     model = _adapter(handler)
     report = run.build_report(situations, model, "refusal")
     model.close()
+    assert len(report["results"]) == len(situations)
     for r in report["results"]:
         assert not r["auto_pass"]
-        assert r["response"]["level"] == 0
-        assert r["response"]["safety_event"] is False
-        assert r["response"]["crisis_type"] is None
+        assert r["response"] is None
+        assert "ModelCallFailed" in r["error"] and "refusal" in r["error"]
         assert "refusal" in r["metrics"]["errors"]
     assert report["metrics"]["with_errors"] == len(situations)
+    assert report["summary"]["model_errors"] == [s["id"] for s in situations]
 
 
 def test_fatal_error_stops_run() -> None:
-    sit = run.load_situations()[0]
+    situations = run.load_situations()[:3]
     model = _adapter(lambda r: api_error(401, "authentication_error"))
-    with pytest.raises(LLMAuthError):
-        model.respond(run.build_request(sit))
+    with pytest.raises(adapter.RunAborted) as info:
+        run.run_suite(situations, model)
     model.close()
+    assert isinstance(info.value.__cause__, LLMAuthError)
 
 
 def test_metrics_in_report() -> None:
@@ -614,17 +652,19 @@ def test_metrics_in_report() -> None:
     report = run.build_report(situations, model, "m")
     model.close()
     with_message = sum(1 for s in situations if "partner_message" in s)
+    owner_calls = len(situations) + _dialog_turns(situations)
     m = report["metrics"]
     assert m["situations"] == len(situations)
-    assert m["input_tokens"] == 200 * len(situations) + 50 * with_message
-    assert m["output_tokens"] == 40 * len(situations) + 10 * with_message
+    assert m["input_tokens"] == 200 * owner_calls + 50 * with_message
+    assert m["output_tokens"] == 40 * owner_calls + 10 * with_message
     expected_cost = (m["input_tokens"] * 4 + m["output_tokens"] * 20) / 1e6
     assert m["cost_usd_total"] == pytest.approx(expected_cost, abs=1e-6)
     assert m["cost_usd_per_30"] == pytest.approx(expected_cost / len(situations) * 30, abs=1e-3)
     assert m["latency_p50_s"] is not None and m["latency_p95_s"] is not None
     row = report["results"][0]["metrics"]
-    assert row["prompt"] == "compare.v0"
-    assert {c["role"] for c in row["calls"]} <= {"owner", "recipient"}
+    assert row["prompt"] == "compare.v1"
+    roles = {c["role"] for r in report["results"] for c in r["metrics"]["calls"]}
+    assert roles == {"owner", "owner_step", "recipient"}
     md = run.render_markdown(report)
     assert "Скорость и стоимость" in md and "$ на 30 ситуаций" in md
 
@@ -636,18 +676,29 @@ def test_percentile_nearest_rank() -> None:
     assert run._percentile([], 50) is None
 
 
-def test_prompt_marked_for_04_only_and_follows_principles() -> None:
-    text = (REPO_DIR / "prompts" / "compare.v0.md").read_text(encoding="utf-8")
+@pytest.mark.parametrize("version", ["compare.v0", "compare.v1"])
+def test_prompt_marked_for_04_only_and_follows_principles(version: str) -> None:
+    path = REPO_DIR / "prompts" / f"{version}.md"
+    text = path.read_text(encoding="utf-8")
     assert "Только для задачи 0.4" in text and "не промпт v0" in text
-    owner = adapter.load_prompt("owner")
+    owner = adapter.load_prompt("owner", path)
     for part in ("переводчик, а не адвокат", "Отправить", "Исповедь приватна", "живой разговор"):
         assert part in owner, part
     for strategy in adapter.STRATEGIES:
         assert strategy in owner
+    recipient = adapter.load_prompt("recipient", path)
+    assert "0–3" in recipient and "обещания" in recipient
+
+
+def test_current_prompt_covers_schema() -> None:
+    """Действующая версия промпта описывает все действия протокола и поля схем ответа."""
+    assert adapter.PROMPT_PATH.name == "compare.v1.md"
+    owner = adapter.load_prompt("owner")
     for action in adapter.CRISIS_ACTIONS:
         assert action in owner, action
     recipient = adapter.load_prompt("recipient")
-    assert "0–3" in recipient and "обещания" in recipient
+    for field in adapter.RECIPIENT_SCHEMA["properties"]:
+        assert field in recipient, field
 
 
 # --------------------------------------------------------------------------- сводное сравнение
@@ -690,7 +741,7 @@ def test_compare_table(tmp_path: Path) -> None:
     assert code == 0
     summary = json.loads((tmp_path / "cmp.json").read_text(encoding="utf-8"))
     assert [r["model"] for r in summary["rows"]] == [OPUS, HAIKU]
-    assert summary["prompt"] == "compare.v0"
+    assert summary["prompt"] == "compare.v1"
     for row in summary["rows"]:
         assert set(row["by_level"]) == {"1", "2", "3", "4", "5"}
         assert row["cost_usd_per_30"] is not None and row["latency_p95_s"] is not None

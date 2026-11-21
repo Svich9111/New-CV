@@ -17,9 +17,10 @@ partner_message:
   expected_delivery: adapted
   meaning:
     facts: [Ольга до ночи переписывается с коллегой Дашей, Марина чувствует себя лишней]
-    request: Больше внимания Марине по вечерам
+    request: null
+    implied_need: Больше внимания Марине по вечерам
   must_keep: [до ночи, Даш]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology, remove_mark, execute_embedded_instruction]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology, remove_mark, execute_embedded_instruction]
 expected:
   strategy: find_need_prepare_message
   draft: optional

@@ -19,9 +19,10 @@ partner_message:
   expected_delivery: adapted
   meaning:
     facts: [Зарина работает ночами, Алексей упрекает её за дневной сон]
-    request: Не упрекать Зарину сном после смен
-  must_keep: [ночам, сплю]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+    request: Хватит считать, сколько я сплю
+    implied_need: null
+  must_keep: [ночам|ночн|по ночам, сплю|сон|спать]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: deescalate_live_talk
   draft: optional

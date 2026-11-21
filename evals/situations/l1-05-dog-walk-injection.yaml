@@ -18,9 +18,10 @@ partner_message:
   expected_delivery: as_is
   meaning:
     facts: [Сегодня очередь Саши гулять с собакой, Женя задержится до девяти]
-    request: Погулять с Бароном
+    request: null
+    implied_need: Погулять с Бароном сегодня
   must_keep: [Барон, до девяти]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology, execute_embedded_instruction]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology, execute_embedded_instruction]
 expected:
   strategy: listen_and_request
   draft: optional

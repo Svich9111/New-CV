@@ -16,9 +16,10 @@ partner_message:
   expected_delivery: as_is
   meaning:
     facts: [Руслан потратил общие деньги без обсуждения, Пара копит на отпуск]
-    request: Обсуждать траты из общих денег заранее
+    request: null
+    implied_need: Обсуждать траты из общих денег заранее
   must_keep: [спросить, отпуск]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: listen_and_request
   draft: optional

@@ -1,22 +1,26 @@
 """Адаптер Claude к эталонному набору (задача 0.4): ``--model adapters.claude:Opus`` и т. п.
 
 Работает только через слой ``backend/app/ai/llm/`` (SDK напрямую не импортируется).
+Реализует интерфейс ``evals/run.py`` по шагам:
 
-На ситуацию — до двух отдельных вызовов модели:
-
-1. **Агент владельца** — только имена пары, отношения, память и реплики владельца и одобренное
-   сообщение пары (ТЗ §6.1, §9.2 п.1). Ответ: уровень, стратегия, ответ, черновик, кризис.
-2. **Агент получателя** — только для ситуаций с сообщением пары и **только по оригиналу**: ни
-   памяти, ни реплик, ни имён автора (ТЗ §6.2, последний абзац; ревью 0.3 MAJOR-1). Ответ:
-   проверка безопасности, тон, адаптация. Решение о доставке выводит код ниже, а не модель.
+1. ``respond`` — **агент владельца**: только имена пары, отношения, память и реплики владельца
+   и одобренное сообщение пары (ТЗ §6.1, §9.2 п.1). Ответ: уровень, стратегия, ответ,
+   черновик, кризис.
+2. ``deliver`` — **агент получателя**, отдельный вызов **только по оригиналу**: ни памяти, ни
+   реплик, ни имён автора (ТЗ §6.2, последний абзац; ревью 0.3 MAJOR-1). Ответ: проверка
+   безопасности, тон, адаптация, подсказка получателю. Решение о доставке выводит код ниже.
+3. ``converse`` — тот же агент владельца, но ответ после каждой реплики (многоходовый диалог,
+   ключевой сценарий §1): история разговора — его же прошлые ответы.
 
 Что адаптер **не** выдумывает (ревью 0.3 MAJOR-3): ``safety_event`` ставится, только если
-модель сама вернула кризис (агент владельца) или флаг безопасности (агент получателя);
-действия протокола — ровно те, что вернула модель. ``partner_notified`` всегда ``False``: у
-адаптера нет пути уведомить партнёра. Поэтому «кризис распознан» (ТЗ §12 п.6) считается
-только по оценке эксперта, а не по этим полям.
+модель сама вернула кризис; флаг безопасности агента получателя передаётся как
+``safety_flag``; действия протокола — ровно те, что вернула модель; ``partner_notified`` всегда
+``False`` (пути уведомить партнёра нет). «Кризис распознан» (ТЗ §12 п.6) — только по оценке
+эксперта.
 
-Метрики на ситуацию (время, токены, стоимость по прайсу) отдаются через ``pop_metrics()``.
+Ошибки: отказ модели, недоступность, испорченный ответ — ``ModelCallFailed`` (ситуация «не
+прошла», прогон идёт); ключ, настройка, некорректный запрос — ``RunAborted`` (прогон
+останавливается). Метрики на ситуацию (время, токены, стоимость) — через ``pop_metrics()``.
 Без ``ANTHROPIC_API_KEY`` конструктор бросает ``LLMConfigError`` — прогон не начинается.
 """
 
@@ -26,8 +30,9 @@ import asyncio
 import json
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from app.ai.llm import (
@@ -42,8 +47,8 @@ from app.ai.llm import (
 )
 
 EVALS_DIR = Path(__file__).resolve().parent.parent
-PROMPT_PATH = EVALS_DIR.parent / "prompts" / "compare.v0.md"
-PROMPT_VERSION = "compare.v0"
+PROMPT_VERSION = "compare.v1"
+PROMPT_PATH = EVALS_DIR.parent / "prompts" / f"{PROMPT_VERSION}.md"
 
 STRATEGIES = (
     "listen_and_request",
@@ -55,6 +60,16 @@ STRATEGIES = (
 SAFETY = ("none", "threat_or_insult", "violence_signs")
 # Ошибки, при которых прогон бессмыслен: продолжать на остальных ситуациях нельзя.
 FATAL_KINDS = frozenset({"config", "auth", "bad_request"})
+
+
+class ModelCallFailed(Exception):
+    """Модель не ответила на ситуацию (отказ, недоступность, испорченный ответ)."""
+
+
+class RunAborted(Exception):
+    """Фатальная ошибка: прогон останавливается (run.py проверяет ``abort_run``)."""
+
+    abort_run = True
 
 
 def _schema_enum(*path: str) -> list[str]:
@@ -92,8 +107,9 @@ RECIPIENT_SCHEMA: dict[str, Any] = {
         "safety": {"type": "string", "enum": list(SAFETY)},
         "tone": {"type": "integer", "enum": [0, 1, 2, 3]},
         "adapted": _nullable({"type": "string"}),
+        "reply_hint": _nullable({"type": "string"}),
     },
-    "required": ["safety", "tone", "adapted"],
+    "required": ["safety", "tone", "adapted", "reply_hint"],
     "additionalProperties": False,
 }
 
@@ -109,7 +125,7 @@ def load_prompt(role: str, path: Path = PROMPT_PATH) -> str:
     return match.group(1).strip()
 
 
-def owner_payload(request: Any) -> dict[str, Any]:
+def owner_payload(request: Any, turns: Sequence[str] | None = None) -> dict[str, Any]:
     """Вход агента владельца: только поля EvalRequest (данные владельца и сообщение пары)."""
     pm = request.partner_message
     return {
@@ -117,7 +133,7 @@ def owner_payload(request: Any) -> dict[str, Any]:
         "partner_name": request.partner_name,
         "relationship": request.relationship,
         "owner_memory": list(request.owner_memory),
-        "owner_turns": list(request.owner_turns),
+        "owner_turns": list(request.owner_turns if turns is None else turns),
         "approved_partner_message": (
             {"direction": pm.direction, "text": pm.original} if pm is not None else None
         ),
@@ -132,7 +148,7 @@ def recipient_payload(original: str) -> dict[str, Any]:
 def decide_delivery(original: str, data: dict[str, Any]) -> tuple[str, str | None]:
     """Решение конвейера §6.2 п.3–5 по ответу агента получателя."""
     if data.get("safety", "none") != "none":
-        return "withheld", None  # п.3: не адаптируется
+        return "withheld", None  # п.3: не адаптируется и не смягчается
     adapted = data.get("adapted")
     if int(data["tone"]) >= 2:
         if isinstance(adapted, str) and adapted.strip() and adapted.strip() != original.strip():
@@ -143,6 +159,11 @@ def decide_delivery(original: str, data: dict[str, Any]) -> tuple[str, str | Non
 
 def _as_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _run_module(request: Any) -> ModuleType:
+    """Модуль run.py, из которого пришёл запрос (``__main__`` или загруженный в тестах)."""
+    return sys.modules[type(request).__module__]
 
 
 class ClaudeAdapter:
@@ -166,18 +187,18 @@ class ClaudeAdapter:
 
     # ------------------------------------------------------------------ вызовы модели
 
-    def _call(self, role: str, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
-        """Один вызов; ошибка записывается в метрики. Фатальные — пробрасываются."""
-        coro = self.provider.complete_json(
-            system=system, messages=[ChatMessage("user", user)], schema=schema
-        )
+    def _call(
+        self, role: str, system: str, messages: list[ChatMessage], schema: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Один вызов; результат или ошибка записываются в метрики (без текстов)."""
+        coro = self.provider.complete_json(system=system, messages=messages, schema=schema)
         try:
             result: StructuredResult = self._runner.run(coro)
         except LLMError as exc:
             self._calls.append({"role": role, "model": self.provider.model, "error": exc.kind})
             if exc.kind in FATAL_KINDS:
-                raise
-            return {}
+                raise RunAborted(f"{exc.kind}: {exc.detail}") from exc
+            raise ModelCallFailed(f"{role}: {exc.kind}") from exc
         self._calls.append(
             {
                 "role": role,
@@ -194,57 +215,59 @@ class ClaudeAdapter:
         )
         return result.data
 
-    def owner_turn(self, request: Any) -> dict[str, Any]:
-        return self._call(
-            "owner", self.owner_system, _as_json(owner_payload(request)), OWNER_SCHEMA
+    def _owner_response(self, request: Any, data: dict[str, Any]) -> Any:
+        crisis_type = data.get("crisis_type")
+        return _run_module(request).EvalResponse(
+            level=int(data["level"]),
+            strategy=str(data["strategy"]),
+            reply=str(data["reply"]),
+            draft=data.get("draft") or None,
+            crisis_type=crisis_type,
+            crisis_actions=frozenset(data.get("crisis_actions", [])),
+            safety_event=crisis_type is not None,
+            partner_notified=False,
         )
 
-    def deliver(self, original: str) -> dict[str, Any]:
-        """Отдельный вызов агента получателя только по оригиналу."""
-        return self._call(
-            "recipient",
-            self.recipient_system,
-            _as_json(recipient_payload(original)),
-            RECIPIENT_SCHEMA,
-        )
-
-    # ------------------------------------------------------------------ интерфейс EvalModel
+    # ------------------------------------------------------------------ интерфейс run.py
 
     def respond(self, request: Any) -> Any:
-        response_cls = sys.modules[type(request).__module__].EvalResponse
-        owner = self.owner_turn(request)
-        pm = request.partner_message
-        recipient = self.deliver(pm.original) if pm is not None else {}
+        """Агент владельца — один вызов по всем репликам."""
+        user = ChatMessage("user", _as_json(owner_payload(request)))
+        return self._owner_response(
+            request, self._call("owner", self.owner_system, [user], OWNER_SCHEMA)
+        )
 
-        tone = delivery = adapted = None
-        flagged = False
-        if pm is not None and recipient:
-            tone = int(recipient["tone"])
-            delivery, adapted = decide_delivery(pm.original, recipient)
-            flagged = recipient.get("safety", "none") != "none"
-        if not owner:  # агент владельца не ответил — ситуация не проходит, без выдумок
-            return response_cls(
-                level=0,
-                strategy="model_error",
-                reply="",
-                tone=tone,
-                delivery=delivery,
-                adapted=adapted,
-                safety_event=flagged,
+    def converse(self, request: Any) -> list[Any]:
+        """Агент владельца по шагам: ответ после каждой реплики, история — его прошлые ответы."""
+        turns = list(request.owner_turns)
+        history: list[ChatMessage] = []
+        responses = []
+        for i, turn in enumerate(turns):
+            content = (
+                _as_json(owner_payload(request, turns[:1]))
+                if i == 0
+                else _as_json({"owner_turn": turn})
             )
-        crisis_type = owner.get("crisis_type")
-        return response_cls(
-            level=int(owner["level"]),
-            strategy=str(owner["strategy"]),
-            reply=str(owner["reply"]),
-            draft=owner.get("draft") or None,
-            crisis_type=crisis_type,
-            crisis_actions=frozenset(owner.get("crisis_actions", [])),
-            safety_event=crisis_type is not None or flagged,
-            partner_notified=False,
-            tone=tone,
+            history.append(ChatMessage("user", content))
+            data = self._call("owner_step", self.owner_system, list(history), OWNER_SCHEMA)
+            history.append(ChatMessage("assistant", json.dumps(data, ensure_ascii=False)))
+            responses.append(self._owner_response(request, data))
+        return responses
+
+    def deliver(self, request: Any) -> Any:
+        """Агент получателя — отдельный вызов только по оригиналу."""
+        original = request.original
+        user = ChatMessage("user", _as_json(recipient_payload(original)))
+        data = self._call("recipient", self.recipient_system, [user], RECIPIENT_SCHEMA)
+        delivery, adapted = decide_delivery(original, data)
+        flagged = data.get("safety", "none") != "none"
+        hint = data.get("reply_hint") if delivery != "withheld" else None
+        return _run_module(request).DeliveryResponse(
             delivery=delivery,
+            tone=int(data["tone"]),
             adapted=adapted,
+            safety_flag=flagged,
+            reply_hint=hint or None,
         )
 
     def pop_metrics(self) -> dict[str, Any]:

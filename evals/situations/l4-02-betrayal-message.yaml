@@ -3,7 +3,7 @@ title: Узнал о встречах с бывшим — сообщение б�
 status: draft
 review_note: Черновик A3 — ждёт утверждения психологом (Д5)
 level: 4
-tags: [измена, доверие]
+tags: [доверие, ложь]
 checks: [level, meaning]
 owner: {name: Марк, age: 27, partner_name: Илья}
 relationship: Вместе пять лет
@@ -18,8 +18,9 @@ partner_message:
   meaning:
     facts: [Илья два месяца встречался с Кириллом, Илья это скрывал, Марку трудно верить]
     request: null
+    implied_need: null
   must_keep: [Кирилл, два месяца, верить]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: support_recommend_therapist
   draft: optional
@@ -29,5 +30,5 @@ expected:
     - Рекомендовать семейного психолога
     - Передать прямое, но не грубое сообщение без адаптации
   agent_must_not:
-    - Смягчать факт измены в сообщении
+    - Смягчать или убирать факты — встречи с Кириллом, ложь два месяца
     - Осуждать Илью от имени агента

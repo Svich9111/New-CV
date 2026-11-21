@@ -17,9 +17,10 @@ partner_message:
   expected_delivery: as_is
   meaning:
     facts: [Аля не уверена в отношениях]
-    request: Дать Але время подумать
+    request: Мне нужно время, чтобы подумать
+    implied_need: null
   must_keep: [время, подумать]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: support_recommend_therapist
   draft: optional

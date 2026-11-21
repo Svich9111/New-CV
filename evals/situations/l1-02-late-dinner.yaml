@@ -16,9 +16,10 @@ partner_message:
   expected_delivery: as_is
   meaning:
     facts: [Тимур задержался на час, не предупредил, Кира ждала с ужином]
-    request: Предупреждать, если задерживается
+    request: null
+    implied_need: Предупреждать, если задерживается
   must_keep: [написать, час]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: listen_and_request
   draft: optional

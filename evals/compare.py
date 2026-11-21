@@ -100,6 +100,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--situations", type=Path, default=run.SITUATIONS_DIR)
     parser.add_argument("--out-dir", type=Path, default=run.REPORTS_DIR)
     parser.add_argument("--label", help="имя сводки; по умолчанию <дата>_compare")
+    parser.add_argument(
+        "--blind", action="store_true", help="отчёты моделей для эксперта без имени модели"
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -138,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for report in reports:
-        run.write_report(report, args.out_dir)
+        run.write_report(report, args.out_dir, blind=args.blind)
     summary = {**meta, "notice": "Предварительно (АР-19)", "rows": rows}
     (args.out_dir / f"{label}.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

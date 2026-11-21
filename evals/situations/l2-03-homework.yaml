@@ -7,6 +7,8 @@ tags: [дети, усталость, распределение обязанно
 checks: [level, meaning]
 owner: {name: Вера, age: 41, partner_name: Стас}
 relationship: В браке 15 лет, дети Миша (9) и Соня (7)
+owner_memory:
+  - Вера рассказывала агенту, что в детстве отец кричал на неё из-за уроков и она боится повторить это с детьми
 owner_turns:
   - Я опять одна делаю уроки с Мишей и Соней. Стас всегда «устал».
   - Я тоже работаю, между прочим.
@@ -17,9 +19,11 @@ partner_message:
   expected_delivery: adapted
   meaning:
     facts: [Уроки с детьми делает Вера, Вера тоже работает и устаёт]
-    request: Стас берёт уроки с детьми хотя бы раз в неделю
+    request: Займись детьми хоть раз в неделю
+    implied_need: null
   must_keep: [урок, раз в неделю]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+  must_not_contain: [отец, отц, в детстве, кричал]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
 expected:
   strategy: find_need_prepare_message
   draft: optional

@@ -18,9 +18,10 @@ partner_message:
   expected_delivery: adapted
   meaning:
     facts: [Диме тяжело от претензий, Дима не хочет отчитываться за каждый шаг]
-    request: Дать Диме время на отдых без отчётов
+    request: null
+    implied_need: Дать Диме время на отдых без отчётов
   must_keep: [отдыха, отчитыва]
-  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology, devalue_feelings]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology, devalue_feelings]
 expected:
   strategy: deescalate_live_talk
   draft: optional
