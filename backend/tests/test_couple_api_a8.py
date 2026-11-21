@@ -432,34 +432,69 @@ async def test_forged_or_deleted_session_is_401(
 # --- Отзыв 18+ через PUT /me/onboarding (ТЗ §9.3; карточка, критерий 2; АР-13) -------------
 
 
-async def test_age_revocation_closes_couple_endpoints_fact(
+async def test_age_revocation_closes_couple_endpoints_but_leave(
     api: httpx.AsyncClient, engine: AsyncEngine
 ) -> None:
-    """Фиксация фактического поведения (см. отчёт, D-3): после «мне нет 18» закрыты все
-    эндпоинты пары, включая выход; открыт только просмотр приглашения. Пара остаётся
-    активной, партнёр её видит и может выйти. Повторное «да» (АР-14) возвращает доступ."""
+    """АР-17 (ТЗ §4.5 п.2, §9.3): после «мне нет 18» закрыты все эндпоинты пары, кроме выхода
+    и просмотра приглашения. Выход — 204, пара распадается для обоих, партнёр свободен.
+    Повторное «да» (АР-14) возвращает доступ."""
     anna, igor, couple_id = await _pair(api)
     _err(await _onboard(api, anna, age=False), 403, "underage")
     olga = await _adult(api, "Ольга")
     _, olga_token = await _create(api, olga)
-    for method, path in (
+    closed = (
         ("get", "/couple"),
         ("post", "/couple"),
         ("post", "/couple/invite"),
-        ("post", "/couple/leave"),
         ("post", f"/invites/{olga_token}/accept"),
-    ):
+    )
+    for method, path in closed:
         _err(await api.request(method, API + path, headers=anna.h), 403, "onboarding_required")
     _preview(await api.get(f"{API}/invites/{olga_token}", headers=anna.h))
-    # Пара не тронута, партнёр видит её активной.
-    body = _ok(await api.get(f"{API}/couple", headers=igor.h), 200, "Couple")
-    assert (body["id"], body["status"]) == (couple_id, "active")
     assert (
         await _db(engine, "SELECT count(*) FROM safety_events WHERE user_id = :u", u=anna.id) == 1
     )
-    # Повторное «да» — доступ возвращается, выход работает.
-    assert (await _onboard(api, anna)).status_code == 200
+    # До выхода пара не тронута: партнёр видит её активной.
+    body = _ok(await api.get(f"{API}/couple", headers=igor.h), 200, "Couple")
+    assert (body["id"], body["status"]) == (couple_id, "active")
+
+    # Выход без онбординга (АР-17): 204, пустое тело, пара распалась для обоих.
     _ok(await api.post(f"{API}/couple/leave", headers=anna.h), 204, None)
+    assert await _db(engine, "SELECT status FROM couples WHERE id = :c", c=couple_id) == "dissolved"
+    assert (
+        await _db(
+            engine,
+            "SELECT count(*) FROM couple_members WHERE couple_id = :c AND active",
+            c=couple_id,
+        )
+        == 0
+    )
+    _err(await api.get(f"{API}/couple", headers=igor.h), 404, "not_found")
+    _err(await api.post(f"{API}/couple/leave", headers=igor.h), 404, "not_found")
+    # Повторный выход — 404 (пары нет), а не 403; прочие эндпоинты по-прежнему закрыты.
+    _err(await api.post(f"{API}/couple/leave", headers=anna.h), 404, "not_found")
+    for method, path in closed:
+        _err(await api.request(method, API + path, headers=anna.h), 403, "onboarding_required")
+    # Партнёр свободен: создаёт новую пару.
+    await _create(api, igor)
+    # Повторное «да» (АР-14) возвращает доступ: пары нет, можно создать новую.
+    assert (await _onboard(api, anna)).status_code == 200
+    _err(await api.get(f"{API}/couple", headers=anna.h), 404, "not_found")
+    await _create(api, anna)
+
+
+async def test_leave_never_requires_onboarding(api: httpx.AsyncClient) -> None:
+    """АР-17: выход из пары не отдаёт 403 ни новичку, ни снявшему 18+; в контракте 403 нет."""
+    assert "403" not in _declared("post", "/couple/leave")
+    newcomer = await _enter(api, "Новичок")
+    _err(await api.post(f"{API}/couple/leave", headers=newcomer.h), 404, "not_found")
+    # Участник ожидающей пары снял 18+ — выход работает, ссылка отозвана.
+    anna = await _adult(api, "Анна")
+    _, token = await _create(api, anna)
+    _err(await _onboard(api, anna, age=False), 403, "underage")
+    _ok(await api.post(f"{API}/couple/leave", headers=anna.h), 204, None)
+    igor = await _adult(api, "Игорь")
+    _err(await api.get(f"{API}/invites/{token}", headers=igor.h), 410, "invite_used")
 
 
 async def test_age_revocation_in_pending_couple_blocks_new_links(
@@ -534,12 +569,7 @@ async def test_bruteforce_timing_is_similar(api: httpx.AsyncClient) -> None:
     assert abs(m_missing - m_malformed) < 0.025
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="D-2 (1.3-test): токен с «/» (в т.ч. %2F) или пустой токен уходит мимо маршрута — "
-    "Starlette отвечает 404 {'detail': 'Not Found'} не по схеме Error и иначе, чем на "
-    "несуществующий токен",
-)
+# D-2 (1.3-test) исправлен в 37f2cbc: ответы маршрутизатора — по схеме Error.
 @pytest.mark.parametrize("path", ["/invites/", "/invites/aaaa%2Fbbbb", "/invites/a/b/accept"])
 async def test_token_with_slash_answers_like_missing(api: httpx.AsyncClient, path: str) -> None:
     guest = await _adult(api, "Слэш")
@@ -906,10 +936,13 @@ async def _s_accept_410(c: httpx.AsyncClient, e: AsyncEngine) -> httpx.Response:
     return await c.post(f"{API}/invites/{t}/accept", headers=(await _adult(c, "Б")).h)
 
 
-def _undeclared(reason: str) -> pytest.MarkDecorator:
-    return pytest.mark.xfail(strict=True, reason=f"D-1 (1.3-test, для A1): {reason}")
+async def _s_leave_204_after_age_revoked(c: httpx.AsyncClient, e: AsyncEngine) -> httpx.Response:
+    a, _, _ = await _pair(c)
+    _err(await _onboard(c, a, age=False), 403, "underage")
+    return await c.post(f"{API}/couple/leave", headers=a.h)
 
 
+# D-1 (1.3-test) исправлен в 50ca3d5: все статусы ниже объявлены, пометки xfail сняты.
 GET_C, POST_C, INV, LEAVE = (
     ("get", "/couple"),
     ("post", "/couple"),
@@ -920,7 +953,6 @@ GET_C, POST_C, INV, LEAVE = (
     ),
 )
 VIEW, ACC = ("get", "/invites/{token}"), ("post", "/invites/{token}/accept")
-NO401 = "401 unauthorized отдаётся, но в контракте для пути не объявлен"
 
 SERVED: list[Any] = [
     pytest.param(GET_C, 200, _s_get_couple_200, id="GET /couple 200"),
@@ -930,23 +962,17 @@ SERVED: list[Any] = [
         403,
         _newcomer("get", "/couple"),
         id="GET /couple 403",
-        marks=_undeclared("GET /couple отдаёт 403 onboarding_required — не объявлен"),
     ),
-    pytest.param(
-        GET_C, 401, _no_session("get", "/couple"), id="GET /couple 401", marks=_undeclared(NO401)
-    ),
+    pytest.param(GET_C, 401, _no_session("get", "/couple"), id="GET /couple 401"),
     pytest.param(POST_C, 201, _s_create_201, id="POST /couple 201"),
     pytest.param(POST_C, 409, _s_create_409, id="POST /couple 409"),
     pytest.param(POST_C, 403, _newcomer("post", "/couple"), id="POST /couple 403"),
-    pytest.param(
-        POST_C, 401, _no_session("post", "/couple"), id="POST /couple 401", marks=_undeclared(NO401)
-    ),
+    pytest.param(POST_C, 401, _no_session("post", "/couple"), id="POST /couple 401"),
     pytest.param(
         POST_C,
         503,
         _no_bot("/couple"),
         id="POST /couple 503",
-        marks=_undeclared("503 service_unavailable без имени бота — не объявлен"),
     ),
     pytest.param(INV, 201, _s_invite_201, id="POST /couple/invite 201"),
     pytest.param(INV, 409, _s_invite_409, id="POST /couple/invite 409"),
@@ -956,37 +982,39 @@ SERVED: list[Any] = [
         404,
         _s_invite_404,
         id="POST /couple/invite 404",
-        marks=_undeclared("POST /couple/invite без пары отдаёт 404 (FB007) — не объявлен"),
     ),
     pytest.param(
         INV,
         401,
         _no_session("post", "/couple/invite"),
         id="POST /couple/invite 401",
-        marks=_undeclared(NO401),
     ),
     pytest.param(
         INV,
         503,
         _no_bot("/couple/invite"),
         id="POST /couple/invite 503",
-        marks=_undeclared("503 service_unavailable без имени бота — не объявлен"),
     ),
     pytest.param(LEAVE, 204, _s_leave_204, id="POST /couple/leave 204"),
     pytest.param(LEAVE, 404, _s_leave_404, id="POST /couple/leave 404"),
+    # АР-17: выход не требует онбординга — без него 404 (нет пары) или 204, но не 403.
     pytest.param(
         LEAVE,
-        403,
+        404,
         _newcomer("post", "/couple/leave"),
-        id="POST /couple/leave 403",
-        marks=_undeclared("POST /couple/leave отдаёт 403 onboarding_required — не объявлен"),
+        id="POST /couple/leave 404 без онбординга",
+    ),
+    pytest.param(
+        LEAVE,
+        204,
+        _s_leave_204_after_age_revoked,
+        id="POST /couple/leave 204 после отзыва 18+",
     ),
     pytest.param(
         LEAVE,
         401,
         _no_session("post", "/couple/leave"),
         id="POST /couple/leave 401",
-        marks=_undeclared(NO401),
     ),
     pytest.param(VIEW, 200, _s_view_200, id="GET /invites 200"),
     pytest.param(VIEW, 404, _s_view_404, id="GET /invites 404"),
@@ -996,7 +1024,6 @@ SERVED: list[Any] = [
         401,
         _no_session("get", "/invites/{t}"),
         id="GET /invites 401",
-        marks=_undeclared(NO401),
     ),
     pytest.param(ACC, 200, _s_accept_200, id="POST accept 200"),
     pytest.param(ACC, 403, _newcomer("post", "/invites/{t}/accept"), id="POST accept 403"),
@@ -1008,7 +1035,6 @@ SERVED: list[Any] = [
         401,
         _no_session("post", "/invites/{t}/accept"),
         id="POST accept 401",
-        marks=_undeclared(NO401),
     ),
 ]
 
@@ -1042,11 +1068,7 @@ def _success_schema(method: str, path: str) -> str:
     }.get((method, path), "Error")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="D-5 (1.3-test, для A1, MINOR): коды not_found, own_invite, couple_not_pending "
-    "отдаются, но не перечислены в Error.code.examples (там есть couple_not_active)",
-)
+# D-4 (1.3-test) исправлен в 50ca3d5.
 def test_served_error_codes_listed_in_contract() -> None:
     known = set(_schema("Error")["properties"]["code"]["examples"])
     served = {
@@ -1089,4 +1111,168 @@ async def test_db_onboarding_check_maps_to_403_when_api_check_is_stale(
     _err(await api.post(f"{API}/couple/invite", headers=pending.h), 403, "onboarding_required")
     assert (
         await _db(engine, "SELECT count(*) FROM couple_members WHERE user_id = :u", u=late.id) == 0
+    )
+
+
+# --- Раунд 2: ответы маршрутизатора (D-2), 23505 по имени ограничения (MINOR-4),
+# --- откат при сбое БД и hide_parameters (MINOR-7) ------------------------------------------
+
+
+async def test_router_404_and_405_follow_error_schema_without_path(api: httpx.AsyncClient) -> None:
+    """D-2: 404/405 маршрутизатора — по схеме Error; 405 несёт Allow; путь (в нём может быть
+    токен приглашения) не попадает ни в тело, ни в заголовки ответа (ТЗ §9.1)."""
+    guest = await _adult(api, "Маршрут")
+    reference = _err(await api.get(f"{API}/invites/{'Q' * 43}", headers=guest.h), 404, "not_found")
+    secret = base64.urlsafe_b64encode(uuid.uuid4().bytes * 2).rstrip(b"=").decode()
+    for headers in (guest.h, {}):
+        for method, path in (
+            ("get", f"/nope/{secret}"),
+            ("post", f"/invites/{secret}/accept/more"),
+            ("get", "/invites/"),
+        ):
+            r = await api.request(method, API + path, headers=headers)
+            assert _err(r, 404, "not_found") == reference
+            assert r.headers["content-type"] == "application/json"
+            assert secret not in r.text and secret not in str(r.headers)
+        for method, path, allow in (
+            ("get", f"/invites/{secret}/accept", {"POST"}),
+            ("put", f"/invites/{secret}", {"GET"}),
+            ("get", "/couple/leave", {"POST"}),
+            ("put", "/couple/invite", {"POST"}),
+        ):
+            r = await api.request(method, API + path, headers=headers)
+            _err(r, 405, "method_not_allowed")
+            assert {m.strip() for m in r.headers["allow"].split(",")} == allow, (path, r.headers)
+            assert secret not in r.text and secret not in str(r.headers)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="R2-1 (1.3-test, раунд 2, MINOR): у пути с двумя методами (GET и POST /couple) "
+    "405 несёт Allow только первого маршрута (GET) — RFC 9110 §15.5.6 требует все методы",
+)
+async def test_405_allow_lists_all_methods_of_path(api: httpx.AsyncClient) -> None:
+    r = await api.delete(f"{API}/couple")
+    _err(r, 405, "method_not_allowed")
+    assert {m.strip() for m in r.headers["allow"].split(",")} == {"GET", "POST"}
+
+
+async def test_one_active_couple_violation_maps_by_constraint_name(
+    api: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """MINOR-4: настоящая ошибка asyncpg 23505 индекса одной пары → FB005 (409
+    already_in_couple), 23505 другого ограничения (хеш токена) — пробрасывается как есть."""
+    from sqlalchemy.exc import IntegrityError
+
+    from app.repositories import couples
+    from app.repositories.couples import CoupleError
+
+    async def violation(sql: str) -> IntegrityError:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            try:
+                with pytest.raises(IntegrityError) as ei:
+                    await conn.execute(text(sql))
+                return ei.value
+            finally:
+                await trans.rollback()
+
+    with_member = (
+        f"WITH u AS (INSERT INTO users (telegram_id) VALUES ({_tg_id()}) RETURNING id), "
+        "c1 AS (INSERT INTO couples (status) VALUES ('pending') RETURNING id), "
+        "c2 AS (INSERT INTO couples (status) VALUES ('pending') RETURNING id) "
+        "INSERT INTO couple_members (couple_id, user_id, role) "
+        "SELECT c1.id, u.id, 'initiator'::member_role FROM c1, u UNION ALL "
+        "SELECT c2.id, u.id, 'initiator'::member_role FROM c2, u"
+    )
+    one_active = await violation(with_member)
+    assert "uq_couple_members_one_active_per_user" in str(one_active)
+    with pytest.raises(CoupleError) as mapped:
+        with couples._db_errors():
+            raise one_active
+    assert mapped.value.sqlstate == "FB005"
+
+    await _create(api, await _adult(api, "Хеш"))
+    dup = await violation(
+        "INSERT INTO invites (couple_id, created_by, token_hash, expires_at, status) "
+        "SELECT couple_id, created_by, token_hash, expires_at, 'revoked' FROM invites LIMIT 1"
+    )
+    assert "uq_invites_token_hash" in str(dup)
+    with pytest.raises(IntegrityError) as passed:
+        with couples._db_errors():
+            raise dup
+    assert passed.value is dup
+
+
+async def test_token_collision_is_500_and_rolls_back_both_writes(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MINOR-4/MINOR-7: коллизия хеша токена — не «уже в паре», а 500; POST /couple не
+    оставляет пары без ссылки, POST /couple/invite не отзывает прежнюю ссылку (одна
+    транзакция); текст исключения (его пишет uvicorn.error) не содержит параметров."""
+    import app.api.couple as couple_api
+
+    app.state.sessionmaker = sessionmaker
+    app.dependency_overrides[get_settings] = _settings
+    raw = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://a8"
+    )
+    strict = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://a8")
+    try:
+        anna, olga, nina = (
+            await _adult(raw, "Анна"),
+            await _adult(raw, "Ольга"),
+            await _adult(raw, "Нина"),
+        )
+        _, taken = await _create(raw, anna)
+        olga_couple, olga_token = await _create(raw, olga)
+        monkeypatch.setattr(couple_api, "new_token", lambda: taken)
+        taken_hash = hashlib.sha256(taken.encode()).digest()
+
+        for who, path in ((nina, "/couple"), (olga, "/couple/invite")):
+            r = await raw.post(API + path, headers=who.h)
+            assert r.status_code == 500, (path, r.text)
+            assert "already_in_couple" not in r.text and taken not in r.text
+            with pytest.raises(Exception) as ei:
+                await strict.post(API + path, headers=who.h)
+            dumped = f"{ei.value}\n{ei.value!r}\n{ei.value.__cause__!r}"
+            assert "uq_invites_token_hash" in dumped
+            assert "parameters hidden" in dumped, dumped
+            for leak in (taken, taken_hash.hex(), repr(taken_hash), str(who.id)):
+                assert leak not in str(ei.value), leak
+    finally:
+        await raw.aclose()
+        await strict.aclose()
+        app.dependency_overrides.clear()
+
+    # POST /couple: ни пары, ни членства у Нины; пар без участников нет.
+    assert (
+        await _db(engine, "SELECT count(*) FROM couple_members WHERE user_id = :u", u=nina.id) == 0
+    )
+    assert (
+        await _db(
+            engine,
+            "SELECT count(*) FROM couples c WHERE NOT EXISTS "
+            "(SELECT 1 FROM couple_members m WHERE m.couple_id = c.id)",
+        )
+        == 0
+    )
+    # POST /couple/invite: прежняя ссылка Ольги активна и единственна.
+    assert (
+        await _db(
+            engine,
+            "SELECT count(*) FROM invites WHERE couple_id = :c AND status = 'active'",
+            c=olga_couple,
+        )
+        == 1
+    )
+    assert (
+        await _db(
+            engine,
+            "SELECT status::text FROM invites WHERE token_hash = :h",
+            h=hashlib.sha256(olga_token.encode()).digest(),
+        )
+        == "active"
     )
