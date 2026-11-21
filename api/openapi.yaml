@@ -135,12 +135,15 @@ paths:
     get:
       tags: [couple]
       summary: Текущая пара и её статус
+      description: Только ожидающая или активная пара; после выхода — 404.
       responses:
         "200":
           description: OK
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Couple" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
         "404": { $ref: "#/components/responses/NotFound" }
     post:
       tags: [couple]
@@ -151,8 +154,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/InviteCreated" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/InvitesUnavailable" }
 
   /couple/invite:
     post:
@@ -164,16 +169,22 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/InviteCreated" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/InvitesUnavailable" }
 
   /couple/leave:
     post:
       tags: [couple]
       summary: Выйти из пары (ФТ-04)
-      description: Агенты и личная память сохраняются, обмен сообщениями прекращается (ТЗ §4.5 п.2).
+      description: >-
+        Агенты и личная память сохраняются, обмен сообщениями прекращается (ТЗ §4.5 п.2).
+        Доступно после входа без завершённого онбординга (DECISIONS.md, АР-17).
       responses:
         "204": { description: Пара расторгнута }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /invites/{token}:
@@ -182,6 +193,7 @@ paths:
     get:
       tags: [couple]
       summary: Проверить приглашение перед принятием
+      description: Доступно после входа, до онбординга; раскрывает только имя пригласившего и срок.
       responses:
         "200":
           description: Приглашение действительно
@@ -193,6 +205,7 @@ paths:
                 properties:
                   inviter_name: { type: [string, "null"] }
                   expires_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
   /invites/{token}/accept:
@@ -207,6 +220,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Couple" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/OnboardingRequired" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
@@ -607,6 +621,10 @@ components:
       name: token
       in: path
       required: true
+      description: >-
+        Токен из ссылки `startapp` — 43 символа base64url (32 случайных байта). Любой неверный
+        формат (длина, алфавит, лишние символы) даёт 404 `not_found`, как несуществующий токен,
+        а не 422: по ответу не отличить «нет такого» от «неверного формата».
       schema: { type: string, minLength: 32, maxLength: 64 }
     DraftId:
       name: draft_id
@@ -642,14 +660,56 @@ components:
             onboarding_required:
               value: { code: onboarding_required, message: Сначала завершите знакомство с сервисом }
     NotFound:
-      description: Не найдено или нет доступа (не различаются, чтобы не раскрывать чужие данные)
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      description: >-
+        Код `not_found`: не найдено или нет доступа (не различаются, чтобы не раскрывать чужие
+        данные). Для пары и приглашений: нет текущей пары (`GET /couple`), нет активного
+        членства (`POST /couple/invite`, `POST /couple/leave`), приглашение не найдено или
+        токен неверного формата (`/invites/{token}`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            not_found:
+              value: { code: not_found, message: Не найдено }
     Conflict:
-      description: Конфликт состояния (уже в паре, устаревшая версия, пара не активна)
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      description: >-
+        Конфликт состояния. Коды: `already_in_couple` — у пользователя уже есть пара
+        (создание пары, принятие приглашения; ФТ-04); `own_invite` — попытка принять своё
+        приглашение; `couple_not_pending` — пара уже не ожидает партнёра (выпуск ссылки в
+        активной паре, принятие приглашения в распавшуюся пару); `version_conflict` —
+        устаревшая версия черновика; `couple_not_active` — пара не активна.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            already_in_couple:
+              value: { code: already_in_couple, message: У вас уже есть пара }
+            own_invite:
+              value: { code: own_invite, message: Это ваше приглашение — отправьте ссылку партнёру }
+            couple_not_pending:
+              value: { code: couple_not_pending, message: Пара уже не ожидает партнёра }
     Gone:
-      description: Приглашение истекло или уже использовано
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      description: >-
+        Приглашение недействительно. Коды: `invite_expired` — срок 7 дней истёк;
+        `invite_used` — уже использовано или отозвано (выпущена новая ссылка, инициатор вышел).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            invite_expired:
+              value: { code: invite_expired, message: Срок приглашения истёк — попросите новую ссылку }
+            invite_used:
+              value: { code: invite_used, message: Приглашение уже использовано — попросите новую ссылку }
+    InvitesUnavailable:
+      description: >-
+        Код `service_unavailable`: выпуск ссылок временно недоступен — сервис не настроен
+        (нет имени бота `FEELINGS_BOT_USERNAME`); по образцу `POST /auth/telegram`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            service_unavailable:
+              value: { code: service_unavailable, message: Приглашения временно недоступны }
     Validation:
       description: Ошибка данных
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -667,8 +727,8 @@ components:
       properties:
         code:
           type: string
-          examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, underage, already_in_couple, invite_expired,
-                     invite_used, couple_not_active, version_conflict, blocked_by_safety,
+          examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, underage, not_found, already_in_couple, own_invite,
+                     couple_not_pending, invite_expired, invite_used, couple_not_active, version_conflict, blocked_by_safety,
                      subscription_required, rate_limited, llm_unavailable]
         message: { type: string, description: Понятное пользователю сообщение на русском }
 
