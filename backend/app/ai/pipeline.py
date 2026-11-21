@@ -51,7 +51,7 @@ from app.ai.calls import (
 )
 from app.ai.dialog import MAX_TOKENS_CLASSIFIER, SafetyVerdict, classify
 from app.ai.facts import numbers_differ
-from app.ai.llm import LLMError
+from app.ai.llm import LLMError, LLMRefusal
 from app.ai.models import AgentModels
 from app.ai.prompts import V0, PromptSet, system_prompt
 
@@ -116,8 +116,9 @@ class NotConfirmed(Exception):
 # Запись реестра хранит и хеш одобренного текста: подмена ``text`` через ``object.__setattr__``
 # после одобрения не проходит (A8-5). Состояние: ``approved`` → ``processing`` → ``used``; одно
 # одобрение — одна доставка (§2 п.2: одно «Отправить» — одна отправка, A8-6). Решение конвейера
-# (доставлено или остановлено безопасностью) расходует одобрение; сбой модели — нет: повтор того
-# же одобрения после ошибки разрешён (текст у автора сохранён, §10). Два одновременных
+# (доставлено или остановлено безопасностью) и отказ модели (АР-27, R3-MINOR-3) расходуют
+# одобрение; прочий сбой (недоступность, испорченный ответ, ошибка настройки, отмена) — нет:
+# повтор того же одобрения после него разрешён (текст у автора сохранён, §10). Два одновременных
 # ``process`` одного одобрения не идут: второй получает ``AlreadyProcessed``. Объект одобрения
 # не переживает границу процесса: в 3.2 воркер вызывает ``approve()`` сам после проверки
 # статуса черновика в БД (BACKLOG Б-48).
@@ -324,10 +325,14 @@ _WORD = re.compile(r"[^\W_]+", re.UNICODE)
 
 def _guard_words(text: str) -> list[str]:
     """Слова для сравнения подсказки с оригиналом: NFKC, без невидимых символов формата
-    (нулевой ширины и т. п., категория Cf), ё → е, без регистра; пунктуация — разделитель
-    (A8-4)."""
+    (нулевой ширины и т. п., категория Cf) и комбинируемых знаков (Mn: ударения), ё → е, без
+    регистра; пунктуация — разделитель (A8-4, A8-8). «Й» после NFD теряет кратку — сравнение
+    одинаково для обоих текстов. Латинские двойники букв не сводятся (О-12, предел эвристики)."""
     text = unicodedata.normalize("NFKC", text)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    # Комбинируемые знаки (ударение U+0301 и т. п., Mn) разбивали слово на части (A8-8).
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) not in ("Cf", "Mn"))
+    text = unicodedata.normalize("NFC", text)
     text = text.casefold().replace("ё", "е")
     return _WORD.findall(text)
 
@@ -366,6 +371,11 @@ async def process(
     entry.state = "processing"
     try:
         delivery = await _process(models, message.text, prompt_set)
+    except LLMRefusal:
+        # Отказ модели — решение «не доставлять» (АР-27): одобрение израсходовано, повтор того же
+        # одобрения не превратит отказ в доставку; нужно новое «Отправить» (ревью R3-MINOR-3).
+        entry.state = "used"
+        raise
     except BaseException:
         entry.state = "approved"  # сбой — одобрение не израсходовано, повтор разрешён
         raise
@@ -456,10 +466,11 @@ async def _process(models: AgentModels, original: str, prompt_set: PromptSet) ->
             **extra,
         )
 
-    def degrade(step: str, exc: LLMError) -> Delivery:
+    def degrade(step: str, exc: LLMError, hint: str | None = None) -> Delivery:
         if exc.kind not in DEGRADE_KINDS:  # отказ и прочее — не доставляется (АР-27)
             raise exc
-        return with_warning(degraded=f"{step}:{exc.kind}")
+        # Подсказка к непроверенной адаптации не показывается — причина в метрике (A8-9).
+        return with_warning(degraded=f"{step}:{exc.kind}", hint=hint)
 
     # п.5 — адаптация формы.
     prompts.append(system_prompt("adapt", prompt_set).name)
@@ -497,7 +508,7 @@ async def _process(models: AgentModels, original: str, prompt_set: PromptSet) ->
             max_tokens=MAX_TOKENS_CLASSIFIER,
         )
     except LLMError as exc:
-        return degrade("meaning", exc)
+        return degrade("meaning", exc, hint)
     if numbers_differ(original, adapted) and "changed_facts" not in problems:
         problems = (*problems, "changed_facts")
     if set(problems) - HINT_ONLY_PROBLEMS:

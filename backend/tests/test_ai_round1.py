@@ -102,12 +102,11 @@ async def test_withheld_author_sees_not_sent_once(category: str) -> None:
 
 async def test_author_control_routes_to_sender_template() -> None:
     """Автор сам контролирует/угрожает → шаблон отправителю, не блок для пострадавшего."""
-    delivery = await process(
-        scripted(safety={"category": "threat_or_insult", "secondary": ["violence"]})
-    )
+    delivery = await process(scripted(safety={"category": "threat_or_insult", "secondary": []}))
     notice = delivery.author_notice
     assert notice is not None and notice.primary == "outgoing_threat"
-    assert notice.text.startswith(prompts.load("crisis", "v0", block="outgoing_threat").text)
+    # Раунд 3: смешанный случай (+ violence) — test_ai_round3.py.
+    assert notice.text == prompts.load("crisis", "v0", block="outgoing_threat").text
 
 
 def test_safety_v2_distinguishes_who_acts() -> None:

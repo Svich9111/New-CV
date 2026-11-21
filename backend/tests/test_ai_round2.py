@@ -83,11 +83,15 @@ async def test_author_acts_gets_only_sender_template(
     )
     notice = delivery.author_notice
     assert notice is not None and notice.primary == "outgoing_threat"
-    # Полный текст ответа — только блок отправителю, дословно.
-    assert notice.text == block("outgoing_threat", prompt_set.crisis)
+    # Полный текст ответа — блок отправителю (смешанный вариант) и нейтральная помощь, дословно
+    # (раунд 3, R3-MAJOR-1): без текста пострадавшему, но и без потери помощи.
+    assert notice.text == "\n\n".join(
+        [block("outgoing_threat_mixed", "v2"), block("author_safety", "v2")]
+    )
     for phrase in VICTIM_PHRASES:
         assert phrase not in notice.text.casefold()
-    assert not {"name_it", "no_tolerate", "emergency_services"} & notice.actions
+    assert not {"name_it", "no_tolerate"} & notice.actions
+    assert {"help_contacts", "emergency_services"} <= notice.actions
     assert {"not_sent", "no_softening", "explain_reason", "return_to_talk"} <= notice.actions
     assert set(secondary) <= set(notice.secondary)  # строки остаются для события
     assert delivery.safety_event == "outgoing_threat"
@@ -146,7 +150,7 @@ def test_not_sent_text_lives_in_crisis_v1() -> None:
     for kind in crisis.CRISIS_TYPES:  # блоки v0 в v1 — без изменений
         assert block(kind, "v1") == block(kind, "v0")
     assert prompts.V0.crisis == "v0"  # по умолчанию — v0 (см. prompts/README.md)
-    assert prompts.V1.crisis == prompts.V2.crisis == "v1"
+    assert prompts.V1.crisis == prompts.V2.crisis == "v2"  # раунд 3: crisis.v2
     assert "NOT_SENT = (" not in (REPO_DIR / "backend/app/ai/crisis.py").read_text()
 
 
@@ -156,8 +160,8 @@ async def test_v2_withheld_notice_uses_crisis_v1() -> None:
         models_of(p), pipeline.approve(TEXT, confirmed=True), prompt_set=prompts.V2
     )
     assert delivery.author_notice is not None
-    assert delivery.author_notice.text == f"{block('not_sent', 'v1')}\n\n{block('self_harm', 'v1')}"
-    assert "crisis.v1" in delivery.prompts
+    assert delivery.author_notice.text == f"{block('not_sent', 'v2')}\n\n{block('self_harm', 'v2')}"
+    assert "crisis.v2" in delivery.prompts
 
 
 # ---------------------------------------------------------------- R2-MINOR-3 (решение A0)
@@ -259,10 +263,12 @@ async def test_concurrent_processing_of_one_approval_is_rejected() -> None:
     msg = pipeline.approve(TEXT, confirmed=True)
     first = asyncio.create_task(pipeline.process(models_of(p), msg))
     await asyncio.sleep(0)
-    with pytest.raises(pipeline.AlreadyProcessed):
-        await pipeline.process(models_of(p), msg)
-    gate.set()
-    assert (await first).status == "as_is"
+    try:
+        with pytest.raises(pipeline.AlreadyProcessed):
+            await asyncio.wait_for(pipeline.process(models_of(p), msg), timeout=5)
+    finally:
+        gate.set()  # даже при ошибке реестра тест не висит на gate.wait()
+    assert (await asyncio.wait_for(first, timeout=5)).status == "as_is"
 
 
 # ---------------------------------------------------------------------------------- A8-7

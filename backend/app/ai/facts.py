@@ -10,13 +10,19 @@
 - «в 7 вечера / дня» (после предлога времени) → ``19``, «7 утра / ночи» → ``7``; «3 дня» без
   предлога — количество дней, ``3``;
 - «полчаса» = «30 минут»; «во-первых / во-вторых» — не числа;
+- привязка к соседним словам: у слова рядом с числами в обоих текстах набор чисел совпадает;
 - числительные словами: количественные и порядковые 2–20, десятки, сто («три», «третий раз»,
   «трижды», «двое»), «первый». «Один / одна» не считаются: чаще значат «в одиночку».
 
 Известные ограничения (в сторону предупреждения, то есть оригинала с предупреждением):
 составные («двадцать пять» против «25») сверяются по частям; месяцы и даты словами («21 ноября»
 против «21.11»); «1 500» против «1500»; гипербола («сто раз» → «много раз»); «полтора часа»
-против «90 минут»."""
+против «90 минут»; лишний или пропавший предлог у одного из нескольких чисел («в 7 и в 9» →
+«в 7 и 9»).
+
+Известные пропуски (расхождение не ловится, остаётся модель смысла): обмен чисел, если рядом с
+ними в двух текстах нет разных общих слов: «Ты обещал в 20, а пришёл в 23» → «Ты пришёл в 20, а
+обещал в 23» (у обоих чисел соседи «в» и «а»); подобные перестройки фразы."""
 
 from __future__ import annotations
 
@@ -101,8 +107,12 @@ def _prepare(text: str) -> str:
     return text
 
 
-def _scan(text: str) -> tuple[list[str], list[tuple[str, str]]]:
-    """Числа по порядку и диапазоны «с X до Y» / «X–Y» (их порядок значим)."""
+Scan = tuple[list[str], list[tuple[str, str]], dict[str, Counter[str]]]
+
+
+def _scan(text: str) -> Scan:
+    """Числа по порядку, диапазоны «с X до Y» / «X–Y» (их порядок значим) и привязка чисел к
+    соседним словам: слово сразу перед числом и сразу после него → какие числа рядом с ним."""
     prepared = _prepare(text)
     tokens = list(_TOKEN.finditer(prepared))
     found: list[str] = []
@@ -145,7 +155,19 @@ def _scan(text: str) -> tuple[list[str], list[tuple[str, str]]]:
         if before in _RANGE_START and between and between[-1] in _RANGE_END:
             ranges.append((found[n], found[n + 1]))
     ranges += [(a, b) for a, b in _DASH_RANGE.findall(prepared)]
-    return found, ranges
+    # Числа подряд без слов между ними («19.30», «2,5», «5–7») — одна группа с общими соседями.
+    is_number = [t.group(1) is not None or WORDS.get(t.group(3) or "") is not None for t in tokens]
+    anchors: dict[str, Counter[str]] = {}
+    for value, index in zip(found, positions, strict=True):
+        start = end = index
+        while start > 0 and is_number[start - 1]:
+            start -= 1
+        while end + 1 < len(tokens) and is_number[end + 1]:
+            end += 1
+        for j in (start - 1, end + 1):
+            if 0 <= j < len(tokens) and tokens[j].group(3) is not None:
+                anchors.setdefault(tokens[j].group(3), Counter())[value] += 1
+    return found, ranges, anchors
 
 
 def numbers(text: str) -> list[str]:
@@ -154,9 +176,15 @@ def numbers(text: str) -> list[str]:
 
 
 def numbers_differ(original: str, adapted: str) -> bool:
-    """Числа оригинала и адаптации расходятся: по составу (мультимножество) или по порядку
-    внутри диапазонов («с 5 до 7» → «с 7 до 5»). Перестановка независимых чисел в
-    предложении («третий раз за 2 недели» → «за 2 недели третий раз») — не расхождение."""
-    a_values, a_ranges = _scan(original)
-    b_values, b_ranges = _scan(adapted)
-    return Counter(a_values) != Counter(b_values) or a_ranges != b_ranges
+    """Числа оригинала и адаптации расходятся: по составу (мультимножество), по порядку внутри
+    диапазонов («с 5 до 7» → «с 7 до 5») или по привязке к соседним словам («2 раза за 3 дня» →
+    «3 раза за 2 дня», «пришёл в 7, а ушёл в 9» → «пришёл в 9, а ушёл в 7»). Перестановка частей
+    предложения вместе с числами («третий раз за 2 недели» → «за 2 недели третий раз») — не
+    расхождение."""
+    a_values, a_ranges, a_anchors = _scan(original)
+    b_values, b_ranges, b_anchors = _scan(adapted)
+    if Counter(a_values) != Counter(b_values) or a_ranges != b_ranges:
+        return True
+    # Обмен чисел между величинами (A8-10, R3-MINOR-1): у слова, которое стоит рядом с числами в
+    # обоих текстах («опоздал 2 раза» → «опоздал 3 раза»), набор чисел должен совпасть.
+    return any(a_anchors[w] != b_anchors[w] for w in a_anchors.keys() & b_anchors.keys())

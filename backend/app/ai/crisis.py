@@ -39,27 +39,51 @@ ACTIONS: dict[CrisisType, frozenset[str]] = {
 }
 
 
-# Сообщение остановлено конвейером, а строки протокола обращены к пострадавшему (насилие,
-# самоповреждение, угроза жизни): автор должен явно узнать, что текст не ушёл (§2 п.2, §9.3
-# «объясняет причину»; DECISIONS АР-28). Текст — блок ``not_sent`` шаблона ``crisis.v1``
-# (утверждают психолог и юрист, ревью R2-MINOR-1). В ``crisis.v0`` такого блока нет: для
-# набора по умолчанию (V0 — все роли v0, АР-26) строка берётся из ``crisis.v1``, где она
-# впервые появилась. У строки ``outgoing_threat`` «не отправлено» сказано в самом блоке.
-NOT_SENT_SINCE = "v1"
-NOT_SENT = load("crisis", NOT_SENT_SINCE, block="not_sent").text
+# Блоки, которых нет в ранних версиях шаблона, и версия, где каждый впервые появился. Набор
+# по умолчанию ``V0`` держит ``crisis.v0`` (все роли v0, тест A8 ``test_default_prompt_set_is_v0``);
+# такие блоки для него берутся из версии, где они появились, а в записи результата видна версия
+# каждого блока: ``template_version`` = «v0+not_sent@v1+author_safety@v2» (ревью R3-MINOR-2).
+#
+# - ``not_sent`` — «не отправлено», первым в ответе автору, если одобренное сообщение
+#   остановлено, а строки протокола обращены к пострадавшему (АР-28, ревью MAJOR-1, R2-MINOR-1);
+# - ``author_safety`` — нейтральная помощь, если главная строка ``outgoing_threat`` (действует
+#   автор), а вторичная — ``violence``/``life_threat``: автор, возможно, сам пострадавший
+#   (R3-MAJOR-1). Блоки для пострадавшего («вина не на тебе») такому автору не идут;
+# - ``outgoing_threat_chat`` / ``outgoing_threat_mixed`` / ``outgoing_threat_mixed_chat`` —
+#   строка ``outgoing_threat`` в личном чате (сообщения не было, без «не отправлено») и в
+#   смешанном случае (без «подумаем, как сказать», §9.3 строка 1).
+LATE_BLOCKS: dict[str, str] = {
+    "not_sent": "v1",
+    "author_safety": "v2",
+    "outgoing_threat_chat": "v2",
+    "outgoing_threat_mixed": "v2",
+    "outgoing_threat_mixed_chat": "v2",
+}
 NOT_SENT_ACTIONS = frozenset({"not_sent", "explain_reason"})
-# Строки, блоки которых обращены к пострадавшему. Если главная строка ``outgoing_threat``
-# (действует сам автор — в остановленном сообщении или по оценке агента в чате), их блоки и
-# действия не добавляются:
-# контролирующий или угрожающий автор не должен слышать «вина не на тебе» (АР-28, R2-MAJOR-1).
+AUTHOR_SAFETY_ACTIONS = frozenset({"help_contacts", "emergency_services"})
+# Строки, блоки которых обращены к пострадавшему: при главной ``outgoing_threat`` вместо них —
+# ``author_safety`` (АР-28, R2-MAJOR-1, R3-MAJOR-1).
 VICTIM_TYPES = frozenset({"violence", "life_threat"})
 
 
-def not_sent_text(version: str) -> str:
+def _block(version: str, name: str, used: dict[str, str]) -> str:
+    """Текст блока версии ``version``; блок из ``LATE_BLOCKS``, которого в ней нет, — из версии,
+    где он появился (записывается в ``used``). Прочие отсутствующие блоки — ``PromptError``."""
     try:
-        return load("crisis", version, block="not_sent").text
+        return load("crisis", version, block=name).text
     except PromptError:
-        return NOT_SENT
+        since = LATE_BLOCKS.get(name)
+        if since is None:
+            raise
+        used[name] = since
+        return load("crisis", since, block=name).text
+
+
+def __getattr__(name: str) -> str:
+    """``NOT_SENT`` читается лениво (О-13): импорт модуля не зависит от наличия crisis.v1."""
+    if name == "NOT_SENT":
+        return load("crisis", LATE_BLOCKS["not_sent"], block="not_sent").text
+    raise AttributeError(name)
 
 
 @dataclass(frozen=True)
@@ -70,7 +94,7 @@ class CrisisResponse:
     secondary: tuple[CrisisType, ...]
     text: str
     actions: frozenset[str]
-    template_version: str
+    template_version: str  # версия шаблона и, если были, блоки из других версий
 
     @property
     def types(self) -> tuple[CrisisType, ...]:
@@ -94,10 +118,14 @@ def respond(
     """Ответ по протоколу. ``primary`` — главная строка, если её назвал агент (иначе — по
     приоритету); ``underage`` всегда главная. Блоки: главная строка, затем вторичные; при
     ``underage`` блок отказа в доступе — последним, чтобы ответ не начинался с отказа.
+
     ``withheld`` — одобренное сообщение остановлено: если среди строк нет ``outgoing_threat``
-    (её блок сам говорит «не отправлено»), первой идёт блок ``not_sent``. Если главная строка
-    ``outgoing_threat`` — блоки ``VICTIM_TYPES`` не добавляются (строки остаются в
-    ``secondary`` для события)."""
+    (её блок сам говорит «не отправлено»), первым идёт блок ``not_sent``.
+
+    Главная ``outgoing_threat`` (действует автор): блоки ``VICTIM_TYPES`` не добавляются, но если
+    такие строки есть, вместо них — ``author_safety`` (помощь без «вина не на тебе»), а блок
+    ``outgoing_threat`` — смешанный, без «подумаем, как сказать». Вне остановленного сообщения
+    (личный чат) — вариант блока без «сообщение не отправлено»."""
     ordered = order([*(types or ()), *([primary] if primary else [])])
     if not ordered:
         raise ValueError("нет строки кризисного протокола")
@@ -106,20 +134,34 @@ def respond(
         main = next(t for t in ordered if t == primary)
     rest = tuple(t for t in ordered if t != main)
     version = prompt_set.version("crisis")
+    used: dict[str, str] = {}
     sequence = (*rest, main) if main == "underage" else (main, *rest)
-    if main == "outgoing_threat":  # действует автор — без текста пострадавшему
-        sequence = tuple(t for t in sequence if t not in VICTIM_TYPES)
-    blocks = [load("crisis", version, block=t).text for t in sequence]
-    parts = [agent_reply.strip()] if agent_reply and agent_reply.strip() else []
+    names: list[str] = list(sequence)
     actions = frozenset().union(*(ACTIONS[t] for t in sequence))
+    if main == "outgoing_threat":  # действует автор — без текста пострадавшему
+        victim = [t for t in sequence if t in VICTIM_TYPES]
+        names = [t for t in sequence if t not in VICTIM_TYPES]
+        actions = frozenset().union(*(ACTIONS[t] for t in sequence if t not in VICTIM_TYPES))
+        mixed = "_mixed" if victim else ""
+        chat = "" if withheld else "_chat"
+        if mixed or chat:
+            names[0] = f"outgoing_threat{mixed}{chat}"
+        if not withheld:  # в чате сообщения не было — «не отправлено» было бы неправдой
+            actions -= {"not_sent"}
+        if victim:
+            names.append("author_safety")
+            actions |= AUTHOR_SAFETY_ACTIONS
+    blocks = [_block(version, n, used) for n in names]
+    parts = [agent_reply.strip()] if agent_reply and agent_reply.strip() else []
     if withheld and "outgoing_threat" not in ordered:
-        parts.append(not_sent_text(version))
+        parts.append(_block(version, "not_sent", used))
         actions |= NOT_SENT_ACTIONS
     parts += blocks
+    label = version + "".join(f"+{n}@{v}" for n, v in used.items())
     return CrisisResponse(
         primary=main,
         secondary=rest,
         text="\n\n".join(parts),
         actions=actions,
-        template_version=version,
+        template_version=label,
     )

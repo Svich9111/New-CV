@@ -71,10 +71,10 @@ V0 = PromptSet()
 # Черновики без прогона эталонного набора (DECISIONS АР-26): не по умолчанию, не в 3.2/продукт до
 # прогона без регрессий. V0 — только прототип 0.5 (консоль, набор), тоже не в 3.2 до «не хуже».
 # V1: safety.v1 (уже «насилие»), meaning.v1 (искажение — с фрагментами).
-V1 = PromptSet(safety="v1", meaning="v1", crisis="v1")
+V1 = PromptSet(safety="v1", meaning="v1", crisis="v2")
 # V2 (ревью 0.5 раунд 1): safety.v2 (кто действует — автор или другой), meaning.v2
 # (added_feeling, проверка подсказки), adapt.v1 (чувство — только из оригинала).
-V2 = PromptSet(safety="v2", meaning="v2", adapt="v1", crisis="v1")
+V2 = PromptSet(safety="v2", meaning="v2", adapt="v1", crisis="v2")
 DRAFT_SETS: tuple[PromptSet, ...] = (V1, V2)  # статус «черновик без прогона» (АР-26)
 
 

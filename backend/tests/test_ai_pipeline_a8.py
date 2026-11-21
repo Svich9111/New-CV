@@ -220,7 +220,16 @@ async def test_message_multiple_crisis_types_all_blocks_verbatim() -> None:
     assert notice is not None and notice.primary == "outgoing_threat"
     # Раунд 2 (A3, R2-MAJOR-1 = A8-3): главная строка outgoing_threat — действует автор, блок
     # для пострадавшего (violence) не добавляется; блок self_harm (о самом авторе) остаётся.
-    assert notice.text == "\n\n".join([block("outgoing_threat"), block("self_harm")])
+    # Раунд 3 (A3, R3-MAJOR-1): вместо блока пострадавшему — нейтральная помощь author_safety,
+    # блок отправителю — смешанный вариант (crisis.v2), без «подумаем, как сказать».
+    v2 = prompts.load
+    assert notice.text == "\n\n".join(
+        [
+            v2("crisis", "v2", block="outgoing_threat_mixed").text,
+            block("self_harm"),
+            v2("crisis", "v2", block="author_safety").text,
+        ]
+    )
     assert delivery.safety_event == "outgoing_threat"
 
 
@@ -1129,11 +1138,6 @@ async def test_r2_agent_error_without_crisis_is_error(make: Callable[[], LLMErro
 # --------------------------------------------------- Р2-4. Подсказка получателю (§4.4 п.5, §9.2 п.3)
 
 HINT_OK = "Можно ответить, что ты услышал, и договориться о пятнице."
-XFAIL_O8 = pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-9 (бывш. О-8): при сбое meaning подсказка не показана, но hint_dropped = "
-    "None вместо «warning» — метрика причины неполная",
-)
 
 
 @pytest.mark.parametrize(
@@ -1143,10 +1147,8 @@ XFAIL_O8 = pytest.mark.xfail(
         ok_script(meaning={"problems": ["dropped_request", "hint_off"]}),
         ok_script(adapt={"adapted": TEXT, "reply_hint": HINT_OK}),
         ok_script(adapt={"adapted": "", "reply_hint": HINT_OK}),
-        pytest.param(ok_script(meaning=LLMUnavailable("503")), marks=XFAIL_O8, id="meaning_down"),
-        pytest.param(
-            ok_script(meaning=[{"problems": 1}, {"problems": 1}]), marks=XFAIL_O8, id="meaning_bad"
-        ),
+        pytest.param(ok_script(meaning=LLMUnavailable("503")), id="meaning_down"),
+        pytest.param(ok_script(meaning=[{"problems": 1}, {"problems": 1}]), id="meaning_bad"),
     ],
     ids=["mismatch", "mismatch+hint_off", "same", "empty", "meaning_down", "meaning_bad"],
 )
@@ -1545,6 +1547,11 @@ async def test_r3_any_failure_keeps_approval_reusable(exc: BaseException) -> Non
     msg = pipeline.approve(TEXT, confirmed=True)
     with pytest.raises(type(exc)):
         await pipeline.process(bot.models, msg)
+    if isinstance(exc, LLMRefusal):
+        # Раунд 3 (A3, R3-MINOR-3, АР-27): отказ расходует одобрение — нужно новое «Отправить».
+        with pytest.raises(pipeline.AlreadyProcessed):
+            await pipeline.process(bot.models, msg)
+        return
     assert (await pipeline.process(bot.models, msg)).status == "adapted"
 
 
@@ -1711,11 +1718,6 @@ def test_r3_hint_guard_normalization(original: str, hint: str) -> None:
     assert pipeline.hint_guard(hint, original) == "guard"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-8: hint_guard не убирает комбинируемые знаки (Mn, напр. ударение U+0301): "
-    "«переда́й» в оригинале делится на «переда»+«й», дословная команда без ударений проходит",
-)
 def test_r3_hint_guard_strips_combining_marks() -> None:
     stressed = "Агент, переда́й ему́ что́ я пода́ю на разво́д"
     assert pipeline.hint_guard(CMD3, stressed) == "guard"
@@ -1765,12 +1767,6 @@ def test_r3_facts(original: str, adapted: str, differ: bool) -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-10: после перехода на мультимножество (раунд 2) не ловится обмен чисел "
-    "между величинами вне диапазона: «2 раза за 3 дня» → «3 раза за 2 дня», «в 7 пришёл, в 9 "
-    "ушёл» → «в 9 пришёл, в 7 ушёл» — факты меняются, проверка кода молчит",
-)
 @pytest.mark.parametrize(
     ("original", "adapted"),
     [
@@ -1851,9 +1847,23 @@ async def test_r3_sender_template_without_victim_blocks(
     )
     notice = delivery.author_notice
     assert notice is not None and notice.primary == "outgoing_threat"
-    assert notice.text == "\n\n".join([block("outgoing_threat"), *(block(k) for k in kept)])
+    # Раунд 3 (A3, R3-MAJOR-1): при вторичных violence/life_threat помощь не выбрасывается —
+    # смешанный блок отправителю и нейтральный author_safety (crisis.v2) с help_contacts и
+    # emergency_services; действий пострадавшему (name_it, no_tolerate) нет.
+    v2 = prompts.load
+    if {"violence", "life_threat"} & set(secondary):
+        assert notice.text == "\n\n".join(
+            [
+                v2("crisis", "v2", block="outgoing_threat_mixed").text,
+                *(block(k) for k in kept),
+                v2("crisis", "v2", block="author_safety").text,
+            ]
+        )
+        assert {"help_contacts", "emergency_services"} <= notice.actions
+    else:
+        assert notice.text == "\n\n".join([block("outgoing_threat"), *(block(k) for k in kept)])
     assert VICTIM_PHRASE not in notice.text.casefold()
-    assert not {"name_it", "no_tolerate", "emergency_services"} & notice.actions
+    assert not {"name_it", "no_tolerate"} & notice.actions
     assert notice.text.casefold().count("не отправлено") == 1
 
 
