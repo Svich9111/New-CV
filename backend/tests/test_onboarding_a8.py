@@ -196,10 +196,6 @@ async def test_consent_must_be_literal_true(
     assert await agents(engine, uid) == 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"дефект D-3 ({REPORT}): число 1 / 1.0 принимается как согласие (контракт: boolean)",
-)
 @pytest.mark.parametrize("consent", CONSENTS)
 @pytest.mark.parametrize("value", [1, 1.0])
 async def test_numeric_one_is_not_consent(
@@ -573,10 +569,6 @@ async def test_c0_controls_inside_rejected(api: httpx.AsyncClient, value: str) -
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"дефект D-1 ({REPORT}): C1-управляющие и разделители строк внутри имени принимаются",
-)
 @pytest.mark.parametrize("value", ["Ве\x85ра", "Ве\x9bра", "Ве ра", "Ве ра"])
 async def test_c1_controls_and_line_separators_inside_rejected(
     api: httpx.AsyncClient, value: str
@@ -587,10 +579,6 @@ async def test_c1_controls_and_line_separators_inside_rejected(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"дефект D-2 ({REPORT}): имя из одних невидимых символов (Cf) не считается пустым",
-)
 @pytest.mark.parametrize("value", ["​", "﻿", "‍‍", "‮"])
 async def test_invisible_only_value_rejected(api: httpx.AsyncClient, value: str) -> None:
     headers, _ = await login(api)

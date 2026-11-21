@@ -118,7 +118,7 @@ def _untouched(row: Any) -> None:
 
 
 @pytest.mark.parametrize("consent", CONSENTS)
-@pytest.mark.parametrize("value", [False, None, "missing"])
+@pytest.mark.parametrize("value", [False, None, "missing", 1, 1.0, "true", 0])
 async def test_missing_consent_is_422_and_nothing_saved(
     client: httpx.AsyncClient, engine: AsyncEngine, consent: str, value: object
 ) -> None:
@@ -183,10 +183,27 @@ async def test_underage_after_onboarding_revokes_access(
     headers, uid = await _login(client)
     assert (await client.put(URL, json=_body(), headers=headers)).status_code == 200
     assert (await probe_client.get("/probe", headers=headers)).status_code == 200
-    resp = await client.put(URL, json=_body(age_confirmed=False), headers=headers)
+    before = await _user_row(engine, uid)
+    resp = await client.put(
+        URL,
+        json=_body(age_confirmed=False, name=MARKER, partner_name="Пётр", timezone="Asia/Tokyo"),
+        headers=headers,
+    )
     assert resp.status_code == 403
     assert resp.json()["code"] == "underage"
-    assert (await _user_row(engine, uid)).age_confirmed_at is None
+    assert MARKER not in resp.text
+    after = await _user_row(engine, uid)
+    assert after.age_confirmed_at is None
+    # Профиль и согласия из отказного запроса не сохраняются (MINOR-7 ревью 1.2).
+    assert (after.name, after.address_form, after.partner_name, after.timezone) == (
+        before.name,
+        before.address_form,
+        before.partner_name,
+        before.timezone,
+    )
+    assert after.consent_terms_at == before.consent_terms_at
+    assert after.consent_data_at == before.consent_data_at
+    assert after.consent_sensitive_at == before.consent_sensitive_at
     assert await _count(engine, UNDERAGE, uid) == 1
     me = (await client.get("/api/v1/me", headers=headers)).json()
     assert me["onboarding_completed"] is False
@@ -376,6 +393,16 @@ async def test_onboarded_user_deleted_is_401(
         {"partner_name": ""},
         {"partner_name": MARKER + "я" * 64},
         {"name": MARKER + "\x00"},
+        {"name": MARKER + "\x85Анна"},
+        {"name": MARKER + "\u2028Анна"},
+        {"name": MARKER + "\u2029Анна"},
+        {"name": MARKER + "\u202eАнна"},
+        {"name": MARKER + "\u200bАнна"},
+        {"address_form": MARKER + "\ufeff"},
+        {"name": "\u200b"},
+        {"name": "\ufeff"},
+        {"partner_name": "\u200d\u200d"},
+        {"partner_name": " \u200b "},
         {"partner_name": MARKER + "\nИгорь"},
         {"name": 42},
         {"name": None},
@@ -406,6 +433,40 @@ async def test_boundary_lengths_accepted(client: httpx.AsyncClient, field: str) 
         resp = await client.put(URL, json=_body(**{field: value}), headers=headers)
         assert resp.status_code == 200
         assert resp.json()[field] == value
+
+
+@pytest.mark.parametrize("value", ["👨‍👩‍👧", "Анна-Мария", "شیرین\u200cدل", "е\u0301ль"])
+async def test_joiners_and_combining_marks_allowed(client: httpx.AsyncClient, value: str) -> None:
+    """ZWJ/ZWNJ и комбинирующие знаки — часть обычного текста, не «невидимое» значение."""
+    headers, _ = await _login(client)
+    resp = await client.put(URL, json=_body(name=value), headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["name"] == value
+
+
+@pytest.mark.parametrize("tz", ["posix/Europe/Moscow", "right/UTC", "Factory", "zone.tab"])
+async def test_service_tz_entries_rejected(client: httpx.AsyncClient, tz: str) -> None:
+    headers, _ = await _login(client)
+    assert (await client.put(URL, json=_body(timezone=tz), headers=headers)).status_code == 422
+
+
+async def test_onboarded_flag_matches_guard_for_every_combination(
+    client: httpx.AsyncClient, probe_client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """GET /me и OnboardedUser используют одно условие (MINOR-6 ревью 1.2)."""
+    marks = ("consent_terms_at", "consent_data_at", "consent_sensitive_at", "age_confirmed_at")
+    headers, uid = await _login(client)
+    assert (await client.put(URL, json=_body(), headers=headers)).status_code == 200
+    for mask in range(16):
+        sets = ", ".join(
+            f"{m} = {'now()' if mask >> i & 1 else 'NULL'}" for i, m in enumerate(marks)
+        )
+        async with engine.begin() as conn:
+            await conn.execute(text(f"UPDATE users SET {sets} WHERE id = :id"), {"id": uid})
+        flag = (await client.get("/api/v1/me", headers=headers)).json()["onboarding_completed"]
+        status = (await probe_client.get("/probe", headers=headers)).status_code
+        assert flag is (mask == 15), mask
+        assert status == (200 if mask == 15 else 403), mask
 
 
 @pytest.mark.parametrize("field", ["name", "address_form", "partner_name"])

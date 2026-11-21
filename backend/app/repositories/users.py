@@ -8,6 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db import user_scope
 from app.schemas import Me, OnboardingRequest
 
+# Единственное определение «онбординг завершён» (ФТ-02): им пользуются и OnboardedUser
+# (is_onboarded), и GET /me (get_me) — расхождение между ними невозможно.
+ONBOARDED_SQL = (
+    "(consent_terms_at IS NOT NULL AND consent_data_at IS NOT NULL "
+    "AND consent_sensitive_at IS NOT NULL AND age_confirmed_at IS NOT NULL)"
+)
+
 
 async def upsert_by_telegram_id(
     sm: async_sessionmaker[AsyncSession], telegram_id: int
@@ -33,9 +40,8 @@ async def is_onboarded(sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID)
     async with user_scope(sm, user_id) as s:
         row = await s.execute(
             text(
-                "SELECT EXISTS (SELECT 1 FROM users WHERE id = :id AND deleted_at IS NULL "
-                "  AND consent_terms_at IS NOT NULL AND consent_data_at IS NOT NULL "
-                "  AND consent_sensitive_at IS NOT NULL AND age_confirmed_at IS NOT NULL)"
+                "SELECT EXISTS (SELECT 1 FROM users WHERE id = :id AND deleted_at IS NULL "  # noqa: S608 — константа ONBOARDED_SQL, ввода нет
+                f"  AND {ONBOARDED_SQL})"
             ),
             {"id": user_id},
         )
@@ -100,10 +106,8 @@ async def get_me(sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID) -> Me
         row = (
             await s.execute(
                 text(
-                    "SELECT id, name, address_form, partner_name, timezone, "
-                    "consent_terms_at IS NOT NULL AND consent_data_at IS NOT NULL "
-                    "  AND consent_sensitive_at IS NOT NULL AND age_confirmed_at IS NOT NULL "
-                    "  AS onboarded, "
+                    "SELECT id, name, address_form, partner_name, timezone, "  # noqa: S608 — константа ONBOARDED_SQL, ввода нет
+                    f"{ONBOARDED_SQL} AS onboarded, "
                     "EXISTS (SELECT 1 FROM couple_members cm JOIN couples c ON c.id = cm.couple_id "
                     "        WHERE cm.user_id = users.id AND cm.active AND c.status = 'active') "
                     "  AS has_couple "

@@ -1,12 +1,19 @@
 """Схемы API — зеркало components.schemas из api/openapi.yaml."""
 
-import re
+import unicodedata
 import uuid
-import zoneinfo
 from functools import cache
-from typing import Annotated, Literal
+from importlib import resources
+from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+)
 
 
 class Me(BaseModel):
@@ -29,20 +36,35 @@ class Session(BaseModel):
     me: Me
 
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-# Служебные файлы базы tz, а не зоны.
-_NOT_ZONES = frozenset({"localtime", "posixrules", "Factory"})
+# Запрещённые внутри строк категории Unicode: управляющие (C0, C1), формата (невидимые,
+# смена направления текста, BOM), разделители строк и абзацев. Имена попадут в промпт и
+# интерфейс — перевод строки или U+202E не должны проходить «в обход» правила.
+_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+# Исключение из Cf: ZWJ и ZWNJ нужны эмодзи-последовательностям и ряду письменностей.
+_ALLOWED_FORMAT = frozenset({"\u200c", "\u200d"})
+# Служебный файл базы tz, а не зона.
+_NOT_ZONES = frozenset({"Factory"})
 
 
-def _no_control_chars(value: str) -> str:
-    if _CONTROL.search(value):
-        raise ValueError("control characters are not allowed")
+def _plain_text(value: str) -> str:
+    visible = False
+    for ch in value:
+        category = unicodedata.category(ch)
+        if category in _FORBIDDEN_CATEGORIES and ch not in _ALLOWED_FORMAT:
+            raise ValueError("control or format characters are not allowed")
+        if category[0] not in "CZ":
+            visible = True
+    if not visible:
+        raise ValueError("value must contain visible characters")
     return value
 
 
 @cache
 def _iana_zones() -> frozenset[str]:
-    return frozenset(zoneinfo.available_timezones()) - _NOT_ZONES
+    """Список зон только из пакета tzdata, а не из системного каталога: набор одинаков на всех
+    машинах и не включает posix/…, right/… и служебные файлы."""
+    names = resources.files("tzdata").joinpath("zones").read_text(encoding="utf-8").split()
+    return frozenset(names) - _NOT_ZONES
 
 
 def _iana_zone(value: str) -> str:
@@ -51,12 +73,20 @@ def _iana_zone(value: str) -> str:
     return value
 
 
+def _must_be_true(value: bool) -> bool:
+    if value is not True:
+        raise ValueError("consent is required")
+    return value
+
+
 ShortText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
-    AfterValidator(_no_control_chars),
+    AfterValidator(_plain_text),
 ]
 TimeZone = Annotated[str, StringConstraints(max_length=64), AfterValidator(_iana_zone)]
+# Контракт: {type: boolean, const: true}. Только JSON true: 1, 1.0, "true" — 422.
+Consent = Annotated[StrictBool, AfterValidator(_must_be_true)]
 
 
 class OnboardingRequest(BaseModel):
@@ -69,7 +99,7 @@ class OnboardingRequest(BaseModel):
     address_form: ShortText
     partner_name: ShortText
     timezone: TimeZone = "Europe/Moscow"
-    consent_terms: Literal[True]
-    consent_data: Literal[True]
-    consent_sensitive: Literal[True]
-    age_confirmed: bool
+    consent_terms: Consent
+    consent_data: Consent
+    consent_sensitive: Consent
+    age_confirmed: StrictBool
