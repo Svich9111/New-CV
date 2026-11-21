@@ -104,6 +104,11 @@ async function mainBtnState(p) {
   return { visible: true, text: (await b.innerText()).trim(), disabled: await b.isDisabled(), hint: hint.join(" ") };
 }
 async function waitText(p, re, timeout = 4000) { await mainArea(p).getByText(re).first().waitFor({ timeout }); }
+// M4 (раунд 2): если MainButton сменила действие на «Отправить»/«Оплатить» после нажатия самой MainButton,
+// следующие ~600 мс нажатия игнорируются. Человек к этому моменту ещё читает черновик — шаги, где «Отправить»
+// нажимается намеренно, ждут дольше защиты. Проверка того, что быстрое двойное касание НЕ отправляет, — раздел 13.
+const GUARD_WAIT_MS = 800;
+const readDraft = (p) => p.waitForTimeout(GUARD_WAIT_MS);
 
 // Что видит Игорь сейчас (только через интерфейс): главный, лента, память. Затем возвращаемся к Анне.
 async function igorView(p) {
@@ -419,7 +424,9 @@ async function scenario(p, hook = async () => {}) {
   const approved = await draft.inputValue();
   ck(approved === keep, "K2", "после «Назад» черновик с правкой сохранился");
 
-  // «Отправить» (двойной клик — одно сообщение)
+  // «Отправить» (двойной клик — одно сообщение). Черновик открыт MainButton «Подготовить сообщение» —
+  // сначала человек читает текст (дольше защиты M4), затем двойное касание «Отправить».
+  await readDraft(p);
   await mainButton(p).dblclick();
   ck((await title(p)) === "Сообщения пары", "K2", "«Отправить» → Сообщения пары");
   const sentOnce = await mainArea(p).getByText(TOKEN).count();
@@ -471,6 +478,7 @@ async function scenario(p, hook = async () => {}) {
   ck((await mainBtnState(p)).text === "Отправить Ане", "K2", "черновик ответа: «Отправить Ане»");
   await hook("igor-draft");
   const igorApproved = await p.getByLabel("Сообщение для Ани").inputValue();
+  await readDraft(p);
   await mainButton(p).click();
   ck((await title(p)) === "Сообщения пары", "K2", "ответ Игоря отправлен");
 
@@ -506,7 +514,7 @@ async function scenario(p, hook = async () => {}) {
   ck(await p.getByRole("dialog").isVisible(), "K1", "выход из пары с подтверждением");
   await hook("profile-sheet");
   const backable = await backButton(p).click({ timeout: 1500 }).then(() => true, () => false);
-  xf("D-2", backable, "K6", "при открытом диалоге «Назад» Telegram нажимается (в Telegram она нативная и вне страницы)", "кнопку перекрывает затемнение диалога");
+  ck(backable, "K6", "при открытом диалоге «Назад» Telegram нажимается (в Telegram она нативная и вне страницы) [D-2 исправлен]", "кнопку перекрывает затемнение диалога");
   if (!backable) await btn(p, "Отмена").click();
   ck((await p.getByRole("dialog").count()) === 0 && (await title(p)) === "Профиль и пара", "K6", "диалог закрыт, экран «Профиль и пара» остаётся");
   await jump(p, "Подписка");
@@ -589,9 +597,8 @@ for (const scheme of ["light", "dark"]) {
     quietPrefix = null;
     const uniq = [...new Set(contrastFails[scheme].map((s) => s.replace(/^[^:]+: /, "")))];
     console.log("    состояний: " + states + ", минимум текст " + minText + ":1, кнопки " + minBtn + ":1");
-    const knownD1 = (x) => scheme === "dark" && /непрочитан/.test(x);
-    ck(uniq.filter((x) => !knownD1(x)).length === 0, "A", "контраст " + scheme + ": весь текст и кнопки ≥ AA", uniq.filter((x) => !knownD1(x)).join(" | "));
-    if (scheme === "dark") xf("D-1", !uniq.some(knownD1), "A", "контраст dark: метка «непрочитанное» (красный текст на чёрном) ≥ 4.5:1", uniq.filter(knownD1).join(" | "));
+    ck(uniq.length === 0, "A", "контраст " + scheme + ": весь текст и кнопки ≥ AA", uniq.join(" | "));
+    if (scheme === "dark") ck(!uniq.some((x) => /непрочитан/.test(x)) && states > 0, "A", "контраст dark: метка «непрочитанное» ≥ 4.5:1 [D-1 исправлен]", uniq.filter((x) => /непрочитан/.test(x)).join(" | "));
     if (scheme === "dark") {
       const bg = await p.locator("main").evaluate((m) => getComputedStyle(m.parentElement).backgroundColor);
       ck(bg === "rgb(0, 0, 0)", "K3", "тёмная тема по prefers-color-scheme: чёрный фон");
@@ -650,7 +657,7 @@ await section("5. Палитра и плашки по computed styles (§8)", as
   ck((await cs(own, "backgroundColor")) === "rgb(17, 17, 17)" && (await cs(own, "color")) === "rgb(255, 255, 255)", "K3", "сообщение владельца — чёрная плашка, белый текст");
   const abg = (await cs(agent, "backgroundColor")).match(/\d+/g).map(Number);
   ck(abg[0] >= 230 && (await cs(agent, "color")) === "rgb(17, 17, 17)", "K3", "сообщение агента — светлая плашка, чёрный текст");
-  await mainButton(p).click(); await mainButton(p).click();
+  await mainButton(p).click(); await readDraft(p); await mainButton(p).click();
   await persona(p, "Игорь"); await jump(p, "Сообщения пары");
   const art = mainArea(p).getByRole("article").first();
   const [bl, bw, bbg] = await art.evaluate((e) => { const s = getComputedStyle(e); return [s.borderLeftColor, s.borderLeftWidth, s.backgroundColor]; });
@@ -743,6 +750,7 @@ await section("7. Навигация с клавиатуры до главных
   await press(/^Подготовить сообщение Игорю$/);
   if (await tabTo(/^Сообщение для Игоря$/)) { await p.keyboard.press("Control+End"); await p.keyboard.type(" Ты вечно всё отменяешь в последний момент."); }
   ck(/изменено тобой/.test(await mainText(p)), "A", "клавиатура: правка черновика");
+  await readDraft(p);
   await press(/^Отправить Игорю$/);
   ck((await title(p)) === "Сообщения пары", "A", "клавиатура: «Отправить Игорю»");
   await press(/^Назад$/);
@@ -763,7 +771,8 @@ await section("7b. Доступные имена переключателей и
   const p = await openPage({ label: "имена" });
   await jump(p, "Профиль и пара");
   const names = await mainArea(p).getByRole("switch").evaluateAll((els) => els.map((e) => e.getAttribute("aria-label") || (e.getAttribute("aria-labelledby") ? "labelledby" : e.innerText.trim())));
-  xf("D-5", names.every((n) => n.length > 5 && !/^(вкл|выкл)$/.test(n)), "A", "переключатели уведомлений названы по смыслу, а не только «вкл»", "имена: " + names.join(", "));
+  ck(names.length === 2 && names.every((n) => n.length > 5 && !/^(вкл|выкл)$/.test(n)), "A", "переключатели уведомлений названы по смыслу, а не только «вкл» [D-5 исправлен]", "имена: " + names.join(", "));
+  ck(names.includes("Новые сообщения от партнёра") && names.includes("Статус подписки"), "A", "имена переключателей совпадают с видимыми подписями", names.join(", "));
   await p.context().close();
 });
 
@@ -849,7 +858,8 @@ await section("9. Негатив: разметка и «инструкции» �
   await mainArea(p).getByRole("article").first().getByRole("button", { name: "Ответить с агентом" }).click();
   const summary = await mainArea(p).getByText(/Аня прислала тебе сообщение/).innerText();
   const invented = ["грустно", "отменённых вечеров", "предупреждать заранее", "вечер вдвоём"].filter((w) => summary.includes(w) && !evil.includes(w));
-  xf("D-6", invented.length === 0, "N", "агент Игоря не приписывает сообщению Ани того, чего в нём нет", "в пересказе: " + invented.join(", "));
+  ck(invented.length === 0, "N", "агент Игоря не приписывает сообщению Ани того, чего в нём нет [D-6 исправлен]", "в пересказе: " + invented.join(", "));
+  ck(!/Она пишет|ей грустно|ей важно/.test(summary), "N", "неизвестный текст агент Игоря своими словами не пересказывает (§9.2 п.2)", summary);
   await p.context().close();
 });
 
@@ -871,9 +881,9 @@ await section("10. Запись в памяти из одобренного со
     await persona(p, "Анна"); await jump(p, "Память");
     const mem = await mainText(p);
     const entry = (mem.split("Из сообщений партнёра")[1] || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
-    const okMeaning = !forbidRe.test(entry);
+    const okMeaning = !forbidRe.test(entry) && expectRe.test(entry) && !/(Игорь|он)\s.*\bей важно/.test(entry);
     if (!okMeaning) memoryFindings.push("Игорь отправил «" + sent.slice(0, 70) + "…», а в памяти Анны: «" + entry + "»");
-    xf("D-4", okMeaning, "N", "вариант " + (variant + 1) + " ответа Игоря → запись памяти Анны не искажает смысл", "запись: «" + entry + "»");
+    ck(okMeaning, "N", "вариант " + (variant + 1) + " ответа Игоря → запись памяти Анны передаёт смысл [D-4 исправлен]", "запись: «" + entry + "»");
     await p.context().close();
   }
 });

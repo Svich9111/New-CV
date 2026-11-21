@@ -326,14 +326,12 @@ async def test_huge_body_does_not_crash(rig: Rig, caplog: pytest.LogCaptureFixtu
     assert big[:100] not in rig.stub.requests[0].content.decode()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR: глубоко вложенный JSON (RecursionError не ValueError) — 500 вместо 200; "
-    "Telegram повторяет доставку (критерий «неверный JSON не роняет обработчик»)",
-)
 async def test_deeply_nested_json_is_ignored(rig: Rig) -> None:
-    r = await rig.post(None, raw=b"[" * 200_000)
-    assert r.status_code == 200
+    # D-1 (раунд 1) исправлен: RecursionError разбора — 200 «ignored», без ответа и без повтора
+    for raw in (b"[" * 200_000, b'{"a":' * 100_000):
+        r = await rig.post(None, raw=raw)
+        assert r.status_code == 200
+    assert rig.stub.requests == []
 
 
 # ---------------------------------------------------------------------------------------------
@@ -491,13 +489,8 @@ async def test_concurrent_ten_identical_deliveries_send_once(rig: Rig) -> None:
     assert len(rig.stub.bodies()) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR: повтор, пришедший пока первая доставка ещё ждёт Bot API, получает 200 "
-    "«duplicate»; если первая затем падает временно (503, отметка снята), а Telegram уже "
-    "закрыл её соединение по тайм-ауту — обновление теряется (ни одного sendMessage успешно)",
-)
 async def test_duplicate_during_inflight_transient_failure_is_not_lost(rig: Rig) -> None:
+    # D-2 (раунд 1) исправлен: повтор ждёт исхода первой доставки
     upd = tg_message("/start")
     rig.stub.gate = asyncio.Event()
     rig.stub.script = [httpx.Response(502, text="Bad Gateway")]
@@ -510,6 +503,10 @@ async def test_duplicate_during_inflight_transient_failure_is_not_lost(rig: Rig)
     r1, r2, _ = await asyncio.gather(rig.post(upd), rig.post(upd), release_later())
     # ожидается: хотя бы одна из доставок не подтверждена (Telegram повторит)
     assert sorted([r1.status_code, r2.status_code]) != [200, 503]
+    # точнее: обе — 503, а следующая доставка обрабатывается (ответ уходит)
+    assert (r1.status_code, r2.status_code) == (503, 503)
+    assert (await rig.post(upd)).status_code == 200
+    assert len(rig.stub.bodies()) == 2
 
 
 # ---------------------------------------------------------------------------------------------
@@ -837,3 +834,378 @@ async def test_notify_actual_request_body_is_fixed_template() -> None:
         assert_button_to_webapp(b)
         assert "parse_mode" not in b
         assert USER_TEXT not in b["text"]
+
+
+# =============================================================================================
+# Раунд 2 (A8): места, изменённые исправлениями 4b2b7a9 — ожидание исхода первой доставки
+# (wait_outcome), общий срок HANDLE_DEADLINE_S, BotApiError.description, try/finally в lifespan.
+# ТЗ §4.1 п.1 (вход через бота: ответ на /start не теряется и не дублируется), §9.1 (секреты),
+# §9.1 п.5 (журналы без текстов).
+# =============================================================================================
+
+
+async def _wait_requests(stub: TgStub, n: int = 1) -> None:
+    for _ in range(500):
+        if len(stub.requests) >= n:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("Bot API не вызван")
+
+
+async def test_many_duplicates_wait_for_successful_first_delivery(rig: Rig) -> None:
+    upd = tg_message("/start")
+    uid = upd["update_id"]
+    rig.stub.gate = asyncio.Event()
+    first = asyncio.create_task(rig.post(upd))
+    await _wait_requests(rig.stub)
+    dups = [asyncio.create_task(rig.post(upd)) for _ in range(50)]
+    await asyncio.sleep(0.05)
+    assert not any(t.done() for t in dups)  # повторы не подтверждаются раньше первой
+    rig.stub.gate.set()
+    results = await asyncio.gather(first, *dups)
+    assert all(r.status_code == 200 for r in results)
+    assert len(rig.stub.bodies()) == 1
+    updates: UpdateDeduplicator = app.state.bot_updates
+    assert not updates.in_progress(uid)  # событие снято, ожидающих не осталось
+    assert len(updates) == 1
+
+
+async def test_many_duplicates_during_transient_failure_all_503_then_processed(rig: Rig) -> None:
+    upd = tg_message("/start")
+    rig.stub.gate = asyncio.Event()
+    rig.stub.script = [httpx.Response(502, text="Bad Gateway")]
+    first = asyncio.create_task(rig.post(upd))
+    await _wait_requests(rig.stub)
+    dups = [asyncio.create_task(rig.post(upd)) for _ in range(30)]
+    # все повторы должны дойти до ожидания раньше исхода первой (опоздавший после снятия
+    # отметки законно обрабатывается заново — это не предмет теста)
+    await asyncio.sleep(0.3)
+    rig.stub.gate.set()
+    results = await asyncio.gather(first, *dups)
+    assert [r.status_code for r in results] == [503] * 31
+    assert len(rig.stub.bodies()) == 1
+    # Telegram повторяет — обновление обрабатывается ровно один раз
+    assert (await rig.post(upd)).status_code == 200
+    assert (await rig.post(upd)).status_code == 200
+    assert len(rig.stub.bodies()) == 2
+
+
+async def test_hanging_bot_api_hits_deadline_for_first_and_duplicate(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(webhook_module, "HANDLE_DEADLINE_S", 0.2)
+    upd = tg_message("/start")
+    uid = upd["update_id"]
+    rig.stub.gate = asyncio.Event()  # Bot API «висит» и не отвечает
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    first = asyncio.create_task(rig.post(upd))
+    await _wait_requests(rig.stub)
+    r1, r2 = await asyncio.gather(first, rig.post(upd))
+    assert (r1.status_code, r2.status_code) == (503, 503)
+    assert loop.time() - t0 < 2.0  # ни одна доставка не висит дольше срока
+    assert not app.state.bot_updates.in_progress(uid)
+    rig.stub.gate.set()
+    assert (await rig.post(upd)).status_code == 200
+    assert len(rig.stub.bodies()) == 2
+
+
+async def test_deadline_cuts_long_429_backoff(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Настоящий asyncio.sleep: 429 с retry_after 10 (в пределах max_retry_after) — срок прерывает паузу
+    monkeypatch.setattr(webhook_module, "HANDLE_DEADLINE_S", 0.2)
+    api = BotApi(BOT_TOKEN, transport=httpx.MockTransport(rig.stub))
+    saved = app.state.bot_api
+    app.state.bot_api = api
+    try:
+        rig.stub.script = [tg_error(429, 10)]
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        r = await rig.post(tg_message("/start"))
+        assert r.status_code == 503
+        assert loop.time() - t0 < 2.0
+    finally:
+        app.state.bot_api = saved
+        await api.aclose()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR D-3 (раунд 2): при отмене обработчика первой доставки (CancelledError) "
+    "ни complete(), ни release() не вызываются — update_id навсегда «в работе», каждый повтор "
+    "ждёт HANDLE_DEADLINE_S и получает 503, ответ на /start теряется",
+)
+async def test_cancelled_first_delivery_does_not_block_update_forever(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Отмена обработчика первой доставки (CancelledError — не Exception) не должна оставлять
+    update_id навсегда «в работе»: иначе каждый повтор ждёт срок и получает 503."""
+    monkeypatch.setattr(webhook_module, "HANDLE_DEADLINE_S", 0.2)
+    upd = tg_message("/start")
+    uid = upd["update_id"]
+    rig.stub.gate = asyncio.Event()
+    first = asyncio.create_task(rig.post(upd))
+    await _wait_requests(rig.stub)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    rig.stub.gate.set()
+    assert not app.state.bot_updates.in_progress(uid)
+    assert (await rig.post(upd)).status_code == 200
+
+
+def test_deadline_relation_to_client_timeouts_and_telegram_wait() -> None:
+    from app.bot.client import DEFAULT_TIMEOUT
+
+    deadline = webhook_module.HANDLE_DEADLINE_S
+    connect, read = DEFAULT_TIMEOUT.connect, DEFAULT_TIMEOUT.read
+    assert connect is not None and read is not None
+    # одна обычная медленная попытка (соединение + чтение) укладывается в срок
+    assert deadline > connect + read
+    # Telegram ждёт ответа на вебхук порядка минуты: 503 должен успеть дойти
+    assert deadline <= 30
+    # без срока худший случай клиента (3 попытки по connect+read и 2 паузы по 10 с) — 65 с
+    api = BotApi(BOT_TOKEN)
+    worst = (api._max_retries + 1) * (connect + read) + api._max_retries * api._max_retry_after
+    assert worst > deadline  # срок — действительно действующий предел
+
+
+# --- UpdateDeduplicator.wait_outcome: модульно ------------------------------------------------
+
+
+async def test_wait_outcome_unknown_and_completed() -> None:
+    d = UpdateDeduplicator()
+    assert await d.wait_outcome(1) is False  # отметки нет
+    assert d.claim(1)
+    d.complete(1)
+    assert await asyncio.wait_for(d.wait_outcome(1), 0.5) is True
+    d.complete(2)  # завершение незакреплённого не создаёт записи
+    d.release(2)
+    assert len(d) == 1 and not d.in_progress(2)
+
+
+async def test_wait_outcome_wakes_all_waiters() -> None:
+    d = UpdateDeduplicator()
+    for uid, finish, expected in ((1, "complete", True), (2, "release", False)):
+        assert d.claim(uid)
+        waiters = [asyncio.create_task(d.wait_outcome(uid)) for _ in range(500)]
+        await asyncio.sleep(0)
+        assert not any(w.done() for w in waiters)
+        getattr(d, finish)(uid)
+        got = await asyncio.wait_for(asyncio.gather(*waiters), 1.0)
+        assert got == [expected] * 500
+        assert not d.in_progress(uid)
+    # повторное завершение/снятие безвредно
+    d.complete(1)
+    d.release(2)
+    assert len(d) == 1
+
+
+async def test_wait_outcome_eviction_wakes_waiter_and_late_complete_is_noop() -> None:
+    d = UpdateDeduplicator(max_size=2)
+    assert d.claim(1)
+    waiter = asyncio.create_task(d.wait_outcome(1))
+    await asyncio.sleep(0)
+    assert d.claim(2) and d.claim(3)  # 1 вытеснено, будучи «в работе»
+    assert await asyncio.wait_for(waiter, 0.5) is False
+    d.complete(1)  # поздний исход вытесненного не возвращает запись
+    assert len(d) == 2 and d.claim(1)
+
+
+async def test_wait_outcome_reclaimed_after_release_is_not_confirmed() -> None:
+    d = UpdateDeduplicator()
+    assert d.claim(5)
+    waiter = asyncio.create_task(d.wait_outcome(5))
+    await asyncio.sleep(0)
+    d.release(5)
+    assert d.claim(5)  # третья доставка взяла обновление до пробуждения ожидающего
+    assert await asyncio.wait_for(waiter, 0.5) is False  # 503: исход ещё неизвестен
+    d.complete(5)
+    assert await d.wait_outcome(5) is True
+
+
+# --- BotApiError.description (ревью m6) -------------------------------------------------------
+
+
+async def _error_for(body: Any, status: int = 400) -> BotApiError:
+    stub = TgStub()
+    stub.script = [httpx.Response(status, json=body)]
+    api = BotApi(BOT_TOKEN, transport=httpx.MockTransport(stub))
+    try:
+        with pytest.raises(BotApiError) as info:
+            await api.call("setWebhook", {"url": "https://x.example"})
+    finally:
+        await api.aclose()
+    return info.value
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        f"Bad Request: bad webhook {BOT_TOKEN}",
+        f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook failed",
+        "x" * 290 + BOT_TOKEN,  # токен на границе обрезки
+        "y" * 5000 + BOT_TOKEN,
+        "Ж" * 5000,
+    ],
+)
+async def test_description_redacted_bounded_and_not_in_str(description: str) -> None:
+    err = await _error_for({"ok": False, "error_code": 400, "description": description})
+    assert err.description is not None
+    assert len(err.description) <= 300
+    _assert_no_token(err.description)
+    assert BOT_ID not in err.description  # нет и обрезка токена
+    for text in (str(err), repr(err), repr(err.args), "".join(traceback.format_exception(err))):
+        assert err.description not in text
+        _assert_no_token(text)
+    assert str(err) == "Bot API setWebhook: error_code 400"
+
+
+@pytest.mark.parametrize("value", [None, 123, {"text": BOT_TOKEN}, [BOT_TOKEN], True])
+async def test_non_string_description_is_dropped(value: Any) -> None:
+    body: dict[str, Any] = {"ok": False, "error_code": 400}
+    if value is not None:
+        body["description"] = value
+    err = await _error_for(body)
+    assert err.description is None
+
+
+async def test_description_not_logged_by_webhook(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    _all_loggers_debug(caplog)
+    marker = "A8-desc-marker: chat not found"
+    for code in (400, 403, 502, 429):
+        rig.stub.script = [
+            httpx.Response(code, json={"ok": False, "error_code": code, "description": marker})
+        ]
+        await rig.post(tg_message("/start"))
+    assert marker not in caplog.text
+    assert "A8-desc-marker" not in caplog.text
+
+
+def test_setup_describe_error_shows_description_without_token() -> None:
+    from app.bot.setup import describe_error
+
+    with_desc = BotApiError(
+        "setWebhook", "error_code 400", error_code=400, description="bad webhook: ***"
+    )
+    assert describe_error(with_desc) == "Bot API setWebhook: error_code 400: bad webhook: ***"
+    plain = BotApiError("setWebhook", "timeout", transient=True)
+    assert describe_error(plain) == "Bot API setWebhook: timeout"
+
+
+def test_setup_main_exits_with_description_on_bot_api_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import runpy
+    import sys
+
+    import app.config as config_module
+
+    async def failing_call(self: BotApi, method: str, payload: dict[str, Any]) -> Any:
+        raise BotApiError(
+            method,
+            "error_code 400",
+            error_code=400,
+            description="Bad Request: bad webhook: IP address 10.0.0.1 is reserved",
+        )
+
+    monkeypatch.setattr(BotApi, "call", failing_call)
+    monkeypatch.setattr(config_module, "get_settings", a8_settings)
+    monkeypatch.setattr(
+        sys, "argv", ["setup", "--webhook-url", "https://hook.feelings.example/api/v1/x"]
+    )
+    monkeypatch.delitem(sys.modules, "app.bot.setup", raising=False)
+    with pytest.raises(SystemExit) as info:
+        runpy.run_module("app.bot.setup", run_name="__main__")
+    msg = str(info.value.code)
+    assert "setChatMenuButton" in msg and "error_code 400" in msg
+    assert "IP address 10.0.0.1 is reserved" in msg
+    _assert_no_token(msg)
+    _assert_no_token(capsys.readouterr().err)
+
+
+# --- lifespan: try/finally (ревью m9) ---------------------------------------------------------
+
+
+class _FakeEngine:
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+
+    async def dispose(self) -> None:
+        self.log.append("dispose")
+
+
+def _patch_lifespan(
+    monkeypatch: pytest.MonkeyPatch, log: list[str], *, ctor_fails=False, close_fails=False
+) -> None:
+    import app.main as main_module
+
+    class FakeBotApi:
+        def __init__(self, token: Any) -> None:
+            if ctor_fails:
+                raise RuntimeError("ctor")
+            log.append("bot_api")
+
+        async def aclose(self) -> None:
+            log.append("aclose")
+            if close_fails:
+                raise RuntimeError("aclose")
+
+    monkeypatch.setattr(main_module, "get_settings", a8_settings)
+    monkeypatch.setattr(main_module, "make_engine", lambda url: _FakeEngine(log))
+    monkeypatch.setattr(main_module, "make_sessionmaker", lambda engine: object())
+    monkeypatch.setattr(main_module, "BotApi", FakeBotApi)
+
+
+async def test_lifespan_normal_shutdown_closes_both(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi import FastAPI
+
+    from app.main import lifespan
+
+    log: list[str] = []
+    _patch_lifespan(monkeypatch, log)
+    async with lifespan(FastAPI()):
+        log.append("serve")
+    assert log == ["bot_api", "serve", "aclose", "dispose"]
+
+
+async def test_lifespan_disposes_engine_when_aclose_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi import FastAPI
+
+    from app.main import lifespan
+
+    log: list[str] = []
+    _patch_lifespan(monkeypatch, log, close_fails=True)
+    with pytest.raises(RuntimeError, match="aclose"):
+        async with lifespan(FastAPI()):
+            pass
+    assert log == ["bot_api", "aclose", "dispose"]
+
+
+async def test_lifespan_disposes_engine_when_bot_api_ctor_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import FastAPI
+
+    from app.main import lifespan
+
+    log: list[str] = []
+    _patch_lifespan(monkeypatch, log, ctor_fails=True)
+    with pytest.raises(RuntimeError, match="ctor"):
+        async with lifespan(FastAPI()):
+            pass
+    assert log == ["dispose"]
+
+
+async def test_lifespan_body_error_closes_both(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi import FastAPI
+
+    from app.main import lifespan
+
+    log: list[str] = []
+    _patch_lifespan(monkeypatch, log)
+    with pytest.raises(KeyboardInterrupt):
+        async with lifespan(FastAPI()):
+            raise KeyboardInterrupt
+    assert log == ["bot_api", "aclose", "dispose"]
