@@ -862,7 +862,7 @@ async def test_many_duplicates_wait_for_successful_first_delivery(rig: Rig) -> N
     await asyncio.sleep(0.05)
     assert not any(t.done() for t in dups)  # повторы не подтверждаются раньше первой
     rig.stub.gate.set()
-    results = await asyncio.gather(first, *dups)
+    results = await asyncio.wait_for(asyncio.gather(first, *dups), 5.0)
     assert all(r.status_code == 200 for r in results)
     assert len(rig.stub.bodies()) == 1
     updates: UpdateDeduplicator = app.state.bot_updates
@@ -881,7 +881,7 @@ async def test_many_duplicates_during_transient_failure_all_503_then_processed(r
     # отметки законно обрабатывается заново — это не предмет теста)
     await asyncio.sleep(0.3)
     rig.stub.gate.set()
-    results = await asyncio.gather(first, *dups)
+    results = await asyncio.wait_for(asyncio.gather(first, *dups), 5.0)
     assert [r.status_code for r in results] == [503] * 31
     assert len(rig.stub.bodies()) == 1
     # Telegram повторяет — обновление обрабатывается ровно один раз
@@ -901,7 +901,7 @@ async def test_hanging_bot_api_hits_deadline_for_first_and_duplicate(
     t0 = loop.time()
     first = asyncio.create_task(rig.post(upd))
     await _wait_requests(rig.stub)
-    r1, r2 = await asyncio.gather(first, rig.post(upd))
+    r1, r2 = await asyncio.wait_for(asyncio.gather(first, rig.post(upd)), 5.0)
     assert (r1.status_code, r2.status_code) == (503, 503)
     assert loop.time() - t0 < 2.0  # ни одна доставка не висит дольше срока
     assert not app.state.bot_updates.in_progress(uid)
@@ -920,7 +920,7 @@ async def test_deadline_cuts_long_429_backoff(rig: Rig, monkeypatch: pytest.Monk
         rig.stub.script = [tg_error(429, 10)]
         loop = asyncio.get_running_loop()
         t0 = loop.time()
-        r = await rig.post(tg_message("/start"))
+        r = await asyncio.wait_for(rig.post(tg_message("/start")), 5.0)
         assert r.status_code == 503
         assert loop.time() - t0 < 2.0
     finally:
@@ -950,7 +950,19 @@ async def test_cancelled_first_delivery_does_not_block_update_forever(
         await first
     rig.stub.gate.set()
     assert not app.state.bot_updates.in_progress(uid)
-    assert (await rig.post(upd)).status_code == 200
+    assert (await asyncio.wait_for(rig.post(upd), 5.0)).status_code == 200
+
+
+async def test_duplicate_wait_is_bounded_even_if_first_never_finishes(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Первая доставка «зависла» навсегда (например, D-3): повтор всё равно отвечает в срок — 503
+    monkeypatch.setattr(webhook_module, "HANDLE_DEADLINE_S", 0.2)
+    upd = tg_message("/start")
+    assert app.state.bot_updates.claim(upd["update_id"])  # отметка без исхода
+    r = await asyncio.wait_for(rig.post(upd), 5.0)
+    assert r.status_code == 503
+    assert rig.stub.requests == []
 
 
 def test_deadline_relation_to_client_timeouts_and_telegram_wait() -> None:
