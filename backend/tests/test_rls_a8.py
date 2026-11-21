@@ -839,6 +839,9 @@ APP_FUNCS = [
     "app_couple_feed(integer, timestamp with time zone)",
     "app_read_original(uuid)",
     "app_mark_read(uuid)",
+    "app_issue_invite(bytea)",  # 0002, задача 0.7b
+    "app_accept_invite(bytea)",
+    "app_leave_couple()",
 ]
 PIPELINE_FUNCS = [
     "pipeline_original(uuid)",
