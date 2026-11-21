@@ -13,6 +13,11 @@ from tests.conftest import app_database_url
 from tests.test_rls_isolation import World, _draft_id
 
 DENIED = r"permission denied|row-level security"
+# Пару создаёт только прошедший онбординг: согласия и 18+ (0003, FB008; ТЗ §4.1 п.2).
+ONBOARDED_USER_SQL = (
+    "INSERT INTO users (id, telegram_id, consent_terms_at, consent_data_at, "
+    "consent_sensitive_at, age_confirmed_at) VALUES (:u, :t, now(), now(), now(), now())"
+)
 
 
 async def _send(sm: async_sessionmaker[AsyncSession], uid: uuid.UUID) -> uuid.UUID:
@@ -217,7 +222,7 @@ async def test_invite_insert_limits(
     uid = uuid.uuid4()
     async with engine.begin() as conn:
         await conn.execute(
-            text("INSERT INTO users (id, telegram_id) VALUES (:u, :t)"),
+            text(ONBOARDED_USER_SQL),
             {"u": uid, "t": 7_100_000_000 + uuid.uuid4().int % 1_000_000},
         )
     async with user_scope(sessionmaker, uid) as s:
@@ -310,7 +315,7 @@ async def test_create_couple_is_pending_and_direct_insert_denied(
     uid = uuid.uuid4()
     async with engine.begin() as conn:
         await conn.execute(
-            text("INSERT INTO users (id, telegram_id) VALUES (:u, :t)"),
+            text(ONBOARDED_USER_SQL),
             {"u": uid, "t": 7_000_000_000 + uuid.uuid4().int % 1_000_000},
         )
     with pytest.raises(ProgrammingError, match=DENIED):

@@ -104,11 +104,19 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Me" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
-          description: Возраст не подтверждён — доступ не предоставляется (ТЗ §9.3)
+          description: >-
+            Код `underage`: возраст 18+ не подтверждён (`age_confirmed: false`) — доступ не
+            предоставляется, ранее данное подтверждение снимается (ТЗ §9.3). Код
+            `onboarding_required` этот эндпоинт не отдаёт: его отдают эндпоинты, требующие
+            завершённого онбординга (см. `components/responses/OnboardingRequired`).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                underage:
+                  value: { code: underage, message: Сервис доступен только с 18 лет }
         "422": { $ref: "#/components/responses/Validation" }
 
   /me/export:
@@ -622,6 +630,16 @@ components:
     Unauthorized:
       description: Нет сессии или неверная подпись initData
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    OnboardingRequired:
+      description: >-
+        Код `onboarding_required`: онбординг не завершён — нет всех трёх согласий или
+        подтверждения 18+ (ФТ-02, ТЗ §4.1 п.2, §9.3)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            onboarding_required:
+              value: { code: onboarding_required, message: Сначала завершите знакомство с сервисом }
     NotFound:
       description: Не найдено или нет доступа (не различаются, чтобы не раскрывать чужие данные)
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -633,9 +651,6 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Validation:
       description: Ошибка данных
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
-    OnboardingRequired:
-      description: Нет согласий или подтверждения 18+ (ФТ-02)
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     SubscriptionRequired:
       description: Подписка закончилась или исчерпан дневной лимит без подписки (ТЗ §11)
@@ -683,7 +698,7 @@ components:
         name: { type: string, minLength: 1, maxLength: 64 }
         address_form: { type: string, minLength: 1, maxLength: 64 }
         partner_name: { type: string, minLength: 1, maxLength: 64 }
-        timezone: { type: string, default: Europe/Moscow }
+        timezone: { type: string, maxLength: 64, default: Europe/Moscow, description: "Зона IANA" }
         consent_terms: { type: boolean, const: true }
         consent_data: { type: boolean, const: true }
         consent_sensitive: { type: boolean, const: true }

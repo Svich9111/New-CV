@@ -67,3 +67,65 @@ def test_implemented_routes_exist_in_contract() -> None:
         rel = path.removeprefix("/api/v1")
         for method in getattr(route, "methods", set()) - {"HEAD", "OPTIONS"}:
             assert method.lower() in paths.get(rel, {}), (method, path)
+
+
+# Коды, которые сервер реально отдаёт (app/api/auth.py, app/api/deps.py; тесты test_auth_api.py,
+# test_onboarding.py). Ревью 1.2 MAJOR-1, тест 1.2 D-6: каждый должен быть объявлен в контракте.
+SERVED_STATUSES = {
+    ("post", "/auth/telegram"): {"200", "401", "403", "422", "503"},
+    ("put", "/me/onboarding"): {"200", "401", "403", "422"},
+}
+
+
+def _resolve(spec: dict[str, Any], obj: dict[str, Any]) -> dict[str, Any]:
+    while "$ref" in obj:
+        node: Any = spec
+        for part in obj["$ref"].removeprefix("#/").split("/"):
+            node = node[part]
+        obj = node
+    return obj
+
+
+def _example_codes(response: dict[str, Any]) -> list[str]:
+    examples = response["content"]["application/json"]["examples"]
+    return [e["value"]["code"] for e in examples.values()]
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+
+def _no_duplicates(loader: yaml.SafeLoader, node: yaml.MappingNode) -> dict[Any, Any]:
+    keys = [loader.construct_object(k) for k, _ in node.value]
+    dup = {k for k in keys if keys.count(k) > 1}
+    assert not dup, (dup, node.start_mark.line + 1)
+    return loader.construct_mapping(node)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates)
+
+
+def test_contract_has_no_duplicate_keys() -> None:
+    """safe_load молча берёт последний из повторённых ключей — повтор скрывает правку."""
+    yaml.load(SPEC_PATH.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)  # noqa: S506
+
+
+def test_served_statuses_are_declared_in_contract() -> None:
+    spec = _spec()
+    for (method, path), statuses in SERVED_STATUSES.items():
+        declared = set(spec["paths"][path][method]["responses"])
+        assert statuses <= declared, (method, path, statuses - declared)
+
+
+def test_onboarding_error_codes_are_described() -> None:
+    """403 онбординга — код underage (с примером); onboarding_required — отдельный ответ для
+    эндпоинтов, требующих онбординга. Оба кода — в общем списке Error.code."""
+    spec = _spec()
+    forbidden = _resolve(spec, spec["paths"]["/me/onboarding"]["put"]["responses"]["403"])
+    assert _example_codes(forbidden) == ["underage"]
+    required = _resolve(spec, {"$ref": "#/components/responses/OnboardingRequired"})
+    assert _example_codes(required) == ["onboarding_required"]
+    known = spec["components"]["schemas"]["Error"]["properties"]["code"]["examples"]
+    assert {"underage", "onboarding_required", "unauthorized"} <= set(known)
+    tz = spec["components"]["schemas"]["OnboardingRequest"]["properties"]["timezone"]
+    assert tz["maxLength"] == 64  # колонка users.timezone — String(64)
