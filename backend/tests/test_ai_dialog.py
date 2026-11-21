@@ -129,11 +129,23 @@ def test_dialog_prompt_has_principles_and_tone() -> None:
         assert phrase.lower() in text.lower(), phrase
 
 
+# Запреты §6.2 п.5 — формулировками запрета, а не подстроками (ревью 0.5 MINOR-6а).
+BANS = {
+    "adapt": (
+        "запрещено: менять, добавлять или убирать факты; убирать или менять просьбу; добавлять\n"
+        "  просьбы, обещания, извинения",
+    ),
+    "draft": ("не придумывай фактов,\n  обещаний и извинений от его имени",),
+}
+
+
 @pytest.mark.parametrize("role", ["adapt", "draft"])
 def test_adaptation_bans_from_tz_6_2_5(role: str) -> None:
     text = prompts.system_prompt(role).text.lower()
-    for phrase in ("факт", "просьб", "обещани", "извинени"):
+    for phrase in BANS[role]:
         assert phrase in text, phrase
+    v1 = prompts.system_prompt("adapt", prompts.V2).text.lower()
+    assert BANS["adapt"][0] in v1  # следующая версия запрет не теряет
 
 
 def test_crisis_templates_without_softening_or_numbers() -> None:

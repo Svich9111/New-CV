@@ -39,6 +39,17 @@ ACTIONS: dict[CrisisType, frozenset[str]] = {
 }
 
 
+# Сообщение остановлено конвейером, а строки протокола обращены к пострадавшему (насилие,
+# самоповреждение, угроза жизни): автор должен явно узнать, что текст не ушёл (§2 п.2, §9.3
+# «объясняет причину»; DECISIONS АР-28). Служебная строка кода, не промпт модели. У строки
+# ``outgoing_threat`` это сказано в самом блоке шаблона.
+NOT_SENT = (
+    "Сообщение не отправлено: в нём есть признаки, при которых я не передаю текст партнёру. "
+    "Партнёр его не получит и о том, что оно было, не узнает. Твой текст сохранён у тебя."
+)
+NOT_SENT_ACTIONS = frozenset({"not_sent", "explain_reason"})
+
+
 @dataclass(frozen=True)
 class CrisisResponse:
     """Ответ автору по протоколу. ``text`` — ответ агента (если был) и блоки шаблона."""
@@ -66,10 +77,13 @@ def respond(
     *,
     primary: str | None = None,
     prompt_set: PromptSet = V0,
+    withheld: bool = False,
 ) -> CrisisResponse:
     """Ответ по протоколу. ``primary`` — главная строка, если её назвал агент (иначе — по
     приоритету); ``underage`` всегда главная. Блоки: главная строка, затем вторичные; при
-    ``underage`` блок отказа в доступе — последним, чтобы ответ не начинался с отказа."""
+    ``underage`` блок отказа в доступе — последним, чтобы ответ не начинался с отказа.
+    ``withheld`` — одобренное сообщение остановлено: если среди строк нет ``outgoing_threat``
+    (её блок сам говорит «не отправлено»), первой идёт строка ``NOT_SENT``."""
     ordered = order([*(types or ()), *([primary] if primary else [])])
     if not ordered:
         raise ValueError("нет строки кризисного протокола")
@@ -81,8 +95,11 @@ def respond(
     sequence = (*rest, main) if main == "underage" else (main, *rest)
     blocks = [load("crisis", version, block=t).text for t in sequence]
     parts = [agent_reply.strip()] if agent_reply and agent_reply.strip() else []
-    parts += blocks
     actions = frozenset().union(*(ACTIONS[t] for t in ordered))
+    if withheld and "outgoing_threat" not in ordered:
+        parts.append(NOT_SENT)
+        actions |= NOT_SENT_ACTIONS
+    parts += blocks
     return CrisisResponse(
         primary=main,
         secondary=rest,

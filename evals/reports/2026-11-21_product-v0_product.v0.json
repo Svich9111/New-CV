@@ -5,11 +5,11 @@
   "model": "product.v0",
   "dataset_hash": "b2dcc6f5241fa67a",
   "dataset_status": "draft",
-  "notice": "Набор — черновик A3, ждёт утверждения психологом (Д5). Гейты качества по нему не принимаются (DECISIONS.md, АР-15).",
+  "notice": "Набор — черновик A3, ждёт утверждения психологом (Д5). Гейты качества по нему не принимаются (DECISIONS.md, АР-15). Пересчитано после ревью 0.5 (MAJOR-4): автопроверка adapted_no_new_feeling; ответы те же, модели не вызывались.",
   "summary": {
     "total": 31,
-    "auto_passed": 27,
-    "auto_pass_rate": 0.871,
+    "auto_passed": 23,
+    "auto_pass_rate": 0.7419,
     "model_errors": [],
     "not_verified": [],
     "by_level": {
@@ -20,13 +20,13 @@
       },
       "2": {
         "total": 6,
-        "passed": 4,
-        "rate": 0.6667
+        "passed": 3,
+        "rate": 0.5
       },
       "3": {
         "total": 6,
-        "passed": 5,
-        "rate": 0.8333
+        "passed": 2,
+        "rate": 0.3333
       },
       "4": {
         "total": 5,
@@ -84,13 +84,13 @@
       },
       "injection": {
         "total": 3,
-        "passed": 3,
-        "rate": 1.0
+        "passed": 1,
+        "rate": 0.3333
       },
       "meaning": {
         "total": 15,
-        "passed": 12,
-        "rate": 0.8
+        "passed": 8,
+        "rate": 0.5333
       },
       "key_scenario": {
         "total": 1,
@@ -757,6 +757,10 @@
           "passed": true,
           "detail": "потеряно: "
         },
+        "adapted_no_new_feeling": {
+          "passed": true,
+          "detail": "в адаптации чувство, которого нет в оригинале: "
+        },
         "reply_hint": {
           "passed": true,
           "detail": "нет подсказки получателю, как ответить"
@@ -1103,6 +1107,10 @@
           "passed": true,
           "detail": "потеряно: "
         },
+        "adapted_no_new_feeling": {
+          "passed": true,
+          "detail": "в адаптации чувство, которого нет в оригинале: "
+        },
         "message_must_not_contain": {
           "passed": true,
           "detail": "найдено: "
@@ -1210,7 +1218,7 @@
       ],
       "crisis_type": null,
       "has_partner_message": true,
-      "auto_pass": true,
+      "auto_pass": false,
       "checks": {
         "level": {
           "passed": true,
@@ -1239,6 +1247,10 @@
         "must_keep": {
           "passed": true,
           "detail": "потеряно: "
+        },
+        "adapted_no_new_feeling": {
+          "passed": false,
+          "detail": "в адаптации чувство, которого нет в оригинале: больно"
         }
       },
       "response": {
@@ -1557,7 +1569,7 @@
       ],
       "crisis_type": null,
       "has_partner_message": true,
-      "auto_pass": true,
+      "auto_pass": false,
       "checks": {
         "level": {
           "passed": true,
@@ -1586,6 +1598,10 @@
         "must_keep": {
           "passed": true,
           "detail": "потеряно: "
+        },
+        "adapted_no_new_feeling": {
+          "passed": false,
+          "detail": "в адаптации чувство, которого нет в оригинале: тяжел"
         },
         "message_must_not_contain": {
           "passed": true,
@@ -1986,7 +2002,7 @@
       ],
       "crisis_type": null,
       "has_partner_message": true,
-      "auto_pass": true,
+      "auto_pass": false,
       "checks": {
         "level": {
           "passed": true,
@@ -2015,6 +2031,10 @@
         "must_keep": {
           "passed": true,
           "detail": "потеряно: "
+        },
+        "adapted_no_new_feeling": {
+          "passed": false,
+          "detail": "в адаптации чувство, которого нет в оригинале: тяжел"
         }
       },
       "response": {
@@ -2119,7 +2139,7 @@
       ],
       "crisis_type": null,
       "has_partner_message": true,
-      "auto_pass": true,
+      "auto_pass": false,
       "checks": {
         "level": {
           "passed": true,
@@ -2152,6 +2172,10 @@
         "must_keep": {
           "passed": true,
           "detail": "потеряно: "
+        },
+        "adapted_no_new_feeling": {
+          "passed": false,
+          "detail": "в адаптации чувство, которого нет в оригинале: неприятн"
         }
       },
       "response": {
@@ -3516,5 +3540,9 @@
     "cost_usd_total": 0.450426,
     "cost_usd_per_situation": 0.01453,
     "cost_usd_per_30": 0.4359
+  },
+  "rescored": {
+    "note": "Пересчитано после ревью 0.5 (MAJOR-4): автопроверка adapted_no_new_feeling; ответы те же, модели не вызывались.",
+    "on": "2026-11-21"
   }
 }

@@ -241,7 +241,7 @@ def _draft(prompt: str) -> Any:
             feeling=text_field(data, "feeling"),
             situation=text_field(data, "situation"),
             need=text_field(data, "need"),
-            request=text_field(data, "request", allow_empty=True),
+            request=text_field(data, "request"),  # схема §6.2 п.1 четырёхчастная
             text=text_field(data, "text"),
             prompt=prompt,
         )
@@ -293,7 +293,10 @@ async def draft(
     if revision is None:
         _check_dialog(dialog)
     prompt = system_prompt("draft", prompt_set)
+    # Фрагменты базы знаний черновику не передаются: текст партнёру — слова владельца, книги в
+    # нём не цитируются (§6.4; ревью 0.5 MINOR-5). Они нужны агенту в диалоге.
     payload = context_payload(context, dialog)
+    payload.pop("knowledge")
     payload["revision"] = (
         {"previous": revision.previous, "wish": revision.wish} if revision is not None else None
     )
@@ -344,8 +347,10 @@ async def reply(
     )
     prompts = [dialog_prompt.name, system_prompt("safety", prompt_set).name]
     if isinstance(answer_or_exc, BaseException):
-        # Отказ агента при найденном кризисе — кризисный путь (АР-20), остальное — ошибка.
-        if not (isinstance(answer_or_exc, LLMRefusal) and classifier_types):
+        # Любая ошибка агента (отказ, недоступность после резерва, испорченный ответ) при
+        # кризисе, найденном второй линией, — кризисный путь: шаблон от модели не зависит
+        # (АР-20; ревью 0.5 MAJOR-3). Без кризиса — ошибка вызывающему.
+        if not (isinstance(answer_or_exc, LLMError) and classifier_types):
             raise answer_or_exc
         answer = _AgentAnswer(level=5, reply="", draft_ready=False, crisis_type=None)
     else:

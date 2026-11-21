@@ -75,7 +75,10 @@ class ScriptedProvider:
         yield ""  # pragma: no cover
 
 
-DEMO_DRAFT = "Мне грустно, когда наши планы отменяются. Мне важно проводить с тобой время."
+DEMO_DRAFT = (
+    "Мне грустно, когда наши планы отменяются. Мне важно проводить с тобой время. Пожалуйста, "
+    "предупреждай меня заранее, если планы меняются."
+)
 
 
 def demo_handler(role: str, payload: dict[str, Any], system: str) -> dict[str, Any]:
@@ -110,7 +113,7 @@ def demo_handler(role: str, payload: dict[str, Any], system: str) -> dict[str, A
             "feeling": "Мне грустно",
             "situation": "наши планы отменяются",
             "need": "проводить с тобой время",
-            "request": "",
+            "request": "предупреждай меня заранее, если планы меняются",
             "text": DEMO_DRAFT,
         }
     if role == "safety":
@@ -126,8 +129,8 @@ def demo_handler(role: str, payload: dict[str, Any], system: str) -> dict[str, A
         return {
             "adapted": text.replace("!", "."),
             "reply_hint": (
-                "Похоже, ей важно проводить время вместе и знать о переменах заранее. Можно "
-                "начать с того, что ты это услышал, и договориться, как предупреждать."
+                "Похоже, автору важно проводить время вместе и знать о переменах заранее. "
+                "Можно начать с того, что это услышано, и договориться, как предупреждать."
             ),
         }
     if role == "meaning":

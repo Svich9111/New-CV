@@ -20,7 +20,10 @@ from app.ai import crisis, dialog, pipeline, prompts
 from app.ai.dialog import OwnerContext, Turn
 from app.ai.llm import (
     FallbackProvider,
+    LLMAuthError,
     LLMBadOutput,
+    LLMError,
+    LLMQuotaError,
     LLMRefusal,
     LLMUnavailable,
 )
@@ -162,7 +165,12 @@ async def test_safety_stops_message_without_adaptation(category: str, expected: 
     notice = delivery.author_notice
     assert notice is not None and notice.primary == expected
     assert ORIGINAL not in notice.text  # ответ автору не пересказывает и не смягчает текст
-    assert "no_softening" in notice.actions or "no_draft" in notice.actions
+    # Автор явно узнаёт, что сообщение не ушло и почему (§2 п.2, §9.3; ревью MAJOR-1, АР-28).
+    assert {"not_sent", "explain_reason", "no_draft"} <= notice.actions
+    assert "не отправлено" in notice.text.lower()
+    assert notice.text.lower().index("не отправлено") < 200  # в начале ответа, не в конце
+    block = prompts.load("crisis", "v0", block=expected).text
+    assert block in notice.text  # блок протокола — дословно, без смягчения
 
 
 async def test_outgoing_threat_notice_explains_and_returns_to_talk() -> None:
@@ -226,7 +234,19 @@ async def test_error_before_tone_known_is_not_delivered(step: str, exc: Exceptio
 
 
 @pytest.mark.parametrize("step", ["adapt", "meaning"])
-@pytest.mark.parametrize("exc", [LLMRefusal("отказ"), LLMUnavailable("нет связи")])
+@pytest.mark.parametrize("exc", [LLMRefusal("отказ"), LLMAuthError("401"), LLMQuotaError("402")])
+async def test_refusal_after_safety_is_not_delivered(step: str, exc: LLMError) -> None:
+    """АР-27: отказ модели (и ошибки ключа, лимита) на адаптации/смысле — не доставляется."""
+    provider = scripted(base_answers(**{step: exc}))
+    with pytest.raises(type(exc)) as info:
+        await pipeline.process(
+            AgentModels.single(provider), pipeline.approve(ORIGINAL, confirmed=True)
+        )
+    assert info.value.user_message  # понятное сообщение автору, текст у него сохранён
+
+
+@pytest.mark.parametrize("step", ["adapt", "meaning"])
+@pytest.mark.parametrize("exc", [LLMUnavailable("нет связи"), LLMBadOutput("мусор")])
 async def test_error_after_safety_falls_back_to_original_with_warning(
     step: str, exc: Exception
 ) -> None:
@@ -235,6 +255,7 @@ async def test_error_after_safety_falls_back_to_original_with_warning(
     assert delivery.shown == ORIGINAL and not delivery.is_adapted
     assert delivery.degraded == f"{step}:{getattr(exc, 'kind', '')}"
     assert delivery.calls[-1].error == getattr(exc, "kind", None)
+    assert delivery.reply_hint is None  # подсказка к непроверенной адаптации не показывается
 
 
 @pytest.mark.parametrize(

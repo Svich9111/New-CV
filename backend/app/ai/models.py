@@ -45,7 +45,7 @@ class AgentModels:
         )
 
 
-def openrouter_models(
+async def openrouter_models_async(
     writer: str = OPENROUTER_SONNET,
     classifier: str = OPENROUTER_HAIKU,
     *,
@@ -54,17 +54,22 @@ def openrouter_models(
     """Модели через OpenRouter (ключ — ``OPENROUTER_API_KEY``; без него — ``LLMConfigError`` до
     сетевого запроса). Прайс берётся из каталога: без цены расходы не считаются как $0.
     ``with_fallback`` — резерв на недоступность: писатель ↔ классификатор (отказ модели на
-    резерв не уходит, АР-20)."""
+    резерв не уходит, АР-20). Асинхронный вариант — для сервера с запущенным циклом (3.2)."""
     OpenRouterProvider(writer)  # ключ проверяется до запроса каталога
-
-    async def prices() -> tuple[OpenRouterProvider, OpenRouterProvider]:
-        w_price, c_price = await asyncio.gather(fetch_price(writer), fetch_price(classifier))
-        return (
-            OpenRouterProvider(writer, price=w_price),
-            OpenRouterProvider(classifier, price=c_price),
-        )
-
-    w, c = asyncio.run(prices())
+    w_price, c_price = await asyncio.gather(fetch_price(writer), fetch_price(classifier))
+    w = OpenRouterProvider(writer, price=w_price)
+    c = OpenRouterProvider(classifier, price=c_price)
     if not with_fallback:
         return AgentModels.split(w, c)
     return AgentModels.split(FallbackProvider(w, c), FallbackProvider(c, w))
+
+
+def openrouter_models(
+    writer: str = OPENROUTER_SONNET,
+    classifier: str = OPENROUTER_HAIKU,
+    *,
+    with_fallback: bool = True,
+) -> AgentModels:
+    """Синхронный вариант ``openrouter_models_async`` — для консоли и прогона набора (вне цикла
+    событий; внутри запущенного цикла — ``RuntimeError``, нужен асинхронный вариант)."""
+    return asyncio.run(openrouter_models_async(writer, classifier, with_fallback=with_fallback))

@@ -158,7 +158,11 @@ def _comparison_lines(rows: Sequence[dict[str, Any]]) -> list[str]:
 
 def render_table(rows: Sequence[dict[str, Any]], meta: dict[str, Any]) -> str:
     lines = [
-        f"# Предварительное сравнение моделей — {meta['label']}",
+        (
+            f"# Прогон промптов продукта — {meta['label']}"
+            if meta.get("report_note")
+            else f"# Предварительное сравнение моделей — {meta['label']}"
+        ),
         "",
         f"Дата: {meta['generated_on']} · набор: `{meta['dataset_hash']}` "
         f"({meta['dataset_status']}) · ситуаций: {meta['situations']} · промпт: "
@@ -385,7 +389,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "not_run": [aliases[n] if args.blind else n for n in not_run],
         "skipped": {aliases[n] if args.blind else n: why for n, why in skipped.items()},
         # Пояснение адаптера к сводке (например, продуктовый конвейер 0.5 вместо compare.v1).
-        "report_note": getattr(models[0], "report_note", None),
+        "report_note": " ".join(
+            dict.fromkeys(n for m in models if (n := getattr(m, "report_note", None)))
+        )
+        or None,
     }
     summary: dict[str, Any] = {**meta, "notice": "Предварительно (АР-19)", "rows": rows}
     if args.blind:

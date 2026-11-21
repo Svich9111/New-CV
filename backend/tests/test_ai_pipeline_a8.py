@@ -163,12 +163,7 @@ def _forge_direct_empty() -> Any:
     return pipeline.ApprovedMessage("   ", _confirmed=True)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-1: ApprovedMessage подделывается в обход approve() (object.__new__, "
-    "dataclasses.replace меняет текст после одобрения, прямой конструктор без проверки текста); "
-    "process проверяет только isinstance",
-)
+# A8-1 исправлен в раунде 1 (A3): реестр выданных approve() объектов и проверка текста.
 @pytest.mark.parametrize("forge", [_forge_new, _forge_replace, _forge_direct_empty])
 async def test_forged_approved_message_is_not_processed(forge: Callable[[], Any]) -> None:
     bot = Bot(ok_script(tone={"tone": 0, "signals": []}))
@@ -204,8 +199,12 @@ async def test_message_crisis_each_type_stops(category: str, kind: str, as_secon
     notice = delivery.author_notice
     assert notice is not None
     # Текст протокола — дословно блок шаблона (модель его не трогала, ничего не смягчено).
-    assert notice.text == block(kind)
+    # Раунд 1 (A3, ревью MAJOR-1, АР-28): если блок обращён к пострадавшему, первой идёт строка
+    # «не отправлено» (у outgoing_threat это сказано в самом блоке).
+    expected = block(kind) if kind == "outgoing_threat" else f"{crisis.NOT_SENT}\n\n{block(kind)}"
+    assert notice.text == expected
     assert notice.primary == kind and "no_draft" in notice.actions
+    assert "not_sent" in notice.actions and "не отправлено" in notice.text
     # Событие — только тип §9.3, без текста сообщения.
     assert delivery.safety_event == kind and delivery.safety_event in crisis.CRISIS_TYPES
     assert TEXT not in notice.text and "ужин" not in notice.text
@@ -321,7 +320,10 @@ async def test_tone_out_of_scale_is_bad_output_not_delivered(bad: Any) -> None:
 # ====================================================== 4. Контроль смысла (§6.2 п.6, §2 п.3)
 
 
-@pytest.mark.parametrize("kind", pipeline.MEANING_PROBLEMS)
+# Раунд 1 (A3): «hint_off» (meaning.v2) снимает только подсказку — проверяется отдельно.
+@pytest.mark.parametrize(
+    "kind", [k for k in pipeline.MEANING_PROBLEMS if k not in pipeline.HINT_ONLY_PROBLEMS]
+)
 async def test_each_meaning_problem_gives_original_with_warning(kind: str) -> None:
     delivery, _ = await run(ok_script(meaning={"problems": [kind]}))
     assert delivery.status == "original_with_warning"
@@ -370,7 +372,8 @@ NUMBER_CASES = [
     ("Ты опоздал в 19:30!", "Ты пришёл в 19:30, мне было обидно.", False),
     ("Ты опоздал в 19:30!", "Ты пришёл в 20:30, мне было обидно.", True),
     ("Ты опоздал в 19:30!", "Ты пришёл в 19.30, мне было обидно.", False),
-    ("Жду уже 2 недели!", "Жду уже две недели, мне грустно.", True),  # осторожно: цифра → слово
+    # Раунд 1 (A3, MINOR-1): числительные словами нормализуются — «2» = «две».
+    ("Жду уже 2 недели!", "Жду уже две недели, мне грустно.", False),
     ("Встреча 21.11 сорвалась!", "Встреча 22.11 сорвалась, мне жаль.", True),
     ("Встреча 21.11 сорвалась!", "Встреча 21 ноября сорвалась, мне жаль.", True),
     ("Ты потратил 1 500 рублей!", "Ты потратил 1500 рублей, меня это тревожит.", True),
@@ -403,12 +406,7 @@ WORD_NUMBER_CASES = [
 ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-2: сверка чисел кодом видит только цифры \\d+ как мультимножество — "
-    "числительные словами («третий раз»→«второй раз», «трижды») и перестановка чисел не ловятся; "
-    "держится только на модели meaning",
-)
+# A8-2 исправлен в раунде 1 (A3): app/ai/facts.py — порядок и числительные словами.
 @pytest.mark.parametrize(("original", "adapted"), WORD_NUMBER_CASES)
 async def test_word_numerals_and_reordered_numbers_checked_by_code(
     original: str, adapted: str
@@ -454,6 +452,13 @@ async def test_error_on_adapt_or_meaning_gives_original_with_warning(
     step: str, make: Callable[[], LLMError]
 ) -> None:
     exc = make()
+    if exc.kind not in pipeline.DEGRADE_KINDS:
+        # Раунд 1 (A3, АР-27): отказ и прочие ошибки на адаптации/смысле — не доставляется.
+        bot = Bot(ok_script(**{step: exc}))
+        with pytest.raises(LLMError) as info:
+            await pipeline.process(bot.models, pipeline.approve(TEXT, confirmed=True))
+        assert info.value.kind == exc.kind
+        return
     delivery, bot = await run(ok_script(**{step: exc}))
     assert delivery.status == "original_with_warning" and delivery.shown == TEXT
     assert not delivery.is_adapted and delivery.mark is None and delivery.harsh_tone_warning
@@ -477,9 +482,9 @@ async def test_refusal_never_goes_to_fallback_model(step: str) -> None:
     try:
         delivery = await pipeline.process(models, pipeline.approve(TEXT, confirmed=True))
     except LLMRefusal:
-        assert step in ("safety", "tone")
+        pass  # раунд 1 (A3, АР-27): отказ на любом шаге — не доставляется
     else:
-        assert step in ("adapt", "meaning") and delivery.status == "original_with_warning"
+        raise AssertionError(f"отказ на {step} доставил сообщение: {delivery.status}")
     assert step not in backup.roles
 
 

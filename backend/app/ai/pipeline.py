@@ -3,13 +3,15 @@
 1. **Одобрение** (п.2). ``approve`` — единственный способ получить ``ApprovedMessage``: только
    при явном подтверждении автора (в продукте — кнопка «Отправить», в прототипе — ответ «да»).
    Без него конвейер не запускается и ничего не доставляется (§2 п.2, ФТ-08).
-2. **Безопасность** (п.3) — отдельный классификатор ``safety.v0`` по одобренному оригиналу.
-   Сработал — сообщение не адаптируется и не доставляется (``withheld``); автору — ответ по
-   кризисному протоколу (``crisis.v0``), событие — только тип, без текста; партнёру ничего.
+2. **Безопасность** (п.3) — отдельный классификатор ``safety`` по одобренному оригиналу.
+   Сработал — сообщение не адаптируется и не доставляется (``withheld``, допущение АР-28); автор
+   явно узнаёт «не отправлено» и получает ответ по кризисному протоколу (``crisis``); событие —
+   только тип, без текста; партнёру ничего. «Младше 18» по тексту сообщения конвейер не
+   останавливает, но событие ``underage`` возвращается (проверка доступа — вне конвейера).
 3. **Тон** (п.4) — агент получателя, ``tone.v0``, шкала 0–3. 0–1 — доставка без изменений.
 4. **Адаптация** (п.5) — при 2–3, ``adapt.v0``; пометку «адаптировано» ставит код.
-5. **Контроль смысла** (п.6) — ``meaning.v0`` и сверка чисел кодом. Расхождение — получатель
-   видит оригинал с предупреждением о резком тоне.
+5. **Контроль смысла** (п.6) — ``meaning`` и сверка чисел кодом (``facts``). Расхождение —
+   получатель видит оригинал с предупреждением о резком тоне, **без** подсказки агента.
 6. **Доставка** (п.7) — ``Delivery``: что увидит получатель, пометка, оригинал по запросу.
 
 Изоляция (§6.2, последний абзац; §9.2): на вход ``process`` — только ``ApprovedMessage`` (текст
@@ -17,15 +19,21 @@
 — только оригинал (и адаптация — в контроле смысла). Текст сообщения — данные, не инструкция
 (§9.2 п.3): он передаётся значением поля JSON, а пометку и решение о доставке принимает код.
 
-Ошибки (§10, АР-20): ошибка или отказ модели на шагах безопасности и тона — сообщение не
-доставляется (``LLMError`` вызывающему, текст у автора сохранён: безопасность не проверена — не
-отправляем). На шагах адаптации и контроля смысла — оригинал с предупреждением: безопасность уже
-проверена, а непроверенную адаптацию показывать нельзя (``degraded`` — вид ошибки)."""
+Подсказка получателю (``reply_hint``, §4.4 п.5) — голос агента получателя, поэтому проверяется:
+не показывается при оригинале с предупреждением; кодом — длина и отсутствие дословных кусков
+оригинала (внедрённая в текст команда не «переезжает» в подсказку); ``meaning.v2`` — ещё и
+моделью (вид ``hint_off``: подсказка снимается, адаптация остаётся).
+
+Ошибки (§10, АР-20, АР-27): любая ошибка модели на шагах безопасности и тона — сообщение не
+доставляется (``LLMError`` вызывающему, текст у автора сохранён). На адаптации и контроле
+смысла недоступность и испорченный ответ — оригинал с предупреждением (``degraded`` — вид
+ошибки); отказ модели и прочие ошибки — не доставляется, ``LLMError`` вызывающему."""
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+import weakref
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from app.ai import crisis
@@ -40,6 +48,7 @@ from app.ai.calls import (
     text_field,
 )
 from app.ai.dialog import MAX_TOKENS_CLASSIFIER, SafetyVerdict, classify
+from app.ai.facts import numbers_differ
 from app.ai.llm import LLMError
 from app.ai.models import AgentModels
 from app.ai.prompts import V0, PromptSet, system_prompt
@@ -60,7 +69,8 @@ TONE_SIGNALS = (
     "demand",
     "shouting",
 )
-MEANING_PROBLEMS = (
+# Виды искажений meaning.v0 / v1 и добавленные в meaning.v2 (ревью 0.5 MAJOR-4, MAJOR-5).
+MEANING_PROBLEMS_V0 = (
     "changed_facts",
     "added_facts",
     "dropped_request",
@@ -71,6 +81,15 @@ MEANING_PROBLEMS = (
     "dropped_feeling",
     "devalued_feelings",
 )
+MEANING_PROBLEMS_V2 = ("added_feeling", "hint_off")
+MEANING_PROBLEMS = (*MEANING_PROBLEMS_V0, *MEANING_PROBLEMS_V2)
+# «hint_off» касается только подсказки: адаптация доставляется, подсказка — нет.
+HINT_ONLY_PROBLEMS = frozenset({"hint_off"})
+# Ошибки адаптации и контроля смысла, при которых доставляется оригинал с предупреждением
+# (АР-27); остальные (отказ, ключ, лимит, некорректный запрос) — не доставляется.
+DEGRADE_KINDS = frozenset({"unavailable", "bad_output", "model_not_found"})
+MAX_HINT_CHARS = 400
+HINT_COPY_WORDS = 5  # столько подряд слов оригинала в подсказке — подсказка не показывается
 # Категория классификатора сообщения → строка §9.3 для ответа автору.
 MESSAGE_CRISIS: dict[str, crisis.CrisisType] = {
     "threat_or_insult": "outgoing_threat",
@@ -87,28 +106,55 @@ class NotConfirmed(Exception):
     """Автор не подтвердил отправку — сообщение не уходит (§2 п.2, ФТ-08)."""
 
 
+# Выданные ``approve`` объекты (по идентичности): ``process`` принимает только их, поэтому
+# ``dataclasses.replace``, ``object.__new__`` и прямой конструктор не подделают одобрение
+# (A8-1). В продукте ту же гарантию даёт статус черновика в БД.
+_ISSUED: dict[int, weakref.ref[ApprovedMessage]] = {}
+
+
 @dataclass(frozen=True)
 class ApprovedMessage:
     """Оригинал, одобренный автором (§6.2 п.2). Создаётся только через ``approve``."""
 
     text: str
-    _confirmed: bool = False
+    _confirmed: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         if self._confirmed is not True:
             raise NotConfirmed("сообщение не подтверждено автором")
+        _check_text(self.text)
+
+    @property
+    def issued(self) -> bool:
+        ref = _ISSUED.get(id(self))
+        return ref is not None and ref() is self
+
+
+def _check_text(text: object) -> None:
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("пустое сообщение")
+    if text != text.strip():
+        raise ValueError("текст не нормализован (approve)")
+    if len(text) > MAX_ORIGINAL_CHARS:
+        raise ValueError(f"сообщение длиннее {MAX_ORIGINAL_CHARS} символов")
 
 
 def approve(text: str, *, confirmed: bool) -> ApprovedMessage:
     """Фиксирует оригинал. ``confirmed`` — явное «Отправить» автора (только ``True``)."""
     if confirmed is not True:
         raise NotConfirmed("без явного «Отправить» сообщение не уходит")
+    if not isinstance(text, str):
+        raise TypeError("текст сообщения — строка")
     clean = text.strip()
-    if not clean:
-        raise ValueError("пустое сообщение")
-    if len(clean) > MAX_ORIGINAL_CHARS:
-        raise ValueError(f"сообщение длиннее {MAX_ORIGINAL_CHARS} символов")
-    return ApprovedMessage(clean, _confirmed=True)
+    _check_text(clean)
+    message = ApprovedMessage(clean, _confirmed=True)
+    key = id(message)
+
+    def forget(_ref: weakref.ref[ApprovedMessage]) -> None:
+        _ISSUED.pop(key, None)
+
+    _ISSUED[key] = weakref.ref(message, forget)
+    return message
 
 
 @dataclass(frozen=True)
@@ -130,6 +176,7 @@ class Delivery:
     calls: tuple[CallRecord, ...]
     prompts: tuple[str, ...]
     degraded: str | None = None  # ошибка адаптации/контроля смысла → оригинал с предупреждением
+    hint_dropped: str | None = None  # почему подсказка не показана: warning | guard | hint_off
 
     @property
     def delivered(self) -> bool:
@@ -168,24 +215,37 @@ ADAPT_SCHEMA: dict[str, Any] = strict_object(
         "reply_hint": {"anyOf": [{"type": "string"}, {"type": "null"}]},
     }
 )
-# meaning.v0 — список видов; meaning.v1 — виды с дословными фрагментами (основание).
+# meaning.v0 — список видов; v1 — виды с дословными фрагментами (основание); v2 — то же плюс
+# «добавлено чувство» и «подсказка не по делу», на входе ещё и подсказка.
 MEANING_SCHEMA_V0: dict[str, Any] = strict_object(
-    {"problems": {"type": "array", "items": {"type": "string", "enum": list(MEANING_PROBLEMS)}}}
-)
-MEANING_SCHEMA_V1: dict[str, Any] = strict_object(
     {
         "problems": {
             "type": "array",
-            "items": strict_object(
-                {
-                    "kind": {"type": "string", "enum": list(MEANING_PROBLEMS)},
-                    "original_fragment": {"type": "string"},
-                    "adapted_fragment": {"type": "string"},
-                }
-            ),
+            "items": {"type": "string", "enum": list(MEANING_PROBLEMS_V0)},
         }
     }
 )
+
+
+def _objects_schema(kinds: tuple[str, ...]) -> dict[str, Any]:
+    return strict_object(
+        {
+            "problems": {
+                "type": "array",
+                "items": strict_object(
+                    {
+                        "kind": {"type": "string", "enum": list(kinds)},
+                        "original_fragment": {"type": "string"},
+                        "adapted_fragment": {"type": "string"},
+                    }
+                ),
+            }
+        }
+    )
+
+
+MEANING_SCHEMA_V1: dict[str, Any] = _objects_schema(MEANING_PROBLEMS_V0)
+MEANING_SCHEMA_V2: dict[str, Any] = _objects_schema(MEANING_PROBLEMS)
 
 
 def _tone(data: dict[str, Any]) -> ToneVerdict:
@@ -200,7 +260,12 @@ def _adaptation(data: dict[str, Any]) -> Adaptation:
 
 
 def meaning_schema(version: str) -> dict[str, Any]:
-    return MEANING_SCHEMA_V0 if version == "v0" else MEANING_SCHEMA_V1
+    return {"v0": MEANING_SCHEMA_V0, "v1": MEANING_SCHEMA_V1}.get(version, MEANING_SCHEMA_V2)
+
+
+def meaning_checks_hint(version: str) -> bool:
+    """С ``meaning.v2`` контроль смысла получает и проверяет подсказку получателю."""
+    return version not in ("v0", "v1")
 
 
 def _problems(data: dict[str, Any]) -> tuple[str, ...]:
@@ -218,12 +283,23 @@ def _problems(data: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(kinds))
 
 
-_NUMBER = re.compile(r"\d+")
+_WORD = re.compile(r"[^\W_]+", re.UNICODE)
 
 
-def numbers_differ(original: str, adapted: str) -> bool:
-    """Сверка чисел кодом: числа оригинала и адаптации должны совпадать (факты, §6.2 п.5)."""
-    return sorted(_NUMBER.findall(original)) != sorted(_NUMBER.findall(adapted))
+def hint_guard(hint: str | None, original: str) -> str | None:
+    """Проверка подсказки кодом: ``None`` — показывать можно, иначе причина. Подсказка не
+    должна быть длинной и не должна нести дословные куски оригинала (так внедрённая в текст
+    команда «агенту» не становится словами агента получателя, §9.2 п.3)."""
+    if hint is None:
+        return None
+    if len(hint) > MAX_HINT_CHARS:
+        return "guard"
+    words = [w.casefold() for w in _WORD.findall(original)]
+    hint_words = " " + " ".join(w.casefold() for w in _WORD.findall(hint)) + " "
+    for i in range(len(words) - HINT_COPY_WORDS + 1):
+        if " " + " ".join(words[i : i + HINT_COPY_WORDS]) + " " in hint_words:
+            return "guard"
+    return None
 
 
 def _same_text(a: str, b: str) -> bool:
@@ -234,8 +310,8 @@ async def process(
     models: AgentModels, message: ApprovedMessage, *, prompt_set: PromptSet = V0
 ) -> Delivery:
     """Конвейер §6.2 п.3–7 по одобренному оригиналу (см. описание модуля)."""
-    if not isinstance(message, ApprovedMessage):
-        raise TypeError("конвейер принимает только ApprovedMessage (approve)")
+    if not isinstance(message, ApprovedMessage) or not message.issued:
+        raise TypeError("конвейер принимает только ApprovedMessage, выданный approve()")
     original = message.text
     log = CallLog()
     prompts = [system_prompt("safety", prompt_set).name]
@@ -259,9 +335,12 @@ async def process(
     # п.3 — безопасность: ошибка модели здесь — сообщение не уходит (LLMError вызывающему).
     verdict: SafetyVerdict = await classify(models, "message", original, log, prompt_set)
     types = [MESSAGE_CRISIS[c] for c in verdict.categories if c in MESSAGE_CRISIS]
-    if types:  # «младше 18» по тексту сообщения — не строка конвейера (§9.3: это вход в сервис)
+    if types:
         notice = crisis.respond(
-            types, primary=MESSAGE_CRISIS.get(verdict.category), prompt_set=prompt_set
+            types,
+            primary=MESSAGE_CRISIS.get(verdict.category),
+            prompt_set=prompt_set,
+            withheld=True,
         )
         prompts.append(f"crisis.{notice.template_version}")
         return result(
@@ -271,6 +350,11 @@ async def process(
             author_notice=notice,
             safety_event=notice.primary,
         )
+
+    # «Младше 18» по тексту сообщения — не строка конвейера (§9.3: это вход в сервис), но
+    # сигнал не теряется: событие без текста для проверки доступа (ревью 0.5 MINOR-2).
+    age_event = "underage" if "underage" in verdict.categories else None
+    base_event = {"safety_event": age_event}
 
     # п.4 — тон (агент получателя, только оригинал).
     prompts.append(system_prompt("tone", prompt_set).name)
@@ -284,19 +368,29 @@ async def process(
         max_tokens=MAX_TOKENS_CLASSIFIER,
     )
     if tone.tone <= 1:
-        return result(status="as_is", shown=original, tone=tone.tone, tone_signals=tone.signals)
+        return result(
+            status="as_is", shown=original, tone=tone.tone, tone_signals=tone.signals, **base_event
+        )
 
-    harsh = {"tone": tone.tone, "tone_signals": tone.signals}
+    harsh = {"tone": tone.tone, "tone_signals": tone.signals, **base_event}
 
     def with_warning(problems: tuple[str, ...] = (), **extra: Any) -> Delivery:
+        # Подсказка агента получателя к отклонённой или непроверенной адаптации не показывается.
+        dropped = "warning" if extra.pop("hint", None) else None
         return result(
             status="original_with_warning",
             shown=original,
             harsh_tone_warning=True,
             meaning_problems=problems,
+            hint_dropped=dropped,
             **harsh,
             **extra,
         )
+
+    def degrade(step: str, exc: LLMError) -> Delivery:
+        if exc.kind not in DEGRADE_KINDS:  # отказ и прочее — не доставляется (АР-27)
+            raise exc
+        return with_warning(degraded=f"{step}:{exc.kind}")
 
     # п.5 — адаптация формы.
     prompts.append(system_prompt("adapt", prompt_set).name)
@@ -311,30 +405,43 @@ async def process(
             max_tokens=MAX_TOKENS_ADAPT,
         )
     except LLMError as exc:
-        return with_warning(degraded=f"adapt:{exc.kind}")
+        return degrade("adapt", exc)
     adapted = adaptation.adapted
     hint = adaptation.reply_hint
     if not adapted or _same_text(adapted, original):
-        return with_warning(reply_hint=hint)
+        return with_warning(hint=hint)
 
     # п.6 — контроль смысла: модель и сверка чисел кодом.
     prompts.append(system_prompt("meaning", prompt_set).name)
+    version = prompt_set.version("meaning")
+    payload: dict[str, Any] = {"original": original, "adapted": adapted}
+    if meaning_checks_hint(version):
+        payload["reply_hint"] = hint
     try:
         problems: tuple[str, ...] = await complete(
             models.meaning,
             prompt=system_prompt("meaning", prompt_set),
-            payload={"original": original, "adapted": adapted},
-            schema=meaning_schema(prompt_set.version("meaning")),
+            payload=payload,
+            schema=meaning_schema(version),
             validate=_problems,
             log=log,
             max_tokens=MAX_TOKENS_CLASSIFIER,
         )
     except LLMError as exc:
-        return with_warning(reply_hint=hint, degraded=f"meaning:{exc.kind}")
+        return degrade("meaning", exc)
     if numbers_differ(original, adapted) and "changed_facts" not in problems:
         problems = (*problems, "changed_facts")
-    if problems:
-        return with_warning(problems, reply_hint=hint)
+    if set(problems) - HINT_ONLY_PROBLEMS:
+        return with_warning(problems, hint=hint)
 
-    # п.7 — доставка адаптации с пометкой; оригинал — по запросу.
-    return result(status="adapted", shown=adapted, is_adapted=True, reply_hint=hint, **harsh)
+    # п.7 — доставка адаптации с пометкой; оригинал — по запросу. Подсказка — после проверок.
+    dropped = "hint_off" if "hint_off" in problems and hint else hint_guard(hint, original)
+    return result(
+        status="adapted",
+        shown=adapted,
+        is_adapted=True,
+        reply_hint=None if dropped else hint,
+        hint_dropped=dropped,
+        meaning_problems=problems,
+        **harsh,
+    )

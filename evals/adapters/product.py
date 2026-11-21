@@ -24,7 +24,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from typing import Any, TypeVar
 
-from app.ai import crisis, dialog, pipeline
+from app.ai import crisis, dialog, pipeline, prompts
 from app.ai.dialog import OwnerContext, PairMessage, Turn
 from app.ai.llm import (
     ChatMessage,
@@ -39,6 +39,7 @@ from app.ai.llm import (
 from app.ai.models import OPENROUTER_HAIKU, OPENROUTER_SONNET, AgentModels
 from app.ai.prompts import V0 as PROMPTS_V0
 from app.ai.prompts import V1 as PROMPTS_V1
+from app.ai.prompts import V2 as PROMPTS_V2
 from app.ai.prompts import PromptSet
 
 from adapters.claude import (
@@ -191,7 +192,9 @@ class ProductAdapter:
         if notice is not None:  # одобренное исходящее остановлено — ответ автору по протоколу
             types = (*(response.types if response else ()), *notice.types)
             primary = response.primary if response else notice.primary
-            response = crisis.respond(types, primary=primary, prompt_set=self.prompt_set)
+            response = crisis.respond(
+                types, primary=primary, prompt_set=self.prompt_set, withheld=True
+            )
             reply = f"{reply}\n\n{notice.text}" if notice.text not in reply else reply
         if response is None:
             return resp_cls(
@@ -252,8 +255,29 @@ class ProductAdapter:
             reply_hint=delivery.reply_hint if delivery.delivered else None,
         )
 
+    def prompt_hashes(self) -> dict[str, str]:
+        """Версия и хеш текста каждого промпта набора (ревью 0.5 MINOR-7)."""
+        out = {}
+        for role in prompts.ROLES:
+            if role == "crisis":
+                continue
+            p = prompts.system_prompt(role, self.prompt_set)
+            out[role] = f"{p.name}@{p.sha}"
+        return out
+
     def pop_metrics(self) -> dict[str, Any]:
         calls, self._calls = self._calls, []
+        # Итог конвейера без текстов: статус, виды расхождений смысла, судьба подсказки.
+        deliveries = [
+            {
+                "status": d.status,
+                "meaning_problems": list(d.meaning_problems),
+                "hint_dropped": d.hint_dropped,
+                "degraded": d.degraded,
+                "safety_event": d.safety_event,
+            }
+            for d in self._deliveries.values()
+        ]
         self._deliveries.clear()
         ok = [c for c in calls if c["error"] is None]
         return {
@@ -264,6 +288,8 @@ class ProductAdapter:
             "output_tokens": sum(c["output_tokens"] for c in calls),
             "cost_usd": round(sum(c["cost_usd"] for c in calls), 8),
             "errors": [c["error"] for c in calls if c["error"] is not None],
+            "prompts": self.prompt_hashes(),
+            "deliveries": deliveries,
         }
 
     def close(self) -> None:
@@ -276,7 +302,14 @@ class V0(ProductAdapter):
 
 
 class V1(ProductAdapter):
-    """v0 + safety.v1 и meaning.v1 (исправления по прогону v0)."""
+    """Черновик без прогона (АР-26): v0 + safety.v1 и meaning.v1."""
 
     name = "product.v1"
     prompt_set = PROMPTS_V1
+
+
+class V2(ProductAdapter):
+    """Черновик без прогона (АР-26): safety.v2, meaning.v2, adapt.v1."""
+
+    name = "product.v2"
+    prompt_set = PROMPTS_V2
