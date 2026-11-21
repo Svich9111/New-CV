@@ -349,8 +349,10 @@ async def reply(
     if isinstance(answer_or_exc, BaseException):
         # Любая ошибка агента (отказ, недоступность после резерва, испорченный ответ) при
         # кризисе, найденном второй линией, — кризисный путь: шаблон от модели не зависит
-        # (АР-20; ревью 0.5 MAJOR-3). Без кризиса — ошибка вызывающему.
-        if not (isinstance(answer_or_exc, LLMError) and classifier_types):
+        # (АР-20; ревью 0.5 MAJOR-3). То же для любой другой ошибки (сбой поставщика вне
+        # LLMError, A8 О-10); прерывание (не Exception) — всегда вызывающему. Без кризиса —
+        # ошибка вызывающему.
+        if not (isinstance(answer_or_exc, Exception) and classifier_types):
             raise answer_or_exc
         answer = _AgentAnswer(level=5, reply="", draft_ready=False, crisis_type=None)
     else:

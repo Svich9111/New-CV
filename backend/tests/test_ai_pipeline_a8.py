@@ -218,9 +218,9 @@ async def test_message_multiple_crisis_types_all_blocks_verbatim() -> None:
     )
     notice = delivery.author_notice
     assert notice is not None and notice.primary == "outgoing_threat"
-    assert notice.text == "\n\n".join(
-        [block("outgoing_threat"), block("violence"), block("self_harm")]
-    )
+    # Раунд 2 (A3, R2-MAJOR-1 = A8-3): главная строка outgoing_threat — действует автор, блок
+    # для пострадавшего (violence) не добавляется; блок self_harm (о самом авторе) остаётся.
+    assert notice.text == "\n\n".join([block("outgoing_threat"), block("self_harm")])
     assert delivery.safety_event == "outgoing_threat"
 
 
@@ -441,7 +441,7 @@ ERROR_IDS = [
     "model_not_found",
 ]
 # АР-27 (раунд 2 A8): ожидание задаётся тестом, а не берётся из кода (иначе проверка — тавтология).
-AR27_DEGRADE = {"unavailable", "bad_output", "model_not_found"}
+AR27_DEGRADE = {"unavailable", "bad_output"}
 
 
 @pytest.mark.parametrize("make", ERRORS, ids=ERROR_IDS)
@@ -1089,12 +1089,6 @@ async def test_r2_victim_gets_violence_template_with_not_sent() -> None:
     assert {"name_it", "help_contacts", "no_tolerate", "not_sent"} <= notice.actions
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-3: главная строка outgoing_threat (действует автор) + вторичная violence — "
-    "к шаблону отправителю добавляется блок пострадавшему «Вина за это не на тебе»; на V0 "
-    "(по умолчанию) классификатор не различает, кто действует (АР-28, ситуация l5-09)",
-)
 async def test_r2_controller_never_told_not_his_fault() -> None:
     delivery, _ = await run(
         ok_script(safety={"category": "threat_or_insult", "secondary": ["violence"]}),
@@ -1208,11 +1202,6 @@ async def test_r2_hint_guard_blocks_verbatim_copy(hint: str) -> None:
 ZW = "​"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-4: защита подсказки не нормализует текст — «ё»/«е» и символы нулевой "
-    "ширины (Cf) в оригинале рвут совпадение пяти слов, дословная команда проходит в подсказку",
-)
 @pytest.mark.parametrize(
     ("original", "hint"),
     [
@@ -1363,12 +1352,6 @@ def test_r2_approve_text_must_be_str(bad: Any) -> None:
         pipeline.approve(bad, confirmed=True)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-5: текст выданного approve() объекта меняется object.__setattr__ после "
-    "одобрения (реестр хранит только идентичность, не текст) — конвейер обрабатывает "
-    "неодобренный/пустой текст",
-)
 @pytest.mark.parametrize("forge", [_forge_setattr_text, _forge_setattr_empty])
 async def test_r2_mutated_issued_message_rejected(forge: Callable[[], Any]) -> None:
     bot = Bot(ok_script(tone={"tone": 0, "signals": []}))
@@ -1377,12 +1360,6 @@ async def test_r2_mutated_issued_message_rejected(forge: Callable[[], Any]) -> N
     assert bot.provider.requests == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-6: одно одобрение доставляется сколько угодно раз — повторный process "
-    "того же ApprovedMessage после доставки не отклоняется (§2 п.2: одно «Отправить» — одна "
-    "отправка; в продукте гарантию даст статус черновика в БД)",
-)
 async def test_r2_approval_is_single_use_after_delivery() -> None:
     bot = Bot(ok_script(tone={"tone": 0, "signals": []}))
     msg = pipeline.approve(TEXT, confirmed=True)
@@ -1464,11 +1441,6 @@ async def test_r2_no_underage_no_event() -> None:
     assert delivery.safety_event is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-7: при остановке (violence/…) вместе с underage сигнал «младше 18» "
-    "теряется — safety_event хранит только главную строку остановки",
-)
 async def test_r2_underage_not_lost_when_withheld() -> None:
     delivery, _ = await run(ok_script(safety={"category": "violence", "secondary": ["underage"]}))
     assert delivery.status == "withheld"

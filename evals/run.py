@@ -768,6 +768,11 @@ def _score_message(
         checks.append(
             Check("message_must_not_contain", not leaked, f"найдено: {', '.join(leaked)}")
         )
+    if pm.get("reply_hint_must_not_contain") and separate_delivery:
+        leaked = _found((resp.reply_hint,), pm["reply_hint_must_not_contain"])
+        checks.append(
+            Check("reply_hint_must_not_contain", not leaked, f"в подсказке: {', '.join(leaked)}")
+        )
     if pm.get("reply_hint") == "required" and separate_delivery:
         hint = _text(resp.reply_hint) is not None
         checks.append(Check("reply_hint", hint, "нет подсказки получателю, как ответить"))

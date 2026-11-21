@@ -31,7 +31,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+import unicodedata
 import weakref
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -86,8 +88,9 @@ MEANING_PROBLEMS = (*MEANING_PROBLEMS_V0, *MEANING_PROBLEMS_V2)
 # «hint_off» касается только подсказки: адаптация доставляется, подсказка — нет.
 HINT_ONLY_PROBLEMS = frozenset({"hint_off"})
 # Ошибки адаптации и контроля смысла, при которых доставляется оригинал с предупреждением
-# (АР-27); остальные (отказ, ключ, лимит, некорректный запрос) — не доставляется.
-DEGRADE_KINDS = frozenset({"unavailable", "bad_output", "model_not_found"})
+# (АР-27); остальные (отказ, ключ, лимит, некорректный запрос, модель не найдена — ошибка
+# настройки, решение A0 по ревью R2-MINOR-3) — не доставляется.
+DEGRADE_KINDS = frozenset({"unavailable", "bad_output"})
 MAX_HINT_CHARS = 400
 HINT_COPY_WORDS = 5  # столько подряд слов оригинала в подсказке — подсказка не показывается
 # Категория классификатора сообщения → строка §9.3 для ответа автору.
@@ -109,7 +112,33 @@ class NotConfirmed(Exception):
 # Выданные ``approve`` объекты (по идентичности): ``process`` принимает только их, поэтому
 # ``dataclasses.replace``, ``object.__new__`` и прямой конструктор не подделают одобрение
 # (A8-1). В продукте ту же гарантию даёт статус черновика в БД.
-_ISSUED: dict[int, weakref.ref[ApprovedMessage]] = {}
+#
+# Запись реестра хранит и хеш одобренного текста: подмена ``text`` через ``object.__setattr__``
+# после одобрения не проходит (A8-5). Состояние: ``approved`` → ``processing`` → ``used``; одно
+# одобрение — одна доставка (§2 п.2: одно «Отправить» — одна отправка, A8-6). Решение конвейера
+# (доставлено или остановлено безопасностью) расходует одобрение; сбой модели — нет: повтор того
+# же одобрения после ошибки разрешён (текст у автора сохранён, §10). Два одновременных
+# ``process`` одного одобрения не идут: второй получает ``AlreadyProcessed``. Объект одобрения
+# не переживает границу процесса: в 3.2 воркер вызывает ``approve()`` сам после проверки
+# статуса черновика в БД (BACKLOG Б-48).
+
+
+class AlreadyProcessed(ValueError):
+    """Одобрение уже израсходовано доставкой или обрабатывается сейчас."""
+
+
+@dataclass
+class _Entry:
+    ref: weakref.ref[ApprovedMessage]
+    digest: str
+    state: Literal["approved", "processing", "used"] = "approved"
+
+
+_ISSUED: dict[int, _Entry] = {}
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -126,8 +155,14 @@ class ApprovedMessage:
 
     @property
     def issued(self) -> bool:
-        ref = _ISSUED.get(id(self))
-        return ref is not None and ref() is self
+        """Выдан ``approve()``, текст не менялся после одобрения."""
+        entry = _ISSUED.get(id(self))
+        return (
+            entry is not None
+            and entry.ref() is self
+            and isinstance(self.text, str)
+            and _digest(self.text) == entry.digest
+        )
 
 
 def _check_text(text: object) -> None:
@@ -153,7 +188,7 @@ def approve(text: str, *, confirmed: bool) -> ApprovedMessage:
     def forget(_ref: weakref.ref[ApprovedMessage]) -> None:
         _ISSUED.pop(key, None)
 
-    _ISSUED[key] = weakref.ref(message, forget)
+    _ISSUED[key] = _Entry(weakref.ref(message, forget), _digest(clean))
     return message
 
 
@@ -172,11 +207,12 @@ class Delivery:
     safety_category: str
     meaning_problems: tuple[str, ...]
     author_notice: crisis.CrisisResponse | None  # ответ автору, если сообщение остановлено
-    safety_event: str | None  # тип для safety_events — без текста (§9.3)
+    safety_event: str | None  # главный тип для safety_events — без текста (§9.3)
     calls: tuple[CallRecord, ...]
     prompts: tuple[str, ...]
     degraded: str | None = None  # ошибка адаптации/контроля смысла → оригинал с предупреждением
     hint_dropped: str | None = None  # почему подсказка не показана: warning | guard | hint_off
+    safety_events: tuple[str, ...] = ()  # все события без текста (главное — первым)
 
     @property
     def delivered(self) -> bool:
@@ -286,6 +322,16 @@ def _problems(data: dict[str, Any]) -> tuple[str, ...]:
 _WORD = re.compile(r"[^\W_]+", re.UNICODE)
 
 
+def _guard_words(text: str) -> list[str]:
+    """Слова для сравнения подсказки с оригиналом: NFKC, без невидимых символов формата
+    (нулевой ширины и т. п., категория Cf), ё → е, без регистра; пунктуация — разделитель
+    (A8-4)."""
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    text = text.casefold().replace("ё", "е")
+    return _WORD.findall(text)
+
+
 def hint_guard(hint: str | None, original: str) -> str | None:
     """Проверка подсказки кодом: ``None`` — показывать можно, иначе причина. Подсказка не
     должна быть длинной и не должна нести дословные куски оригинала (так внедрённая в текст
@@ -294,8 +340,8 @@ def hint_guard(hint: str | None, original: str) -> str | None:
         return None
     if len(hint) > MAX_HINT_CHARS:
         return "guard"
-    words = [w.casefold() for w in _WORD.findall(original)]
-    hint_words = " " + " ".join(w.casefold() for w in _WORD.findall(hint)) + " "
+    words = _guard_words(original)
+    hint_words = " " + " ".join(_guard_words(hint)) + " "
     for i in range(len(words) - HINT_COPY_WORDS + 1):
         if " " + " ".join(words[i : i + HINT_COPY_WORDS]) + " " in hint_words:
             return "guard"
@@ -309,10 +355,25 @@ def _same_text(a: str, b: str) -> bool:
 async def process(
     models: AgentModels, message: ApprovedMessage, *, prompt_set: PromptSet = V0
 ) -> Delivery:
-    """Конвейер §6.2 п.3–7 по одобренному оригиналу (см. описание модуля)."""
+    """Конвейер §6.2 п.3–7 по одобренному оригиналу (см. описание модуля). Одно одобрение —
+    одно решение конвейера; после сбоя модели одобрение можно передать снова."""
     if not isinstance(message, ApprovedMessage) or not message.issued:
         raise TypeError("конвейер принимает только ApprovedMessage, выданный approve()")
-    original = message.text
+    _check_text(message.text)
+    entry = _ISSUED[id(message)]
+    if entry.state != "approved":
+        raise AlreadyProcessed("это одобрение уже обработано: нужно новое «Отправить»")
+    entry.state = "processing"
+    try:
+        delivery = await _process(models, message.text, prompt_set)
+    except BaseException:
+        entry.state = "approved"  # сбой — одобрение не израсходовано, повтор разрешён
+        raise
+    entry.state = "used"
+    return delivery
+
+
+async def _process(models: AgentModels, original: str, prompt_set: PromptSet) -> Delivery:
     log = CallLog()
     prompts = [system_prompt("safety", prompt_set).name]
 
@@ -349,12 +410,20 @@ async def process(
             safety_category=verdict.category,
             author_notice=notice,
             safety_event=notice.primary,
+            # «Младше 18» не теряется и при остановке — отдельное событие (A8-7).
+            safety_events=(
+                notice.primary,
+                *(("underage",) if "underage" in verdict.categories else ()),
+            ),
         )
 
     # «Младше 18» по тексту сообщения — не строка конвейера (§9.3: это вход в сервис), но
     # сигнал не теряется: событие без текста для проверки доступа (ревью 0.5 MINOR-2).
     age_event = "underage" if "underage" in verdict.categories else None
-    base_event = {"safety_event": age_event}
+    base_event: dict[str, Any] = {
+        "safety_event": age_event,
+        "safety_events": (age_event,) if age_event else (),
+    }
 
     # п.4 — тон (агент получателя, только оригинал).
     prompts.append(system_prompt("tone", prompt_set).name)
