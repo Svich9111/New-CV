@@ -289,11 +289,17 @@
   }
   const softenable = (text) => SOFTEN.filter((r) => text.indexOf(r.from) !== -1);
 
-  // Какой заготовленный вариант лежит в отправленном тексте (правка может дописать фразы)
+  // Какой заготовленный вариант отправлен. Только точное совпадение (N-1): допускаются лишь дописанные
+  // фразы из SOFTEN — их смысл агент получателя знает и пересказывает отдельно. Любая другая правка —
+  // и агент получателя уже не пересказывает заготовку, а предлагает прочитать сообщение.
+  const norm = (t) => t.replace(/\s+/g, " ").trim();
   function findVariant(author, original) {
+    let core = original;
+    for (const r of SOFTEN) core = core.split(r.from + ".").join(" ").split(r.from).join(" ");
+    core = norm(core);
     const sets = DRAFTS[author];
     for (const name of Object.keys(sets)) {
-      const idx = sets[name].findIndex((v) => original.indexOf(v.text) !== -1);
+      const idx = sets[name].findIndex((v) => norm(v.text) === core);
       if (idx !== -1) return { set: name, idx };
     }
     return null;
@@ -307,11 +313,12 @@
   }
 
   // Запись в памяти получателя — только из одобренного текста (§6.3, ФТ-14)
-  function partnerMemoryFrom(author, ref) {
+  // Для неизвестного текста — дословная цитата отправленного, без пересказа
+  function partnerMemoryFrom(author, ref, original) {
     const v = variantOf(author, ref);
     if (v) return v.memory;
     const a = NAMES[author];
-    return a.nom + (a.fem ? " прислала" : " прислал") + " сообщение (агент не додумывает его смысл)";
+    return a.nom + (a.fem ? " написала" : " написал") + " (дословно): «" + original + "»";
   }
 
   // Пересказ входящего агентом получателя — только из того, что автор отправил (§6.2, §9.2 п.2)
@@ -441,7 +448,7 @@
     S.users[to].memory.push({
       id: "pm" + ++memSeq,
       cat: "partner",
-      text: partnerMemoryFrom(S.persona, variant),
+      text: partnerMemoryFrom(S.persona, variant, original),
       src: "одобренное сообщение " + NAMES[S.persona].gen + " · сегодня",
     });
     u.draft = null;
@@ -665,9 +672,12 @@
         html:
           '<section class="chat" data-screen="chat" aria-live="polite">' +
           '<div class="chat-day">Сегодня · этот разговор видишь только ты</div>' +
-          '<button type="button" class="help-link" data-action="go" data-to="help">Если тебе сейчас опасно или очень тяжело — Помощь</button>' + msgs +
+          msgs +
           (u.typing ? '<div class="msg msg--agent msg--typing" data-typing>Агент печатает…</div>' : "") + options +
           "</section>" +
+          // Низ чата закреплён: вход в «Помощь» виден всегда, при любой длине ленты (§9.3, N-3)
+          '<div class="chat-bottom">' +
+          '<button type="button" class="help-link" data-action="go" data-to="help">Если тебе сейчас опасно или очень тяжело — Помощь</button>' +
           (suggest.length && !u.typing
             ? '<div class="chips" data-suggest><span class="tiny muted" style="width:100%">Подсказка прототипа — нажми, чтобы вставить:</span>' +
               suggest.map((s) => '<button type="button" class="chip" data-action="suggest" data-text="' + esc(s) + '">' + esc(s) + "</button>").join("") + "</div>"
@@ -677,7 +687,7 @@
           '<button type="button" class="icon-btn" data-action="mic" aria-label="' + (u.recording ? "Закончить запись" : "Записать голосовое") + '" aria-pressed="' + u.recording + '">' + MIC + "</button>" +
           '<textarea id="chat-input" rows="1" data-model="input" placeholder="Что тебя беспокоит?" aria-label="Сообщение агенту">' + esc(u.input) + "</textarea>" +
           '<button type="button" class="icon-btn icon-btn--fill" data-action="send-agent" aria-label="Отправить агенту">' + SEND + "</button>" +
-          "</div>",
+          "</div></div>",
         main: hasOwn || u.replyContext ? { text: S.persona === "anna" ? "Подготовить сообщение " + p.dat : "Подготовить ответ " + p.dat, action: openDraft } : null,
       };
     },

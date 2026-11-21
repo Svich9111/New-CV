@@ -429,6 +429,7 @@ p { margin: 0 0 12px; }
 .contact:last-child { border-bottom: 0; }
 .contact__phone { display: inline-block; font-weight: 700; font-size: 18px; color: var(--text); text-underline-offset: 3px; padding: 4px 0; }
 .contact__phone .small { font-weight: 400; color: var(--text-muted); }
+.chat-bottom { position: sticky; bottom: -8px; margin: 0 -16px -8px; padding: 4px 16px 8px; background: var(--bg); display: flex; flex-direction: column; z-index: 1; }
 .help-link { align-self: center; border: 0; background: transparent; font-size: 13px; color: var(--text-muted); text-decoration: underline; text-underline-offset: 3px; padding: 4px 8px; }
 
 /* --- Тост --- */

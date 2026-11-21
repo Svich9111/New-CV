@@ -302,7 +302,7 @@ await step("3. Ключевой сценарий «Анна и Игорь» (Т�
 
   // Память Игоря получила запись только из одобренного сообщения
   await h.jump("memory");
-  ok(/Аня просит предупреждать заранее/.test(await page.locator("#content").innerText()), "память Игоря: запись из одобренного сообщения Ани (ФТ-14)");
+  ok((await page.locator("#content").innerText()).includes("Аня написала (дословно): «" + edited + "»"), "память Игоря: Анна правила текст — запись дословно из одобренного сообщения (ФТ-14, N-1)");
   ok(/Партнёр этого не видит/.test(await page.locator("[data-private-note]").innerText()), "пояснение «партнёр этого не видит»");
   ok(!/плевать/.test(await page.locator("#content").innerText()), "в памяти Игоря нет слов из личного чата Ани");
 
@@ -390,7 +390,9 @@ async function annaSends(page, mode) {
 async function everythingIgorSees(page) {
   const h = H(page);
   const texts = [];
-  const grab = async () => texts.push(await page.locator("#phone").innerText());
+  // innerText не включает значения полей — добавляем текст черновика и ввода отдельно (T-1)
+  const grab = async () => texts.push(await page.evaluate(() =>
+    document.getElementById("phone").innerText + "\n" + [...document.querySelectorAll("#phone textarea, #phone input")].map((e) => e.value).join("\n")));
   await h.persona("igor");
   await h.jump("home"); await grab();
   await h.jump("messages");
@@ -405,6 +407,7 @@ async function everythingIgorSees(page) {
   await h.clickMain();
   await grab();
   await page.click('[data-action="variant"]');
+  ok((await page.locator("#draft-meta").innerText()).startsWith("Вариант 2 из 2"), "T-1: открыт и второй вариант ответа Игоря");
   await grab();
   for (const s of ["memory", "profile", "subscription", "help", "invite"]) { await h.jump(s); await grab(); }
   return texts.join("\n");
@@ -590,6 +593,53 @@ await step("11. Исправления MINOR: m1/D-4, m3, m4, m5, m6, D-1, D-2, 
   const closeH = await p3.evaluate(() => { const b = document.getElementById("tg-close"); return b.hidden ? 0 : b.getBoundingClientRect().height; });
   ok(closeH === 0 || closeH <= 44, "m7: кнопка «Закрыть» в шапке не переносится");
   await p.context().close(); await p3.context().close();
+});
+
+await step("12. N-1: пересказ и память получателя — только по точному совпадению с вариантом; N-3: «Помощь» в чате видна всегда", async () => {
+  const page = await newPage(375);
+  const h = H(page);
+  await setupPair(page);
+  await h.jump("draft");
+  const base = await page.inputValue("#draft-text");
+  const tail = " Хотя нет, предупреждать не нужно.";
+  await page.locator("#draft-text").press("Control+End");
+  await page.keyboard.type(tail);
+  const sent = await page.inputValue("#draft-text");
+  ok(sent === base + tail, "Анна дописала к варианту отказ от просьбы");
+  await h.clickMain();
+  await h.persona("igor"); await h.jump("messages");
+  await page.getByRole("button", { name: "Ответить с агентом" }).click();
+  const recap = await page.locator('#content .msg[data-from="agent"]').last().innerText();
+  ok(/Пересказывать его своими словами не буду/.test(recap) && !/просит/.test(recap), "N-1: изменённый вариант — агент Игоря не пересказывает заготовку");
+  await h.jump("memory");
+  const mem = await page.locator("#content").innerText();
+  ok(!/Аня просит/.test(mem) && mem.includes("«" + sent + "»"), "N-1: в памяти Игоря — дословный текст, без заготовленной фразы");
+  // Ответ Игоря: набор «нейтральный», заготовка про отмены не подставляется
+  await h.jump("draft");
+  ok(!/срывались/.test(await page.inputValue("#draft-text")), "N-1: черновик Игоря не опирается на заготовку Ани");
+  // Точное совпадение + заданная фраза SOFTEN — пересказ остаётся
+  const p2 = await newPage(375);
+  const h2 = H(p2);
+  await setupPair(p2); await annaSends(p2, "v1edit");
+  await h2.persona("igor"); await h2.jump("messages");
+  await p2.getByRole("button", { name: "Ответить с агентом" }).click();
+  ok(/Она просит предупреждать заранее/.test(await p2.locator('#content .msg[data-from="agent"]').last().innerText()), "вариант без изменений (+ заданная фраза) — пересказ по варианту");
+  // N-3: после длинной переписки вход в «Помощь» виден без прокрутки
+  await h2.persona("anna"); await h2.jump("chat");
+  for (let i = 0; i < 6; i++) {
+    await p2.fill("#chat-input", "Ещё одна мысль номер " + (i + 1) + ", довольно длинная, чтобы лента точно ушла за экран.");
+    await p2.click('[data-action="send-agent"]');
+    await p2.waitForFunction(() => !document.querySelector("[data-typing]"));
+  }
+  const vis = await p2.evaluate(() => {
+    const b = document.querySelector(".help-link"); const c = document.getElementById("content");
+    const r = b.getBoundingClientRect(); const cr = c.getBoundingClientRect();
+    return c.scrollHeight > c.clientHeight && r.top >= cr.top && r.bottom <= cr.bottom;
+  });
+  ok(vis, "N-3: «Помощь» в чате видна при длинной ленте");
+  await p2.locator(".help-link").click();
+  ok((await h2.screen()) === "help", "N-3: переход в «Помощь»");
+  await page.context().close(); await p2.context().close();
 });
 
 // ---------- 7. Скриншоты ----------
