@@ -120,8 +120,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     label = run._safe_label(args.label or f"{date.today().isoformat()}_compare")
     reports = []
+    # Слепой режим (ревью 0.4 MINOR-5, 0.3 R2-MINOR-4): модели — «model-A/B/C» в именах файлов и
+    # в сводке md; соответствие — только в json сводки (blind_key).
+    aliases = {m.name: f"model-{chr(ord('A') + i)}" for i, m in enumerate(models)}
     for model in models:
-        model_label = run._safe_label(f"{label}_{model.name}")
+        tag = aliases[model.name] if args.blind else model.name
+        model_label = run._safe_label(f"{label}_{tag}")
         try:
             report = run.build_report(situations, model, model_label, args.situations)
         except Exception as exc:
@@ -130,6 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         reports.append(report)
 
     rows = [summary_row(r) for r in reports]
+    table_rows = [{**r, "model": aliases[r["model"]]} for r in rows] if args.blind else rows
     first = reports[0]
     meta = {
         "label": label,
@@ -142,12 +147,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for report in reports:
         run.write_report(report, args.out_dir, blind=args.blind)
-    summary = {**meta, "notice": "Предварительно (АР-19)", "rows": rows}
+    summary: dict[str, Any] = {**meta, "notice": "Предварительно (АР-19)", "rows": rows}
+    if args.blind:
+        summary["blind_key"] = {alias: name for name, alias in aliases.items()}
     (args.out_dir / f"{label}.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     md_path = args.out_dir / f"{label}.md"
-    md_path.write_text(render_table(rows, meta), encoding="utf-8")
+    md_path.write_text(render_table(table_rows, meta), encoding="utf-8")
     print(f"Сводка: {md_path}")
     return 0
 

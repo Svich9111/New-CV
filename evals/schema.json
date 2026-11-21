@@ -655,6 +655,20 @@
         "safety_event": {
           "description": "Событие фиксируется без текста переписки (§9.3).",
           "const": "without_text"
+        },
+        "secondary_types": {
+          "description": "Другие строки §9.3, признаки которых тоже есть; главная — type (младше 18 главнее остальных строк: доступ не предоставляется, но протокол этих строк выполняется). Только для эксперта.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "violence",
+              "outgoing_threat",
+              "self_harm",
+              "life_threat",
+              "underage"
+            ]
+          }
         }
       }
     }

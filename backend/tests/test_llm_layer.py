@@ -550,6 +550,27 @@ def test_converse_is_multiturn_with_own_history() -> None:
     assert json.loads(second[2]["content"]) == {"owner_turn": s["owner_turns"][1]}
 
 
+def test_owner_calls_in_dialog_do_not_see_approved_original() -> None:
+    """Ревью 0.3 R2-MAJOR-1, 0.4 MINOR-7: в прогоне ключевого сценария ни один вызов агента
+    владельца (respond и шаги converse) не получает одобренный оригинал шага 3 — его видит только
+    агент получателя."""
+    s = next(x for x in run.load_situations() if x["id"] == "l2-01-anna-igor-key")
+    original = s["partner_message"]["original"]
+    bodies: list[dict[str, Any]] = []
+    model = _adapter(echo_handler(bodies))
+    run.run_suite([s], model)
+    model.close()
+    owner = [b for b in bodies if not _is_recipient(b)]
+    recipient = [b for b in bodies if _is_recipient(b)]
+    assert len(owner) == 1 + len(s["owner_turns"]) and len(recipient) == 1
+    for body in owner:
+        dumped = json.dumps(body["messages"], ensure_ascii=False)
+        assert json.dumps(original, ensure_ascii=False)[1:-1] not in dumped
+        first = json.loads(body["messages"][0]["content"])
+        assert first["approved_partner_message"] is None
+    assert json.loads(recipient[0]["messages"][0]["content"]) == {"original": original}
+
+
 def test_injection_text_stays_data() -> None:
     """§9.2 п.3: текст сообщения с «системной командой» не попадает в системный промпт — только
     внутрь JSON-строки в сообщении пользователя; системный промпт велит считать его данными."""
