@@ -16,3 +16,4 @@
 | Б-10 | 0.7-review r2 n4 | Шаг инфраструктуры: LOGIN и пароль для `feelings_api`, роль входа для `feelings_worker`, проверка при старте, что приложение не суперпользователь; downgrade не возвращает TEMP/CREATE | Задачи 0.8, 4.7 |
 | Б-11 | 0.7-review r2 m9 | Тест админа — по всем 14 личным таблицам и EXECUTE на функции; проверка удаления enum и функций при downgrade | Задача 1.6 |
 | Б-12 | 0.7-review r3 n9 | `pipeline_deliver` не проверяет, что пара ещё активна: ответ после распада пары доставляется (ТЗ §4.5 п.2). Уточнить правило одобрения черновика (статусы approved/rejected/blocked ставит не пользователь) | Задачи 3.1, 3.2 |
+| Б-13 | 0.7b, заметка A1 | У `feelings_app` остались прямые UPDATE `couple_members(active, left_at)`, `couples(status, dissolved_at)`, INSERT/UPDATE `invites`: выход прямым UPDATE не распускает пару и не отзывает ссылки. Отозвать после перевода эндпоинтов на `app_leave_couple` / `app_issue_invite` (миграция A1) | Задача 1.3 |

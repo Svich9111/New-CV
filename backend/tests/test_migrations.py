@@ -1,7 +1,7 @@
 """0.7: миграция обратима и создаёт 17 таблиц ТЗ §7 с RLS на личных данных."""
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from tests.conftest import TEST_DATABASE_URL, alembic
 
@@ -41,10 +41,16 @@ async def _tables() -> dict[str, bool]:
     return result
 
 
-async def test_upgrade_downgrade_upgrade(migrated_db: str) -> None:
+async def test_upgrade_downgrade_upgrade(
+    migrated_db: str, engine: AsyncEngine, app_engine: AsyncEngine
+) -> None:
     alembic("downgrade", "base")
     assert await _tables() == {}
     alembic("upgrade", "head")
+    # Схема пересоздана: подготовленные запросы в пулах общих движков устарели
+    # (asyncpg InvalidCachedStatementError) — следующие тесты должны взять новые соединения.
+    await engine.dispose()
+    await app_engine.dispose()
     tables = await _tables()
     assert set(tables) == TZ_TABLES
     for name, rls in tables.items():
