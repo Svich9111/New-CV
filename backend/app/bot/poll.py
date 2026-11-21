@@ -41,7 +41,7 @@ from app.config import ConfigError, Settings, check_dev_bot_config, get_settings
 from app.core.logging import install_log_redaction
 
 DEV_NOTICE = (
-    "режим разработки: опрос getUpdates, вебхук удалён; в продуктиве — вебхук "
+    "режим разработки: опрос getUpdates (вебхук бота удаляется); в продуктиве — вебхук "
     "(python -m app.bot.setup --webhook-url https://<домен>/api/v1/telegram/webhook)"
 )
 POLL_TIMEOUT_S = 25
@@ -75,7 +75,7 @@ async def _fetch(
     api: BotApi, payload: dict[str, object], stop: asyncio.Event
 ) -> tuple[bool, object]:
     """getUpdates, прерываемый остановкой: (False, None) — пришла остановка."""
-    fetch = asyncio.ensure_future(api.call("getUpdates", payload, timeout=POLL_HTTP_TIMEOUT))
+    fetch = asyncio.ensure_future(api.call("getUpdates", payload, http_timeout=POLL_HTTP_TIMEOUT))
     stopper = asyncio.ensure_future(stop.wait())
     try:
         await asyncio.wait({fetch, stopper}, return_when=asyncio.FIRST_COMPLETED)
@@ -142,9 +142,12 @@ async def poll_updates(
         for update in batch:
             if stop.is_set():
                 break  # необработанные придут при следующем запуске
-            if await process_update(
-                api, seen, update, webapp_url, handler=handler, deadline_s=deadline_s
-            ) is Delivery.RETRY:
+            if (
+                await process_update(
+                    api, seen, update, webapp_url, handler=handler, deadline_s=deadline_s
+                )
+                is Delivery.RETRY
+            ):
                 retry = True
                 break  # offset не сдвигаем: это обновление придёт снова
             uid = update_id_of(update)
@@ -163,7 +166,7 @@ async def poll_updates(
             await api.call(
                 "getUpdates",
                 {"offset": offset, "timeout": 0, "limit": 1, "allowed_updates": ALLOWED_UPDATES},
-                timeout=CONFIRM_HTTP_TIMEOUT,
+                http_timeout=CONFIRM_HTTP_TIMEOUT,
             )
             log.info("processed updates confirmed")
         except BotApiError as err:
@@ -192,9 +195,7 @@ async def run(
     api = BotApi(settings.telegram_bot_token, transport=transport)
     try:
         await api.call("deleteWebhook", {"drop_pending_updates": drop_pending})
-        log.info(
-            "webhook deleted; pending updates %s", "dropped" if drop_pending else "kept"
-        )
+        log.info("webhook deleted; pending updates %s", "dropped" if drop_pending else "kept")
         log.info("polling getUpdates; Ctrl+C to stop")
         offset = await poll_updates(
             api, webapp_url=settings.webapp_url, stop=stop, retry_delays=retry_delays
@@ -205,7 +206,10 @@ async def run(
         await api.aclose()
 
 
-def _install_signal_handlers(stop: asyncio.Event) -> None:
+_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def _install_signal_handlers(stop: asyncio.Event) -> list[signal.Signals]:
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
 
@@ -214,22 +218,30 @@ def _install_signal_handlers(stop: asyncio.Event) -> None:
             main_task.cancel()  # повторный сигнал — не ждать окончания обработки
         stop.set()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    installed = []
+    for sig in _SIGNALS:
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, on_signal)
+            installed.append(sig)
+    return installed
 
 
 async def _amain(drop_pending: bool) -> None:
     stop = asyncio.Event()
-    _install_signal_handlers(stop)
-    await run(get_settings(), drop_pending=drop_pending, stop=stop)
+    installed = _install_signal_handlers(stop)
+    try:
+        await run(get_settings(), drop_pending=drop_pending, stop=stop)
+    finally:
+        loop = asyncio.get_running_loop()
+        for sig in installed:
+            loop.remove_signal_handler(sig)
 
 
 def main(argv: list[str] | None = None) -> None:
     install_log_redaction()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser(
-        description="Опрос getUpdates — только режим разработки; в продуктиве — вebhook"
+        description="Опрос getUpdates — только режим разработки; в продуктиве — вебхук"
     )
     parser.add_argument(
         "--drop-pending",

@@ -2,9 +2,12 @@
 update_id, клиент Bot API (таймауты, 429, токен вне журналов и ошибок). Сети нет: Bot API
 подменён httpx.MockTransport. Данные — выдуманные."""
 
+import asyncio
 import inspect
 import json
 import logging
+import os
+import signal
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -12,12 +15,22 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+from app.bot import check as check_module
+from app.bot import poll as poll_module
+from app.bot import setup as bot_setup
 from app.bot import webhook as webhook_module
 from app.bot.client import BotApi, BotApiError
 from app.bot.dedup import UpdateDeduplicator
+from app.bot.handlers import HINT_TEXT, START_TEXT
 from app.bot.notifications import NotificationKind, notify
 from app.bot.setup import configure_bot
-from app.config import ConfigError, Settings, check_bot_config, get_settings
+from app.config import (
+    ConfigError,
+    Settings,
+    check_bot_config,
+    check_dev_bot_config,
+    get_settings,
+)
 from app.main import app
 
 TOKEN = "123456:TEST-bot-token-not-real-AAAAAAAA"
@@ -892,3 +905,544 @@ def test_webhook_route_is_service_only() -> None:
 
     assert ("POST", URL) in SERVICE_ROUTES
     assert URL not in app.openapi()["paths"]
+
+
+# --- Режим разработки: опрос getUpdates, setup --no-webhook, check (без сети) -----------------
+
+HANG = "hang"  # getUpdates «висит» (долгий опрос без новых обновлений)
+
+
+def _dev_settings(**overrides: Any) -> Settings:
+    """Только то, что нужно опросу: без секрета вебхука, секрета сессии и с недоступной БД."""
+    base: dict[str, Any] = {
+        "telegram_bot_token": SecretStr(TOKEN),
+        "webapp_url": WEBAPP_URL,
+        "bot_username": "FeelingsTestBot",
+        "database_url": "postgresql+asyncpg://nobody:nothing@db.invalid:1/none",
+    }
+    base.update(overrides)
+    return Settings(**base)
+
+
+class PollTelegram:
+    """Подменённый Bot API для опроса: getUpdates отдаёт пакеты по очереди; когда пакеты
+    кончились — ставит остановку и отвечает пустым списком (как истёкший долгий опрос)."""
+
+    def __init__(self, stop: asyncio.Event) -> None:
+        self.stop = stop
+        self.batches: list[Any] = []
+        self.send_responses: list[httpx.Response | Exception] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.read_timeouts: list[float | None] = []
+        self.raw: list[str] = []
+        self.hanging = asyncio.Event()
+        self.notify_after_polls: int | None = None
+        self.polls_reached = asyncio.Event()
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        self.raw.append(str(request.url) + request.content.decode())
+        method = request.url.path.rsplit("/", 1)[-1]
+        payload = json.loads(request.content or b"{}")
+        self.calls.append((method, payload))
+        if method == "getUpdates":
+            self.read_timeouts.append(request.extensions["timeout"]["read"])
+            if self.notify_after_polls is not None and len(self.polls()) >= self.notify_after_polls:
+                self.polls_reached.set()
+            if payload.get("timeout") == 0:  # подтверждение при остановке
+                return httpx.Response(200, json={"ok": True, "result": []})
+            if not self.batches:
+                self.stop.set()
+                return httpx.Response(200, json={"ok": True, "result": []})
+            nxt = self.batches.pop(0)
+            if nxt == HANG:
+                self.hanging.set()
+                await asyncio.Event().wait()
+            if isinstance(nxt, Exception):
+                raise nxt
+            if isinstance(nxt, httpx.Response):
+                return nxt
+            return httpx.Response(200, json={"ok": True, "result": nxt})
+        if method == "sendMessage" and self.send_responses:
+            nxt = self.send_responses.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+        result: Any = True if method != "sendMessage" else {"message_id": 1}
+        return httpx.Response(200, json={"ok": True, "result": result})
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self.handler)
+
+    def methods(self) -> list[str]:
+        return [m for m, _ in self.calls]
+
+    def polls(self) -> list[dict[str, Any]]:
+        return [p for m, p in self.calls if m == "getUpdates"]
+
+    def sent(self) -> list[dict[str, Any]]:
+        return [p for m, p in self.calls if m == "sendMessage"]
+
+
+async def _run_poll(tg: PollTelegram, stop: asyncio.Event, **kw: Any) -> int | None:
+    settings = kw.pop("settings", None) or _dev_settings()
+    return await asyncio.wait_for(
+        poll_module.run(
+            settings, stop=stop, transport=tg.transport(), retry_delays=(0.0, 0.01), **kw
+        ),
+        5.0,
+    )
+
+
+def _assert_clean(text: str) -> None:
+    assert TOKEN not in text
+    assert TOKEN.split(":", 1)[1] not in text
+    assert PAYLOAD not in text
+    assert "ЛИЧНОЕ_ПРИЗНАНИЕ_Qw7" not in text
+
+
+async def test_poll_deletes_webhook_processes_updates_and_moves_offset(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    u1 = _message(f"/start {PAYLOAD}")
+    u2 = _message("ЛИЧНОЕ_ПРИЗНАНИЕ_Qw7")
+    tg.batches = [[u1, u2]]
+    offset = await _run_poll(tg, stop)
+    assert tg.methods()[0] == "deleteWebhook"
+    assert tg.calls[0][1] == {"drop_pending_updates": False}
+    first, second = tg.polls()
+    assert "offset" not in first
+    assert first["timeout"] == 25
+    assert first["allowed_updates"] == bot_setup.ALLOWED_UPDATES == ["message"]
+    # offset подтверждает только обработанные обновления
+    assert second["offset"] == u2["update_id"] + 1 == offset
+    # чтение ответа ждёт дольше долгого опроса
+    assert all(t is not None and t > 25 for t in tg.read_timeouts)
+    sent = tg.sent()
+    assert [s["text"] for s in sent] == [START_TEXT, HINT_TEXT]
+    for s in sent:
+        _assert_webapp_button(s)
+    assert "режим разработки" in caplog.text
+    assert "в продуктиве — вебхук" in caplog.text
+    _assert_clean(caplog.text)
+
+
+async def test_poll_drop_pending_flag() -> None:
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    await _run_poll(tg, stop, drop_pending=True)
+    assert tg.calls[0] == ("deleteWebhook", {"drop_pending_updates": True})
+
+
+def test_poll_main_parses_drop_pending(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list[bool] = []
+
+    async def fake_amain(drop_pending: bool) -> None:
+        seen.append(drop_pending)
+
+    monkeypatch.setattr(poll_module, "_amain", fake_amain)
+    poll_module.main([])
+    poll_module.main(["--drop-pending"])
+    assert seen == [False, True]
+    err = capsys.readouterr().err
+    assert "режим разработки" in err and "в продуктиве — вебхук" in err
+
+
+async def test_poll_repeated_update_id_replies_once() -> None:
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    u = _message("/start")
+    tg.batches = [[u], [u]]  # Telegram прислал то же обновление ещё раз
+    await _run_poll(tg, stop)
+    assert len(tg.sent()) == 1
+
+
+async def test_poll_transient_failure_does_not_move_offset_and_retries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    u1, u2 = _message("/start"), _message(f"/start {PAYLOAD}")
+    tg.batches = [[u1, u2], [u2]]
+    tg.send_responses = [
+        httpx.Response(200, json={"ok": True, "result": {"message_id": 1}}),
+        httpx.Response(502, json={"ok": False, "error_code": 502, "description": "Bad Gateway"}),
+    ]
+    offset = await _run_poll(tg, stop)
+    polls = tg.polls()
+    # после сбоя на u2 offset сдвинут только за u1 — u2 запрошено снова
+    assert polls[1]["offset"] == u1["update_id"] + 1
+    assert polls[2]["offset"] == u2["update_id"] + 1 == offset
+    assert len(tg.sent()) == 3  # u1, u2 (сбой), u2 (повтор)
+    assert "fetched again" in caplog.text
+    _assert_clean(caplog.text)
+
+
+async def test_poll_permanent_bot_api_error_moves_offset() -> None:
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    u = _message("/start")
+    tg.batches = [[u]]
+    tg.send_responses = [
+        httpx.Response(403, json={"ok": False, "error_code": 403, "description": "blocked"})
+    ]
+    offset = await _run_poll(tg, stop)
+    assert offset == u["update_id"] + 1
+    assert len(tg.sent()) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ConnectError(f"connect to https://api.telegram.org/bot{TOKEN}/getUpdates"),
+        httpx.ReadTimeout(f"read https://api.telegram.org/bot{TOKEN}/getUpdates"),
+        httpx.Response(502, text="bad gateway"),
+        httpx.Response(409, json={"ok": False, "error_code": 409, "description": "Conflict"}),
+        httpx.Response(429, json={"ok": False, "error_code": 429, "parameters": {}}),
+    ],
+)
+async def test_poll_retries_get_updates_after_network_errors(
+    failure: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    u = _message("/start")
+    tg.batches = [failure, failure, [u]]
+    offset = await _run_poll(tg, stop)
+    assert offset == u["update_id"] + 1
+    assert len(tg.sent()) == 1
+    assert len(tg.polls()) == 4
+    assert "retry in" in caplog.text
+    _assert_clean(caplog.text)
+
+
+async def test_poll_retry_pause_grows_and_is_interrupted_by_stop() -> None:
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    tg.batches = [httpx.ConnectError("x")] * 3
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    task = asyncio.create_task(
+        poll_module.run(
+            _dev_settings(), stop=stop, transport=tg.transport(), retry_delays=(0.0, 0.0, 60.0)
+        )
+    )
+    tg.notify_after_polls = 3
+    await asyncio.wait_for(tg.polls_reached.wait(), 5.0)
+    await asyncio.sleep(0.05)
+    assert not task.done()  # ждёт 60 с перед четвёртым запросом
+    stop.set()
+    await asyncio.wait_for(task, 2.0)
+    assert loop.time() - started < 5
+    assert len(tg.polls()) == 3
+
+
+async def test_poll_bad_token_stops_with_error_without_token() -> None:
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    tg.batches = [httpx.Response(401, json={"ok": False, "error_code": 401})]
+    with pytest.raises(poll_module.PollStopped) as info:
+        await _run_poll(tg, stop)
+    assert info.value.error.error_code == 401
+    assert TOKEN not in str(info.value)
+    assert len(tg.polls()) == 1
+
+
+def test_poll_main_exits_without_token_in_output(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_api(token: Any, **kw: Any) -> BotApi:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                401, json={"ok": False, "error_code": 401, "description": "Unauthorized"}
+            )
+
+        return BotApi(token, transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(poll_module, "BotApi", fake_api)
+    monkeypatch.setattr(poll_module, "get_settings", _dev_settings)
+    with pytest.raises(SystemExit) as info:
+        poll_module.main([])
+    msg = str(info.value.code)
+    assert "deleteWebhook" in msg and "401" in msg and "Unauthorized" in msg
+    out = capsys.readouterr()
+    for text in (msg, out.out, out.err):
+        assert TOKEN not in text
+
+
+async def test_poll_stop_during_long_poll_confirms_processed_updates() -> None:
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    u = _message("/start")
+    tg.batches = [[u], HANG]
+    task = asyncio.create_task(_run_poll(tg, stop))
+    await asyncio.wait_for(tg.hanging.wait(), 5.0)
+    stop.set()  # Ctrl+C / SIGTERM
+    offset = await asyncio.wait_for(task, 2.0)
+    assert offset == u["update_id"] + 1
+    confirm = tg.polls()[-1]
+    assert confirm["offset"] == offset and confirm["timeout"] == 0
+    assert len(tg.sent()) == 1
+
+
+async def test_poll_stop_mid_batch_finishes_current_update_only() -> None:
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    u1, u2 = _message("/start"), _message("/start")
+    tg.batches = [[u1, u2]]
+    handled: list[int] = []
+
+    async def handler(api: BotApi, update: dict[str, Any], webapp_url: str) -> str:
+        handled.append(update["update_id"])
+        stop.set()  # сигнал пришёл во время обработки первого
+        await asyncio.sleep(0)
+        return "start"
+
+    api = BotApi(TOKEN, transport=tg.transport())
+    offset = await asyncio.wait_for(
+        poll_module.poll_updates(api, webapp_url=WEBAPP_URL, stop=stop, handler=handler), 5.0
+    )
+    await api.aclose()
+    assert handled == [u1["update_id"]]
+    assert offset == u1["update_id"] + 1
+    assert tg.polls()[-1] == {
+        "offset": offset,
+        "timeout": 0,
+        "limit": 1,
+        "allowed_updates": ["message"],
+    }
+
+
+async def test_poll_processing_deadline_retries_update() -> None:
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    u = _message("/start")
+    tg.batches = [[u], [u]]
+    calls: list[int] = []
+
+    async def slow_once(api: BotApi, update: dict[str, Any], webapp_url: str) -> str:
+        calls.append(update["update_id"])
+        if len(calls) == 1:
+            await asyncio.Event().wait()
+        return "start"
+
+    api = BotApi(TOKEN, transport=tg.transport())
+    offset = await asyncio.wait_for(
+        poll_module.poll_updates(
+            api,
+            webapp_url=WEBAPP_URL,
+            stop=stop,
+            handler=slow_once,
+            deadline_s=0.05,
+            retry_delays=(0.0,),
+        ),
+        5.0,
+    )
+    await api.aclose()
+    assert calls == [u["update_id"], u["update_id"]]
+    assert tg.polls()[1].get("offset") is None  # после срока — то же обновление снова
+    assert offset == u["update_id"] + 1
+
+
+async def test_poll_sigterm_stops_gracefully(monkeypatch: pytest.MonkeyPatch) -> None:
+    holder: dict[str, PollTelegram] = {}
+
+    def fake_api(token: Any, **kw: Any) -> BotApi:
+        return BotApi(token, transport=holder["tg"].transport())
+
+    monkeypatch.setattr(poll_module, "BotApi", fake_api)
+    monkeypatch.setattr(poll_module, "get_settings", _dev_settings)
+    tg = PollTelegram(asyncio.Event())
+    tg.batches = [HANG]
+    holder["tg"] = tg
+    task = asyncio.create_task(poll_module._amain(False))
+    await asyncio.wait_for(tg.hanging.wait(), 5.0)
+    os.kill(os.getpid(), signal.SIGTERM)
+    await asyncio.wait_for(task, 2.0)
+    assert tg.methods() == ["deleteWebhook", "getUpdates"]
+    # обработчики сигналов сняты
+    assert not asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+
+
+def test_poll_needs_no_webhook_secret_or_database() -> None:
+    settings = _dev_settings()
+    assert settings.telegram_webhook_secret.get_secret_value() == ""
+    assert settings.session_secret.get_secret_value() == ""
+    check_dev_bot_config(settings)
+    poll_module.check_poll_config(settings)
+    # проверка сервера не ослаблена: без секрета вебхука сервис не стартует
+    with pytest.raises(ConfigError, match="WEBHOOK_SECRET"):
+        check_bot_config(settings)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("telegram_bot_token", SecretStr("")),
+        ("webapp_url", ""),
+        ("webapp_url", "http://app.example.test/"),
+        ("webapp_url", "https://"),
+    ],
+)
+def test_dev_bot_config_requires_token_and_https_webapp(field: str, value: Any) -> None:
+    with pytest.raises(ConfigError) as exc:
+        check_dev_bot_config(_dev_settings(**{field: value}))
+    assert TOKEN not in str(exc.value)
+
+
+@pytest.mark.parametrize("env", ["prod", "production", " PROD "])
+async def test_poll_refuses_production_env(env: str) -> None:
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    with pytest.raises(ConfigError, match="development only"):
+        await _run_poll(tg, stop, settings=_dev_settings(env=env))
+    assert tg.calls == []  # вебхук продуктива не тронут
+
+
+# --- setup --no-webhook -------------------------------------------------------------------------
+
+
+def _patch_api(monkeypatch: pytest.MonkeyPatch, module: Any, fake: FakeTelegram) -> None:
+    def factory(token: Any, **kw: Any) -> BotApi:
+        return BotApi(token, transport=httpx.MockTransport(fake.handler))
+
+    monkeypatch.setattr(module, "BotApi", factory)
+
+
+def test_setup_no_webhook_sets_only_commands_and_menu_button(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fake: FakeTelegram,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    _patch_api(monkeypatch, bot_setup, fake)
+    monkeypatch.setattr(bot_setup, "get_settings", _dev_settings)  # секрета вебхука нет
+    bot_setup.main(["--no-webhook"])
+    assert sorted(m for m, _ in fake.calls) == ["setChatMenuButton", "setMyCommands"]
+    menu = dict(fake.calls)["setChatMenuButton"]["menu_button"]
+    assert menu == {"type": "web_app", "text": "Открыть", "web_app": {"url": WEBAPP_URL}}
+    out = capsys.readouterr()
+    assert "вебхук не менялся" in out.out
+    for text in (out.out, out.err, caplog.text):
+        assert TOKEN not in text
+
+
+def test_setup_without_flag_still_requires_webhook_secret(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeTelegram
+) -> None:
+    _patch_api(monkeypatch, bot_setup, fake)
+    monkeypatch.setattr(bot_setup, "get_settings", _dev_settings)
+    with pytest.raises(SystemExit) as info:
+        bot_setup.main([])
+    assert "WEBHOOK_SECRET" in str(info.value.code)
+    assert fake.calls == []
+
+
+def test_setup_no_webhook_conflicts_with_webhook_url() -> None:
+    with pytest.raises(SystemExit):
+        bot_setup.main(["--no-webhook", "--webhook-url", "https://api.example.test/hook"])
+
+
+# --- check (getMe) ------------------------------------------------------------------------------
+
+
+def _check_fake(me: httpx.Response, hook_url: str = "") -> FakeTelegram:
+    fake = FakeTelegram()
+    info = {"url": hook_url, "pending_update_count": 2}
+    fake.responses = [me, httpx.Response(200, json={"ok": True, "result": info})]
+    return fake
+
+
+def _me(username: str = "FeelingsTestBot") -> httpx.Response:
+    bot_id = int(TOKEN.split(":", 1)[0])
+    result = {"id": bot_id, "is_bot": True, "first_name": "Чувства", "username": username}
+    return httpx.Response(200, json={"ok": True, "result": result})
+
+
+async def test_check_reports_username_and_working_token() -> None:
+    fake = _check_fake(_me())
+    lines = await check_module.check_bot(
+        _dev_settings(webapp_url=""), transport=httpx.MockTransport(fake.handler)
+    )
+    text = "\n".join(lines)
+    assert "Токен рабочий: бот @FeelingsTestBot" in text
+    assert "https://t.me/FeelingsTestBot" in text
+    assert "Вебхук: не задан" in text
+    assert [m for m, _ in fake.calls] == ["getMe", "getWebhookInfo"]
+    assert TOKEN not in text
+    assert TOKEN.split(":", 1)[0] not in text  # id бота — часть токена
+
+
+async def test_check_warns_on_username_mismatch_and_webhook_set() -> None:
+    fake = _check_fake(_me("OtherTestBot"), hook_url="https://api.example.test/hook")
+    lines = await check_module.check_bot(
+        _dev_settings(), transport=httpx.MockTransport(fake.handler)
+    )
+    text = "\n".join(lines)
+    assert "не совпадает с @OtherTestBot" in text
+    assert "Вебхук: задан" in text
+    assert "api.example.test" not in text
+
+
+def test_check_main_prints_result_without_token(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    fake = _check_fake(_me())
+    _patch_api(monkeypatch, check_module, fake)
+    monkeypatch.setattr(check_module, "get_settings", lambda: _dev_settings(webapp_url=""))
+    check_module.main()
+    out = capsys.readouterr()
+    assert "Токен рабочий: бот @FeelingsTestBot" in out.out
+    for text in (out.out, out.err, caplog.text):
+        assert TOKEN not in text
+        assert TOKEN.split(":", 1)[1] not in text
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            httpx.Response(
+                401, json={"ok": False, "error_code": 401, "description": "Unauthorized"}
+            ),
+            "Токен не работает",
+        ),
+        (httpx.ConnectError(f"https://api.telegram.org/bot{TOKEN}/getMe"), "Не удалось"),
+    ],
+)
+def test_check_main_fails_without_token_in_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    response: Any,
+    expected: str,
+) -> None:
+    fake = FakeTelegram()
+    fake.responses = [response]
+    _patch_api(monkeypatch, check_module, fake)
+    monkeypatch.setattr(check_module, "get_settings", _dev_settings)
+    with pytest.raises(SystemExit) as info:
+        check_module.main()
+    msg = str(info.value.code)
+    assert msg.startswith(expected)
+    out = capsys.readouterr()
+    for text in (msg, out.out, out.err):
+        assert TOKEN not in text
+
+
+def test_check_main_requires_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        check_module, "get_settings", lambda: _dev_settings(telegram_bot_token=SecretStr(""))
+    )
+    with pytest.raises(SystemExit) as info:
+        check_module.main()
+    assert "FEELINGS_TELEGRAM_BOT_TOKEN" in str(info.value.code)

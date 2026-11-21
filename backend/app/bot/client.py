@@ -74,13 +74,13 @@ class BotApi:
         await self._http.aclose()
 
     async def call(
-        self, method: str, payload: dict[str, Any], *, timeout: httpx.Timeout | None = None
+        self, method: str, payload: dict[str, Any], *, http_timeout: httpx.Timeout | None = None
     ) -> Any:
-        """`timeout` — для отдельного вызова (долгий опрос getUpdates), иначе общий."""
+        """`http_timeout` — тайм-ауты httpx одного вызова (долгий опрос getUpdates)."""
         attempt = 0
         while True:
             try:
-                return await self._call_once(method, payload, timeout)
+                return await self._call_once(method, payload, http_timeout)
             except BotApiError as err:
                 retry = err.retry_after
                 if (
@@ -94,11 +94,11 @@ class BotApi:
                 await self._sleep(retry)
 
     async def _call_once(
-        self, method: str, payload: dict[str, Any], timeout: httpx.Timeout | None
+        self, method: str, payload: dict[str, Any], http_timeout: httpx.Timeout | None
     ) -> Any:
         url = f"{self._base}/bot{self._token.get_secret_value()}/{method}"
         try:
-            resp = await self._http.post(url, json=payload, timeout=timeout or self.timeout)
+            resp = await self._http.post(url, json=payload, timeout=http_timeout or self.timeout)
         except httpx.TimeoutException:
             raise BotApiError(method, "timeout", transient=True) from None
         except httpx.HTTPError:
