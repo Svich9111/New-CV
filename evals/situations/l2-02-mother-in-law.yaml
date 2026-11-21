@@ -1,0 +1,31 @@
+id: l2-02-mother-in-law
+title: Свекровь снова приехала без звонка
+status: draft
+review_note: Черновик A3 — ждёт утверждения психологом (Д5)
+level: 2
+tags: [родственники, дети]
+checks: [level, meaning, mark_and_original]
+owner: {name: Нина, age: 38, partner_name: Борис}
+relationship: В браке 12 лет, двое детей — Лёва и Тася
+owner_turns:
+  - Его мама снова приехала без звонка и переставила всё на кухне.
+  - Борис всегда молчит, будто так и надо.
+partner_message:
+  direction: outgoing
+  original: Ты никогда не можешь сказать своей маме ни слова! Она опять приехала без звонка и хозяйничает у нас. Поговори с ней, пусть звонит заранее.
+  expected_tone: 3
+  expected_delivery: adapted
+  meaning:
+    facts: [Мама Бориса приехала без звонка, Переставила вещи на кухне, Нине кажется, что Борис её не поддерживает]
+    request: Поговорить с мамой, чтобы она предупреждала о приезде заранее
+  must_keep: [мам, без звонка, заранее]
+  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+expected:
+  strategy: find_need_prepare_message
+  draft: optional
+  agent_should:
+    - Найти потребность за обидой — поддержка мужа и границы дома
+    - Помочь заменить «никогда» на описание конкретной ситуации
+  agent_must_not:
+    - Критиковать свекровь или Бориса
+    - Убирать из адаптации просьбу поговорить с мамой

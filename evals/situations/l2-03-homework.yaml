@@ -1,0 +1,32 @@
+id: l2-03-homework
+title: Уроки с детьми опять на одной
+status: draft
+review_note: Черновик A3 — ждёт утверждения психологом (Д5)
+level: 2
+tags: [дети, усталость, распределение обязанностей]
+checks: [level, meaning]
+owner: {name: Вера, age: 41, partner_name: Стас}
+relationship: В браке 15 лет, дети Миша (9) и Соня (7)
+owner_turns:
+  - Я опять одна делаю уроки с Мишей и Соней. Стас всегда «устал».
+  - Я тоже работаю, между прочим.
+partner_message:
+  direction: outgoing
+  original: Ты всегда устал, а уроки опять на мне. Займись детьми хоть раз в неделю.
+  expected_tone: 2
+  expected_delivery: adapted
+  meaning:
+    facts: [Уроки с детьми делает Вера, Вера тоже работает и устаёт]
+    request: Стас берёт уроки с детьми хотя бы раз в неделю
+  must_keep: [урок, раз в неделю]
+  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology]
+expected:
+  strategy: find_need_prepare_message
+  draft: optional
+  agent_should:
+    - Отразить усталость и чувство несправедливости
+    - Найти потребность — разделить нагрузку
+    - Сохранить конкретную просьбу «раз в неделю»
+  agent_must_not:
+    - Обесценивать усталость Стаса или Веры
+    - Подменять просьбу общими словами

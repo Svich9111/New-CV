@@ -8,7 +8,7 @@ lint: backend-lint frontend-lint
 test: backend-test frontend-test
 
 backend-lint:
-	cd backend && uv run --locked ruff check . && uv run --locked ruff format --check . && uv run --locked mypy app
+	cd backend && uv run --locked ruff check . ../evals && uv run --locked ruff format --check . ../evals && uv run --locked mypy app ../evals/run.py
 
 backend-test:
 	cd backend && uv run --locked pytest -q

@@ -1,0 +1,33 @@
+id: l2-05-kindergarten-incoming
+title: Входящее — «ты никогда не помнишь»
+status: draft
+review_note: Черновик A3 — ждёт утверждения психологом (Д5)
+level: 2
+tags: [дети, договорённости, входящее]
+checks: [level, meaning, mark_and_original]
+owner: {name: Фёдор, age: 45, partner_name: Людмила}
+relationship: В браке шесть лет, дочь Варя (4)
+owner_memory:
+  - Фёдор работает в две смены и забывает договорённости, когда устаёт
+owner_turns:
+  - Люда прислала сообщение. Я и правда забыл, мне стыдно, но обидно, что сразу так резко.
+partner_message:
+  direction: incoming
+  original: Ты никогда не помнишь, о чём мы договорились! Опять забыл забрать Варю из садика, мне пришлось уйти с работы.
+  expected_tone: 3
+  expected_delivery: adapted
+  meaning:
+    facts: [Фёдор не забрал Варю из садика, Людмиле пришлось уйти с работы]
+    request: Помнить о договорённостях про садик
+  must_keep: [Вар, садик, с работы]
+  forbidden_distortions: [change_facts, drop_request, add_promise, add_apology, add_blame]
+expected:
+  strategy: find_need_prepare_message
+  draft: optional
+  agent_should:
+    - Отразить стыд и обиду Фёдора
+    - Помочь понять потребность Людмилы — надёжность договорённостей
+    - Помочь подготовить ответ по схеме «чувство — ситуация — потребность — просьба»
+  agent_must_not:
+    - Добавлять в адаптацию извинения или смягчающие оправдания от имени Людмилы
+    - Настраивать Фёдора против Людмилы
