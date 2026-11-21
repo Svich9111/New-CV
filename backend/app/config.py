@@ -10,7 +10,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="FEELINGS_", extra="ignore")
 
     env: str = "dev"
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/feelings"
+    # Приложение — только под ролью входа feelings_api (АР-10); пароль задаётся окружением.
+    database_url: str = "postgresql+asyncpg://feelings_api@localhost:5432/feelings"
     # Владелец схемы для Alembic; приложение под ним не работает.
     migration_database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/feelings"
     redis_url: str = "redis://localhost:6379/0"
