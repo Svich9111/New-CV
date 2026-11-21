@@ -25,7 +25,7 @@ from app.bot.notifications import NotificationKind, notify_user
 from app.config import get_settings
 from app.core.crypto import Keyring, generate_key_entry, parse_keyring
 from app.core.session import issue_token
-from app.db import user_scope
+from app.db import sqlstate, user_scope
 from app.main import app
 from app.repositories import account, texts
 from tests.contract import assert_matches
@@ -325,7 +325,41 @@ async def test_export_conflict_is_409(
         await _raise_sqlstate(sm, user_id, "40P01")
 
     monkeypatch.setattr(account, "export_account", _conflict)
-    _error(await client.get("/api/v1/me/export", headers=user.headers), 409, "conflict_retry")
+    resp = await client.get("/api/v1/me/export", headers=user.headers)
+    _error(resp, 409, "conflict_retry")
+    assert resp.headers["cache-control"] == "no-store"  # 4.5-test О-9
+
+
+async def test_lost_rights_are_server_error_not_logout(
+    client: httpx.AsyncClient, sessionmaker: SM, engine: AsyncEngine, keys: Keyring
+) -> None:
+    """Ревью 4.5 MINOR-1 / Э2-M1: 42501 из-за отозванного EXECUTE — сбой сервера (ошибка
+    пробрасывается → 500), а не 401: живой пользователь не разлогинивается и не удаляется.
+    401 — только если пользователя действительно нет. Права меняются только в тестовой БД
+    и возвращаются в finally."""
+    user = await _login(client)
+    for fn in ("app_delete_account()", "app_export_partner_messages()"):
+        async with engine.begin() as conn:
+            await conn.execute(text(f"REVOKE EXECUTE ON FUNCTION {fn} FROM feelings_app"))
+        try:
+            with pytest.raises(DBAPIError) as ei:
+                if fn.startswith("app_delete"):
+                    await account.delete_account(sessionmaker, user.id)
+                else:
+                    await account.export_account(sessionmaker, keys, user.id)
+            assert sqlstate(ei.value) == "42501"
+            with pytest.raises(DBAPIError):  # через API — тоже не 401 (необработанная → 500)
+                if fn.startswith("app_delete"):
+                    await client.delete("/api/v1/me", headers=user.headers)
+                else:
+                    await client.get("/api/v1/me/export", headers=user.headers)
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(text(f"GRANT EXECUTE ON FUNCTION {fn} TO feelings_app"))
+        assert (await client.get("/api/v1/me", headers=user.headers)).status_code == 200
+    # Пользователя нет на самом деле — по-прежнему AccountGone (401).
+    with pytest.raises(account.AccountGone):
+        await account.export_account(sessionmaker, keys, uuid.uuid4())
 
 
 async def test_delete_and_export_of_vanished_user_is_401(sessionmaker: SM, keys: Keyring) -> None:

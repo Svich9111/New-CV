@@ -14,8 +14,8 @@
 выгрузка — это и есть выдача по запросу (решение 4.5 этап 2, A2)."""
 
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, cast
 
@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core import crypto
 from app.core.crypto import Keyring
 from app.db import sqlstate, user_scope
+from app.repositories import users
 from app.repositories.texts import open_row
 from app.repositories.users import ONBOARDED_SQL
 from app.schemas import (
@@ -52,14 +53,21 @@ class AccountGone(Exception):
     """Пользователя нет или он удалён (42501 функций БД, строки профиля нет): для API — 401."""
 
 
-@contextmanager
-def _account_errors() -> Iterator[None]:
-    """42501 функций аккаунта → AccountGone; остальные ошибки БД (в т.ч. 40P01/40001 — их
-    переводит в 409 общий обработчик, АР-24) — как есть."""
+@asynccontextmanager
+async def _account_errors(
+    sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID
+) -> AsyncIterator[None]:
+    """42501 → AccountGone, только если пользователя действительно нет: код 42501 у функций
+    аккаунта значит и «нет пользователя» (их собственный RAISE), и «нет права» (отозван EXECUTE,
+    сбой RLS) — по коду их не различить, а текст и HINT ошибки не контракт. Поэтому при 42501
+    существование неудалённого пользователя перепроверяется в новой транзакции (прежняя уже
+    отменена): нет — 401; есть — сбой прав, ошибка пробрасывается (500), живого пользователя
+    не разлогинивают (ревью 4.5 этап 2 MINOR-1, тест Э2-M1). Остальные ошибки БД (в т.ч.
+    40P01/40001 — их переводит в 409 общий обработчик, АР-24) — как есть."""
     try:
         yield
     except DBAPIError as exc:
-        if sqlstate(exc) == "42501":
+        if sqlstate(exc) == "42501" and not await users.is_active(sm, user_id):
             raise AccountGone from exc
         raise
 
@@ -88,7 +96,7 @@ def _optional_text(
 async def delete_account(sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID) -> None:
     """Полное удаление (АР-23): пара распускается как при выходе, данные удаляются каскадом,
     аудит пишет сама функция (АР-24). Нет пользователя или уже удалён — AccountGone."""
-    with _account_errors():
+    async with _account_errors(sm, user_id):
         async with user_scope(sm, user_id) as s:
             await s.execute(text("SELECT app_delete_account()"))
 
@@ -390,7 +398,7 @@ async def export_account(
     """Все свои данные одним документом (ФТ-21, АР-25), в одной транзакции. Первой —
     функция сообщений пары: она берёт блокировки в порядке АР-13 (пользователь → пары →
     сообщения) и отвечает 42501, если пользователя уже нет."""
-    with _account_errors():
+    async with _account_errors(sm, user_id):
         async with user_scope(sm, user_id) as s:
             sent, received = await _couple_messages(s, keys)
             profile, exported_at = await _profile(s, user_id)

@@ -1341,11 +1341,6 @@ async def test_export_functions_refuse_anonymous_and_unknown(sessionmaker: SM) -
             assert getattr(err.value.orig, "sqlstate", None) == "42501"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="4.5-test Э2-M1 (= ревью A6 MINOR-1): 42501 «permission denied» сбоя прав "
-    "маскируется под 401 «войдите заново» вместо 500",
-)
 @pytest.mark.parametrize("fn", ["app_export_partner_messages()", "app_export_safety_events()"])
 async def test_lost_execute_right_is_not_reported_as_logout(
     api: httpx.AsyncClient, engine: AsyncEngine, fn: str

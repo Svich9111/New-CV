@@ -56,6 +56,8 @@ def install_error_handlers(app: FastAPI) -> None:
                 "code": "conflict_retry",
                 "message": "Не получилось с первого раза — повторите, пожалуйста",
             },
+            # Повтор — новым запросом: ответ не кэшируется (в т.ч. у /me/export, тест 4.5 О-9).
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.exception_handler(StarletteHTTPException)
