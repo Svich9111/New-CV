@@ -107,6 +107,7 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         "cost_usd_total": m.get("cost_usd_total"),
         "with_errors": m.get("with_errors"),
         "not_verified": len(s["not_verified"]),
+        "comparison": _comparison_cell(report.get("comparison")),
         "error_kinds": dict(
             sorted(
                 Counter(
@@ -119,8 +120,40 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _comparison_cell(cmp_: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Итог сравнения с ``--baseline`` для сводки (без деталей по ситуациям)."""
+    if cmp_ is None:
+        return None
+    keys = ("baseline", "baseline_model", "verdict", "auto_pass_rate_delta", "crisis_rate_delta")
+    return {
+        **{k: cmp_.get(k) for k in keys},
+        "regressions": list(cmp_.get("regressions", [])),
+        "improvements": list(cmp_.get("improvements", [])),
+    }
+
+
 def _num(value: float | None, fmt: str) -> str:
     return "—" if value is None else format(value, fmt)
+
+
+def _comparison_lines(rows: Sequence[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for r in rows:
+        c = r.get("comparison")
+        if not c:
+            continue
+        deltas = (
+            f"доля прохождения {c['auto_pass_rate_delta']:+}, кризисы {c['crisis_rate_delta']:+}"
+            if c["auto_pass_rate_delta"] is not None and c["crisis_rate_delta"] is not None
+            else "доли: нет данных"
+        )
+        lines += [
+            f"Сравнение `{r['model']}` с `{c['baseline']}` (модель `{c['baseline_model']}`): "
+            f"**{c['verdict']}** — {deltas}; регрессии: {', '.join(c['regressions']) or 'нет'}; "
+            f"улучшения: {', '.join(c['improvements']) or 'нет'}.",
+            "",
+        ]
+    return lines
 
 
 def render_table(rows: Sequence[dict[str, Any]], meta: dict[str, Any]) -> str:
@@ -208,10 +241,14 @@ def render_table(rows: Sequence[dict[str, Any]], meta: dict[str, Any]) -> str:
         "получателя), а не время до первого символа: с требованием ТЗ §10 «до первого символа "
         "≤5 с в 95%» эти цифры не сопоставимы (ревью 0.4b MINOR-7).",
         "",
-        "Ограничение (ревью 0.4 MINOR-8): безопасность и адаптацию оценивает один вызов агента "
-        "получателя, а не отдельный классификатор §6.2 п.3 (задача 3.2) — цифры «доставка» и "
-        "«Кризисы (авто)» нельзя переносить на продуктовый конвейер.",
+        meta.get("report_note")
+        or (
+            "Ограничение (ревью 0.4 MINOR-8): безопасность и адаптацию оценивает один вызов "
+            "агента получателя, а не отдельный классификатор §6.2 п.3 (задача 3.2) — цифры "
+            "«доставка» и «Кризисы (авто)» нельзя переносить на продуктовый конвейер."
+        ),
         "",
+        *_comparison_lines(rows),
         "Отчёты моделей (детали по ситуациям и таблица для психолога):",
         "",
         *[f"- `{r['report']}.md`" for r in rows],
@@ -247,12 +284,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="пересчитать сохранённые ответы сводки текущими автопроверками, без вызова моделей",
     )
     parser.add_argument("--rescore-note", default=RESCORE_NOTE, help="пометка пересчёта")
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        metavar="ОТЧЁТ.json",
+        help="отчёт модели (run.py/compare.py) для сравнения каждой модели прогона с ним",
+    )
     args = parser.parse_args(argv)
     if args.rescore is not None:
         return rescore(args.rescore, args.situations, args.rescore_note)
     if args.max_cost_usd <= 0:
         print("--max-cost-usd должен быть больше нуля", file=sys.stderr)
         return 1
+    baseline: dict[str, Any] | None = None
+    if args.baseline is not None:
+        try:
+            baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"Отчёт для сравнения не прочитан: {exc}", file=sys.stderr)
+            return 1
 
     try:
         situations = run.load_situations(args.situations)
@@ -310,6 +360,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if errors:
             print(f"Модель {model.name} не ответила на {len(errors)} ситуаций", file=sys.stderr)
             code = code or 4
+        report["comparison"] = run.compare(report, baseline)
         run.write_report(report, args.out_dir, blind=args.blind)
         reports.append(report)
 
@@ -333,6 +384,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "budget_stopped": budget_stopped,
         "not_run": [aliases[n] if args.blind else n for n in not_run],
         "skipped": {aliases[n] if args.blind else n: why for n, why in skipped.items()},
+        # Пояснение адаптера к сводке (например, продуктовый конвейер 0.5 вместо compare.v1).
+        "report_note": getattr(models[0], "report_note", None),
     }
     summary: dict[str, Any] = {**meta, "notice": "Предварительно (АР-19)", "rows": rows}
     if args.blind:
