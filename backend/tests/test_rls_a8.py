@@ -197,25 +197,38 @@ async def test_partner_and_outsider_cannot_read_by_direct_id(
 
 
 @pytest.mark.parametrize(
-    ("table", "attr", "setter"),
+    ("table", "attr", "setter", "delete_granted"),
     [
-        ("conversation_messages", "conv_message_id", "text_enc = 'x'"),
-        ("message_drafts", "draft_id", "text_enc = 'x', status = 'approved'"),
-        ("memory_items", "memory_id", "text_enc = 'x'"),
-        ("conversations", "conversation_id", "summary_enc = 'x'"),
-        ("agents", "agent_id", "profile_summary_enc = 'x'"),
+        ("conversation_messages", "conv_message_id", "text_enc = 'x'", True),
+        ("message_drafts", "draft_id", "text_enc = 'x', status = 'approved'", True),
+        ("memory_items", "memory_id", "text_enc = 'x'", True),
+        ("conversations", "conversation_id", "summary_enc = 'x'", True),
+        # 4.5 (миграция 0005, Б-38): DELETE на agents у приложения отозван совсем —
+        # агент удаляется только вместе с аккаунтом (app_delete_account).
+        ("agents", "agent_id", "profile_summary_enc = 'x'", False),
     ],
 )
 async def test_partner_cannot_update_or_delete_private_rows(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession], table: str, attr: str, setter: str
+    w: W,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    table: str,
+    attr: str,
+    setter: str,
+    delete_granted: bool,
 ) -> None:
     """Чужие реплики, черновики, память, агент — ни изменить, ни удалить (ТЗ §7, §6.3)."""
     target = getattr(w.a, attr)
     async with user_scope(sessionmaker, w.b.user_id) as s:
         upd = await s.execute(text(f"UPDATE {table} SET {setter} WHERE id = :i"), {"i": target})
-        dele = await s.execute(text(f"DELETE FROM {table} WHERE id = :i"), {"i": target})
         assert upd.rowcount == 0  # type: ignore[attr-defined]
-        assert dele.rowcount == 0  # type: ignore[attr-defined]
+    if delete_granted:
+        async with user_scope(sessionmaker, w.b.user_id) as s:
+            dele = await s.execute(text(f"DELETE FROM {table} WHERE id = :i"), {"i": target})
+            assert dele.rowcount == 0  # type: ignore[attr-defined]
+    else:
+        with pytest.raises(ProgrammingError, match=DENIED):
+            async with user_scope(sessionmaker, w.b.user_id) as s:
+                await s.execute(text(f"DELETE FROM {table} WHERE id = :i"), {"i": target})
     async with user_scope(sessionmaker, w.a.user_id) as s:
         assert await _count(s, f"SELECT count(*) FROM {table} WHERE id = :i", i=target) == 1
 
@@ -883,6 +896,7 @@ APP_FUNCS = [
     "app_issue_invite(bytea)",  # 0002, задача 0.7b
     "app_accept_invite(bytea)",
     "app_leave_couple()",
+    "app_delete_account()",  # 0005, задача 4.5
 ]
 PIPELINE_FUNCS = [
     "pipeline_original(uuid)",
@@ -1202,8 +1216,10 @@ async def test_account_deletion_cascades_personal_data(
             text("INSERT INTO safety_events (user_id, type) VALUES (:u, 'self_harm')"),
             {"u": w.a.user_id},
         )
-        res = await s.execute(text("DELETE FROM users WHERE id = app_uid()"))
-        assert res.rowcount == 1  # type: ignore[attr-defined]
+    # 4.5 (АР-23, Б-19): удаление — только функцией app_delete_account(); прямой DELETE
+    # строки users у приложения отозван (проверка — test_cannot_delete_other_user).
+    async with user_scope(sessionmaker, w.a.user_id) as s:
+        await s.execute(text("SELECT app_delete_account()"))
     left = {
         "users": "SELECT count(*) FROM users WHERE id = :u",
         "agents": "SELECT count(*) FROM agents WHERE user_id = :u",
@@ -1231,14 +1247,36 @@ async def test_account_deletion_cascades_personal_data(
             )
         ).scalar_one()
         assert n == 1
+        # Пара не осталась «активной с одним участником» (Б-19): распущена, Игорь свободен.
+        row = await conn.execute(
+            text(
+                "SELECT c.status::text, bool_or(cm.active) FROM couples c "
+                "JOIN couple_members cm ON cm.couple_id = c.id WHERE c.id = :k GROUP BY c.status"
+            ),
+            {"k": w.couple_id},
+        )
+        assert tuple(row.one()) == ("dissolved", False)
 
 
 async def test_cannot_delete_other_user(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
+    """Прямой DELETE на users отозван (Б-19, миграция 0005): ни чужую, ни свою строку
+    приложение не удаляет — 42501; удаление аккаунта только функцией и только своего."""
+    for actor, target in ((w.b, w.a), (w.a, w.a)):
+        with pytest.raises(ProgrammingError, match=DENIED) as ei:
+            async with user_scope(sessionmaker, actor.user_id) as s:
+                await s.execute(text("DELETE FROM users WHERE id = :a"), {"a": target.user_id})
+        assert getattr(ei.value.orig, "sqlstate", None) == "42501"
+    # Функция удаляет только текущего пользователя: Игорь удалил себя — Анна на месте.
     async with user_scope(sessionmaker, w.b.user_id) as s:
-        res = await s.execute(text("DELETE FROM users WHERE id = :a"), {"a": w.a.user_id})
-        assert res.rowcount == 0  # type: ignore[attr-defined]
+        await s.execute(text("SELECT app_delete_account()"))
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            text("SELECT id FROM users WHERE id IN (:a, :b)"),
+            {"a": w.a.user_id, "b": w.b.user_id},
+        )
+        assert [r.id for r in rows] == [w.a.user_id]
 
 
 # --- Журналы без чтения: ТЗ §9.1 п.5, §9.3 --------------------------------------------------
@@ -1290,21 +1328,54 @@ async def test_user_cannot_change_own_telegram_id(
         assert n.scalar_one() == 1
 
 
-@pytest.mark.xfail(
-    reason="дефект D-7, перенесён в BACKLOG Б-3 (задача 4.5); docs/reviews/0.7-test.md",
-    strict=True,
-)
-async def test_upsert_user_after_soft_delete_returns_account(
+async def test_relogin_after_account_delete_creates_new_user(
     engine: AsyncEngine, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    """После удаления аккаунта (ФТ-21) человек может войти снова; app_upsert_user не должен
-    молча возвращать NULL на время 30-дневного окна удаления."""
+    """D-7 / Б-3 (закрыт в 4.5, АР-23): после удаления аккаунта (ФТ-21) человек входит тем же
+    Telegram ID и получает нового пользователя — без онбординга, агента, памяти и пары
+    старого; app_upsert_user не возвращает NULL."""
     tg = next(_tg)
-    sm = async_sessionmaker(engine)
-    async with sm() as s, s.begin():
-        await s.execute(
-            text("INSERT INTO users (telegram_id, deleted_at) VALUES (:t, now())"), {"t": tg}
-        )
     async with user_scope(sessionmaker, None) as s:
-        uid = (await s.execute(text("SELECT app_upsert_user(:t)"), {"t": tg})).scalar_one()
-    assert uid is not None
+        old = (await s.execute(text("SELECT app_upsert_user(:t)"), {"t": tg})).scalar_one()
+    assert old is not None
+    async with user_scope(sessionmaker, old) as s:
+        await s.execute(
+            text(
+                "UPDATE users SET name = 'Старое имя', consent_terms_at = now(), "
+                "consent_data_at = now(), consent_sensitive_at = now(), "
+                "age_confirmed_at = now() WHERE id = app_uid()"
+            )
+        )
+        agent = (
+            await s.execute(text("INSERT INTO agents (user_id) VALUES (app_uid()) RETURNING id"))
+        ).scalar_one()
+        await s.execute(
+            text(
+                "INSERT INTO memory_items (agent_id, type, text_enc, source) "
+                "VALUES (:a, 'fact', 'old-memory', 'owner_dialog')"
+            ),
+            {"a": agent},
+        )
+        await s.execute(text("SELECT app_create_couple()"))
+    async with user_scope(sessionmaker, old) as s:
+        await s.execute(text("SELECT app_delete_account()"))
+    async with user_scope(sessionmaker, None) as s:
+        new = (await s.execute(text("SELECT app_upsert_user(:t)"), {"t": tg})).scalar_one()
+    assert new is not None and new != old
+    async with user_scope(sessionmaker, new) as s:
+        me = (
+            await s.execute(
+                text("SELECT name, consent_terms_at, age_confirmed_at FROM users WHERE id = :u"),
+                {"u": new},
+            )
+        ).one()
+        assert tuple(me) == (None, None, None)
+        for table in ("agents", "memory_items", "couples", "couple_members", "invites"):
+            n = await _count(s, f"SELECT count(*) FROM {table}")
+            assert n == 0, table
+    async with engine.connect() as conn:
+        left = await conn.execute(
+            text("SELECT count(*) FROM users WHERE telegram_id = :t OR id = :o"),
+            {"t": tg, "o": old},
+        )
+        assert left.scalar_one() == 1
