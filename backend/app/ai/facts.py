@@ -10,7 +10,8 @@
 - «в 7 вечера / дня» (после предлога времени) → ``19``, «7 утра / ночи» → ``7``; «3 дня» без
   предлога — количество дней, ``3``;
 - «полчаса» = «30 минут»; «во-первых / во-вторых» — не числа;
-- привязка к соседним словам: у слова рядом с числами в обоих текстах набор чисел совпадает;
+- привязка к соседним словам (по грубой основе: «часа» = «часов»): у слова рядом с числами в
+  обоих текстах набор чисел совпадает;
 - числительные словами: количественные и порядковые 2–20, десятки, сто («три», «третий раз»,
   «трижды», «двое»), «первый». «Один / одна» не считаются: чаще значат «в одиночку».
 
@@ -99,6 +100,27 @@ _REWRITES = ((re.compile(r"\bполчаса\b"), "30 минут"), (re.compile(r
 _DASH_RANGE = re.compile(r"(\d+)\s*[-–—]\s*(\d+)")
 
 
+_ENDINGS = tuple(
+    sorted(
+        (
+            "ами ями ов ев ей ам ям ах ях ом ем ой ий ый ая яя ое ее ую юю а я ы и у ю о е ь й"
+        ).split(),
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _stem(word: str) -> str:
+    """Грубая основа соседнего слова: одно окончание срезается, если остаётся не меньше трёх
+    букв («часа» = «часов» = «час», «минуты» = «минут»; О-15). Совпадение основ разных слов
+    уводит в сторону предупреждения, а не пропуска."""
+    for ending in _ENDINGS:
+        if word.endswith(ending) and len(word) - len(ending) >= 3:
+            return word[: -len(ending)]
+    return word
+
+
 def _prepare(text: str) -> str:
     text = text.casefold().replace("ё", "е")
     text = _NOT_NUMBERS.sub(" ", text)
@@ -166,7 +188,7 @@ def _scan(text: str) -> Scan:
             end += 1
         for j in (start - 1, end + 1):
             if 0 <= j < len(tokens) and tokens[j].group(3) is not None:
-                anchors.setdefault(tokens[j].group(3), Counter())[value] += 1
+                anchors.setdefault(_stem(tokens[j].group(3)), Counter())[value] += 1
     return found, ranges, anchors
 
 

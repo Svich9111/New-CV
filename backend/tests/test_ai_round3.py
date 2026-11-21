@@ -64,7 +64,8 @@ async def test_mixed_message_keeps_help(prompt_set: prompts.PromptSet, victim: s
     delivery = await process(p, prompt_set)
     notice = delivery.author_notice
     assert notice is not None and notice.primary == "outgoing_threat"
-    assert notice.text == f"{block('outgoing_threat_mixed')}\n\n{block('author_safety')}"
+    safety = "author_safety_life" if victim == "life_threat" else "author_safety"  # раунд 4
+    assert notice.text == f"{block('outgoing_threat_mixed')}\n\n{block(safety)}"
     text = notice.text.casefold()
     for phrase in (*VICTIM_PHRASES, "подумаем, как сказать"):
         assert phrase not in text
@@ -72,7 +73,7 @@ async def test_mixed_message_keeps_help(prompt_set: prompts.PromptSet, victim: s
     assert text.count("не отправлено") == 1
     assert {"help_contacts", "emergency_services", "not_sent", "explain_reason"} <= notice.actions
     assert not {"name_it", "no_tolerate"} & notice.actions
-    expected = "v0+outgoing_threat_mixed@v2+author_safety@v2" if prompt_set is prompts.V0 else "v2"
+    expected = f"v0+outgoing_threat_mixed@v2+{safety}@v2" if prompt_set is prompts.V0 else "v2"
     assert notice.template_version == expected
     assert f"crisis.{expected}" in delivery.prompts
 

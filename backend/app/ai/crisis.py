@@ -34,7 +34,8 @@ ACTIONS: dict[CrisisType, frozenset[str]] = {
         {"not_sent", "no_softening", "explain_reason", "return_to_talk", "no_draft"}
     ),
     "self_harm": frozenset({"stay_in_conversation", "crisis_line_24h", "no_draft"}),
-    "life_threat": frozenset({"emergency_services", "no_draft", "no_softening"}),
+    # Блок life_threat называет раздел «Помощь» — контакты помощи даются (раунд 4).
+    "life_threat": frozenset({"emergency_services", "help_contacts", "no_draft", "no_softening"}),
     "underage": frozenset({"no_access", "help_contacts", "no_draft", "no_softening"}),
 }
 
@@ -58,6 +59,7 @@ LATE_BLOCKS: dict[str, str] = {
     "outgoing_threat_chat": "v2",
     "outgoing_threat_mixed": "v2",
     "outgoing_threat_mixed_chat": "v2",
+    "author_safety_life": "v2",
 }
 NOT_SENT_ACTIONS = frozenset({"not_sent", "explain_reason"})
 AUTHOR_SAFETY_ACTIONS = frozenset({"help_contacts", "emergency_services"})
@@ -115,17 +117,43 @@ def respond(
     prompt_set: PromptSet = V0,
     withheld: bool = False,
 ) -> CrisisResponse:
-    """Ответ по протоколу. ``primary`` — главная строка, если её назвал агент (иначе — по
-    приоритету); ``underage`` всегда главная. Блоки: главная строка, затем вторичные; при
-    ``underage`` блок отказа в доступе — последним, чтобы ответ не начинался с отказа.
+    """Ответ по протоколу §9.3. Текст определяется **набором** строк и контекстом, а не главной
+    строкой и не порядком вторичных (ревью 0.5 R4-MAJOR-1). Главная строка (``primary`` от
+    агента, иначе по ``PRIORITY``; ``underage`` — всегда главная) идёт в событие и задаёт только
+    первый блок в ветке «Б».
 
-    ``withheld`` — одобренное сообщение остановлено: если среди строк нет ``outgoing_threat``
-    (её блок сам говорит «не отправлено»), первым идёт блок ``not_sent``.
+    Контекст: ``withheld = True`` — остановлено одобренное сообщение; ``False`` — личный чат
+    (сообщения не было: ни «не отправлено», ни действия ``not_sent``).
 
-    Главная ``outgoing_threat`` (действует автор): блоки ``VICTIM_TYPES`` не добавляются, но если
-    такие строки есть, вместо них — ``author_safety`` (помощь без «вина не на тебе»), а блок
-    ``outgoing_threat`` — смешанный, без «подумаем, как сказать». Вне остановленного сообщения
-    (личный чат) — вариант блока без «сообщение не отправлено»."""
+    Таблица правил (T — есть ``outgoing_threat``; V — ``violence``; L — ``life_threat``;
+    H — ``self_harm``; U — ``underage``):
+
+    ==  ==========================  ==============================================================
+    №   Условие                     Блоки по порядку
+    ==  ==========================  ==============================================================
+    А   T (действует автор)         1. ``outgoing_threat`` — сообщение, нет V/L/U (v0:
+                                       «не отправлено», «подумаем, как сказать»);
+                                       ``outgoing_threat_chat`` — чат, нет V/L/U;
+                                       ``outgoing_threat_mixed`` — сообщение, есть V, L или U;
+                                       ``outgoing_threat_mixed_chat`` — чат, есть V, L или U
+                                       (оба — без «подумаем, как сказать»: при насилии и
+                                       угрозе жизни §9.3 стр. 1; младше 18 доступа нет);
+                                    2. ``self_harm``, если H;
+                                    3. ``author_safety_life``, если L (безусловное «немедленно
+                                       звони в экстренные службы», §9.3 стр. 4); иначе
+                                       ``author_safety``, если V; блоков для пострадавшего
+                                       (``violence``, ``life_threat``: «вина не на тебе») нет;
+                                    4. ``underage``, если U.
+    Б   нет T                       0. ``not_sent``, если сообщение;
+                                    1. блок главной строки (кроме ``underage``);
+                                    2. остальные строки по ``PRIORITY``;
+                                    3. ``underage`` — последним, чтобы ответ не начинался с отказа.
+    ==  ==========================  ==============================================================
+
+    Действия: объединение действий показанных строк (в «А» — без ``violence``/``life_threat``,
+    зато ``help_contacts`` и ``emergency_services`` при V или L); в «Б» для сообщения —
+    ``not_sent`` и ``explain_reason``; в чате ``not_sent`` нет никогда. Ответ агента (если есть)
+    — перед блоками."""
     ordered = order([*(types or ()), *([primary] if primary else [])])
     if not ordered:
         raise ValueError("нет строки кризисного протокола")
@@ -133,30 +161,44 @@ def respond(
     if primary in CRISIS_TYPES and "underage" not in ordered:
         main = next(t for t in ordered if t == primary)
     rest = tuple(t for t in ordered if t != main)
+    present = set(ordered)
     version = prompt_set.version("crisis")
     used: dict[str, str] = {}
-    sequence = (*rest, main) if main == "underage" else (main, *rest)
-    names: list[str] = list(sequence)
-    actions = frozenset().union(*(ACTIONS[t] for t in sequence))
-    if main == "outgoing_threat":  # действует автор — без текста пострадавшему
-        victim = [t for t in sequence if t in VICTIM_TYPES]
-        names = [t for t in sequence if t not in VICTIM_TYPES]
-        actions = frozenset().union(*(ACTIONS[t] for t in sequence if t not in VICTIM_TYPES))
-        mixed = "_mixed" if victim else ""
-        chat = "" if withheld else "_chat"
-        if mixed or chat:
-            names[0] = f"outgoing_threat{mixed}{chat}"
-        if not withheld:  # в чате сообщения не было — «не отправлено» было бы неправдой
-            actions -= {"not_sent"}
-        if victim:
+    names: list[str] = []
+    actions: frozenset[str]
+    if "outgoing_threat" in present:  # правило «А»
+        danger = present & VICTIM_TYPES
+        mixed = bool(danger) or "underage" in present
+        names.append(
+            "outgoing_threat" + ("_mixed" if mixed else "") + ("" if withheld else "_chat")
+        )
+        shown: list[CrisisType] = ["outgoing_threat"]
+        if "self_harm" in present:
+            names.append("self_harm")
+            shown.append("self_harm")
+        if "life_threat" in present:
+            names.append("author_safety_life")
+        elif "violence" in present:
             names.append("author_safety")
+        if "underage" in present:
+            names.append("underage")
+            shown.append("underage")
+        actions = frozenset().union(*(ACTIONS[t] for t in shown))
+        if danger:
             actions |= AUTHOR_SAFETY_ACTIONS
-    blocks = [_block(version, n, used) for n in names]
+    else:  # правило «Б»
+        sequence: list[CrisisType] = [t for t in (main, *rest) if t != "underage"]
+        if "underage" in present:
+            sequence.append("underage")
+        names = list(sequence)
+        actions = frozenset().union(*(ACTIONS[t] for t in sequence))
+        if withheld:
+            names.insert(0, "not_sent")
+            actions |= NOT_SENT_ACTIONS
+    if not withheld:
+        actions -= {"not_sent"}
     parts = [agent_reply.strip()] if agent_reply and agent_reply.strip() else []
-    if withheld and "outgoing_threat" not in ordered:
-        parts.append(_block(version, "not_sent", used))
-        actions |= NOT_SENT_ACTIONS
-    parts += blocks
+    parts += [_block(version, n, used) for n in names]
     label = version + "".join(f"+{n}@{v}" for n, v in used.items())
     return CrisisResponse(
         primary=main,

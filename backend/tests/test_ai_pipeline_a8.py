@@ -1050,6 +1050,10 @@ async def test_r2_every_stop_says_not_sent_once(category: str, secondary: list[s
     if "outgoing_threat" not in kinds:
         assert notice.text.startswith(crisis.NOT_SENT + "\n\n")
     for kind in kinds:
+        # Раунд 4 (A3, R4-MAJOR-1): при outgoing_threat в наборе блок отправителю — по составу
+        # строк, а блоки пострадавшему заменяет author_safety[_life] (правило «А» crisis.respond).
+        if "outgoing_threat" in kinds and kind in {"outgoing_threat", *crisis.VICTIM_TYPES}:
+            continue
         assert block(kind) in notice.text
     assert TEXT not in notice.text
 
@@ -1856,7 +1860,12 @@ async def test_r3_sender_template_without_victim_blocks(
             [
                 v2("crisis", "v2", block="outgoing_threat_mixed").text,
                 *(block(k) for k in kept),
-                v2("crisis", "v2", block="author_safety").text,
+                # Раунд 4 (A3, R4-MINOR-2): при life_threat — безусловный author_safety_life.
+                v2(
+                    "crisis",
+                    "v2",
+                    block="author_safety_life" if "life_threat" in secondary else "author_safety",
+                ).text,
             ]
         )
         assert {"help_contacts", "emergency_services"} <= notice.actions
@@ -1908,7 +1917,9 @@ async def test_r4_mixed_message_full_text_and_actions(
     )
     notice = delivery.author_notice
     assert notice is not None and bot.roles == ["safety"]
-    expected = [b2("outgoing_threat_mixed"), *(block(k) for k in middle), b2("author_safety")]
+    # Раунд 4 (A3, R4-MINOR-2): при life_threat — безусловный author_safety_life.
+    safety = "author_safety_life" if "life_threat" in secondary else "author_safety"
+    expected = [b2("outgoing_threat_mixed"), *(block(k) for k in middle), b2(safety)]
     assert notice.text == "\n\n".join(expected)
     assert {"help_contacts", "emergency_services", "not_sent", "no_draft"} <= notice.actions
     assert not VICTIM_ACTIONS & notice.actions
@@ -1916,7 +1927,7 @@ async def test_r4_mixed_message_full_text_and_actions(
     assert VICTIM_PHRASE not in low and SUGGEST_WORDS not in low
     assert low.count("не отправлено") == 1
     assert delivery.safety_event == "outgoing_threat"
-    assert notice.template_version == "v0+outgoing_threat_mixed@v2+author_safety@v2"
+    assert notice.template_version == f"v0+outgoing_threat_mixed@v2+{safety}@v2"
     assert delivery.prompts[-1] == f"crisis.{notice.template_version}"
 
 
@@ -1958,7 +1969,9 @@ async def test_r4_chat_threat_by_agent_full_text(
     )
     result = await dialog.reply(bot.models, CTX, TURNS)
     assert result.crisis is not None and result.draft is None
-    tail = [b2("author_safety")] if secondary and secondary != ["self_harm"] else []
+    # Раунд 4 (A3, R4-MINOR-2): при life_threat — безусловный author_safety_life.
+    safety = "author_safety_life" if "life_threat" in secondary else "author_safety"
+    tail = [b2(safety)] if secondary and secondary != ["self_harm"] else []
     expected = ["Я слышу, как ты зол.", b2(name), *(block(k) for k in middle), *tail]
     assert result.reply == "\n\n".join(expected)
     low = result.reply.casefold()
@@ -1974,13 +1987,6 @@ async def test_r4_chat_threat_by_agent_full_text(
 VICTIM_MAIN = ["violence", "life_threat", "self_harm", "underage"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MAJOR A8-11: главная строка — пострадавший (violence/life_threat/self_harm/underage), "
-    "вторичная outgoing_threat: добавляется полный блок outgoing_threat v0 — «вместе подумаем, "
-    "как сказать об этом» рядом с насилием (§9.3 строка 1: не предлагать «подобрать слова»), а в "
-    "личном чате ещё и «Это сообщение не отправлено» и действие not_sent, хотя сообщения не было",
-)
 @pytest.mark.parametrize("main", VICTIM_MAIN)
 async def test_r4_chat_victim_main_with_threat_secondary(main: str) -> None:
     bot = Bot(
@@ -2003,11 +2009,6 @@ async def test_r4_chat_victim_main_with_threat_secondary(main: str) -> None:
         assert SUGGEST_WORDS not in low
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MAJOR A8-11: остановленное сообщение, главная violence/life_threat, вторичная "
-    "threat_or_insult — пострадавшему предлагают «вместе подумаем, как сказать об этом» (§9.3)",
-)
 @pytest.mark.parametrize("main", ["violence", "life_threat"])
 async def test_r4_message_victim_main_with_threat_secondary(main: str) -> None:
     delivery, _ = await run(
@@ -2118,7 +2119,9 @@ def test_r4_facts_known_gaps_documented() -> None:
     assert not facts.numbers_differ(
         "Обещал прийти к 7, пришёл к 9", "Пришёл к 7, обещал прийти к 9"
     )
-    assert not facts.numbers_differ("2 часа, 5 минут", "5 часов, 2 минуты")
+    # Раунд 4 (A3, О-15): соседние слова сравниваются по основе («часа» = «часов») — обмен
+    # «2 часа, 5 минут» → «5 часов, 2 минуты» теперь ловится; это уже не пропуск.
+    assert facts.numbers_differ("2 часа, 5 минут", "5 часов, 2 минуты")
     assert "Известные пропуски" in (facts.__doc__ or "")
 
 
