@@ -85,3 +85,20 @@ def test_empty_bot_token_never_validates() -> None:
 def test_malformed_rejected() -> None:
     with pytest.raises(InitDataError):
         validate_init_data("%%%", TOKEN, DAY, now=time.time())
+
+
+def test_missing_hash_reason() -> None:
+    with pytest.raises(InitDataError, match="no hash"):
+        validate_init_data("auth_date=1&user=%7B%22id%22%3A1%7D", TOKEN, DAY, now=NOW)
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "%D0%B0" * 32, "g" * 64, "a" * 65])
+def test_bad_hash_format_rejected(bad: str) -> None:
+    base = sign_init_data(_fields(), TOKEN).rsplit("&hash=", 1)[0]
+    with pytest.raises(InitDataError):
+        validate_init_data(f"{base}&hash={bad}", TOKEN, DAY, now=NOW)
+
+
+def test_uppercase_hash_accepted() -> None:
+    base, digest = sign_init_data(_fields(), TOKEN).rsplit("&hash=", 1)
+    assert validate_init_data(f"{base}&hash={digest.upper()}", TOKEN, DAY, now=NOW).id == 42

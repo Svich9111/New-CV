@@ -119,6 +119,104 @@ async def test_token_for_unknown_user_rejected(client: httpx.AsyncClient) -> Non
     assert resp.status_code == 401
 
 
+async def _count(engine: AsyncEngine, tg: int) -> int:
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text("SELECT count(*) FROM users WHERE telegram_id = :t"), {"t": tg}
+        )
+        return int(res.scalar_one())
+
+
+async def test_user_created_once_without_telegram_name(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """Собирается минимум (ТЗ §9.1 п.2): только telegram_id; имя спрашивается в онбординге."""
+    tg = _tg()
+    for _ in range(2):
+        assert (
+            await client.post("/api/v1/auth/telegram", json={"init_data": _init_data(tg)})
+        ).status_code == 200
+    assert await _count(engine, tg) == 1
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT name, address_form, partner_name FROM users WHERE telegram_id = :t"),
+                {"t": tg},
+            )
+        ).one()
+    assert tuple(row) == (None, None, None)
+
+
+async def test_future_auth_date_rejected_http(client: httpx.AsyncClient) -> None:
+    future = _init_data(_tg(), auth_date=int(time.time()) + 3600)
+    assert (
+        await client.post("/api/v1/auth/telegram", json={"init_data": future})
+    ).status_code == 401
+
+
+async def test_non_ascii_hash_is_401_not_500(client: httpx.AsyncClient) -> None:
+    base = _init_data(_tg()).rsplit("&hash=", 1)[0]
+    resp = await client.post("/api/v1/auth/telegram", json={"init_data": base + "&hash=%D0%B0"})
+    assert resp.status_code == 401
+    assert resp.json()["code"] == "invalid_init_data"
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        Settings(telegram_bot_token=SecretStr(""), session_secret=SecretStr(SECRET)),
+        Settings(telegram_bot_token=SecretStr(TOKEN), session_secret=SecretStr("")),
+        Settings(telegram_bot_token=SecretStr(TOKEN), session_secret=SecretStr("short")),
+    ],
+)
+async def test_misconfigured_service_refuses_before_creating_user(
+    client: httpx.AsyncClient, engine: AsyncEngine, settings: Settings
+) -> None:
+    app.dependency_overrides[get_settings] = lambda: settings
+    tg = _tg()
+    resp = await client.post("/api/v1/auth/telegram", json={"init_data": _init_data(tg)})
+    assert resp.status_code == 503
+    assert resp.json()["code"] == "service_unavailable"
+    assert await _count(engine, tg) == 0
+
+
+def test_startup_fails_without_keys() -> None:
+    from app.config import ConfigError, check_auth_config
+
+    with pytest.raises(ConfigError):
+        check_auth_config(Settings(telegram_bot_token=SecretStr(""), session_secret=SecretStr("")))
+
+
+async def test_deleted_user_loses_access_immediately(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """Удалённый аккаунт теряет доступ сразу, а не по истечении токена (ФТ-21)."""
+    tg = _tg()
+    body = (await client.post("/api/v1/auth/telegram", json={"init_data": _init_data(tg)})).json()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE users SET deleted_at = now() WHERE telegram_id = :t"), {"t": tg}
+        )
+    resp = await client.get(
+        "/api/v1/me", headers={"Authorization": f"Bearer {body['access_token']}"}
+    )
+    assert resp.status_code == 401
+
+
+async def test_responses_match_contract(client: httpx.AsyncClient) -> None:
+    """Ответы — по схемам api/openapi.yaml."""
+    from tests.contract import assert_matches
+
+    ok = await client.post("/api/v1/auth/telegram", json={"init_data": _init_data(_tg())})
+    assert_matches(ok.json(), "Session")
+    me = await client.get(
+        "/api/v1/me", headers={"Authorization": f"Bearer {ok.json()['access_token']}"}
+    )
+    assert_matches(me.json(), "Me")
+    bad = await client.post("/api/v1/auth/telegram", json={"init_data": "x=1"})
+    assert_matches(bad.json(), "Error")
+
+
 async def test_validation_error_does_not_echo_body(client: httpx.AsyncClient) -> None:
     resp = await client.post("/api/v1/auth/telegram", json={"init_data": ""})
     assert resp.status_code == 422

@@ -27,6 +27,7 @@ dev = [
   "psycopg[binary]>=3.2",
   "openapi-spec-validator>=0.9.0",
   "pyyaml>=6.0.4",
+  "jsonschema>=4.26.0",
 ]
 
 [tool.pytest.ini_options]

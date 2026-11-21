@@ -13,15 +13,23 @@ class SessionError(Exception):
     pass
 
 
-def issue_token(user_id: uuid.UUID, secret: str, ttl_s: int, now: float | None = None) -> str:
-    if len(secret) < 32:
+MIN_SECRET_LEN = 32
+
+
+def _check_secret(secret: str) -> None:
+    if len(secret) < MIN_SECRET_LEN:
         raise SessionError("session secret must be at least 32 characters")
+
+
+def issue_token(user_id: uuid.UUID, secret: str, ttl_s: int, now: float | None = None) -> str:
+    _check_secret(secret)
     iat = int(time.time() if now is None else now)
     payload = {"sub": str(user_id), "iat": iat, "exp": iat + ttl_s, "aud": AUDIENCE}
     return jwt.encode(payload, secret, algorithm=ALGORITHM)
 
 
 def read_token(token: str, secret: str) -> uuid.UUID:
+    _check_secret(secret)
     try:
         payload = jwt.decode(
             token,

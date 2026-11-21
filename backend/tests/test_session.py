@@ -21,3 +21,9 @@ def test_alg_none_rejected() -> None:
     forged = jwt.encode({"sub": str(uuid.uuid4())}, key="", algorithm="none")
     with pytest.raises(SessionError):
         read_token(forged, "k" * 32)
+
+
+def test_read_with_short_secret_refused() -> None:
+    token = issue_token(uuid.uuid4(), "k" * 32, 60)
+    with pytest.raises(SessionError):
+        read_token(token, "")

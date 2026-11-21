@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from app.api.deps import AppSettings, CurrentUser, SessionMaker, unauthorized
+from app.config import ConfigError, check_auth_config
 from app.core.session import issue_token
 from app.core.telegram import InitDataError, validate_init_data
 from app.errors import AppError
@@ -16,6 +17,10 @@ router = APIRouter()
 async def auth_telegram(
     body: TelegramAuthRequest, sm: SessionMaker, settings: AppSettings
 ) -> Session:
+    try:
+        check_auth_config(settings)
+    except ConfigError as exc:
+        raise AppError(503, "service_unavailable", "Вход временно недоступен") from exc
     try:
         tg = validate_init_data(
             body.init_data,

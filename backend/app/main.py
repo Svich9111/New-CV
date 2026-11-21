@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api import auth
-from app.config import get_settings
+from app.config import check_auth_config, get_settings
 from app.db import make_engine, make_sessionmaker
 from app.errors import install_error_handlers
 
@@ -14,7 +14,9 @@ from app.errors import install_error_handlers
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if getattr(app.state, "sessionmaker", None) is None:
-        engine = make_engine(get_settings().database_url)
+        settings = get_settings()
+        check_auth_config(settings)  # сервис не стартует с пустыми ключами
+        engine = make_engine(settings.database_url)
         app.state.sessionmaker = make_sessionmaker(engine)
         yield
         await engine.dispose()

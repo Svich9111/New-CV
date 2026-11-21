@@ -10,12 +10,14 @@ initData и его поля в журналы не пишутся.
 import hashlib
 import hmac
 import json
+import re
 import time
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode
 
 # Допуск на расхождение часов клиента и сервера при проверке auth_date «из будущего».
 CLOCK_SKEW_S = 60
+_HASH_RE = re.compile(r"[0-9a-fA-F]{64}")
 
 
 class InitDataError(Exception):
@@ -55,6 +57,8 @@ def validate_init_data(
     received = fields.pop("hash", None)
     if not received:
         raise InitDataError("no hash")
+    if not _HASH_RE.fullmatch(received):
+        raise InitDataError("bad hash format")
     dcs = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
     expected = hmac.new(_secret_key(bot_token), dcs.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, received.lower()):

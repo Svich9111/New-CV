@@ -19,6 +19,15 @@ async def upsert_by_telegram_id(
         return uuid.UUID(str(value)) if value is not None else None
 
 
+async def is_active(sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID) -> bool:
+    async with user_scope(sm, user_id) as s:
+        row = await s.execute(
+            text("SELECT EXISTS (SELECT 1 FROM users WHERE id = :id AND deleted_at IS NULL)"),
+            {"id": user_id},
+        )
+        return bool(row.scalar_one())
+
+
 async def get_me(sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID) -> Me | None:
     async with user_scope(sm, user_id) as s:
         row = (

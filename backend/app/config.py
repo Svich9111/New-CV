@@ -21,6 +21,18 @@ class Settings(BaseSettings):
     session_ttl_s: int = 3600
 
 
+class ConfigError(Exception):
+    pass
+
+
+def check_auth_config(settings: Settings) -> None:
+    """Без токена бота и стойкого секрета сессии вход невозможен — отказ до любых записей в БД."""
+    if not settings.telegram_bot_token.get_secret_value():
+        raise ConfigError("FEELINGS_TELEGRAM_BOT_TOKEN is empty")
+    if len(settings.session_secret.get_secret_value()) < 32:
+        raise ConfigError("FEELINGS_SESSION_SECRET must be at least 32 characters")
+
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings()

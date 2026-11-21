@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings, get_settings
 from app.core.session import SessionError, read_token
 from app.errors import AppError
+from app.repositories import users
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -24,15 +25,20 @@ def unauthorized() -> AppError:
 
 
 async def current_user_id(
+    request: Request,
     creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> uuid.UUID:
     if creds is None or creds.scheme.lower() != "bearer":
         raise unauthorized()
     try:
-        return read_token(creds.credentials, settings.session_secret.get_secret_value())
+        user_id = read_token(creds.credentials, settings.session_secret.get_secret_value())
     except SessionError as exc:
         raise unauthorized() from exc
+    # Удалённый пользователь теряет доступ сразу, не дожидаясь истечения токена (ФТ-21).
+    if not await users.is_active(get_sessionmaker(request), user_id):
+        raise unauthorized()
+    return user_id
 
 
 SessionMaker = Annotated[async_sessionmaker[AsyncSession], Depends(get_sessionmaker)]

@@ -62,6 +62,13 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Session" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Аккаунт удалён; повторная регистрация — задача 4.5
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "422": { $ref: "#/components/responses/Validation" }
+        "503":
+          description: Вход временно недоступен (сервис не настроен)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
 
   /me:
     get:
@@ -630,7 +637,7 @@ components:
       properties:
         code:
           type: string
-          examples: [invalid_init_data, onboarding_required, already_in_couple, invite_expired,
+          examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, already_in_couple, invite_expired,
                      invite_used, couple_not_active, version_conflict, blocked_by_safety,
                      subscription_required, rate_limited, llm_unavailable]
         message: { type: string, description: Понятное пользователю сообщение на русском }
