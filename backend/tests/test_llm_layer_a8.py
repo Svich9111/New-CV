@@ -330,11 +330,6 @@ async def test_config_errors_do_not_fall_back(
     assert spare.bodies == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR: errors.py LLMRefusal.fallback_ok = True — отказ по безопасности уходит на "
-    "резервную модель вопреки DECISIONS.md АР-20 (резервная — только для недоступности)",
-)
 async def test_refusal_does_not_go_to_fallback() -> None:
     """DECISIONS.md АР-20: отказ модели (refusal) не переадресуется резервной модели."""
     refusal = httpx2.Response(200, json=_message([], stop_reason="refusal"))
@@ -406,11 +401,6 @@ async def test_key_not_in_logs_or_exceptions(
     assert FAKE_KEY not in caplog.text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR: claude.py — журнал SDK «anthropic» на уровне DEBUG пишет тело запроса "
-    "(json_data: реплики, память) — CLAUDE.md «в журналах нет текстов сообщений»",
-)
 async def test_message_text_not_in_debug_logs(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG)
     await _ask(ClaudeProvider(OPUS, client=Wire(lambda r: _json_reply({"ok": True})).client()))
@@ -471,11 +461,6 @@ async def test_cost_flows_into_result_and_adapter_metrics() -> None:
     assert result.usage == Usage(3_000, 1_000, 2_000, 0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR: pricing.cost_usd — модель без прайса молча стоит $0.0 (в сводке сравнения "
-    "«$0.0000 на ситуацию»), а не «неизвестно»; ТЗ §10 «контроль расходов»",
-)
 def test_unknown_price_is_not_free() -> None:
     assert cost_usd("claude-opus-5-5-20261101", Usage(1_000_000, 1_000_000)) != 0.0
 
@@ -721,20 +706,13 @@ def fake_api(request: pytest.FixtureRequest) -> Iterator[tuple[str, type[_FakeAp
         server.server_close()
 
 
-COMPARE_OUTAGE = pytest.mark.xfail(
-    strict=True,
-    reason="MINOR: compare.py — модель не ответила ни на одну ситуацию (529 на всё): код 0, "
-    "пишутся отчёт модели и сводка «0% / $0» вместо кода 3 без отчёта, как в run.py (§10)",
-)
-
-
 @pytest.mark.parametrize(
     ("script", "args", "fake_api"),
     [
         pytest.param(*CLI_CASES[0], 401, id="run-ключ отклонён"),
         pytest.param(*CLI_CASES[0], 529, id="run-перегрузка"),
         pytest.param(*CLI_CASES[1], 401, id="compare-ключ отклонён"),
-        pytest.param(*CLI_CASES[1], 529, id="compare-перегрузка", marks=COMPARE_OUTAGE),
+        pytest.param(*CLI_CASES[1], 529, id="compare-перегрузка"),
     ],
     indirect=["fake_api"],
 )
@@ -753,12 +731,6 @@ def test_cli_with_rejected_key_or_outage_fails_without_report(
     assert not out.exists() or list(out.iterdir()) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MAJOR (0.3 R2-MAJOR-1 / A6): run.py _call_model передаёт в converse запрос с "
-    "partner_message — на шагах 1–2 ключевого сценария модель видит одобренный оригинал "
-    "шага 3 (approved_partner_message), проверки шагов теряют смысл (ТЗ §1)",
-)
 def test_echo_owner_steps_do_not_see_approved_original(situations: list[dict[str, Any]]) -> None:
     model, wire = _echo_adapter()
     key = [s for s in situations if s.get("dialog")]

@@ -1110,12 +1110,6 @@ def test_r2_respond_only_author_leak_is_caught(situations: list[dict[str, Any]])
     assert not results["l2-03-homework"]["checks"]["adapted_no_author_context"]["passed"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR D-7: run.py run_suite/score — у модели только с respond шаги диалога "
-    "(converse) и подсказка получателю (reply_hint) не проверяются, но ситуация получает "
-    "auto_pass=True («пройдено»), а не «не проверено»; ключевой сценарий §1 засчитывается",
-)
 def test_r2_respond_only_key_scenario_is_not_passed(situations: list[dict[str, Any]]) -> None:
     oracle = Oracle(situations)  # только respond, без reply_hint
     report = run.build_report(situations, oracle, "o", SITUATIONS_DIR)
@@ -1125,11 +1119,6 @@ def test_r2_respond_only_key_scenario_is_not_passed(situations: list[dict[str, A
     assert report["summary"]["auto_passed"] < len(situations)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MAJOR (R2-MAJOR-1 A6): run.py _call_model — converse получает запрос с "
-    "partner_message: шаги 1–2 ключевого сценария видят одобренный текст шага 3 (ТЗ §1)",
-)
 def test_r2_converse_request_has_no_approved_original(situations: list[dict[str, Any]]) -> None:
     seen: list[Any] = []
 
