@@ -254,7 +254,8 @@ async def test_outsider_cannot_send_into_couple(
 
 
 async def _draft_id(s: AsyncSession) -> uuid.UUID:
-    return (await s.execute(text("SELECT id FROM message_drafts LIMIT 1"))).scalar_one()
+    value = (await s.execute(text("SELECT id FROM message_drafts LIMIT 1"))).scalar_one()
+    return uuid.UUID(str(value))
 
 
 async def test_member_can_send_within_active_couple(

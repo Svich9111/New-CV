@@ -4,15 +4,22 @@
 посторонняя со своей ожидающей парой. Данные заводит суперпользователь (в обход RLS),
 проверки — через `user_scope` (роль feelings_app + app.user_id), как в приложении.
 
+Раунд 2 (АР-10…АР-12): приложение входит как feelings_api и в user_scope становится
+feelings_app; сообщения пары, пары, подписки меняются только функциями app_*/pipeline_*, права
+на таблицы — по колонкам. Проверяемые свойства раунда 1 те же; там, где раньше защита давала
+«0 строк», теперь ожидается «permission denied», а итог проверяется суперпользователем.
+
 Тесты, помеченные xfail(strict=True), фиксируют дефекты продукта из docs/reviews/0.7-test.md:
 когда дефект исправят, тест станет XPASS и упадёт — пометку нужно снять.
 """
 
+import asyncio
 import hashlib
 import itertools
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
@@ -31,6 +38,7 @@ from tests.conftest import TEST_DATABASE_URL
 _tg = itertools.count(5_000_000)
 
 RLS_DENIED = "row-level security"
+DENIED = "permission denied"
 
 
 @dataclass
@@ -226,121 +234,407 @@ async def test_cannot_insert_into_partner_conversation_or_drafts(
                 await s.execute(text(sql), params)
 
 
-# --- Подписки и платежи пары: ФТ-19, ТЗ §7 --------------------------------------------------
+# --- Подписки и платежи пары: ФТ-19, ТЗ §7, АР-12 -------------------------------------------
 
 
 async def test_outsider_cannot_read_or_touch_couple_subscription_and_payments(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
     async with user_scope(sessionmaker, w.c.user_id) as s:
         assert await _count(s, "SELECT count(*) FROM subscriptions") == 0
         assert await _count(s, "SELECT count(*) FROM payments") == 0
-        upd = await s.execute(
-            text("UPDATE subscriptions SET status = 'canceled' WHERE id = :i"),
-            {"i": w.subscription_id},
-        )
-        assert upd.rowcount == 0  # type: ignore[attr-defined]
-    with pytest.raises(ProgrammingError, match=RLS_DENIED):
-        async with user_scope(sessionmaker, w.c.user_id) as s:
-            await s.execute(
-                text(
-                    "INSERT INTO payments (subscription_id, amount, provider, status) "
-                    "VALUES (:s, 1, 'x', 'succeeded')"
-                ),
-                {"s": w.subscription_id},
-            )
+    for who in (w.c, w.a):  # ни посторонний, ни участник пары не пишут в подписку напрямую
+        with pytest.raises(ProgrammingError, match=DENIED):
+            async with user_scope(sessionmaker, who.user_id) as s:
+                await s.execute(
+                    text("UPDATE subscriptions SET status = 'canceled' WHERE id = :i"),
+                    {"i": w.subscription_id},
+                )
+        with pytest.raises(ProgrammingError, match=DENIED):
+            async with user_scope(sessionmaker, who.user_id) as s:
+                await s.execute(
+                    text(
+                        "INSERT INTO payments (subscription_id, amount, provider, status) "
+                        "VALUES (:s, 1, 'x', 'succeeded')"
+                    ),
+                    {"s": w.subscription_id},
+                )
     for member in (w.a, w.b):  # статус оплаты виден обоим партнёрам (ФТ-19)
         async with user_scope(sessionmaker, member.user_id) as s:
             assert await _count(s, "SELECT count(*) FROM payments") == 1
+    async with engine.connect() as conn:
+        st = await conn.execute(
+            text("SELECT status FROM subscriptions WHERE id = :i"), {"i": w.subscription_id}
+        )
+        assert st.scalar_one() == "active"
+        n = await conn.execute(
+            text("SELECT count(*) FROM payments WHERE subscription_id = :i"),
+            {"i": w.subscription_id},
+        )
+        assert n.scalar_one() == 1
 
 
-# --- partner_messages: ФТ-08, ФТ-10, ТЗ §2 п.2, §4.3 п.3, §7 ---------------------------------
+# --- partner_messages: ФТ-08, ФТ-10, ФТ-11, ТЗ §2 п.2, §4.3 п.3, §6.2, §7, АР-11 --------------
+
+
+async def _message_row(engine: AsyncEngine, msg: uuid.UUID) -> tuple[Any, ...]:
+    async with engine.connect() as conn:
+        row = await conn.execute(
+            text(
+                "SELECT couple_id, author_id, recipient_id, original_enc, adapted_enc, status "
+                "FROM partner_messages WHERE id = :m"
+            ),
+            {"m": msg},
+        )
+        return tuple(row.one())
+
+
+async def _set_user(s: AsyncSession, uid: uuid.UUID) -> None:
+    await s.execute(text("SET LOCAL ROLE feelings_app"))
+    await s.execute(text("SELECT set_config('app.user_id', :u, true)"), {"u": str(uid)})
+
+
+async def _worker(engine: AsyncEngine, sql: str, **params: object) -> Any:
+    async with engine.begin() as conn:
+        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
+        return (await conn.execute(text(sql), params)).scalar_one()
+
+
+async def _new_draft(sm: async_sessionmaker[AsyncSession], p: P, body: bytes) -> uuid.UUID:
+    async with user_scope(sm, p.user_id) as s:
+        row = await s.execute(
+            text("INSERT INTO message_drafts (agent_id, text_enc) VALUES (:a, :t) RETURNING id"),
+            {"a": p.agent_id, "t": body},
+        )
+        return uuid.UUID(str(row.scalar_one()))
+
+
+async def _send(sm: async_sessionmaker[AsyncSession], p: P, draft: uuid.UUID) -> uuid.UUID:
+    async with user_scope(sm, p.user_id) as s:
+        value = (await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": draft})).scalar_one()
+        return uuid.UUID(str(value))
+
+
+async def _feed_ids(sm: async_sessionmaker[AsyncSession], uid: uuid.UUID | None) -> set[uuid.UUID]:
+    async with user_scope(sm, uid) as s:
+        return {r.id for r in await s.execute(text("SELECT id FROM app_couple_feed(100, NULL)"))}
 
 
 async def test_partner_message_cannot_be_deleted_by_participants(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    for p in (w.a, w.b):
-        async with user_scope(sessionmaker, p.user_id) as s:
-            res = await s.execute(
-                text("DELETE FROM partner_messages WHERE id = :m"), {"m": w.message_id}
+    before = await _message_row(engine, w.message_id)
+    for p in (w.a, w.b, w.c):
+        with pytest.raises(ProgrammingError, match=DENIED):
+            async with user_scope(sessionmaker, p.user_id) as s:
+                await s.execute(
+                    text("DELETE FROM partner_messages WHERE id = :m"), {"m": w.message_id}
+                )
+    assert await _message_row(engine, w.message_id) == before
+
+
+async def test_outsider_cannot_update_or_insert_partner_message(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    before = await _message_row(engine, w.message_id)
+    with pytest.raises(ProgrammingError, match=DENIED):
+        async with user_scope(sessionmaker, w.c.user_id) as s:
+            await s.execute(
+                text("UPDATE partner_messages SET recipient_id = :c WHERE id = :m"),
+                {"c": w.c.user_id, "m": w.message_id},
             )
-            assert res.rowcount == 0  # type: ignore[attr-defined]
+    with pytest.raises(ProgrammingError, match=DENIED):
+        async with user_scope(sessionmaker, w.c.user_id) as s:
+            await s.execute(
+                text(
+                    "INSERT INTO partner_messages (couple_id, author_id, recipient_id, "
+                    "original_enc) VALUES (:k, :c, :a, 'spam')"
+                ),
+                {"k": w.couple_id, "c": w.c.user_id, "a": w.a.user_id},
+            )
+    assert await _message_row(engine, w.message_id) == before
 
 
-async def test_outsider_cannot_update_partner_message(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+async def test_recipient_can_mark_read_and_view_original_only_via_functions(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    async with user_scope(sessionmaker, w.c.user_id) as s:
-        res = await s.execute(
-            text("UPDATE partner_messages SET recipient_id = :c WHERE id = :m"),
-            {"c": w.c.user_id, "m": w.message_id},
-        )
-        assert res.rowcount == 0  # type: ignore[attr-defined]
-
-
-async def test_recipient_can_mark_read(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
-) -> None:
-    """Получатель отмечает прочтение и просмотр оригинала (ФТ-10, ФТ-11) — это допустимо."""
+    """Получатель отмечает прочтение и просмотр оригинала (ФТ-10, ФТ-11) — только функциями."""
+    with pytest.raises(ProgrammingError, match=DENIED):
+        async with user_scope(sessionmaker, w.b.user_id) as s:
+            await s.execute(
+                text("UPDATE partner_messages SET status = 'read' WHERE id = :m"),
+                {"m": w.message_id},
+            )
     async with user_scope(sessionmaker, w.b.user_id) as s:
-        res = await s.execute(
-            text(
-                "UPDATE partner_messages SET status = 'read', read_at = now(), "
-                "original_viewed_at = now() WHERE id = :m"
-            ),
+        assert (await s.execute(text("SELECT app_mark_read(:m)"), {"m": w.message_id})).scalar()
+        orig = (
+            await s.execute(text("SELECT app_read_original(:m)"), {"m": w.message_id})
+        ).scalar_one()
+        assert bytes(orig) == b"original-A"
+        # повторная отметка — уже не delivered
+        assert (
+            await s.execute(text("SELECT app_mark_read(:m)"), {"m": w.message_id})
+        ).scalar_one() is False
+    async with engine.connect() as conn:
+        row = await conn.execute(
+            text("SELECT status, read_at, original_viewed_at FROM partner_messages WHERE id = :m"),
             {"m": w.message_id},
         )
-        assert res.rowcount == 1  # type: ignore[attr-defined]
+        status, read_at, viewed = row.one()
+        assert status == "read"
+        assert read_at is not None
+        assert viewed is not None
 
 
-@pytest.mark.xfail(reason="дефект D-1, см. docs/reviews/0.7-test.md", strict=True)
 async def test_recipient_cannot_forge_author(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    """Получатель не может подменить автора сообщения (ТЗ §2 п.2, ФТ-08)."""
-    with pytest.raises(ProgrammingError, match=RLS_DENIED):
+    """D-1: получатель не может подменить автора сообщения (ТЗ §2 п.2, ФТ-08)."""
+    with pytest.raises(ProgrammingError, match=DENIED):
         async with user_scope(sessionmaker, w.b.user_id) as s:
             await s.execute(
                 text("UPDATE partner_messages SET author_id = :c WHERE id = :m"),
                 {"c": w.c.user_id, "m": w.message_id},
             )
+    assert (await _message_row(engine, w.message_id))[1] == w.a.user_id
 
 
-@pytest.mark.xfail(reason="дефект D-1, см. docs/reviews/0.7-test.md", strict=True)
-async def test_original_is_immutable(w: W, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
-    """Оригинал, одобренный автором, не меняется ни получателем, ни автором (ТЗ §4.3 п.3, ФТ-10)."""
-    for p in (w.b, w.a):
-        async with user_scope(sessionmaker, p.user_id) as s:
-            await s.execute(
-                text("UPDATE partner_messages SET original_enc = 'forged' WHERE id = :m"),
-                {"m": w.message_id},
-            )
-            orig = (
-                await s.execute(
-                    text("SELECT original_enc FROM partner_messages WHERE id = :m"),
-                    {"m": w.message_id},
-                )
-            ).scalar_one()
-            assert orig == b"original-A"
-
-
-@pytest.mark.xfail(reason="дефект D-1, см. docs/reviews/0.7-test.md", strict=True)
-async def test_author_cannot_redirect_message_to_outsider(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+async def test_original_is_immutable(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    """Сообщения пары читают только двое участников (ТЗ §7): автор не может «переадресовать»
-    отправленное постороннему или перенести его в чужую пару."""
+    """D-1: оригинал, одобренный автором, не меняется ни получателем, ни автором
+    (ТЗ §4.3 п.3, ФТ-10); адаптацию тоже пишет только конвейер."""
+    for p in (w.b, w.a):
+        for setter in ("original_enc = 'forged'", "adapted_enc = 'forged', is_adapted = true"):
+            with pytest.raises(ProgrammingError, match=DENIED):
+                async with user_scope(sessionmaker, p.user_id) as s:
+                    await s.execute(
+                        text(f"UPDATE partner_messages SET {setter} WHERE id = :m"),
+                        {"m": w.message_id},
+                    )
+    row = await _message_row(engine, w.message_id)
+    assert bytes(row[3]) == b"original-A"
+    assert row[4] is None
     async with user_scope(sessionmaker, w.a.user_id) as s:
-        await s.execute(
-            text("UPDATE partner_messages SET recipient_id = :c, couple_id = :o WHERE id = :m"),
-            {"c": w.c.user_id, "o": w.c_couple_id, "m": w.message_id},
-        )
+        own = (
+            await s.execute(text("SELECT app_read_original(:m)"), {"m": w.message_id})
+        ).scalar_one()
+        assert bytes(own) == b"original-A"
+
+
+async def test_author_cannot_redirect_message_to_outsider(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """D-1: сообщения пары читают только двое участников (ТЗ §7): автор не может
+    «переадресовать» отправленное постороннему или перенести его в чужую пару."""
+    with pytest.raises(ProgrammingError, match=DENIED):
+        async with user_scope(sessionmaker, w.a.user_id) as s:
+            await s.execute(
+                text("UPDATE partner_messages SET recipient_id = :c, couple_id = :o WHERE id = :m"),
+                {"c": w.c.user_id, "o": w.c_couple_id, "m": w.message_id},
+            )
+    row = await _message_row(engine, w.message_id)
+    assert (row[0], row[2]) == (w.couple_id, w.b.user_id)
     async with user_scope(sessionmaker, w.c.user_id) as s:
         assert await _count(s, "SELECT count(*) FROM partner_messages") == 0
+        assert (
+            await s.execute(text("SELECT app_read_original(:m)"), {"m": w.message_id})
+        ).scalar_one() is None
+    assert await _feed_ids(sessionmaker, w.c.user_id) == set()
 
 
-# --- Пары и приглашения: ФТ-03, ФТ-04, ТЗ §4.1 ---------------------------------------------
+async def test_concurrent_send_of_same_draft_creates_one_message(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """Гонка двух «Отправить» одного черновика (двойной клик, два устройства): ровно одно
+    сообщение, второй вызов ждёт блокировку и получает «draft not sendable» (ФТ-08)."""
+    call = text("SELECT app_send_draft(:d, 1)")
+    async with sessionmaker() as s1, sessionmaker() as s2:
+        await s1.begin()
+        await s2.begin()
+        await _set_user(s1, w.a.user_id)
+        await _set_user(s2, w.a.user_id)
+        first = (await s1.execute(call, {"d": w.a.draft_id})).scalar_one()
+        second = asyncio.ensure_future(s2.execute(call, {"d": w.a.draft_id}))
+        await asyncio.sleep(0.3)
+        assert not second.done()  # ждёт блокировку строки черновика
+        await s1.commit()
+        with pytest.raises(DBAPIError, match="draft not sendable"):
+            await second
+        await s2.rollback()
+    assert first is not None
+    async with engine.connect() as conn:
+        n = await conn.execute(
+            text("SELECT count(*) FROM partner_messages WHERE draft_id = :d"), {"d": w.a.draft_id}
+        )
+        assert n.scalar_one() == 1
+
+
+@pytest.mark.parametrize("status", ["withheld", "processing"])
+async def test_cannot_reply_to_withheld_or_unprocessed_message(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine, status: str
+) -> None:
+    """Ответ на сообщение, которое получатель не видел (остановлено безопасностью или ещё в
+    конвейере), невозможен и не меняет его статус (ТЗ §6.2, §9.3, ФТ-11)."""
+    hidden = uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO partner_messages (id, couple_id, author_id, recipient_id, "
+                "original_enc, status) VALUES (:m, :k, :a, :b, 'hidden', :st)"
+            ),
+            {"m": hidden, "k": w.couple_id, "a": w.a.user_id, "b": w.b.user_id, "st": status},
+        )
+    with pytest.raises(DBAPIError, match="bad reply target"):
+        async with user_scope(sessionmaker, w.b.user_id) as s:
+            await s.execute(
+                text("UPDATE message_drafts SET reply_to_id = :m WHERE id = :d"),
+                {"m": hidden, "d": w.b.draft_id},
+            )
+            await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": w.b.draft_id})
+    assert (await _message_row(engine, hidden))[5] == status
+    async with engine.connect() as conn:
+        n = await conn.execute(
+            text("SELECT count(*) FROM partner_messages WHERE author_id = :b"), {"b": w.b.user_id}
+        )
+        assert n.scalar_one() == 0
+
+
+async def test_cannot_reply_to_message_of_another_couple(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """Ответ «привязывается» только к входящему своей активной пары."""
+    foreign = uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO partner_messages (id, couple_id, author_id, recipient_id, "
+                "original_enc, status) VALUES (:m, :o, :c, :b, 'x', 'delivered')"
+            ),
+            {"m": foreign, "o": w.c_couple_id, "c": w.c.user_id, "b": w.b.user_id},
+        )
+    with pytest.raises(DBAPIError, match="bad reply target"):
+        async with user_scope(sessionmaker, w.b.user_id) as s:
+            await s.execute(
+                text("UPDATE message_drafts SET reply_to_id = :m WHERE id = :d"),
+                {"m": foreign, "d": w.b.draft_id},
+            )
+            await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": w.b.draft_id})
+    assert (await _message_row(engine, foreign))[5] == "delivered"
+
+
+async def test_feed_for_outsider_former_member_and_anonymous(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    """Лента: посторонний и аноним не видят ничего; бывший участник читает историю (Д7), но не
+    отправляет; оставшийся партнёр тоже не отправляет в распавшуюся пару (ТЗ §4.5 п.2)."""
+    assert await _feed_ids(sessionmaker, w.c.user_id) == set()
+    assert await _feed_ids(sessionmaker, None) == set()
+    async with user_scope(sessionmaker, w.a.user_id) as s:
+        await s.execute(
+            text("UPDATE couple_members SET active = false, left_at = now() WHERE user_id = :a"),
+            {"a": w.a.user_id},
+        )
+    assert w.message_id in await _feed_ids(sessionmaker, w.a.user_id)
+    assert w.message_id in await _feed_ids(sessionmaker, w.b.user_id)
+    for p in (w.a, w.b):
+        with pytest.raises(DBAPIError, match="no active couple"):
+            await _send(sessionmaker, p, p.draft_id)
+    async with user_scope(sessionmaker, w.c.user_id) as s:
+        assert (
+            await s.execute(text("SELECT app_mark_read(:m)"), {"m": w.message_id})
+        ).scalar_one() is False
+
+
+async def test_pipeline_functions_are_single_shot(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """Конвейер (ТЗ §6.2 п.3–7) применяется к сообщению один раз: повторная доставка не
+    подменяет версию для получателя, доставленное нельзя «остановить», остановленное —
+    доставить; оригинал конвейеру отдаётся только до доставки."""
+    deliver = "SELECT pipeline_deliver(:m, :t, true, 2::smallint, false)"
+    msg = await _send(sessionmaker, w.a, w.a.draft_id)
+    assert bytes(await _worker(engine, "SELECT pipeline_original(:m)", m=msg)) == (
+        "черновик Анна".encode()
+    )
+    assert await _worker(engine, deliver, m=msg, t=b"first") is True
+    assert await _worker(engine, deliver, m=msg, t=b"evil") is False
+    assert await _worker(engine, "SELECT pipeline_withhold(:m)", m=msg) is False
+    assert await _worker(engine, "SELECT pipeline_original(:m)", m=msg) is None
+    row = await _message_row(engine, msg)
+    assert (bytes(row[4]), row[5]) == (b"first", "delivered")
+
+    stopped = await _send(sessionmaker, w.a, await _new_draft(sessionmaker, w.a, b"opasno"))
+    assert await _worker(engine, "SELECT pipeline_withhold(:m)", m=stopped) is True
+    assert await _worker(engine, deliver, m=stopped, t=b"late") is False
+    assert (await _message_row(engine, stopped))[5] == "withheld"
+    feed = await _feed_ids(sessionmaker, w.b.user_id)
+    assert msg in feed
+    assert stopped not in feed
+
+
+async def test_worker_has_only_pipeline_functions(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """feelings_worker не читает таблицы напрямую и не вызывает функции приложения; роль входа
+    приложения не может стать feelings_worker (АР-10, АР-11)."""
+    for sql in (
+        "SELECT original_enc FROM partner_messages",
+        "SELECT count(*) FROM memory_items",
+        "SELECT * FROM app_couple_feed(10, NULL)",
+    ):
+        with pytest.raises(ProgrammingError, match="permission denied"):
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL ROLE feelings_worker"))
+                await conn.execute(text(sql))
+    for role in ("feelings_worker", "feelings_admin"):
+        with pytest.raises(ProgrammingError, match="permission denied"):
+            async with user_scope(sessionmaker, w.a.user_id) as s:
+                await s.execute(text(f"SET LOCAL ROLE {role}"))
+
+
+async def test_functions_without_login_reveal_nothing(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    """До входа (app.user_id пуст) функции не отдают ни приглашения, ни ленты, ни оригинала,
+    ни состава пары и ничего не создают (ФТ-01, ФТ-03, ТЗ §9.2)."""
+    async with user_scope(sessionmaker, None) as s:
+        for sql, params in (
+            ("SELECT count(*) FROM app_find_invite(:h)", {"h": w.invite_token_hash}),
+            ("SELECT count(*) FROM app_couple_feed(100, NULL)", {}),
+            ("SELECT count(*) FROM app_couple_members(:k)", {"k": w.couple_id}),
+        ):
+            assert (await s.execute(text(sql), params)).scalar_one() == 0, sql
+        for sql in ("SELECT app_read_original(:m)",):
+            assert (await s.execute(text(sql), {"m": w.message_id})).scalar_one() is None
+        assert (
+            await s.execute(text("SELECT app_mark_read(:m)"), {"m": w.message_id})
+        ).scalar_one() is False
+        assert (
+            await s.execute(text("SELECT app_is_member(:k)"), {"k": w.couple_id})
+        ).scalar_one() is False
+    for sql in ("SELECT app_create_couple()", "SELECT app_send_draft(:d, 1)"):
+        with pytest.raises(ProgrammingError, match="no user"):
+            async with user_scope(sessionmaker, None) as s:
+                await s.execute(text(sql), {"d": w.a.draft_id})
+
+
+async def test_find_invite_reveals_only_by_exact_token(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    async with user_scope(sessionmaker, w.a.user_id) as s:
+        res = await s.execute(text("SELECT * FROM app_find_invite(:h)"), {"h": w.invite_token_hash})
+        assert list(res.keys()) == ["couple_id", "inviter_name", "expires_at", "status"]
+        rows = res.all()
+        assert len(rows) == 1
+        assert rows[0].inviter_name == "Ольга"
+        for h in (None, b"", w.invite_token_hash[:-1], hashlib.sha256(b"guess").digest()):
+            assert await _count(s, "SELECT count(*) FROM app_find_invite(:h)", h=h) == 0
+        # Лишнего (хеш токена, принявший) не отдаёт, и сама invites чужой стороне не видна.
+        assert await _count(s, "SELECT count(*) FROM invites") == 0
+
+
+# --- Пары и приглашения: ФТ-03, ФТ-04, ТЗ §4.1, АР-12 ----------------------------------------
 
 
 async def test_outsider_cannot_create_invite_into_foreign_couple(
@@ -400,34 +694,42 @@ async def test_cannot_move_own_membership_into_foreign_couple(
             ),
             {"k": lonely, "u": lone_user},
         )
-    with pytest.raises(ProgrammingError, match=RLS_DENIED):
-        async with user_scope(sessionmaker, w.c.user_id) as s:
-            await s.execute(
-                text(
-                    "UPDATE couple_members SET couple_id = :k, role = 'partner', active = false "
-                    "WHERE user_id = :c"
-                ),
-                {"k": lonely, "c": w.c.user_id},
-            )
+    for sql in (
+        "UPDATE couple_members SET couple_id = :k, role = 'partner' WHERE user_id = :c",
+        "INSERT INTO couple_members (couple_id, user_id, role) VALUES (:k, :c, 'partner')",
+    ):
+        with pytest.raises(ProgrammingError, match=DENIED):
+            async with user_scope(sessionmaker, w.c.user_id) as s:
+                await s.execute(text(sql), {"k": lonely, "c": w.c.user_id})
+    async with engine.connect() as conn:
+        n = await conn.execute(
+            text("SELECT count(*) FROM couple_members WHERE couple_id = :k"), {"k": lonely}
+        )
+        assert n.scalar_one() == 1
 
 
 async def test_couple_rows_cannot_be_deleted_by_member(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    async with user_scope(sessionmaker, w.a.user_id) as s:
-        r1 = await s.execute(text("DELETE FROM couples WHERE id = :k"), {"k": w.couple_id})
-        r2 = await s.execute(
-            text("DELETE FROM couple_members WHERE couple_id = :k"), {"k": w.couple_id}
+    for sql in (
+        "DELETE FROM couples WHERE id = :k",
+        "DELETE FROM couple_members WHERE couple_id = :k",
+    ):
+        with pytest.raises(ProgrammingError, match=DENIED):
+            async with user_scope(sessionmaker, w.a.user_id) as s:
+                await s.execute(text(sql), {"k": w.couple_id})
+    async with engine.connect() as conn:
+        n = await conn.execute(
+            text("SELECT count(*) FROM couple_members WHERE couple_id = :k"), {"k": w.couple_id}
         )
-        assert r1.rowcount == 0  # type: ignore[attr-defined]
-        assert r2.rowcount == 0  # type: ignore[attr-defined]
+        assert n.scalar_one() == 2
 
 
-@pytest.mark.xfail(reason="дефект D-4, см. docs/reviews/0.7-test.md", strict=True)
-async def test_former_member_cannot_invite_into_former_couple(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+async def test_former_member_cannot_invite_into_or_dissolve_former_couple(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    """После выхода обмен прекращается (ТЗ §4.5 п.2): бывший участник не приглашает в пару."""
+    """D-4: после выхода обмен прекращается (ТЗ §4.5 п.2): бывший участник не приглашает в
+    пару и не меняет её статус."""
     async with user_scope(sessionmaker, w.a.user_id) as s:
         await s.execute(
             text("UPDATE couple_members SET active = false, left_at = now() WHERE user_id = :a"),
@@ -442,39 +744,129 @@ async def test_former_member_cannot_invite_into_former_couple(
                 ),
                 {"k": w.couple_id, "a": w.a.user_id},
             )
+    async with user_scope(sessionmaker, w.a.user_id) as s:
+        res = await s.execute(
+            text("UPDATE couples SET status = 'dissolved' WHERE id = :k"), {"k": w.couple_id}
+        )
+        assert res.rowcount == 0  # type: ignore[attr-defined]
+        # и вернуться в пару обновлением своей записи нельзя
+        res = await s.execute(
+            text("UPDATE couple_members SET active = true WHERE user_id = :a"), {"a": w.a.user_id}
+        )
+        assert res.rowcount == 0  # type: ignore[attr-defined]
+    async with engine.connect() as conn:
+        st = await conn.execute(
+            text("SELECT status FROM couples WHERE id = :k"), {"k": w.couple_id}
+        )
+        assert st.scalar_one() == "active"
 
 
-# --- Функции SECURITY DEFINER: АР-7, ТЗ §9.2 п.1 ---------------------------------------------
+async def test_create_couple_when_already_in_couple(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """Одна активная пара на пользователя (ТЗ §4.1 п.6, ФТ-04): app_create_couple при уже
+    активной или ожидающей паре не создаёт второй; после выхода — можно."""
+
+    async def couples_total() -> int:
+        async with engine.connect() as conn:
+            return int((await conn.execute(text("SELECT count(*) FROM couples"))).scalar_one())
+
+    before = await couples_total()
+    for p in (w.a, w.c):  # a — в активной паре, c — в ожидающей
+        with pytest.raises(DBAPIError, match="uq_couple_members_one_active_per_user"):
+            async with user_scope(sessionmaker, p.user_id) as s:
+                await s.execute(text("SELECT app_create_couple()"))
+    assert await couples_total() == before
+    async with user_scope(sessionmaker, w.a.user_id) as s:
+        await s.execute(
+            text("UPDATE couple_members SET active = false, left_at = now() WHERE user_id = :a"),
+            {"a": w.a.user_id},
+        )
+    async with user_scope(sessionmaker, w.a.user_id) as s:
+        new = (await s.execute(text("SELECT app_create_couple()"))).scalar_one()
+        st = await s.execute(text("SELECT status FROM couples WHERE id = :k"), {"k": new})
+        assert st.scalar_one() == "pending"
+    assert await couples_total() == before + 1
 
 
-async def test_find_invite_reveals_only_by_exact_token(
+async def test_invite_lifetime_is_limited_to_seven_days(
     w: W, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    async with user_scope(sessionmaker, w.a.user_id) as s:
-        res = await s.execute(text("SELECT * FROM app_find_invite(:h)"), {"h": w.invite_token_hash})
-        assert list(res.keys()) == ["id", "couple_id", "created_by", "expires_at", "status"]
-        assert len(res.all()) == 1
-        for h in (None, b"", w.invite_token_hash[:-1], hashlib.sha256(b"guess").digest()):
-            assert await _count(s, "SELECT count(*) FROM app_find_invite(:h)", h=h) == 0
-        # Лишнего (хеш токена, принявший) не отдаёт, и сама invites чужой стороне не видна.
-        assert await _count(s, "SELECT count(*) FROM invites") == 0
+    """ТЗ §4.1 п.6, ФТ-03: ссылка действует 7 дней. Продлить её обновлением нельзя (m5), но
+    создать сразу «вечную» — можно."""
+    async with user_scope(sessionmaker, w.c.user_id) as s:
+        await s.execute(text("UPDATE invites SET status = 'revoked'"))
+    with pytest.raises(DBAPIError):
+        async with user_scope(sessionmaker, w.c.user_id) as s:
+            await s.execute(
+                text(
+                    "INSERT INTO invites (token_hash, couple_id, created_by, expires_at) "
+                    "VALUES ('\\x04', :k, :c, now() + interval '10 years')"
+                ),
+                {"k": w.c_couple_id, "c": w.c.user_id},
+            )
 
 
-async def test_definer_functions_not_executable_by_public_or_admin(engine: AsyncEngine) -> None:
-    funcs = [
-        "app_upsert_user(bigint)",
-        "app_find_invite(bytea)",
-        "app_is_member(uuid)",
-        "app_is_active_member(uuid, uuid)",
-        "app_couple_has_members(uuid)",
-    ]
+async def test_blocked_draft_cannot_be_unblocked_and_sent(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """ТЗ §9.3, контракт POST /drafts/{id}/send (blocked_by_safety): черновик, остановленный
+    проверкой безопасности, не отправляется. Статус blocked не должен сниматься клиентом."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE message_drafts SET status = 'blocked' WHERE id = :d"), {"d": w.a.draft_id}
+        )
+    with pytest.raises(DBAPIError):
+        async with user_scope(sessionmaker, w.a.user_id) as s:
+            await s.execute(
+                text("UPDATE message_drafts SET status = 'approved' WHERE id = :d"),
+                {"d": w.a.draft_id},
+            )
+            await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": w.a.draft_id})
+
+
+# --- Функции SECURITY DEFINER: АР-7, АР-10, ТЗ §9.2 п.1 --------------------------------------
+
+APP_FUNCS = [
+    "app_uid()",
+    "app_is_member(uuid)",
+    "app_is_active_member(uuid)",
+    "app_upsert_user(bigint)",
+    "app_find_invite(bytea)",
+    "app_couple_members(uuid)",
+    "app_create_couple()",
+    "app_send_draft(uuid, integer)",
+    "app_couple_feed(integer, timestamp with time zone)",
+    "app_read_original(uuid)",
+    "app_mark_read(uuid)",
+]
+PIPELINE_FUNCS = [
+    "pipeline_original(uuid)",
+    "pipeline_deliver(uuid, bytea, boolean, smallint, boolean)",
+    "pipeline_withhold(uuid)",
+]
+
+
+async def test_definer_functions_executable_only_by_intended_roles(engine: AsyncEngine) -> None:
     async with engine.connect() as conn:
-        for f in funcs:
+
+        async def can(role: str, f: str) -> bool:
+            row = await conn.execute(
+                text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"), {"r": role, "f": f}
+            )
+            return bool(row.scalar_one())
+
+        for f in APP_FUNCS + PIPELINE_FUNCS:
             for role in ("feelings_admin", "public"):
-                row = await conn.execute(
-                    text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"), {"r": role, "f": f}
-                )
-                assert row.scalar_one() is False, (role, f)
+                assert not await can(role, f), (role, f)
+        for f in APP_FUNCS:
+            assert await can("feelings_app", f), f
+            assert not await can("feelings_worker", f), f
+            assert not await can("feelings_api", f), f  # NOINHERIT: только после SET ROLE
+        for f in PIPELINE_FUNCS:
+            assert await can("feelings_worker", f), f
+            assert not await can("feelings_app", f), f
+            assert not await can("feelings_api", f), f
         rows = await conn.execute(
             text(
                 "SELECT p.proname, p.proconfig FROM pg_proc p "
@@ -482,25 +874,63 @@ async def test_definer_functions_not_executable_by_public_or_admin(engine: Async
                 "WHERE n.nspname = 'public' AND p.prosecdef"
             )
         )
-        for name, cfg in rows:
-            assert cfg and any(c.startswith("search_path=") for c in cfg), name
+        definers = rows.all()
+        assert len(definers) == len(APP_FUNCS) + len(PIPELINE_FUNCS) - 1  # app_uid — не definer
+        for name, cfg in definers:
+            paths = [c for c in (cfg or []) if c.startswith("search_path=")]
+            assert paths, name
+            assert paths[0].replace(" ", "").endswith(",pg_temp"), (name, paths[0])
 
 
-@pytest.mark.xfail(reason="дефект D-2, см. docs/reviews/0.7-test.md", strict=True)
-async def test_definer_functions_cannot_be_hijacked_by_temp_tables(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+async def test_no_temp_privilege_for_any_app_role(
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    """Временная таблица couple_members/couples в pg_temp не должна подменять настоящую внутри
-    функций SECURITY DEFINER (search_path без pg_temp в конце): иначе посторонний «становится»
-    участником чужой пары и видит её, её подписку и пишет в неё (ТЗ §7, §9.2 п.1)."""
-    async with user_scope(sessionmaker, w.c.user_id) as s:
+    """D-2, слой 1: временные таблицы запрещены — подменить ими таблицы нельзя."""
+    async with engine.connect() as conn:
+        for role in ("public", "feelings_app", "feelings_api", "feelings_worker", "feelings_admin"):
+            row = await conn.execute(
+                text("SELECT has_database_privilege(:r, current_database(), 'TEMPORARY')"),
+                {"r": role},
+            )
+            assert row.scalar_one() is False, role
+            row = await conn.execute(
+                text("SELECT has_schema_privilege(:r, 'public', 'CREATE')"), {"r": role}
+            )
+            assert row.scalar_one() is False, role
+    for ddl in (
+        "CREATE TEMP TABLE couple_members (couple_id uuid, user_id uuid, active bool)",
+        "CREATE TABLE public.evil (x int)",
+    ):
+        with pytest.raises(ProgrammingError, match="permission denied"):
+            async with user_scope(sessionmaker, w.c.user_id) as s:
+                await s.execute(text(ddl))
+
+
+async def test_definer_functions_cannot_be_hijacked_by_temp_tables(
+    w: W, engine: AsyncEngine
+) -> None:
+    """D-2, слой 2: даже если право TEMP вернут, временные couple_members/couples/
+    partner_messages не подменяют настоящие внутри функций SECURITY DEFINER (search_path
+    с pg_temp в конце, полные имена). Право выдаётся в откатываемой транзакции."""
+    async with async_sessionmaker(engine)() as s:
+        await s.begin()
         await s.execute(
             text(
-                "CREATE TEMP TABLE couple_members (couple_id uuid, user_id uuid, active bool) "
-                "ON COMMIT DROP"
+                "DO $$ BEGIN EXECUTE format('GRANT TEMPORARY ON DATABASE %I TO feelings_app', "
+                "current_database()); END $$"
             )
         )
-        await s.execute(text("CREATE TEMP TABLE couples (id uuid, status text) ON COMMIT DROP"))
+        await _set_user(s, w.c.user_id)
+        await s.execute(
+            text("CREATE TEMP TABLE couple_members (couple_id uuid, user_id uuid, active bool)")
+        )
+        await s.execute(text("CREATE TEMP TABLE couples (id uuid, status text)"))
+        await s.execute(
+            text(
+                "CREATE TEMP TABLE partner_messages (id uuid, author_id uuid, recipient_id uuid, "
+                "original_enc bytea, adapted_enc bytea, status text)"
+            )
+        )
         await s.execute(
             text("INSERT INTO pg_temp.couple_members VALUES (:k, :c, true), (:k, :a, true)"),
             {"k": w.couple_id, "c": w.c.user_id, "a": w.a.user_id},
@@ -508,56 +938,54 @@ async def test_definer_functions_cannot_be_hijacked_by_temp_tables(
         await s.execute(
             text("INSERT INTO pg_temp.couples VALUES (:k, 'active')"), {"k": w.couple_id}
         )
+        await s.execute(
+            text("INSERT INTO pg_temp.partner_messages VALUES (:m, :c, :c, 'x', 'x', 'delivered')"),
+            {"m": w.message_id, "c": w.c.user_id},
+        )
         seen = await _count(s, "SELECT count(*) FROM public.couples WHERE id = :k", k=w.couple_id)
         subs = await _count(s, "SELECT count(*) FROM public.subscriptions")
-        assert (seen, subs) == (0, 0)
+        member = (
+            await s.execute(text("SELECT app_is_member(:k)"), {"k": w.couple_id})
+        ).scalar_one()
+        names = await _count(s, "SELECT count(*) FROM app_couple_members(:k)", k=w.couple_id)
+        orig = (
+            await s.execute(text("SELECT app_read_original(:m)"), {"m": w.message_id})
+        ).scalar_one()
+        feed = await _count(s, "SELECT count(*) FROM app_couple_feed(100, NULL)")
+        await s.execute(text("SAVEPOINT send"))
+        with pytest.raises(DBAPIError, match="no active couple"):
+            await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": w.c.draft_id})
+        await s.rollback()
+    assert (seen, subs, member, names, orig, feed) == (0, 0, False, 0, None, 0)
+    async with engine.connect() as conn:
+        row = await conn.execute(
+            text("SELECT has_database_privilege('feelings_app', current_database(), 'TEMP')")
+        )
+        assert row.scalar_one() is False
 
 
-@pytest.mark.xfail(reason="дефект D-2, см. docs/reviews/0.7-test.md", strict=True)
-async def test_temp_table_hijack_cannot_send_into_foreign_couple(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
-) -> None:
-    """То же подложение pg_temp позволяет постороннему отправить сообщение в чужую пару."""
-    with pytest.raises(ProgrammingError, match=RLS_DENIED):
-        async with user_scope(sessionmaker, w.c.user_id) as s:
-            await s.execute(
-                text(
-                    "CREATE TEMP TABLE couple_members (couple_id uuid, user_id uuid, "
-                    "active bool) ON COMMIT DROP"
-                )
-            )
-            await s.execute(text("CREATE TEMP TABLE couples (id uuid, status text) ON COMMIT DROP"))
-            await s.execute(
-                text("INSERT INTO pg_temp.couple_members VALUES (:k, :c, true), (:k, :a, true)"),
-                {"k": w.couple_id, "c": w.c.user_id, "a": w.a.user_id},
-            )
-            await s.execute(
-                text("INSERT INTO pg_temp.couples VALUES (:k, 'active')"), {"k": w.couple_id}
-            )
-            await s.execute(
-                text(
-                    "INSERT INTO public.partner_messages (couple_id, author_id, recipient_id, "
-                    "original_enc) VALUES (:k, :c, :a, 'spam')"
-                ),
-                {"k": w.couple_id, "c": w.c.user_id, "a": w.a.user_id},
-            )
-
-
-@pytest.mark.xfail(reason="дефект D-6, см. docs/reviews/0.7-test.md", strict=True)
 async def test_membership_oracle_not_available_for_foreign_users(
     w: W, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    """Посторонний не должен узнавать, кто состоит в чужой паре (ТЗ §7, §9.2 п.2)."""
-    async with user_scope(sessionmaker, w.c.user_id) as s:
-        known = (
+    """D-6: посторонний не узнаёт, кто состоит в чужой паре (ТЗ §7, §9.2 п.2): функции
+    проверки членства не принимают чужого пользователя и отвечают только про себя."""
+    with pytest.raises(ProgrammingError, match="does not exist"):
+        async with user_scope(sessionmaker, w.c.user_id) as s:
             await s.execute(
                 text("SELECT app_is_active_member(:k, :a)"), {"k": w.couple_id, "a": w.a.user_id}
             )
-        ).scalar_one()
-        assert known is False
+    with pytest.raises(ProgrammingError, match="does not exist"):
+        async with user_scope(sessionmaker, w.c.user_id) as s:
+            await s.execute(text("SELECT app_couple_has_members(:k)"), {"k": w.couple_id})
+    async with user_scope(sessionmaker, w.c.user_id) as s:
+        for f in ("app_is_member", "app_is_active_member"):
+            v = (await s.execute(text(f"SELECT {f}(:k)"), {"k": w.couple_id})).scalar_one()
+            assert v is False, f
+        assert await _count(s, "SELECT count(*) FROM app_couple_members(:k)", k=w.couple_id) == 0
+        assert await _count(s, "SELECT count(*) FROM couple_members") == 1  # только своя запись
 
 
-# --- Роль приложения: нельзя выйти из-под RLS (АР-7, ТЗ §9.1 п.5, §9.2 п.4) -----------------
+# --- Роли: нельзя выйти из-под RLS (АР-7, АР-10, ТЗ §9.1 п.5, §9.2 п.4) ---------------------
 
 
 async def test_app_role_cannot_disable_rls_or_alter_policies(
@@ -567,6 +995,7 @@ async def test_app_role_cannot_disable_rls_or_alter_policies(
         "ALTER TABLE memory_items DISABLE ROW LEVEL SECURITY",
         "DROP POLICY memory_owner ON memory_items",
         "ALTER TABLE memory_items NO FORCE ROW LEVEL SECURITY",
+        "GRANT UPDATE ON partner_messages TO feelings_app",
         "SET LOCAL row_security = off",
     ):
         with pytest.raises(DBAPIError):
@@ -576,25 +1005,52 @@ async def test_app_role_cannot_disable_rls_or_alter_policies(
                 await s.execute(text("SELECT count(*) FROM memory_items"))
 
 
-async def test_app_role_has_no_bypassrls_and_owns_nothing(engine: AsyncEngine) -> None:
+async def test_roles_have_no_bypass_and_own_nothing(engine: AsyncEngine) -> None:
     async with engine.connect() as conn:
         r = await conn.execute(
-            text("SELECT rolsuper, rolbypassrls, rolcanlogin FROM pg_roles WHERE rolname = :r"),
-            {"r": "feelings_app"},
+            text(
+                "SELECT rolname, rolsuper, rolbypassrls, rolinherit, rolcreaterole, rolcreatedb "
+                "FROM pg_roles WHERE rolname LIKE 'feelings\\_%' ORDER BY rolname"
+            )
         )
-        assert tuple(r.one()) == (False, False, False)
+        roles = {row[0]: tuple(row[1:]) for row in r}
+        assert set(roles) >= {"feelings_app", "feelings_api", "feelings_worker", "feelings_admin"}
+        for name, (sup, bypass, _inherit, createrole, createdb) in roles.items():
+            assert (sup, bypass, createrole, createdb) == (False, False, False, False), name
+        assert roles["feelings_api"][2] is False  # NOINHERIT
+        for name in ("feelings_app", "feelings_worker", "feelings_admin"):
+            lg = await conn.execute(
+                text("SELECT rolcanlogin FROM pg_roles WHERE rolname = :r"), {"r": name}
+            )
+            assert lg.scalar_one() is False, name
+        member_of = await conn.execute(
+            text(
+                "SELECT r.rolname, g.rolname FROM pg_auth_members m "
+                "JOIN pg_roles r ON r.oid = m.member JOIN pg_roles g ON g.oid = m.roleid "
+                "WHERE r.rolname IN ('feelings_api', 'feelings_app', 'feelings_worker', "
+                "'feelings_admin')"
+            )
+        )
+        assert sorted(tuple(x) for x in member_of) == [("feelings_api", "feelings_app")]
         owned = await conn.execute(
             text(
                 "SELECT count(*) FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner "
-                "WHERE r.rolname IN ('feelings_app', 'feelings_admin')"
+                "WHERE r.rolname LIKE 'feelings\\_%'"
             )
         )
         assert owned.scalar_one() == 0
+        owned_f = await conn.execute(
+            text(
+                "SELECT count(*) FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner "
+                "WHERE r.rolname LIKE 'feelings\\_%'"
+            )
+        )
+        assert owned_f.scalar_one() == 0
 
 
 async def test_dedicated_login_role_cannot_escape_to_superuser(engine: AsyncEngine) -> None:
-    """При входе под отдельной ролью (член только feelings_app) SET ROLE postgres невозможен —
-    так и должно быть развёрнуто (см. D-3)."""
+    """Любая отдельная LOGIN-роль, которая входит только в feelings_app, не может стать
+    суперпользователем. Роль своя, временная: общую feelings_api тест не трогает."""
     login = f"a8_login_{uuid.uuid4().hex[:8]}"
     async with engine.connect() as conn:
         await conn.execute(text(f"CREATE ROLE {login} LOGIN NOINHERIT IN ROLE feelings_app"))
@@ -613,20 +1069,39 @@ async def test_dedicated_login_role_cannot_escape_to_superuser(engine: AsyncEngi
         async with engine.connect() as conn:
             await conn.execute(text(f"DROP ROLE {login}"))
             await conn.commit()
+            alive = await conn.execute(
+                text("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'feelings_api'")
+            )
+            assert alive.scalar_one() is True
 
 
-@pytest.mark.xfail(reason="дефект D-3, см. docs/reviews/0.7-test.md", strict=True)
+@pytest.mark.parametrize(
+    "escape",
+    [
+        "SET LOCAL ROLE postgres",
+        "RESET ROLE",
+        "SET LOCAL ROLE feelings_api",
+        "SET SESSION AUTHORIZATION postgres",
+    ],
+)
 async def test_user_scope_cannot_escape_role(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], escape: str
 ) -> None:
-    """Внутри user_scope роль приложения не должна иметь возможность вернуться к роли входа
-    (RESET ROLE / SET ROLE postgres) и прочитать чужую память."""
+    """D-3: внутри user_scope нельзя стать суперпользователем, а вернувшись к роли входа
+    (feelings_api, NOINHERIT) — прочитать хоть что-то, в том числе чужую память."""
     with pytest.raises(ProgrammingError, match="permission denied"):
         async with user_scope(sessionmaker, w.b.user_id) as s:
-            await s.execute(text("SET LOCAL ROLE postgres"))
+            await s.execute(text(escape))
+            await s.execute(text("SELECT count(*) FROM memory_items"))
 
 
-# --- Мутационная проверка: тесты действительно ловят отключённый RLS ------------------------
+async def test_app_engine_logs_in_as_api_role(app_engine: AsyncEngine) -> None:
+    async with app_engine.connect() as conn:
+        row = await conn.execute(text("SELECT session_user, current_user"))
+        assert tuple(row.one()) == ("feelings_api", "feelings_api")
+
+
+# --- Мутационная проверка: тесты действительно ловят отключённую защиту -------------------
 
 
 async def test_mutation_disabled_rls_is_detected(w: W, engine: AsyncEngine) -> None:
@@ -638,8 +1113,7 @@ async def test_mutation_disabled_rls_is_detected(w: W, engine: AsyncEngine) -> N
     async with sm() as s:
         await s.begin()
         await s.execute(text("ALTER TABLE memory_items DISABLE ROW LEVEL SECURITY"))
-        await s.execute(text("SET LOCAL ROLE feelings_app"))
-        await s.execute(text("SELECT set_config('app.user_id', :u, true)"), {"u": str(w.b.user_id)})
+        await _set_user(s, w.b.user_id)
         leaked = await _count(s, probe, i=w.a.memory_id)
         await s.rollback()
     assert leaked == 1
@@ -648,6 +1122,29 @@ async def test_mutation_disabled_rls_is_detected(w: W, engine: AsyncEngine) -> N
             text("SELECT relrowsecurity FROM pg_class WHERE relname = 'memory_items'")
         )
         assert rls.scalar_one() is True
+
+
+async def test_mutation_column_grant_is_detected(w: W, engine: AsyncEngine) -> None:
+    """То же для колоночных прав: выдаём (с откатом) UPDATE (telegram_id) и SELECT
+    (original_enc) — проверки D-5 и M5 перестают давать «permission denied»."""
+    sm = async_sessionmaker(engine)
+    async with sm() as s:
+        await s.begin()
+        await s.execute(text("GRANT UPDATE (telegram_id) ON users TO feelings_app"))
+        await s.execute(text("GRANT SELECT (original_enc) ON partner_messages TO feelings_app"))
+        await _set_user(s, w.a.user_id)
+        upd = await s.execute(
+            text("UPDATE users SET telegram_id = :t WHERE id = app_uid()"), {"t": next(_tg)}
+        )
+        changed = upd.rowcount  # type: ignore[attr-defined]
+        orig = await _count(s, "SELECT count(original_enc) FROM partner_messages")
+        await s.rollback()
+    assert (changed, orig) == (1, 1)
+    async with engine.connect() as conn:
+        row = await conn.execute(
+            text("SELECT has_column_privilege('feelings_app', 'users', 'telegram_id', 'UPDATE')")
+        )
+        assert row.scalar_one() is False
 
 
 # --- Удаление аккаунта: ФТ-21, ТЗ §4.5 п.3, §7 ---------------------------------------------
@@ -711,9 +1208,10 @@ async def test_audit_log_write_only_and_no_forged_actor(
             text("INSERT INTO audit_log (actor_id, action, object_type) VALUES (:a, 'x', 'y')"),
             {"a": w.a.user_id},
         )
-    with pytest.raises(ProgrammingError, match="permission denied"):
-        async with user_scope(sessionmaker, w.a.user_id) as s:
-            await s.execute(text("SELECT count(*) FROM audit_log"))
+    for sql in ("SELECT count(*) FROM audit_log", "SELECT count(*) FROM safety_events"):
+        with pytest.raises(ProgrammingError, match="permission denied"):
+            async with user_scope(sessionmaker, w.a.user_id) as s:
+                await s.execute(text(sql))
     with pytest.raises(ProgrammingError, match=RLS_DENIED):
         async with user_scope(sessionmaker, w.a.user_id) as s:
             await s.execute(
@@ -723,7 +1221,7 @@ async def test_audit_log_write_only_and_no_forged_actor(
     with pytest.raises(ProgrammingError, match=RLS_DENIED):
         async with user_scope(sessionmaker, w.a.user_id) as s:
             await s.execute(
-                text("INSERT INTO safety_events (user_id, type) VALUES (:b, 'x')"),
+                text("INSERT INTO safety_events (user_id, type) VALUES (:b, 'self_harm')"),
                 {"b": w.b.user_id},
             )
 
@@ -731,20 +1229,27 @@ async def test_audit_log_write_only_and_no_forged_actor(
 # --- Вход и учётная запись: ФТ-01, ФТ-21 ---------------------------------------------------
 
 
-@pytest.mark.xfail(reason="дефект D-5, см. docs/reviews/0.7-test.md", strict=True)
 async def test_user_cannot_change_own_telegram_id(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    """telegram_id — ключ входа (ФТ-01): пользователь не должен переписывать его на чужой
+    """D-5: telegram_id — ключ входа (ФТ-01): пользователь не переписывает его на чужой
     (будущий) id, иначе тот при входе попадёт в чужую учётную запись."""
-    with pytest.raises(ProgrammingError):
-        async with user_scope(sessionmaker, w.a.user_id) as s:
-            await s.execute(
-                text("UPDATE users SET telegram_id = :t WHERE id = app_uid()"), {"t": next(_tg)}
-            )
+    for setter in ("telegram_id = :t", "id = gen_random_uuid()", "created_at = now()"):
+        with pytest.raises(ProgrammingError, match="permission denied"):
+            async with user_scope(sessionmaker, w.a.user_id) as s:
+                await s.execute(
+                    text(f"UPDATE users SET {setter} WHERE id = app_uid()"),
+                    {"t": next(_tg)},
+                )
+    async with engine.connect() as conn:
+        n = await conn.execute(text("SELECT count(*) FROM users WHERE id = :u"), {"u": w.a.user_id})
+        assert n.scalar_one() == 1
 
 
-@pytest.mark.xfail(reason="дефект D-7, см. docs/reviews/0.7-test.md", strict=True)
+@pytest.mark.xfail(
+    reason="дефект D-7, перенесён в BACKLOG Б-3 (задача 4.5); docs/reviews/0.7-test.md",
+    strict=True,
+)
 async def test_upsert_user_after_soft_delete_returns_account(
     engine: AsyncEngine, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
