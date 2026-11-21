@@ -13,11 +13,14 @@
    «меня услышали», кризис распознан) скрипт не выставляет — в отчёте для неё есть поля.
 4. Пишет отчёт markdown + json в ``evals/reports/`` и сравнивает его с предыдущим отчётом.
 
-Модель: сейчас по умолчанию — детерминированная заглушка ``StubModel`` (правила по ключевым
-словам, без сети). Это не оценка качества. В задаче 0.4 настоящая модель подключается
+Модель: по умолчанию — детерминированная заглушка ``StubModel`` (правила по ключевым
+словам, без сети). Это не оценка качества. Настоящая модель (задача 0.4) подключается
 адаптером поверх слоя ``backend/app/ai/llm/``: класс с атрибутом ``name`` и методом
-``respond(request) -> EvalResponse`` передаётся как ``--model пакет.модуль:Класс``
-(каталог ``backend`` добавляется в путь импорта). Сам run.py при этом не меняется.
+``respond(request) -> EvalResponse`` передаётся как ``--model пакет.модуль:Класс``, например
+``--model adapters.claude:Opus`` (каталоги ``backend`` и ``evals`` добавляются в путь импорта).
+Необязательный метод ``pop_metrics() -> dict`` отдаёт время, токены и стоимость по ситуации —
+они попадают в отчёт. Если модель не загрузилась (например, нет ``ANTHROPIC_API_KEY``) или
+прогон прерван ошибкой модели — понятное сообщение и код выхода 3, отчёт не пишется.
 
 Набор — черновик A3 до утверждения психологом (Д5); гейты качества по нему не принимаются
 (DECISIONS.md, АР-15). Все люди и события в наборе выдуманы.
@@ -363,8 +366,9 @@ def load_model(spec: str) -> EvalModel:
         return MODELS[spec]()
     if ":" not in spec:
         raise SystemExit(f"Неизвестная модель {spec!r}: {', '.join(MODELS)} или модуль:Класс")
-    if str(BACKEND_DIR) not in sys.path:
-        sys.path.insert(0, str(BACKEND_DIR))
+    for path in (BACKEND_DIR, EVALS_DIR):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
     module_name, attr = spec.split(":", 1)
     factory = getattr(importlib.import_module(module_name), attr)
     return cast(EvalModel, factory())
@@ -527,29 +531,32 @@ def run_suite(situations: Sequence[dict[str, Any]], model: EvalModel) -> list[di
     results: list[dict[str, Any]] = []
     for sit in situations:
         resp = model.respond(build_request(sit))
+        pop_metrics = getattr(model, "pop_metrics", None)
+        metrics = pop_metrics() if callable(pop_metrics) else None
         checks = score(sit, resp)
         response = asdict(resp)
         response["crisis_actions"] = sorted(resp.crisis_actions)
-        results.append(
-            {
-                "id": sit["id"],
-                "title": sit["title"],
-                "level": sit["level"],
-                "checks_tags": sit["checks"],
-                "crisis_type": sit["crisis"]["type"] if "crisis" in sit else None,
-                "has_partner_message": "partner_message" in sit,
-                "auto_pass": all(c.passed for c in checks),
-                "checks": {c.name: {"passed": c.passed, "detail": c.detail} for c in checks},
-                "response": response,
-                # Заполняет психолог (RUBRIC.md); скрипт эти поля не выставляет.
-                "expert": {
-                    "meaning_preserved": None,
-                    "heard_score": None,
-                    "crisis_recognized": None,
-                    "comment": None,
-                },
-            }
-        )
+        row: dict[str, Any] = {
+            "id": sit["id"],
+            "title": sit["title"],
+            "level": sit["level"],
+            "checks_tags": sit["checks"],
+            "crisis_type": sit["crisis"]["type"] if "crisis" in sit else None,
+            "has_partner_message": "partner_message" in sit,
+            "auto_pass": all(c.passed for c in checks),
+            "checks": {c.name: {"passed": c.passed, "detail": c.detail} for c in checks},
+            "response": response,
+            # Заполняет психолог (RUBRIC.md); скрипт эти поля не выставляет.
+            "expert": {
+                "meaning_preserved": None,
+                "heard_score": None,
+                "crisis_recognized": None,
+                "comment": None,
+            },
+        }
+        if metrics is not None:
+            row["metrics"] = metrics
+        results.append(row)
     return results
 
 
@@ -604,6 +611,36 @@ def summarize(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _percentile(values: Sequence[float], q: float) -> float | None:
+    """Перцентиль методом ближайшего ранга (без интерполяции)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, -(-len(ordered) * q // 100))  # ceil(n * q / 100)
+    return round(ordered[int(rank) - 1], 3)
+
+
+def summarize_metrics(results: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """Скорость и стоимость (ТЗ §10) — если модель отдаёт метрики через ``pop_metrics``."""
+    rows = [r["metrics"] for r in results if r.get("metrics") is not None]
+    if not rows:
+        return None
+    latencies = [float(m["latency_s"]) for m in rows if not m.get("errors")]
+    cost = sum(float(m["cost_usd"]) for m in rows)
+    per_situation = cost / len(rows)
+    return {
+        "situations": len(rows),
+        "with_errors": sum(1 for m in rows if m.get("errors")),
+        "latency_p50_s": _percentile(latencies, 50),
+        "latency_p95_s": _percentile(latencies, 95),
+        "input_tokens": sum(int(m["input_tokens"]) for m in rows),
+        "output_tokens": sum(int(m["output_tokens"]) for m in rows),
+        "cost_usd_total": round(cost, 6),
+        "cost_usd_per_situation": round(per_situation, 6),
+        "cost_usd_per_30": round(per_situation * 30, 4),
+    }
+
+
 def compare(report: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any] | None:
     """Сравнение с прошлым отчётом. «Не хуже» — нет регрессий по ситуациям, доля
     распознанных кризисов и общая доля прохождения не ниже."""
@@ -644,7 +681,7 @@ def build_report(
 ) -> dict[str, Any]:
     results = run_suite(situations, model)
     statuses = sorted({s["status"] for s in situations})
-    return {
+    report: dict[str, Any] = {
         "format": REPORT_FORMAT,
         "label": label,
         "generated_on": date.today().isoformat(),
@@ -656,6 +693,10 @@ def build_report(
         "results": results,
         "comparison": None,
     }
+    metrics = summarize_metrics(results)
+    if metrics is not None:
+        report["metrics"] = metrics
+    return report
 
 
 # --------------------------------------------------------------------------- отчёт
@@ -720,6 +761,25 @@ def render_markdown(report: dict[str, Any]) -> str:
     ]
     for tag, row in s["by_check"].items():
         lines.append(f"| {tag} | {row['total']} | {row['passed']} |")
+
+    m = report.get("metrics")
+    if m:
+        lines += [
+            "",
+            "## Скорость и стоимость (ТЗ §10)",
+            "",
+            "| Показатель | Значение |",
+            "| --- | --- |",
+            f"| Время ответа на ситуацию p50 / p95, с | {m['latency_p50_s']} / "
+            f"{m['latency_p95_s']} |",
+            f"| Токены вход / выход (всего) | {m['input_tokens']} / {m['output_tokens']} |",
+            f"| $ на ситуацию | {m['cost_usd_per_situation']:.4f} |",
+            f"| $ на 30 ситуаций | {m['cost_usd_per_30']:.2f} |",
+            f"| Ситуаций с ошибкой модели | {m['with_errors']} из {m['situations']} |",
+            "",
+            "Время — сумма вызовов на ситуацию (агент владельца + агент получателя), по прайсу "
+            "из `backend/app/ai/llm/pricing.py`.",
+        ]
 
     cmp_ = report.get("comparison")
     lines += ["", "## Сравнение с прошлым отчётом", ""]
@@ -807,9 +867,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SituationError as exc:
         print(f"Ошибка набора: {exc}", file=sys.stderr)
         return 1
-    model = load_model(args.model)
+    try:
+        model = load_model(args.model)
+    except Exception as exc:  # понятная ошибка вместо трассы; отчёт не пишется
+        print(f"Модель {args.model} не загружена: {exc}", file=sys.stderr)
+        return 3
     label = _safe_label(args.label or f"{date.today().isoformat()}_{model.name}")
-    report = build_report(situations, model, label, args.situations)
+    try:
+        report = build_report(situations, model, label, args.situations)
+    except Exception as exc:
+        print(f"Прогон прерван ошибкой модели: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
 
     previous_path = None if args.no_compare else args.baseline or find_previous(args.out_dir, label)
     previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path else None
