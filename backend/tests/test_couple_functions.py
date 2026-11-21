@@ -30,14 +30,23 @@ def _sqlstate(exc: DBAPIError) -> str | None:
     return getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
 
 
-async def _user(engine: AsyncEngine, name: str) -> uuid.UUID:
-    """Пользователь с агентом и записью памяти (проверяем, что выход их не трогает)."""
+ONBOARDED = (
+    "consent_terms_at = now(), consent_data_at = now(), consent_sensitive_at = now(), "
+    "age_confirmed_at = now()"
+)
+
+
+async def _user(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> uuid.UUID:
+    """Пользователь с агентом и записью памяти (проверяем, что выход их не трогает).
+    По умолчанию прошёл онбординг: согласия и 18+ (ТЗ §4.1 п.2)."""
     uid, aid = uuid.uuid4(), uuid.uuid4()
     async with engine.begin() as conn:
         await conn.execute(
             text("INSERT INTO users (id, telegram_id, name) VALUES (:id, :tg, :n)"),
             {"id": uid, "tg": next(_tg), "n": name},
         )
+        if onboarded:
+            await conn.execute(text(f"UPDATE users SET {ONBOARDED} WHERE id = :u"), {"u": uid})
         await conn.execute(
             text("INSERT INTO agents (id, user_id) VALUES (:a, :u)"), {"a": aid, "u": uid}
         )
@@ -60,6 +69,34 @@ async def _fails(sm: SM, uid: uuid.UUID | None, code: str, sql: str, **params: o
     with pytest.raises(DBAPIError) as ei:
         await _call(sm, uid, sql, **params)
     assert _sqlstate(ei.value) == code, ei.value
+
+
+async def _wait_lock_waiters(engine: AsyncEngine, func: str, n: int) -> None:
+    """Ждёт, пока n сеансов с вызовом func встанут в ожидание блокировки.
+
+    AUTOCOMMIT: каждый опрос — своя транзакция, снимок pg_stat_activity свежий (ревью M1)."""
+    async with engine.connect() as conn:
+        watch = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        for _ in range(400):
+            waiting = await watch.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                    "AND wait_event_type = 'Lock' AND query LIKE :q"
+                ),
+                {"q": f"%{func}(%"},
+            )
+            if waiting.scalar_one() >= n:
+                return
+            await asyncio.sleep(0.025)
+    pytest.fail(f"{n} вызова {func} не дошли до блокировки")
+
+
+async def _try(sm: SM, uid: uuid.UUID, sql: str, **params: object) -> object:
+    """Результат вызова или SQLSTATE ошибки (для гонок)."""
+    try:
+        return await _call(sm, uid, sql, **params)
+    except DBAPIError as exc:
+        return _sqlstate(exc)
 
 
 async def _pending(
@@ -251,31 +288,17 @@ async def test_concurrent_accepts_one_wins(sessionmaker: SM, engine: AsyncEngine
     _, couple, token = await _pending(sessionmaker, engine)
     first, second = await _user(engine, "Ася"), await _user(engine, "Тимур")
 
-    async def attempt(uid: uuid.UUID) -> object:
-        try:
-            return await _call(sessionmaker, uid, ACCEPT, h=token)
-        except DBAPIError as exc:
-            return _sqlstate(exc)
-
     async with engine.connect() as holder:
         await holder.execute(
             text("SELECT 1 FROM invites WHERE token_hash = :h FOR UPDATE"), {"h": token}
         )
-        tasks = asyncio.gather(attempt(first), attempt(second))
-        async with engine.connect() as watch:
-            for _ in range(200):
-                waiting = await watch.execute(
-                    text(
-                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
-                        "AND wait_event_type = 'Lock' AND query LIKE '%app_accept_invite%'"
-                    )
-                )
-                if waiting.scalar_one() >= 2:
-                    break
-                await asyncio.sleep(0.05)
-            else:
-                pytest.fail("обе попытки не дошли до блокировки")
-        await holder.rollback()
+        tasks = asyncio.gather(
+            _try(sessionmaker, first, ACCEPT, h=token), _try(sessionmaker, second, ACCEPT, h=token)
+        )
+        try:
+            await _wait_lock_waiters(engine, "app_accept_invite", 2)
+        finally:
+            await holder.rollback()
         results = await tasks
     assert sorted(map(str, results)) == sorted([str(couple), "FB003"])
     winner = first if results[0] == couple else second
@@ -356,6 +379,152 @@ async def test_leave_does_not_touch_other_couples(sessionmaker: SM, engine: Asyn
     c = await _row(engine, "SELECT status FROM couples WHERE id = :c", c=other_couple)
     inv = await _row(engine, "SELECT status FROM invites WHERE token_hash = :h", h=other_token)
     assert c["status"] == "pending" and inv["status"] == "active"
+
+
+# --- Раунд 1 ревью 0.7b: миграция 0003 ------------------------------------------------------
+
+
+@pytest.mark.parametrize("h", [None, b"", b"short", b"x" * 33])
+async def test_accept_rejects_bad_hash(
+    sessionmaker: SM, engine: AsyncEngine, h: bytes | None
+) -> None:
+    """n5 / A8 D-2: хеш токена проверяется так же, как в app_issue_invite."""
+    await _fails(sessionmaker, await _user(engine, "Ада"), "22023", ACCEPT, h=h)
+
+
+@pytest.mark.parametrize(
+    ("sql", "params"),
+    [
+        ("SELECT app_create_couple()", {}),
+        (ISSUE, {"h": b"i" * 32}),
+        (ACCEPT, {"h": b"a" * 32}),
+        (LEAVE, {}),
+    ],
+)
+async def test_unknown_or_deleted_user_rejected(
+    sessionmaker: SM, engine: AsyncEngine, sql: str, params: dict[str, object]
+) -> None:
+    """A8 D-3: несуществующий или удалённый app.user_id — 42501, а не ошибка FK."""
+    deleted = await _user(engine, "Удалённый")
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE users SET deleted_at = now() WHERE id = :u"), {"u": deleted}
+        )
+    for uid in (uuid.uuid4(), deleted):
+        await _fails(sessionmaker, uid, "42501", sql, **params)
+
+
+@pytest.mark.parametrize(
+    "missing", ["consent_terms_at", "consent_data_at", "consent_sensitive_at", "age_confirmed_at"]
+)
+async def test_onboarding_required_to_create_or_join(
+    sessionmaker: SM, engine: AsyncEngine, missing: str
+) -> None:
+    """n1: ТЗ §4.1 п.2, п.4, §9.3 — пару создаёт и принимает приглашение только прошедший
+    онбординг (все согласия и 18+); иначе FB008, ничего не меняется."""
+    _, couple, token = await _pending(sessionmaker, engine)
+    newbie = await _user(engine, "Новичок")
+    async with engine.begin() as conn:
+        await conn.execute(text(f"UPDATE users SET {missing} = NULL WHERE id = :u"), {"u": newbie})
+    await _fails(sessionmaker, newbie, "FB008", ACCEPT, h=token)
+    await _fails(sessionmaker, newbie, "FB008", "SELECT app_create_couple()")
+    inv = await _row(engine, "SELECT status FROM invites WHERE token_hash = :h", h=token)
+    assert inv["status"] == "active"
+    assert len(await _members(engine, couple)) == 1
+    n = await _row(engine, "SELECT count(*) AS n FROM couple_members WHERE user_id = :u", u=newbie)
+    assert n["n"] == 0
+
+
+async def test_leave_allowed_without_onboarding(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Выйти из пары можно и после отзыва подтверждения 18+ (выход не требует онбординга)."""
+    uid, couple, _ = await _pending(sessionmaker, engine)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE users SET age_confirmed_at = NULL WHERE id = :u"), {"u": uid}
+        )
+    assert await _call(sessionmaker, uid, LEAVE) == couple
+
+
+async def test_leave_writes_audit_without_texts(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """n2: в audit_log видно, кто вышел (ТЗ §7: кто, действие, объект, время), без текстов."""
+    _, couple, token = await _pending(sessionmaker, engine)
+    partner = await _user(engine, "Ник")
+    await _call(sessionmaker, partner, ACCEPT, h=token)
+    await _call(sessionmaker, partner, LEAVE)
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT actor_id, action, object_type, object_id FROM audit_log "
+                    "WHERE object_id = :c"
+                ),
+                {"c": couple},
+            )
+        ).all()
+        cols = await conn.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'audit_log'"
+            )
+        )
+        assert {c[0] for c in cols} == {
+            "id",
+            "actor_id",
+            "action",
+            "object_type",
+            "object_id",
+            "created_at",
+        }
+    assert [tuple(r) for r in rows] == [(partner, "couple.leave", "couple", couple)]
+
+
+async def test_concurrent_leaves_second_gets_fb007(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """n3: оба партнёра выходят одновременно — успешен один, второй получает FB007;
+    dissolved_at не перезаписывается, в журнале одна запись."""
+    initiator, couple, token = await _pending(sessionmaker, engine)
+    partner = await _user(engine, "Ник")
+    await _call(sessionmaker, partner, ACCEPT, h=token)
+    async with engine.connect() as holder:
+        await holder.execute(text("SELECT 1 FROM couples WHERE id = :c FOR UPDATE"), {"c": couple})
+        tasks = asyncio.gather(
+            _try(sessionmaker, initiator, LEAVE), _try(sessionmaker, partner, LEAVE)
+        )
+        try:
+            await _wait_lock_waiters(engine, "app_leave_couple", 2)
+        finally:
+            await holder.rollback()
+        results = await tasks
+    assert sorted(map(str, results)) == sorted([str(couple), "FB007"])
+    c = await _row(engine, "SELECT dissolved_at, now() AS now FROM couples WHERE id = :c", c=couple)
+    audit = await _row(
+        engine,
+        "SELECT count(*) AS n, max(created_at) AS at FROM audit_log "
+        "WHERE object_id = :c AND action = 'couple.leave'",
+        c=couple,
+    )
+    assert audit["n"] == 1
+    assert c["dissolved_at"] == audit["at"]  # одна транзакция выхода — одно now()
+
+
+async def test_concurrent_create_and_accept_same_user(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """n7: app_create_couple блокирует строку пользователя, как и принятие приглашения;
+    одновременное принятие тем же пользователем получает FB005, а не 23505."""
+    _, couple, token = await _pending(sessionmaker, engine)
+    user = await _user(engine, "Двойной")
+    async with engine.connect() as holder:
+        await holder.execute(text("SELECT 1 FROM users WHERE id = :u FOR UPDATE"), {"u": user})
+        create = asyncio.ensure_future(_try(sessionmaker, user, "SELECT app_create_couple()"))
+        try:
+            await _wait_lock_waiters(engine, "app_create_couple", 1)
+            accept = asyncio.ensure_future(_try(sessionmaker, user, ACCEPT, h=token))
+            await _wait_lock_waiters(engine, "app_accept_invite", 1)
+        finally:
+            await holder.rollback()
+        created, accepted = await create, await accept
+    assert isinstance(created, uuid.UUID) and created != couple
+    assert accepted == "FB005"
+    assert len(await _members(engine, couple)) == 1
 
 
 # --- Права ------------------------------------------------------------------------------------
