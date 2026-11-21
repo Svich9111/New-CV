@@ -1,16 +1,19 @@
 // Проверка прототипа 0.6 (Playwright, Chromium). Запуск: node frontend/prototype/check.mjs
-// Что проверяется — критерии карточки docs/tasks/0.6.md.
+// Что проверяется — критерии карточки docs/tasks/0.6.md и замечания раунда 1 (docs/reviews/0.6-*.md).
+// Скриншоты по умолчанию пишутся во временный каталог; в закоммиченный screens/ — только с флагом --update-screens.
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright");
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const URL = pathToFileURL(join(HERE, "index.html")).href;
-const SHOTS = join(HERE, "screens");
+const UPDATE_SCREENS = process.argv.includes("--update-screens");
+const SHOTS = UPDATE_SCREENS ? join(HERE, "screens") : mkdtempSync(join(tmpdir(), "proto-0.6-screens-"));
 mkdirSync(SHOTS, { recursive: true });
 
 const SCREENS = ["welcome", "onboarding", "invite", "home", "chat", "draft", "messages", "memory", "profile", "subscription", "help"];
@@ -45,7 +48,10 @@ async function newPage(width = 375, colorScheme = "light") {
 const H = (page) => ({
   screen: () => page.locator("#content").getAttribute("data-current"),
   main: () => page.locator("#tg-main"),
-  clickMain: async () => { await page.locator("#tg-main").click(); },
+  // Дождаться конца защиты от двойного касания и вернуть «настоящую» недоступность кнопки
+  disabled: () => page.locator("#tg-main").isDisabled(),
+  // Для «Отправить»/«Оплатить» дождаться конца защиты от двойного касания (как сделал бы человек)
+  clickMain: async () => { await page.waitForFunction(() => !document.querySelector("#tg-main[data-guard]")); await page.locator("#tg-main").click(); },
   persona: async (p) => { await page.click(`[data-persona="${p}"]`); },
   jump: async (s) => { await page.selectOption("#jump", s); },
   back: async () => { await page.click("#tg-back"); },
@@ -168,10 +174,10 @@ await step("3. Ключевой сценарий «Анна и Игорь» (Т�
 
   // Онбординг
   ok((await h.screen()) === "onboarding", "Онбординг");
-  ok(await h.main().isDisabled(), "без согласий MainButton недоступна");
+  ok(await h.disabled(), "без согласий MainButton недоступна");
   ok(/отметь все четыре/.test(await page.locator("#tg-main-hint").innerText()), "недоступность пояснена подписью, а не только цветом");
   await onboard(page);
-  ok(!(await h.main().isDisabled()), "после согласий и 18+ — доступна");
+  ok(!(await h.disabled()), "после согласий и 18+ — доступна");
   await h.clickMain();
 
   // Приглашение
@@ -186,7 +192,7 @@ await step("3. Ключевой сценарий «Анна и Игорь» (Т�
 
   // До принятия приглашения отправка недоступна (§4.1 п.5)
   await h.jump("draft");
-  ok(await h.main().isDisabled(), "черновик до создания пары: «Отправить» недоступна");
+  ok(await h.disabled(), "черновик до создания пары: «Отправить» недоступна");
   ok(/примет приглашение/.test(await page.locator("#tg-main-hint").innerText()), "с подписью почему");
   await h.back();
 
@@ -296,7 +302,7 @@ await step("3. Ключевой сценарий «Анна и Игорь» (Т�
 
   // Память Игоря получила запись только из одобренного сообщения
   await h.jump("memory");
-  ok(/просила предупреждать/.test(await page.locator("#content").innerText()), "память Игоря: запись из одобренного сообщения Ани (ФТ-14)");
+  ok(/Аня просит предупреждать заранее/.test(await page.locator("#content").innerText()), "память Игоря: запись из одобренного сообщения Ани (ФТ-14)");
   ok(/Партнёр этого не видит/.test(await page.locator("[data-private-note]").innerText()), "пояснение «партнёр этого не видит»");
   ok(!/плевать/.test(await page.locator("#content").innerText()), "в памяти Игоря нет слов из личного чата Ани");
 
@@ -358,8 +364,236 @@ await step("6. Тёмная тема: prefers-color-scheme и переключа
   await page.context().close();
 });
 
+// ---------- Общая подготовка: пара создана ----------
+async function setupPair(page) {
+  const h = H(page);
+  await h.clickMain(); await h.clickMain(); await h.clickMain();
+  await onboard(page); await h.clickMain();
+  await h.persona("igor"); await h.clickMain(); await onboard(page); await h.clickMain();
+  await h.persona("anna");
+  await page.click('[data-action="to-home"]');
+}
+// Анна отправляет: "v1edit" — вариант 1 + пример правки; "v2" — вариант 2; иначе — свой текст целиком
+async function annaSends(page, mode) {
+  const h = H(page);
+  await h.persona("anna");
+  await h.jump("draft");
+  if (mode === "v2") await page.click('[data-action="variant"]');
+  else if (mode === "v1edit") await page.click('[data-action="example-edit"]');
+  else if (mode !== "v1") await page.fill("#draft-text", mode);
+  const sent = await page.inputValue("#draft-text");
+  await h.clickMain();
+  return sent;
+}
+// Весь текст, который видит Игорь: главный, лента (с оригиналом), чат после «Ответить с агентом»,
+// оба варианта черновика ответа, память, остальные экраны
+async function everythingIgorSees(page) {
+  const h = H(page);
+  const texts = [];
+  const grab = async () => texts.push(await page.locator("#phone").innerText());
+  await h.persona("igor");
+  await h.jump("home"); await grab();
+  await h.jump("messages");
+  const show = page.getByRole("button", { name: "Показать оригинал" });
+  if (await show.count()) await show.first().click();
+  await grab();
+  await page.getByRole("button", { name: "Ответить с агентом" }).first().click();
+  await page.click('[data-action="suggest"]');
+  await page.click('[data-action="send-agent"]');
+  await page.waitForFunction(() => !document.querySelector("[data-typing]"));
+  await grab();
+  await h.clickMain();
+  await grab();
+  await page.click('[data-action="variant"]');
+  await grab();
+  for (const s of ["memory", "profile", "subscription", "help", "invite"]) { await h.jump(s); await grab(); }
+  return texts.join("\n");
+}
+// Слова, которые есть только в личном чате и памяти Анны (её агент и её записи), — у Игоря их быть не должно
+const ANNA_PRIVATE = ["плевать", "обидно", "обид", "задел", "не замечают", "первом месте", "ценн", "дизайнер", "вторник", "годовщин", "поздно вечером", "третий раз за месяц", "за час до встречи", "главная"];
+
+await step("8. M1: адаптация меняет только заданные фразы — факты, отрицания, просьбы и «люблю» не трогаются (§2 п.3, §6.2 п.5)", async () => {
+  const page = await newPage(375);
+  const keep = [
+    "Ты никогда не предупреждаешь заранее.",
+    "Я всегда тебя жду и всегда тебя люблю.",
+    "Тебе плевать на меня.",
+    "Ему плевать на меня.",
+    "Я никогда не думала, что ты уйдёшь. Пожалуйста, предупреждай заранее.",
+    "Ты вечно занят, а я тебя люблю.",
+    "Мы встречаемся в субботу в 19:00 у кафе на Садовой.",
+  ];
+  for (const t of keep) {
+    const r = await page.evaluate((t) => window.ChuvstvaProto.adaptText(t), t);
+    ok(r.text === t && !r.adapted, `без изменений: «${t}»`);
+  }
+  const r = await page.evaluate(() => window.ChuvstvaProto.adaptText(
+    "Я тебя люблю и всегда жду. Ты вечно всё отменяешь в последний момент. Пожалуйста, предупреждай заранее — в пятницу в 19:00."));
+  ok(r.adapted && !/вечно всё отменяешь/.test(r.text), "заданная фраза смягчена");
+  ok(r.text.startsWith("Я тебя люблю и всегда жду.") && r.text.endsWith("Пожалуйста, предупреждай заранее — в пятницу в 19:00."), "соседние «люблю», «всегда», просьба и время — слово в слово");
+  ok(/отмены в последний момент/.test(r.text), "факт (отмены в последний момент) сохранён в смягчённой фразе");
+  const r2 = await page.evaluate(() => window.ChuvstvaProto.adaptText("Ты опять меня не слышишь. Мне это важно."));
+  ok(r2.adapted && r2.text === "Мне кажется, сейчас ты меня не слышишь. Мне это важно.", "вторая заданная фраза смягчается без родовых окончаний");
+
+  // Через интерфейс: резкий, но незаданный текст доходит как есть и подсказка ничего не обещает (m8)
+  await setupPair(page);
+  const h = H(page);
+  await h.jump("draft");
+  const harsh = "Ты никогда не предупреждаешь заранее. Я всегда тебя жду и всегда тебя люблю. Тебе плевать на меня.";
+  await page.fill("#draft-text", harsh);
+  ok((await page.locator("[data-harsh-hint]").count()) === 0, "m8: для фраз без заданного смягчения подсказка не обещает смягчения");
+  await h.clickMain();
+  await h.persona("igor"); await h.jump("messages");
+  const card = page.locator('[data-msg="incoming"]');
+  ok((await card.locator("[data-delivered]").innerText()) === harsh, "Игорю доставлено слово в слово");
+  ok((await card.locator(".badge").innerText()).includes("без изменений") && (await card.locator("[data-adapted]").count()) === 0, "пометка «без изменений», не «адаптировано»");
+  ok(!/сохранены/.test(await card.innerText()), "нет ложного «смысл сохранён»");
+  await page.context().close();
+});
+
+await step("9. M2/M3: агент Игоря пересказывает только отправленное; личный чат и память Анны не видны Игорю нигде (§2 п.4, §6.2, §9.2)", async () => {
+  for (const mode of ["v1edit", "v2", "Привет. Давай поговорим вечером о выходных."]) {
+    const page = await newPage(375);
+    const h = H(page);
+    await setupPair(page);
+    // Анна сначала исповедуется своему агенту
+    await page.click('[data-action="go"][data-to="chat"]');
+    await page.click('[data-action="suggest"]'); await page.click('[data-action="send-agent"]');
+    await page.waitForFunction(() => document.querySelectorAll('#content .msg[data-from="agent"]').length === 2);
+    await page.click('[data-action="suggest"]'); await page.click('[data-action="send-agent"]');
+    await page.waitForSelector("[data-options]");
+    const sent = await annaSends(page, mode);
+    const all = await everythingIgorSees(page);
+    const leaked = ANNA_PRIVATE.filter((w) => all.toLowerCase().includes(w) && !sent.toLowerCase().includes(w));
+    const label = mode.length > 8 ? "свой текст" : mode;
+    ok(leaked.length === 0, `${label}: у Игоря нет слов из личного чата и памяти Анны` + (leaked.length ? ": " + leaked.join(", ") : ""));
+    await h.jump("chat");
+    const recap = await page.locator('#content .msg[data-from="agent"]').filter({ hasText: "Аня прислала тебе сообщение" }).first().innerText();
+    // Основы слов: пересказ может менять форму («выберем» → «выбрать»), но не добавлять содержание
+    const claims = ["грустн", "одинок", "проводить", "предупрежд", "вечер на выходных", "этой неделе", "три раза", "отмен", "сорвал", "скуча"];
+    const invented = claims.filter((w) => recap.includes(w) && !sent.includes(w));
+    ok(invented.length === 0, `${label}: пересказ агента Игоря — только из отправленного` + (invented.length ? ": " + invented.join(", ") : ""));
+    if (label === "свой текст") ok(/Пересказывать его своими словами не буду/.test(recap), "неизвестный текст: агент не додумывает, предлагает прочитать слова Ани");
+    await page.context().close();
+  }
+});
+
+await step("10. M4: двойное касание MainButton не перескакивает через черновик и не отправляет дважды (§2 п.2)", async () => {
+  const page = await newPage(375);
+  const h = H(page);
+  await setupPair(page);
+  await page.click('[data-action="go"][data-to="chat"]');
+  await page.click('[data-action="suggest"]'); await page.click('[data-action="send-agent"]');
+  await page.waitForFunction(() => document.querySelectorAll('#content .msg[data-from="agent"]').length === 2);
+  await page.dblclick("#tg-main");
+  ok((await h.screen()) === "draft", "двойное касание «Подготовить сообщение» → остаёмся на «Черновике»");
+  ok(!(await page.locator("#tg-main").isDisabled()), "«Отправить» не мигает серым — защита невидима");
+  await page.waitForFunction(() => !document.querySelector("#tg-main[data-guard]"));
+  await page.locator("#tg-main").click({ clickCount: 3, delay: 40 });
+  const sentCount = await page.evaluate(() => document.querySelectorAll('[data-msg="sent"]').length);
+  ok((await h.screen()) === "messages" && sentCount === 1, "тройное касание «Отправить» — ровно одно сообщение");
+  await h.persona("igor"); await h.jump("messages");
+  ok((await page.locator('[data-msg="incoming"]').count()) === 1, "у Игоря ровно одно входящее");
+  // Двойное касание без пары: черновик и никакой отправки
+  const p2 = await newPage(375);
+  const h2 = H(p2);
+  await h2.clickMain(); await h2.clickMain(); await h2.clickMain(); await onboard(p2); await h2.clickMain();
+  await p2.click('[data-action="to-home"]');
+  await p2.dblclick("#tg-main");
+  ok((await h2.screen()) === "chat", "двойное касание «Поговорить с агентом» → чат, дальше не проваливается");
+  await page.context().close(); await p2.context().close();
+});
+
+await step("11. Исправления MINOR: m1/D-4, m3, m4, m5, m6, D-1, D-2, D-5, t1", async () => {
+  const page = await newPage(375);
+  const h = H(page);
+  // m5: до создания пары — ни «Осталось 7 дней», ни оплаты, ни «без лимита»
+  await h.clickMain(); await h.clickMain(); await h.clickMain(); await onboard(page); await h.clickMain();
+  await h.jump("subscription");
+  const sub = await page.locator("#content").innerText();
+  ok(!/Осталось/.test(sub) && /начнётся, когда пара будет создана/.test(sub), "m5: до пары пробный период не идёт — подписано словами");
+  ok(!(await h.main().isVisible()) && (await page.locator(".plan").count()) === 0, "m5: до пары оплаты нет");
+  ok(!/без дневного лимита/.test(sub), "m5: нет «без дневного лимита» (§10)");
+  await page.context().close();
+
+  const p = await newPage(375);
+  const g = H(p);
+  await setupPair(p);
+  await g.jump("subscription");
+  ok(/осталось 7 дней/.test(await p.locator("#content").innerText()) && (await g.main().isVisible()), "m5: после создания пары — пробный период и оплата");
+  // m4: «Помощь» из чата в один шаг, номера — tel:
+  await g.jump("chat");
+  await p.getByRole("button", { name: /Помощь/ }).click();
+  ok((await g.screen()) === "help", "m4: из чата в «Помощь» одним нажатием");
+  const tels = await p.locator('a.contact__phone[href^="tel:"]').count();
+  ok(tels === 3, "m4: номера помощи — ссылки tel: (" + tels + ")");
+  // m6: «Другой вариант» после правки — с подтверждением
+  await g.jump("draft");
+  await p.locator("#draft-text").press("Control+End");
+  await p.keyboard.type(" Моя приписка.");
+  await p.click('[data-action="variant"]');
+  ok(await p.locator("[data-confirm-variant]").isVisible(), "m6: после правки «Другой вариант» спрашивает подтверждение");
+  await p.click('[data-action="variant-cancel"]');
+  ok((await p.inputValue("#draft-text")).endsWith("Моя приписка."), "m6: «Оставить мой текст» сохраняет правку");
+  await p.click('[data-action="variant"]'); await p.click('[data-action="variant-confirm"]');
+  ok((await p.locator("#draft-meta").innerText()).startsWith("Вариант 2 из 2"), "m6: «Заменить» подставляет новый вариант");
+  await p.click('[data-action="variant"]');
+  ok((await p.locator("#draft-meta").innerText()).startsWith("Вариант 1 из 2"), "m6: без правки подтверждение не нужно");
+  // m3: изменённое выделено в доставленном тексте и в оригинале
+  await p.click('[data-action="example-edit"]');
+  await g.clickMain();
+  await g.persona("igor"); await g.jump("messages");
+  const card = p.locator('[data-msg="incoming"]');
+  ok((await card.locator("[data-delivered] mark.changed").count()) === 1, "m3: в доставленном тексте выделена изменённая фраза");
+  ok(/фраз: 1/.test(await card.locator("[data-what-changed]").innerText()), "m3: подписано, что изменено и сколько");
+  await card.getByRole("button", { name: "Показать оригинал" }).click();
+  ok((await card.locator("[data-original] mark.changed").innerText()).includes("Ты вечно всё отменяешь"), "m3: в оригинале выделено, что было");
+  const markBg = await card.locator("mark.changed").first().evaluate((el) => getComputedStyle(el).backgroundColor);
+  ok(markBg !== ACCENT, "m3: выделение не красное");
+  // t1: после сценария — без горизонтальной прокрутки и лишнего красного, в обеих темах
+  for (const theme of ["light", "dark"]) {
+    await p.click(`[data-theme-set="${theme}"]`);
+    for (const persona of ["igor", "anna"]) {
+      await g.persona(persona);
+      for (const s of ["home", "messages", "chat", "memory"]) {
+        await g.jump(s);
+        const bad = await accentViolations(p);
+        ok((await g.noHScroll()) && bad.length === 0, `t1 ${theme}/${persona}/${s}: без прокрутки и лишнего красного` + (bad.length ? ": " + bad.join(", ") : ""));
+      }
+    }
+  }
+  // D-1: «непрочитанное» — текст цветом --text, красные только точка и рамка
+  await p.click('[data-theme-set="dark"]');
+  const p3 = await newPage(375, "dark");
+  const g3 = H(p3);
+  await setupPair(p3); await annaSends(p3, "v1"); await g3.persona("igor"); await g3.jump("home");
+  const badge = await p3.locator("[data-unread]").evaluate((el) => { const cs = getComputedStyle(el); return [cs.color, cs.borderTopColor]; });
+  ok(badge[0] === "rgb(255, 255, 255)" && badge[1] === ACCENT, "D-1: текст метки белый в тёмной теме, рамка красная");
+  // m1/D-4: память Анны из ответа Игоря — без искажений и с верным родом
+  await g3.jump("messages");
+  await p3.getByRole("button", { name: "Ответить с агентом" }).click();
+  await g3.clickMain();
+  await g3.clickMain();
+  await g3.persona("anna"); await g3.jump("memory");
+  const mem = await p3.locator("#content").innerText();
+  ok(/Игорь обещал сказать заранее/.test(mem) && !/Игорь просил/.test(mem) && !/ей важно/.test(mem), "D-4: память Анны передаёт смысл ответа Игоря (обещал, не «просил»)");
+  // D-2: при открытом диалоге «Назад» доступна и закрывает его
+  await g3.jump("profile");
+  await p3.click('[data-action="sheet"][data-sheet="leave"]');
+  await g3.back();
+  ok((await p3.locator(".sheet-backdrop").count()) === 0 && (await g3.screen()) === "profile", "D-2: «Назад» закрывает диалог");
+  // D-5: переключатели названы по смыслу
+  const names = await p3.getByRole("switch").evaluateAll((els) => els.map((e) => e.getAttribute("aria-label")));
+  ok(names.join("|") === "Новые сообщения от партнёра|Статус подписки", "D-5: доступные имена переключателей");
+  // m7: «Закрыть» — одна строка
+  await g3.jump("home");
+  const closeH = await p3.evaluate(() => { const b = document.getElementById("tg-close"); return b.hidden ? 0 : b.getBoundingClientRect().height; });
+  ok(closeH === 0 || closeH <= 44, "m7: кнопка «Закрыть» в шапке не переносится");
+  await p.context().close(); await p3.context().close();
+});
+
 // ---------- 7. Скриншоты ----------
-await step("7. Скриншоты светлой и тёмной темы → frontend/prototype/screens/", async () => {
+await step("7. Скриншоты светлой и тёмной темы → " + (UPDATE_SCREENS ? "frontend/prototype/screens/" : SHOTS + " (для обновления screens/ — флаг --update-screens)"), async () => {
   let count = 0;
   for (const scheme of ["light", "dark"]) {
     const page = await newPage(375, scheme);
