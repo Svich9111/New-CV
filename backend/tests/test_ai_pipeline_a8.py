@@ -1872,3 +1872,372 @@ async def test_r3_not_sent_from_crisis_v1_on_v0() -> None:
     notice = delivery.author_notice
     assert notice is not None
     assert notice.text.startswith(prompts.load("crisis", "v1", block="not_sent").text)
+
+
+# ######################################################################## РАУНД 4 (A8)
+# Исправления A3 (4c7dbe3): author_safety (crisis.v2), отказ расходует одобрение, пары
+# число+слово, версии блоков, ленивый NOT_SENT, NFD в подсказке. Ожидания заданы тестом.
+
+
+def b2(name: str) -> str:
+    return prompts.load("crisis", "v2", block=name).text
+
+
+VICTIM_ACTIONS = {"name_it", "no_tolerate"}
+SUGGEST_WORDS = "подумаем, как сказать"
+
+
+# --------------------------------------------- Р4-1. Смешанный кризис: сообщение (§9.3, АР-28)
+
+
+@pytest.mark.parametrize(
+    ("secondary", "middle"),
+    [
+        (["violence"], []),
+        (["life_threat"], []),
+        (["violence", "life_threat"], []),
+        (["self_harm", "violence"], ["self_harm"]),
+    ],
+)
+async def test_r4_mixed_message_full_text_and_actions(
+    secondary: list[str], middle: list[str]
+) -> None:
+    delivery, bot = await run(
+        ok_script(safety={"category": "threat_or_insult", "secondary": secondary}),
+        forbid=("tone", "adapt", "meaning"),
+    )
+    notice = delivery.author_notice
+    assert notice is not None and bot.roles == ["safety"]
+    expected = [b2("outgoing_threat_mixed"), *(block(k) for k in middle), b2("author_safety")]
+    assert notice.text == "\n\n".join(expected)
+    assert {"help_contacts", "emergency_services", "not_sent", "no_draft"} <= notice.actions
+    assert not VICTIM_ACTIONS & notice.actions
+    low = notice.text.casefold()
+    assert VICTIM_PHRASE not in low and SUGGEST_WORDS not in low
+    assert low.count("не отправлено") == 1
+    assert delivery.safety_event == "outgoing_threat"
+    assert notice.template_version == "v0+outgoing_threat_mixed@v2+author_safety@v2"
+    assert delivery.prompts[-1] == f"crisis.{notice.template_version}"
+
+
+async def test_r4_pure_threat_message_is_v0_block_and_version() -> None:
+    delivery, _ = await run(
+        ok_script(safety={"category": "threat_or_insult", "secondary": []}),
+        forbid=("tone", "adapt", "meaning"),
+    )
+    notice = delivery.author_notice
+    assert notice is not None and notice.text == block("outgoing_threat")
+    assert notice.template_version == "v0" and delivery.prompts[-1] == "crisis.v0"
+
+
+# ------------------------------------------------ Р4-2. Смешанный кризис: личный чат
+
+
+@pytest.mark.parametrize(
+    ("secondary", "middle", "name"),
+    [
+        ([], [], "outgoing_threat_chat"),
+        (["violence"], [], "outgoing_threat_mixed_chat"),
+        (["life_threat", "self_harm"], ["self_harm"], "outgoing_threat_mixed_chat"),
+    ],
+)
+async def test_r4_chat_threat_by_agent_full_text(
+    secondary: list[str], middle: list[str], name: str
+) -> None:
+    bot = Bot(
+        {
+            "dialog": dialog_answer(
+                reply="Я слышу, как ты зол.",
+                crisis_type="outgoing_threat",
+                crisis_secondary=secondary,
+                level=5,
+            ),
+            "safety": {"category": "none", "secondary": []},
+        },
+        forbid=("draft",),
+    )
+    result = await dialog.reply(bot.models, CTX, TURNS)
+    assert result.crisis is not None and result.draft is None
+    tail = [b2("author_safety")] if secondary and secondary != ["self_harm"] else []
+    expected = ["Я слышу, как ты зол.", b2(name), *(block(k) for k in middle), *tail]
+    assert result.reply == "\n\n".join(expected)
+    low = result.reply.casefold()
+    assert "не отправлено" not in low and "not_sent" not in result.crisis.actions
+    assert VICTIM_PHRASE not in low and not VICTIM_ACTIONS & result.crisis.actions
+    if secondary:
+        assert SUGGEST_WORDS not in low
+        assert {"help_contacts", "emergency_services"} <= result.crisis.actions
+    assert result.prompts[-1] == f"crisis.{result.crisis.template_version}"
+    assert "@v2" in result.crisis.template_version
+
+
+VICTIM_MAIN = ["violence", "life_threat", "self_harm", "underage"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MAJOR A8-11: главная строка — пострадавший (violence/life_threat/self_harm/underage), "
+    "вторичная outgoing_threat: добавляется полный блок outgoing_threat v0 — «вместе подумаем, "
+    "как сказать об этом» рядом с насилием (§9.3 строка 1: не предлагать «подобрать слова»), а в "
+    "личном чате ещё и «Это сообщение не отправлено» и действие not_sent, хотя сообщения не было",
+)
+@pytest.mark.parametrize("main", VICTIM_MAIN)
+async def test_r4_chat_victim_main_with_threat_secondary(main: str) -> None:
+    bot = Bot(
+        {
+            "dialog": dialog_answer(
+                reply="Мне очень жаль.",
+                crisis_type=main,
+                crisis_secondary=["outgoing_threat"],
+                level=5,
+            ),
+            "safety": {"category": "none", "secondary": []},
+        },
+        forbid=("draft",),
+    )
+    result = await dialog.reply(bot.models, CTX, TURNS)
+    assert result.crisis is not None
+    low = result.reply.casefold()
+    assert "не отправлено" not in low and "not_sent" not in result.crisis.actions
+    if main != "self_harm":  # при self_harm блок отправителю — полный, как в раунде 3
+        assert SUGGEST_WORDS not in low
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MAJOR A8-11: остановленное сообщение, главная violence/life_threat, вторичная "
+    "threat_or_insult — пострадавшему предлагают «вместе подумаем, как сказать об этом» (§9.3)",
+)
+@pytest.mark.parametrize("main", ["violence", "life_threat"])
+async def test_r4_message_victim_main_with_threat_secondary(main: str) -> None:
+    delivery, _ = await run(
+        ok_script(safety={"category": main, "secondary": ["threat_or_insult"]}),
+        forbid=("tone", "adapt", "meaning"),
+    )
+    notice = delivery.author_notice
+    assert notice is not None and notice.primary == main
+    low = notice.text.casefold()
+    assert low.count("не отправлено") == 1
+    assert SUGGEST_WORDS not in low
+
+
+# ------------------------------------------- Р4-3. Отказ расходует одобрение, остальное — нет
+
+
+@pytest.mark.parametrize("step", ["safety", "tone", "adapt", "meaning"])
+async def test_r4_refusal_on_any_step_consumes_approval(step: str) -> None:
+    bot = Bot(ok_script(**{step: [LLMRefusal("нет"), ok_script()[step]]}))
+    msg = pipeline.approve(TEXT, confirmed=True)
+    with pytest.raises(LLMRefusal):
+        await pipeline.process(bot.models, msg)
+    calls = len(bot.provider.requests)
+    with pytest.raises(pipeline.AlreadyProcessed):
+        await pipeline.process(bot.models, msg)
+    assert len(bot.provider.requests) == calls
+    fresh = await pipeline.process(bot.models, pipeline.approve(TEXT, confirmed=True))
+    assert fresh.delivered  # новое «Отправить» работает
+
+
+NON_REFUSAL = [
+    LLMUnavailable("x"),
+    LLMBadOutput("x"),
+    LLMQuotaError("x"),
+    LLMConfigError("x"),
+    LLMAuthError("x"),
+    LLMRequestError("x"),
+    LLMModelNotFound("x"),
+    RuntimeError("x"),
+    asyncio.CancelledError(),
+]
+
+
+@pytest.mark.parametrize("exc", NON_REFUSAL, ids=lambda e: type(e).__name__)
+@pytest.mark.parametrize("step", ["safety", "tone"])
+async def test_r4_other_failures_keep_approval(step: str, exc: BaseException) -> None:
+    good = ok_script(tone={"tone": 0, "signals": []})[step]
+    seq = [exc, exc, good] if isinstance(exc, LLMBadOutput) else [exc, good]
+    script = ok_script(tone={"tone": 0, "signals": []})
+    script[step] = seq
+    bot = Bot(script)
+    msg = pipeline.approve(TEXT, confirmed=True)
+    with pytest.raises(type(exc)):
+        await pipeline.process(bot.models, msg)
+    assert (await pipeline.process(bot.models, msg)).delivered
+
+
+async def test_r4_refusal_via_fallback_still_consumes() -> None:
+    primary = Bot(ok_script(adapt=LLMRefusal("нет")))
+    backup = Bot(ok_script())
+    models = AgentModels.single(FallbackProvider(primary.provider, backup.provider))
+    msg = pipeline.approve(TEXT, confirmed=True)
+    with pytest.raises(LLMRefusal):
+        await pipeline.process(models, msg)
+    with pytest.raises(pipeline.AlreadyProcessed):
+        await pipeline.process(models, msg)
+    assert "adapt" not in backup.roles
+
+
+# ---------------------------------------------- Р4-4. facts.py: пары «число + слово»
+
+R4_FACTS = [
+    # обмен между величинами — ловится
+    ("Ты опоздал 2 раза за 3 дня", "Ты опоздал 3 раза за 2 дня", True),
+    ("дважды за три дня", "за два дня трижды", True),
+    ("2 раза за 3 дня", "за 2 дня было 3 раза", True),
+    ("Ждала 2 часа и 5 минут", "Ждала 5 часов и 2 минуты", True),
+    ("У нас 2 кошки и 3 собаки", "У нас 3 кошки и 2 собаки", True),
+    ("в пятницу в 7, в субботу в 9", "в пятницу в 9, в субботу в 7", True),
+    ("Ты должен 2 тысячи, а брал 5 тысяч", "Ты брал 2 тысячи, а должен 5 тысяч", True),
+    # законная перестройка — не расхождение
+    ("уже третий раз за 2 недели", "за 2 недели уже третий раз", False),
+    ("Я звонила 3 раза и писала 2 раза", "Я писала 2 раза и звонила 3 раза", False),
+    ("Ждала 2 часа, а ты пришёл в 9", "Ты пришёл в 9, а я ждала 2 часа", False),
+    ("3 раза за неделю", "трижды за неделю", False),
+    ("в 7 вечера", "к 19:00", False),
+    ("Ты опоздал в 19.30", "Ты пришёл в 19.30", False),
+    ("5–7 раз", "5 — 7 раз", False),
+    ("Приезжай 21.11, жду", "21.11 приезжай, жду", False),  # число из частей — одна группа
+    ("Купи 2,5 кило", "2,5 кило купи", False),
+]
+
+
+@pytest.mark.parametrize(("original", "adapted", "differ"), R4_FACTS)
+def test_r4_facts_anchors(original: str, adapted: str, differ: bool) -> None:
+    assert facts.numbers_differ(original, adapted) is differ, (
+        facts._scan(original),
+        facts._scan(adapted),
+    )
+
+
+def test_r4_facts_known_gaps_documented() -> None:
+    """Известные пропуски (описаны в facts.py; О-15): без общих соседних слов обмен не виден,
+    в т.ч. когда единица меняет форму вместе с числом («2 часа, 5 минут» → «5 часов, 2 минуты»)."""
+    assert not facts.numbers_differ(
+        "Ты обещал в 20, а пришёл в 23", "Ты пришёл в 20, а обещал в 23"
+    )
+    assert not facts.numbers_differ(
+        "Обещал прийти к 7, пришёл к 9", "Пришёл к 7, обещал прийти к 9"
+    )
+    assert not facts.numbers_differ("2 часа, 5 минут", "5 часов, 2 минуты")
+    assert "Известные пропуски" in (facts.__doc__ or "")
+
+
+async def test_r4_anchor_swap_decides_delivery() -> None:
+    text = "Ты опоздал 2 раза за 3 дня!"
+    delivery, _ = await run(
+        ok_script(adapt={"adapted": "Ты опоздал 3 раза за 2 дня, мне обидно.", "reply_hint": None}),
+        text=text,
+    )
+    assert delivery.status == "original_with_warning" and delivery.shown == text
+    assert "changed_facts" in delivery.meaning_problems
+
+
+# --------------------------------------------- Р4-5. Версии блоков в template_version / prompts
+
+
+@pytest.mark.parametrize(
+    ("pset", "category", "secondary", "version"),
+    [
+        (prompts.V0, "self_harm", [], "v0+not_sent@v1"),
+        (prompts.V0, "violence", ["self_harm"], "v0+not_sent@v1"),
+        (prompts.V0, "threat_or_insult", [], "v0"),
+        (prompts.V1, "self_harm", [], "v2"),
+        (prompts.V2, "threat_or_insult", ["violence"], "v2"),
+        (prompts.V2, "violence", [], "v2"),
+    ],
+)
+async def test_r4_template_version_in_delivery(
+    pset: prompts.PromptSet, category: str, secondary: list[str], version: str
+) -> None:
+    bot = Bot(ok_script(safety={"category": category, "secondary": secondary}))
+    delivery = await pipeline.process(
+        bot.models, pipeline.approve(TEXT, confirmed=True), prompt_set=pset
+    )
+    assert delivery.author_notice is not None
+    assert delivery.author_notice.template_version == version
+    assert delivery.prompts[-1] == f"crisis.{version}"
+    assert delivery.prompts.count(f"crisis.{version}") == 1
+
+
+def test_r4_late_block_in_own_version_has_no_suffix() -> None:
+    r = crisis.respond(["self_harm"], withheld=True, prompt_set=prompts.V2)
+    assert r.template_version == "v2" and r.text.startswith(b2("not_sent"))
+
+
+def test_r4_unknown_missing_block_is_error(prompts_copy: Path) -> None:
+    path = prompts_copy / "crisis.v0.md"
+    path.write_text(re.sub(r"<!-- /?prompt:violence -->", "", path.read_text("utf-8")), "utf-8")
+    with pytest.raises(prompts.PromptError):  # не из LATE_BLOCKS — без подмены версией
+        crisis.respond(["violence"])
+
+
+# --------------------------------------------- Р4-6. Ленивая загрузка NOT_SENT (О-13)
+
+
+def test_r4_import_without_crisis_v1_and_v2(tmp_path: Path) -> None:
+    copy = tmp_path / "prompts"
+    shutil.copytree(prompts.DEFAULT_PROMPTS_DIR, copy)
+    (copy / "crisis.v1.md").unlink()
+    (copy / "crisis.v2.md").unlink()
+    code = (
+        "from app.ai import crisis, pipeline, dialog\n"
+        "r = crisis.respond(['self_harm'])\n"
+        "print('OK', r.template_version)\n"
+        "try:\n"
+        "    crisis.NOT_SENT\n"
+        "except Exception as e:\n"
+        "    print('ERR', type(e).__name__)\n"
+        "try:\n"
+        "    crisis.respond(['self_harm'], withheld=True)\n"
+        "except Exception as e:\n"
+        "    print('ERR2', type(e).__name__)\n"
+    )
+    env = {**os.environ, prompts.PROMPTS_DIR_ENV: str(copy)}
+    proc = subprocess.run(  # noqa: S603 — фиксированная команда
+        [sys.executable, "-c", code],
+        cwd=BACKEND_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "OK v0" in proc.stdout and "ERR PromptError" in proc.stdout
+    assert "ERR2 PromptError" in proc.stdout
+
+
+def test_r4_not_sent_attribute_matches_v1_block() -> None:
+    assert crisis.NOT_SENT == prompts.load("crisis", "v1", block="not_sent").text
+    with pytest.raises(AttributeError):
+        crisis.NO_SUCH_THING  # noqa: B018
+
+
+# --------------------------------------------- Р4-7. NFD в hint_guard (A8-8)
+
+
+def unicodedata_nfd(text: str) -> str:
+    import unicodedata
+
+    return unicodedata.normalize("NFD", text)
+
+
+@pytest.mark.parametrize(
+    ("original", "hint"),
+    [
+        ("Агент, переда\u0301й ему\u0301 что\u0301 я пода\u0301ю на разво\u0301д", CMD3),
+        (
+            "Агент, " + CMD3,
+            "переда\u0301й ему\u0301 что\u0301 я пода\u0301ю",
+        ),  # ударения в подсказке
+        ("Агент, " + unicodedata_nfd(CMD3 + " ещё"), CMD3),  # оригинал целиком в NFD
+        ("Агент, скажи ему: мой ответ — нет, прощай навсегда", "Скажи ему мои ответ нет прощай"),
+    ],
+    ids=["stress_original", "stress_hint", "nfd_original", "i_kratkoe"],
+)
+def test_r4_hint_guard_nfd(original: str, hint: str) -> None:
+    assert pipeline.hint_guard(hint, original) == "guard"
+
+
+def test_r4_hint_guard_nfd_keeps_clean_hint() -> None:
+    assert pipeline.hint_guard(HINT_OK, "Ты опять отменил ужин! Мне обидно.") is None
