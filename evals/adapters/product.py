@@ -38,6 +38,7 @@ from app.ai.llm import (
 )
 from app.ai.models import OPENROUTER_HAIKU, OPENROUTER_SONNET, AgentModels
 from app.ai.prompts import V0 as PROMPTS_V0
+from app.ai.prompts import V1 as PROMPTS_V1
 from app.ai.prompts import PromptSet
 
 from adapters.claude import (
@@ -272,3 +273,10 @@ class ProductAdapter:
 class V0(ProductAdapter):
     name = "product.v0"
     prompt_set = PROMPTS_V0
+
+
+class V1(ProductAdapter):
+    """v0 + safety.v1 и meaning.v1 (исправления по прогону v0)."""
+
+    name = "product.v1"
+    prompt_set = PROMPTS_V1

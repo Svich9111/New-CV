@@ -185,7 +185,12 @@ async def test_underage_category_on_message_is_not_a_pipeline_stop() -> None:
 
 
 async def test_meaning_mismatch_delivers_original_with_warning() -> None:
-    delivery, _ = await run_pipeline(base_answers(meaning={"problems": ["dropped_request"]}))
+    problem = {
+        "kind": "dropped_request",
+        "original_fragment": "предупреждай заранее",
+        "adapted_fragment": "",
+    }
+    delivery, _ = await run_pipeline(base_answers(meaning={"problems": [problem, problem]}))
     assert delivery.status == "original_with_warning"
     assert delivery.shown == ORIGINAL
     assert delivery.harsh_tone_warning and not delivery.is_adapted
@@ -248,6 +253,43 @@ async def test_json_not_by_schema_is_bad_output(step: str, bad: dict[str, Any]) 
         await pipeline.process(
             AgentModels.single(provider), pipeline.approve(ORIGINAL, confirmed=True)
         )
+
+
+@pytest.mark.parametrize(
+    "bad", [{"problems": ["lost"]}, {"problems": [{"kind": "lost"}]}, {"problems": 1}]
+)
+async def test_bad_meaning_json_degrades(bad: dict[str, Any]) -> None:
+    delivery, _ = await run_pipeline(base_answers(meaning=bad))
+    assert delivery.status == "original_with_warning"
+    assert delivery.degraded == "meaning:bad_output"
+
+
+@pytest.mark.parametrize(
+    ("prompt_set", "item"),
+    [
+        (prompts.V0, "dropped_request"),
+        (
+            prompts.V1,
+            {
+                "kind": "dropped_request",
+                "original_fragment": "предупреждай",
+                "adapted_fragment": "",
+            },
+        ),
+    ],
+)
+async def test_meaning_schema_by_prompt_version(prompt_set: prompts.PromptSet, item: Any) -> None:
+    provider = scripted(base_answers(meaning={"problems": [item]}))
+    delivery = await pipeline.process(
+        AgentModels.single(provider),
+        pipeline.approve(ORIGINAL, confirmed=True),
+        prompt_set=prompt_set,
+    )
+    assert delivery.meaning_problems == ("dropped_request",)
+    assert f"meaning.{prompt_set.meaning}" in delivery.prompts
+    assert f"safety.{prompt_set.safety}" in delivery.prompts
+    items = provider.requests[-1]["schema"]["properties"]["problems"]["items"]
+    assert items["type"] == ("string" if prompt_set is prompts.V0 else "object")
 
 
 async def test_bad_output_is_retried_once() -> None:

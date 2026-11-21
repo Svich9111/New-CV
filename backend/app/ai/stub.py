@@ -56,6 +56,7 @@ class ScriptedProvider:
                 "system": system,
                 "messages": [(m.role, m.content) for m in messages],
                 "max_tokens": max_tokens,
+                "schema": dict(schema),
             }
         )
         data = self.handler(role, payload, system)

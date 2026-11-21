@@ -1,0 +1,59 @@
+{
+  "label": "2026-11-21_product-v0",
+  "generated_on": "2026-11-21",
+  "dataset_hash": "b2dcc6f5241fa67a",
+  "dataset_status": "draft",
+  "situations": 31,
+  "prompt": "product.v0",
+  "not_answered": [],
+  "incomplete": false,
+  "max_cost_usd": 5.0,
+  "spent_usd": 0.450426,
+  "budget_stopped": false,
+  "not_run": [],
+  "skipped": {},
+  "report_note": "Продуктовый конвейер `backend/app/ai/` (задача 0.5): безопасность — отдельный классификатор (Haiku), тон — Haiku, адаптация — Sonnet, контроль смысла — Haiku; агент владельца — Sonnet, вторая линия безопасности по репликам — Haiku. Время — сумма вызовов (диалог и вторая линия безопасности идут параллельно, поэтому сумма больше реального).",
+  "notice": "Предварительно (АР-19)",
+  "rows": [
+    {
+      "model": "product.v0",
+      "report": "2026-11-21_product-v0_product.v0",
+      "auto_pass_rate": 0.871,
+      "by_level": {
+        "1": 0.8333,
+        "2": 0.6667,
+        "3": 0.8333,
+        "4": 1.0,
+        "5": 1.0
+      },
+      "crisis_auto": "8/8",
+      "false_crisis": 1,
+      "latency_p50_s": 7.036,
+      "latency_p95_s": 19.175,
+      "cost_usd_per_situation": 0.01453,
+      "cost_usd_per_30": 0.4359,
+      "cost_usd_total": 0.450426,
+      "with_errors": 0,
+      "not_verified": 0,
+      "comparison": {
+        "baseline": "2026-11-21_compare_openrouter_anthropic-claude-sonnet-5.5",
+        "baseline_model": "anthropic/claude-sonnet-5.5",
+        "verdict": "хуже",
+        "auto_pass_rate_delta": 0.0323,
+        "crisis_rate_delta": 0.0,
+        "regressions": [
+          "l2-02-mother-in-law",
+          "l2-05-kindergarten-incoming",
+          "l3-03-night-shifts"
+        ],
+        "improvements": [
+          "l1-04-headphones",
+          "l2-01-anna-igor-key",
+          "l3-04-dacha-arguments",
+          "l4-02-betrayal-message"
+        ]
+      },
+      "error_kinds": {}
+    }
+  ]
+}

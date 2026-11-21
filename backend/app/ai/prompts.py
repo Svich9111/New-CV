@@ -68,6 +68,9 @@ class PromptSet:
 
 
 V0 = PromptSet()
+# v0 + safety.v1 (уже «насилие») и meaning.v1 (искажение — с фрагментами). Прогона набора ещё нет
+# (кончились кредиты OpenRouter) — по правилу CLAUDE.md по умолчанию в коде V0 (задача 0.5).
+V1 = PromptSet(safety="v1", meaning="v1")
 
 
 def prompts_dir() -> Path:

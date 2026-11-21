@@ -168,8 +168,23 @@ ADAPT_SCHEMA: dict[str, Any] = strict_object(
         "reply_hint": {"anyOf": [{"type": "string"}, {"type": "null"}]},
     }
 )
-MEANING_SCHEMA: dict[str, Any] = strict_object(
+# meaning.v0 — список видов; meaning.v1 — виды с дословными фрагментами (основание).
+MEANING_SCHEMA_V0: dict[str, Any] = strict_object(
     {"problems": {"type": "array", "items": {"type": "string", "enum": list(MEANING_PROBLEMS)}}}
+)
+MEANING_SCHEMA_V1: dict[str, Any] = strict_object(
+    {
+        "problems": {
+            "type": "array",
+            "items": strict_object(
+                {
+                    "kind": {"type": "string", "enum": list(MEANING_PROBLEMS)},
+                    "original_fragment": {"type": "string"},
+                    "adapted_fragment": {"type": "string"},
+                }
+            ),
+        }
+    }
 )
 
 
@@ -184,8 +199,23 @@ def _adaptation(data: dict[str, Any]) -> Adaptation:
     )
 
 
+def meaning_schema(version: str) -> dict[str, Any]:
+    return MEANING_SCHEMA_V0 if version == "v0" else MEANING_SCHEMA_V1
+
+
 def _problems(data: dict[str, Any]) -> tuple[str, ...]:
-    return enum_list(data, "problems", MEANING_PROBLEMS)
+    """Виды искажений (v0 — строки, v1 — объекты с фрагментами). Фрагменты — только основание
+    для модели, в результат не идут: это тексты сообщения, а метрики — без текстов."""
+    items = data["problems"]
+    if not isinstance(items, list):
+        raise TypeError("problems")
+    kinds = []
+    for item in items:
+        kind = item.get("kind") if isinstance(item, dict) else item
+        if not isinstance(kind, str) or kind not in MEANING_PROBLEMS:
+            raise ValueError("problems")
+        kinds.append(kind)
+    return tuple(dict.fromkeys(kinds))
 
 
 _NUMBER = re.compile(r"\d+")
@@ -294,7 +324,7 @@ async def process(
             models.meaning,
             prompt=system_prompt("meaning", prompt_set),
             payload={"original": original, "adapted": adapted},
-            schema=MEANING_SCHEMA,
+            schema=meaning_schema(prompt_set.version("meaning")),
             validate=_problems,
             log=log,
             max_tokens=MAX_TOKENS_CLASSIFIER,
