@@ -48,6 +48,13 @@ class Person:
     agent_id: uuid.UUID
     draft_id: uuid.UUID
     marker: bytes  # уникальная метка во всех текстах человека
+    embedding: str  # текст уникального эмбеддинга его памяти (как его выводит pgvector)
+
+
+def _vector(seed: uuid.UUID) -> str:
+    """Уникальный эмбеддинг: первые 16 компонент — байты uuid / 256 (точны во float4)."""
+    head = [b / 256 for b in seed.bytes]
+    return "[" + ",".join(str(v) for v in head + [0.0] * (1024 - len(head))) + "]"
 
 
 async def _person(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> Person:
@@ -60,10 +67,17 @@ async def _person(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> 
             text("INSERT INTO users (id, telegram_id, name) VALUES (:id, :tg, :n)"),
             {"id": uid, "tg": tg, "n": name},
         )
+        embedding = (
+            await conn.execute(text("SELECT CAST(:v AS vector)::text"), {"v": _vector(uid)})
+        ).scalar_one()
         if onboarded:
             await conn.execute(text(f"UPDATE users SET {ONBOARDED} WHERE id = :u"), {"u": uid})
         await conn.execute(
-            text("INSERT INTO agents (id, user_id) VALUES (:a, :u)"), {"a": aid, "u": uid}
+            text(
+                "INSERT INTO agents (id, user_id, tone_settings) "
+                "VALUES (:a, :u, jsonb_build_object('note', CAST(:m AS text)))"
+            ),
+            {"a": aid, "u": uid, "m": marker.decode()},
         )
         await conn.execute(
             text("INSERT INTO conversations (id, agent_id) VALUES (:c, :a)"),
@@ -78,16 +92,16 @@ async def _person(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> 
         )
         await conn.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, text_enc, source) "
-                "VALUES (:a, 'fact', :t, 'owner_dialog')"
+                "INSERT INTO memory_items (agent_id, type, text_enc, source, embedding) "
+                "VALUES (:a, 'fact', :t, 'owner_dialog', CAST(:e AS vector))"
             ),
-            {"a": aid, "t": b"pamyat " + marker},
+            {"a": aid, "t": b"pamyat " + marker, "e": embedding},
         )
         await conn.execute(
             text("INSERT INTO message_drafts (id, agent_id, text_enc) VALUES (:d, :a, :t)"),
             {"d": did, "a": aid, "t": b"chernovik " + marker},
         )
-    return Person(uid, tg, aid, did, marker)
+    return Person(uid, tg, aid, did, marker, embedding)
 
 
 async def _couple(sm: SM, initiator: Person, partner: Person) -> tuple[uuid.UUID, bytes]:
@@ -128,36 +142,45 @@ async def _message(
 
 
 async def _traces(engine: AsyncEngine, person: Person) -> dict[str, int]:
-    """Сколько строк в каждой колонке схемы содержит id, Telegram ID или текстовую метку
-    человека. Перебор information_schema: новая таблица попадёт в проверку сама."""
+    """Сколько строк в каждой колонке схемы содержит id, Telegram ID, текстовую метку или
+    эмбеддинг человека. Перебор information_schema по всем колонкам любого типа: bytea — по
+    байтам метки, остальные (uuid, числа, jsonb, массивы, vector, …) — по CAST(... AS text).
+    Новая таблица или колонка попадёт в проверку сама (ревью 4.5 MINOR-5)."""
     found: dict[str, int] = {}
     async with engine.connect() as conn:
         cols = (
             await conn.execute(
                 text(
-                    "SELECT table_name, column_name, data_type FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name <> 'alembic_version' "
-                    "AND data_type IN ('uuid', 'bigint', 'bytea', 'text', 'character varying')"
+                    "SELECT c.table_name, c.column_name, c.data_type "
+                    "FROM information_schema.columns c JOIN information_schema.tables t "
+                    "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
+                    "WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' "
+                    "AND c.table_name <> 'alembic_version'"
                 )
             )
         ).all()
         tables = {c.table_name for c in cols}
-        assert {"users", "audit_log", "partner_messages", "memory_items"} <= tables
+        assert {"users", "audit_log", "partner_messages", "memory_items", "agents"} <= tables
+        assert ("memory_items", "embedding", "USER-DEFINED") in {tuple(c) for c in cols}
+        params: dict[str, object] = {
+            "uid": str(person.user_id),
+            "tg": rf"(^|[^0-9]){person.telegram_id}([^0-9]|$)",
+            "mark": person.marker.decode(),
+            "emb": person.embedding,
+        }
         for table, column, dtype in cols:
-            value: object
-            if dtype == "uuid":
-                cond, value = f'"{column}" = :v', person.user_id
-            elif dtype == "bigint":
-                cond, value = f'"{column}" = :v', person.telegram_id
-            elif dtype == "bytea":
-                cond, value = f'position(:v IN "{column}") > 0', person.marker
+            values: dict[str, object]
+            if dtype == "bytea":
+                cond, values = f'position(:v IN "{column}") > 0', {"v": person.marker}
             else:
-                cond, value = f'strpos("{column}", :v) > 0', person.marker.decode()
-            n = (
-                await conn.execute(
-                    text(f'SELECT count(*) FROM "{table}" WHERE {cond}'),
-                    {"v": value},
+                t = f'CAST("{column}" AS text)'
+                cond = (
+                    f"(strpos({t}, :uid) > 0 OR {t} ~ :tg OR strpos({t}, :mark) > 0 "
+                    f"OR strpos({t}, :emb) > 0)"
                 )
+                values = params
+            n = (
+                await conn.execute(text(f'SELECT count(*) FROM "{table}" WHERE {cond}'), values)
             ).scalar_one()
             if n:
                 found[f"{table}.{column}"] = int(n)
@@ -204,10 +227,19 @@ async def _scene(sm: SM, engine: AsyncEngine) -> Scene:
         )
         await conn.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, text_enc, source, source_message_id) "
-                "VALUES (:a, 'from_partner', :t, 'partner_message', :m)"
+                "INSERT INTO memory_items (agent_id, type, text_enc, source, source_message_id, "
+                "embedding) VALUES (:a, 'from_partner', :t, 'partner_message', :m, "
+                "CAST(:e AS vector))"
             ),
-            {"a": igor.agent_id, "t": b"citata " + anna.marker, "m": anna_msg},
+            {"a": igor.agent_id, "t": b"citata " + anna.marker, "m": anna_msg, "e": anna.embedding},
+        )
+        # Версия для Анны (агент получателя адаптировал сообщение Игоря; ТЗ §6.2 п.4–6).
+        await conn.execute(
+            text(
+                "UPDATE partner_messages SET is_adapted = true, tone_score = 2, "
+                "harsh_tone_warning = true WHERE id IN (:a, :b)"
+            ),
+            {"a": igor_msg, "b": igor_reply},
         )
         own_mem = (
             await conn.execute(
@@ -271,6 +303,8 @@ async def test_delete_leaves_no_row_with_user_id(sessionmaker: SM, engine: Async
         "memory_items.text_enc",
         "message_drafts.text_enc",
         "partner_messages.original_enc",
+        "memory_items.embedding",
+        "agents.tone_settings",
     ):
         assert before.get(col), (col, before)
     async with engine.connect() as conn:
@@ -346,6 +380,22 @@ async def test_partner_keeps_own_messages_and_is_free(
     assert msgs == {
         sc.igor_msg: (sc.igor.user_id, None, None),
         sc.igor_reply: (sc.igor.user_id, None, None),
+    }
+    # Ревью 4.5 MINOR-3: версии для удалённого получателя нет, оригинал автора на месте.
+    async with engine.connect() as conn:
+        recipient_side = {
+            tuple(r)
+            for r in await conn.execute(
+                text(
+                    "SELECT adapted_enc, is_adapted, tone_score, harsh_tone_warning, "
+                    "original_enc FROM partner_messages WHERE couple_id = :c"
+                ),
+                {"c": sc.couple},
+            )
+        }
+    assert recipient_side == {
+        (None, False, None, False, b"ot igorya " + sc.igor.marker),
+        (None, False, None, False, b"otvet igorya " + sc.igor.marker),
     }
     assert draft_reply is None
     assert memory == {sc.igor_memory_own}  # из сообщения Анны — удалена, своя — на месте
@@ -701,13 +751,323 @@ async def test_race_both_partners_delete(sessionmaker: SM, engine: AsyncEngine) 
     assert tuple(leaves) == (1, 0)  # выход записан один раз и обезличен
 
 
+# --- Порядок «пара → сообщения»: удаление против конвейера и двух удалений (MAJOR-1) ------
+
+
+async def _worker_try(engine: AsyncEngine, sql: str, **params: object) -> object:
+    """Вызов функции конвейера под feelings_worker (задача 3.2): результат или SQLSTATE."""
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await conn.execute(text("SET LOCAL ROLE feelings_worker"))
+            return (await conn.execute(text(sql), params)).scalar_one()
+    except DBAPIError as exc:
+        return _sqlstate(exc)
+
+
+DELIVER = "SELECT pipeline_deliver(:m, '\\x01'::bytea, true, 2::smallint, true)"
+WITHHOLD = "SELECT pipeline_withhold(:m)"
+
+
+async def _cross(
+    sm: SM, engine: AsyncEngine
+) -> tuple[Person, Person, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+    """X (Анна) ← Y (ответ Игоря на X) ← Z (ответ Анны на Y, ещё в конвейере)."""
+    anna, igor = await _person(engine, "Анна"), await _person(engine, "Игорь")
+    couple, _ = await _couple(sm, anna, igor)
+    x = await _message(engine, couple, anna, igor, b"x " + anna.marker)
+    y = await _message(engine, couple, igor, anna, b"y " + igor.marker, reply_to=x)
+    z = await _message(engine, couple, anna, igor, b"z " + anna.marker, reply_to=y)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE partner_messages SET status = 'processing' WHERE id = :z"), {"z": z}
+        )
+    return anna, igor, couple, x, y, z
+
+
+@pytest.mark.parametrize("first", ["delete", "deliver"])
+async def test_race_delete_vs_pipeline_delivering_own_reply(
+    sessionmaker: SM, engine: AsyncEngine, first: str
+) -> None:
+    """Ревью 4.5 MAJOR-1 (а): Анна удаляет аккаунт, пока конвейер доставляет её ответ Z на
+    ответ Игоря Y. Раньше удаление брало Y → Z, доставка Z → Y: 40P01. Теперь обе сначала
+    берут пару (удаление FOR UPDATE, конвейер FOR KEY SHARE) и идут по очереди.
+    Удаление первым — доставка false (Z удалено); доставка первой — Y «отвечено», затем Z
+    удаляется вместе с аккаунтом. Держатель строки Y задаёт порядок: первый встаёт на Y, второй
+    — на паре."""
+    anna, igor, couple, _x, y, z = await _cross(sessionmaker, engine)
+    delete = ("app_delete_account", _try(sessionmaker, anna.user_id, DELETE))
+    deliver = ("pipeline_deliver", _worker_try(engine, DELIVER, m=z))
+    steps = [delete, deliver] if first == "delete" else [deliver, delete]
+    got = dict(
+        zip(
+            [st[0] for st in steps],
+            await _hold_and_race(
+                engine, "SELECT 1 FROM partner_messages WHERE id = :y FOR UPDATE", {"y": y}, steps
+            ),
+            strict=True,
+        )
+    )
+    assert got == {"app_delete_account": None, "pipeline_deliver": first == "deliver"}
+    assert await _traces(engine, anna) == {}
+    row = await _row(
+        engine,
+        "SELECT author_id, recipient_id, reply_to_id, status::text AS status, adapted_enc "
+        "FROM partner_messages WHERE id = :y",
+        y=y,
+    )
+    assert row == {
+        "author_id": igor.user_id,
+        "recipient_id": None,
+        "reply_to_id": None,
+        "status": "answered" if first == "deliver" else "delivered",
+        "adapted_enc": None,
+    }
+    assert list(await _members(engine, couple)) == [igor.user_id]
+
+
+@pytest.mark.parametrize("dissolved", [True, False], ids=["former", "active"])
+@pytest.mark.parametrize("first", ["anna", "igor"])
+async def test_race_former_partners_delete_with_cross_replies(
+    sessionmaker: SM, engine: AsyncEngine, first: str, dissolved: bool
+) -> None:
+    """Ревью 4.5 MAJOR-1 (б): пара распалась раньше, в истории встречные ответы; бывшие
+    партнёры (и, для сравнения, партнёры активной пары) удаляют аккаунты одновременно.
+    Раньше каждый блокировал ответы другого и ждал их
+    на каскаде (40P01); теперь второй ждёт общую пару, а первый не трогает строку второго в
+    users (сообщения партнёра меняются одной командой). Держатель строк Y и Z задаёт порядок."""
+    anna, igor, couple, x, y, z = await _cross(sessionmaker, engine)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE partner_messages SET status = 'delivered' WHERE id = :z"), {"z": z}
+        )
+    if dissolved:
+        await _call(sessionmaker, igor.user_id, "SELECT app_leave_couple()")
+    a = ("app_delete_account", _try(sessionmaker, anna.user_id, DELETE))
+    i = ("app_delete_account", _try(sessionmaker, igor.user_id, DELETE))
+    steps = [a, i] if first == "anna" else [i, a]
+    async with engine.connect() as holder:
+        await holder.execute(
+            text("SELECT 1 FROM partner_messages WHERE id = ANY(:m) FOR UPDATE"), {"m": [y, z]}
+        )
+        tasks: list[asyncio.Future[object]] = []
+        try:
+            for n, (func, coro) in enumerate(steps, start=1):
+                tasks.append(asyncio.ensure_future(coro))
+                await _wait_lock_waiters(engine, func, n)
+        finally:
+            await holder.rollback()
+        results = list(await asyncio.wait_for(asyncio.gather(*tasks), timeout=30))
+    assert results == [None, None]
+    assert await _traces(engine, anna) == {} and await _traces(engine, igor) == {}
+    async with engine.connect() as conn:
+        left = (
+            await conn.execute(
+                text(
+                    "SELECT (SELECT count(*) FROM couples WHERE id = :c), "
+                    "(SELECT count(*) FROM partner_messages WHERE id = ANY(:m))"
+                ),
+                {"c": couple, "m": [x, y, z]},
+            )
+        ).one()
+    assert tuple(left) == (0, 0)  # второй удалившийся убирает опустевшую пару с перепиской
+
+
+async def test_pipeline_after_recipient_deleted_keeps_no_recipient_version(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Сообщение Игоря Анне ещё в конвейере, Анна удаляет аккаунт: доставка проходит, но
+    версии для получателя (адаптация, тон, предупреждение) нет — её некому показывать (АР-23,
+    ревью 4.5 MINOR-3). Остановка безопасностью (withhold) по-прежнему работает."""
+    anna, igor = await _person(engine, "Анна"), await _person(engine, "Игорь")
+    couple, _ = await _couple(sessionmaker, anna, igor)
+    p1 = await _message(engine, couple, igor, anna, b"p1 " + igor.marker)
+    p2 = await _message(engine, couple, igor, anna, b"p2 " + igor.marker)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE partner_messages SET status = 'processing', adapted_enc = NULL "
+                "WHERE id IN (:a, :b)"
+            ),
+            {"a": p1, "b": p2},
+        )
+    await _call(sessionmaker, anna.user_id, DELETE)
+    assert await _worker_try(engine, DELIVER, m=p1) is True
+    assert await _worker_try(engine, WITHHOLD, m=p2) is True
+    row = await _row(
+        engine,
+        "SELECT recipient_id, status::text AS status, adapted_enc, is_adapted, tone_score, "
+        "harsh_tone_warning, original_enc FROM partner_messages WHERE id = :m",
+        m=p1,
+    )
+    assert row == {
+        "recipient_id": None,
+        "status": "delivered",
+        "adapted_enc": None,
+        "is_adapted": False,
+        "tone_score": None,
+        "harsh_tone_warning": False,
+        "original_enc": b"p1 " + igor.marker,
+    }
+    assert (
+        await _row(engine, "SELECT status::text AS s FROM partner_messages WHERE id = :m", m=p2)
+    )["s"] == "withheld"
+    # Получатель есть — версия для получателя сохраняется как раньше (контракт 3.2).
+    olga = await _person(engine, "Ольга")
+    c2, _ = await _couple(sessionmaker, igor, olga)
+    p3 = await _message(engine, c2, igor, olga, b"p3")
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE partner_messages SET status = 'processing' WHERE id = :m"), {"m": p3}
+        )
+    assert await _worker_try(engine, DELIVER, m=p3) is True
+    row = await _row(
+        engine,
+        "SELECT adapted_enc, is_adapted, tone_score, harsh_tone_warning FROM partner_messages "
+        "WHERE id = :m",
+        m=p3,
+    )
+    assert row == {
+        "adapted_enc": b"\x01",
+        "is_adapted": True,
+        "tone_score": 2,
+        "harsh_tone_warning": True,
+    }
+
+
+# --- app_send_draft: коды 0005 (ревью 4.5 MINOR-4) ----------------------------------------
+
+
+async def test_send_draft_42501_without_login_or_for_deleted_sender(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Без app.user_id и для отправителя с deleted_at — 42501 (до 0005 — FA001); черновик
+    не отправлен, сообщения нет."""
+    anna, igor = await _person(engine, "Анна"), await _person(engine, "Игорь")
+    await _couple(sessionmaker, anna, igor)
+    await _fails(sessionmaker, None, "42501", SEND, d=anna.draft_id)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE users SET deleted_at = now() WHERE id = :u"), {"u": anna.user_id}
+        )
+    await _fails(sessionmaker, anna.user_id, "42501", SEND, d=anna.draft_id)
+    row = await _row(
+        engine,
+        "SELECT d.status::text AS status, (SELECT count(*) FROM partner_messages m "
+        "WHERE m.draft_id = d.id) AS n FROM message_drafts d WHERE d.id = :d",
+        d=anna.draft_id,
+    )
+    assert row == {"status": "draft", "n": 0}
+
+
+async def test_send_draft_recipient_changed_while_waiting_gets_fa003(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Ветка ``v_recipient IS DISTINCT FROM v_locked``: Вера с ожидающей парой жмёт «Отправить»
+    (получателя нет — строка не блокирована), пока отправка ждёт черновик, Гость принимает
+    ссылку. После ожидания пара активна, но получатель не тот, чья строка заблокирована, —
+    FA003, сообщения нет; повторная отправка уходит новому партнёру."""
+    vera = await _person(engine, "Вера")
+    await _call(sessionmaker, vera.user_id, CREATE)
+    token = _token()
+    await _call(sessionmaker, vera.user_id, "SELECT app_issue_invite(:h)", h=token)
+    guest = await _person(engine, "Гость")
+    async with engine.connect() as holder:
+        await holder.execute(
+            text("SELECT 1 FROM message_drafts WHERE id = :d FOR UPDATE"), {"d": vera.draft_id}
+        )
+        task = asyncio.ensure_future(_try(sessionmaker, vera.user_id, SEND, d=vera.draft_id))
+        try:
+            await _wait_lock_waiters(engine, "app_send_draft", 1)
+            assert await _try(sessionmaker, guest.user_id, ACCEPT, h=token) is not None
+        finally:
+            await holder.rollback()
+        assert await asyncio.wait_for(task, timeout=30) == "FA003"
+    assert (
+        await _row(
+            engine,
+            "SELECT count(*) AS n FROM partner_messages WHERE author_id = :u",
+            u=vera.user_id,
+        )
+    )["n"] == 0
+    msg = await _call(sessionmaker, vera.user_id, SEND, d=vera.draft_id)
+    row = await _row(engine, "SELECT recipient_id FROM partner_messages WHERE id = :m", m=msg)
+    assert row == {"recipient_id": guest.user_id}
+
+
+# --- Журнал: старая сессия не возвращает id удалённого (ревью 4.5-test M-1) ---------------
+
+
+AUDIT = (
+    "INSERT INTO audit_log (actor_id, action, object_type) "
+    "VALUES (app_uid(), 'me.export', 'user') RETURNING 1"
+)
+
+
+async def test_audit_insert_only_for_existing_user(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Живой пользователь пишет аудит со своим actor_id; после удаления запрос с прежним
+    app.user_id получает отказ RLS (42501) и не возвращает id в журнал; чужой actor_id — тоже
+    отказ; помеченный deleted_at — отказ."""
+    anna, igor = await _person(engine, "Анна"), await _person(engine, "Игорь")
+    assert isinstance(await _call(sessionmaker, igor.user_id, AUDIT), int)
+    await _fails(
+        sessionmaker,
+        igor.user_id,
+        "42501",
+        "INSERT INTO audit_log (actor_id, action, object_type) "
+        "VALUES (:a, 'me.export', 'user') RETURNING 1",
+        a=anna.user_id,
+    )
+    await _call(sessionmaker, anna.user_id, DELETE)
+    await _fails(sessionmaker, anna.user_id, "42501", AUDIT)
+    assert await _traces(engine, anna) == {}
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE users SET deleted_at = now() WHERE id = :u"), {"u": igor.user_id}
+        )
+    await _fails(sessionmaker, igor.user_id, "42501", AUDIT)
+
+
+async def test_audit_insert_waits_for_running_delete(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Запись аудита во время незавершённого удаления ждёт его (FOR KEY SHARE строки users в
+    политике) и после него отклоняется — id не попадает в журнал мимо обезличивания."""
+    anna = await _person(engine, "Анна")
+    async with engine.connect() as holder:
+        # Держатель — строка журнала с её id: удаление встаёт на обезличивании, уже
+        # заблокировав строку users.
+        await holder.execute(
+            text(
+                "INSERT INTO audit_log (actor_id, action, object_type) "
+                "VALUES (:u, 'user.update', 'user')"
+            ),
+            {"u": anna.user_id},
+        )
+        await holder.commit()
+        await holder.execute(
+            text("SELECT 1 FROM audit_log WHERE actor_id = :u FOR UPDATE"), {"u": anna.user_id}
+        )
+        steps = [
+            ("app_delete_account", _try(sessionmaker, anna.user_id, DELETE)),
+            ("INSERT INTO audit_log ", _try(sessionmaker, anna.user_id, AUDIT)),
+        ]
+        tasks: list[asyncio.Future[object]] = []
+        try:
+            for func, coro in steps:
+                tasks.append(asyncio.ensure_future(coro))
+                await _wait_lock_waiters(engine, func, 1)
+        finally:
+            await holder.rollback()
+        deleted, audited = await asyncio.wait_for(asyncio.gather(*tasks), timeout=30)
+    assert (deleted, audited) == (None, "42501")
+    assert await _traces(engine, anna) == {}
+
+
 # --- Миграция обратима ---------------------------------------------------------------------
 
 
 async def test_migration_0005_reversible(engine: AsyncEngine, app_engine: AsyncEngine) -> None:
     """0005 → 0004 → 0005: downgrade возвращает DELETE на users и agents, политики users_self,
-    agents_owner и drafts_delete из 0001, app_send_draft из 0001 и убирает app_delete_account;
-    повторный upgrade снова их меняет."""
+    agents_owner, drafts_delete и audit_insert из 0001, app_send_draft, pipeline_deliver и
+    pipeline_withhold из 0001 и убирает app_delete_account; повторный upgrade снова их меняет."""
 
     async def state() -> tuple[object, ...]:
         async with engine.connect() as conn:
@@ -721,7 +1081,13 @@ async def test_migration_0005_reversible(engine: AsyncEngine, app_engine: AsyncE
                     " WHERE policyname = 'drafts_delete'), "
                     "to_regprocedure('app_delete_account()') IS NOT NULL, "
                     "position('FOR KEY SHARE' IN "
-                    "pg_get_functiondef('app_send_draft(uuid, integer)'::regprocedure)) > 0"
+                    "pg_get_functiondef('app_send_draft(uuid, integer)'::regprocedure)) > 0, "
+                    "position('FOR KEY SHARE' IN pg_get_functiondef("
+                    "'pipeline_deliver(uuid, bytea, boolean, smallint, boolean)'::regprocedure)) > 0, "
+                    "position('FOR KEY SHARE' IN "
+                    "pg_get_functiondef('pipeline_withhold(uuid)'::regprocedure)) > 0, "
+                    "(SELECT position('users' IN with_check) > 0 FROM pg_policies "
+                    " WHERE policyname = 'audit_insert')"
                 )
             )
             return tuple(row.one())
@@ -739,6 +1105,9 @@ async def test_migration_0005_reversible(engine: AsyncEngine, app_engine: AsyncE
         True,
         True,
         True,
+        True,
+        True,
+        True,
     )
     try:
         assert await state() == upgraded
@@ -748,6 +1117,9 @@ async def test_migration_0005_reversible(engine: AsyncEngine, app_engine: AsyncE
             True,
             True,
             ["agents.agents_owner", "users.users_self"],
+            False,
+            False,
+            False,
             False,
             False,
             False,

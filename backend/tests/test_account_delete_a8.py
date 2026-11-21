@@ -953,11 +953,6 @@ async def _deliver_outcome(engine: AsyncEngine, keys: Keyring, msg: uuid.UUID) -
         return _code(exc)
 
 
-@pytest.mark.xfail(
-    reason="MAJOR D-1a (= ревью A6 MAJOR-1а, docs/reviews/4.5-test.md): удаление блокирует "
-    "ответ партнёра Y раньше своего ответа Z, конвейер доставки Z — Z раньше Y: 40P01",
-    strict=True,
-)
 async def test_race_delete_vs_pipeline_delivering_own_reply_no_deadlock(
     sessionmaker: SM, engine: AsyncEngine, keys: Keyring
 ) -> None:
@@ -976,11 +971,6 @@ async def test_race_delete_vs_pipeline_delivering_own_reply_no_deadlock(
     assert res[0] is None and res[1] in (True, False), res
 
 
-@pytest.mark.xfail(
-    reason="MAJOR D-1b (= ревью A6 MAJOR-1б, docs/reviews/4.5-test.md): бывшие партнёры "
-    "удаляют аккаунты одновременно — каждый блокирует ответы другого, затем ждёт их: 40P01",
-    strict=True,
-)
 async def test_race_both_former_partners_delete_with_cross_replies_no_deadlock(
     sessionmaker: SM, engine: AsyncEngine, keys: Keyring
 ) -> None:
@@ -1003,11 +993,6 @@ async def test_race_both_former_partners_delete_with_cross_replies_no_deadlock(
 # --- 7. Дефект: журнал принимает id удалённого пользователя от «живой» старой сессии ---------
 
 
-@pytest.mark.xfail(
-    reason="MINOR M-1 (docs/reviews/4.5-test.md): политика audit_insert (0001) пропускает "
-    "actor_id = app_uid() для уже удалённого пользователя — id возвращается в журнал",
-    strict=True,
-)
 async def test_stale_session_cannot_put_deleted_id_back_into_audit(
     sessionmaker: SM, engine: AsyncEngine, keys: Keyring
 ) -> None:

@@ -17,20 +17,36 @@ DECISIONS.md АР-13, АР-23; BACKLOG Б-3, Б-19, Б-20.
      распускается для обоих, ``active``-приглашения отзываются, в ``audit_log`` —
      ``couple.leave``. Если партнёр успел выйти раньше (``FB007`` после ожидания блокировки
      пары), удаление продолжается: пара уже распущена;
-   - ссылки других строк на сообщения удаляемого разрываются заранее, до каскада:
-     ``partner_messages.reply_to_id`` и ``message_drafts.reply_to_id`` партнёра → NULL,
-     записи памяти партнёра, созданные из сообщений удаляемого
-     (``memory_items.source_message_id``, тип ``from_partner``; CHECK не допускает NULL), —
-     удаляются. Это те же действия, что выполнил бы каскад FK, но строки партнёра
-     блокируются раньше строк удаляемого — в том же порядке, что у конвейера
-     (``pipeline_deliver``: ответ → исходное сообщение), без взаимоблокировки с ним;
-   - ``audit_log`` обезличивается: ``actor_id`` и ``object_id``, равные id удаляемого, → NULL
-     (таблица без FK на ``users``, каскад её не затрагивает);
+   - все пары пользователя, включая распавшиеся, блокируются ``FOR UPDATE`` в порядке id —
+     до любых строк сообщений. Общий порядок блокировок (АР-13, АР-23): пользователь →
+     приглашения → пары → сообщения. Каждое сообщение, которое затрагивает удаление
+     (написанное им, адресованное ему, ответ на его сообщение), лежит в одной из его пар;
+     конвейер (``pipeline_deliver``/``pipeline_withhold``, п.5) первым шагом берёт пару
+     сообщения ``FOR KEY SHARE``. Поэтому удаление и доставка в этой паре идут по очереди,
+     а два удаления с общей (в т.ч. распавшейся) парой — тоже: встречных блокировок
+     сообщений нет (ревью 4.5 MAJOR-1, 4.5-test D-1). Отправка (``app_send_draft``)
+     блокирует строки обоих пользователей до черновика и пары — с удалением любого из них
+     она расходится раньше, на строке пользователя;
+   - сообщения партнёра, адресованные удаляемому или отвечающие на его сообщения, меняются
+     одной командой до каскада: ``recipient_id`` → NULL (остаются у автора),
+     ``reply_to_id`` на сообщение удаляемого → NULL, версия для получателя обнуляется
+     (``adapted_enc``, ``tone_score`` → NULL, ``is_adapted``, ``harsh_tone_warning`` → false;
+     CHECK ``is_adapted → adapted_enc``): её делал агент получателя для получателя (ТЗ §6.2
+     п.4–6, принцип 3), автору лента отдаёт оригинал; оригинал не меняется (ревью 4.5
+     MINOR-3). Именно одной командой: строку, уже изменённую в своей транзакции,
+     PostgreSQL при следующем изменении (например, каскадом SET NULL) перепроверяет по всем
+     FK и берёт ``FOR KEY SHARE`` строки автора в ``users`` — её держит ``FOR UPDATE``
+     одновременное удаление аккаунта автора, ожидающее общую пару (40P01, 4.5-test D-1b);
+   - ``message_drafts.reply_to_id`` партнёра на сообщения удаляемого → NULL; записи памяти
+     партнёра, созданные из сообщений удаляемого (``memory_items.source_message_id``, тип
+     ``from_partner``; CHECK не допускает NULL), — удаляются (то же сделал бы каскад FK);
+   - ``audit_log`` обезличивается одним проходом: ``actor_id`` и ``object_id``, равные id
+     удаляемого, → NULL (таблица без FK на ``users``, каскад её не затрагивает);
    - ``DELETE FROM users``; каскадом FK удаляются агент, диалоги и их реплики, память,
      черновики, членство в парах, созданные им приглашения (в т.ч. действующие — Б-20),
-     написанные им сообщения пары, события безопасности. ``SET NULL``: сообщения партнёра
-     удаляемому (``partner_messages.recipient_id`` — остаются у автора), приглашения, которые он
+     написанные им сообщения пары, события безопасности. ``SET NULL``: приглашения, которые он
      принял (``invites.used_by``), плательщик подписки пары (``subscriptions.payer_id``);
+     ``partner_messages.recipient_id`` к этому моменту уже NULL (см. выше);
    - пары, в которых после этого не осталось ни одного участника (ожидавшая партнёра пара;
      пара, второй участник которой удалил аккаунт раньше), удаляются вместе с подпиской и
      платежами (каскад FK): они больше ничьи, а пара без участников нарушала бы инвариант
@@ -76,11 +92,24 @@ DECISIONS.md АР-13, АР-23; BACKLOG Б-3, Б-19, Б-20.
    ``users``) — и тогда же удаляются сообщения удаляемого, ссылавшиеся на эти черновики
    (АР-23). Сообщения партнёра ссылаются на черновики партнёра и удалением не затрагиваются.
 
+5. Конвейер (0001, задача 3.2): ``pipeline_deliver`` и ``pipeline_withhold`` первым шагом
+   берут пару сообщения ``FOR KEY SHARE`` (порядок пары → сообщения, п.1). Блокировка
+   совместима с другими доставками и с отправкой; ждёт её только ``FOR UPDATE`` пары
+   (удаление аккаунта, выход). Сообщение удалено, пока конвейер ждал, — ``false``.
+   Получатель удалил аккаунт до доставки — сообщение доставляется без версии для
+   получателя (``adapted_enc``/``tone_score`` NULL, флаги false), как в п.1.
+
+6. Ревью 4.5-test M-1. Политика ``audit_insert`` пропускает ``actor_id = app_uid()``, только
+   если строка пользователя существует и не помечена ``deleted_at``; строка берётся
+   ``FOR KEY SHARE``: запрос, начатый до удаления, не вернёт id удалённого в журнал —
+   запись и удаление идут по очереди, после удаления — отказ RLS (``42501``).
+
 Коды ошибок новых и изменённых функций — DECISIONS.md, АР-13 и АР-23.
 
 Downgrade возвращает права DELETE на ``users`` и ``agents``, политики ``users_self``,
-``agents_owner`` и ``drafts_delete`` из 0001, определение
-``app_send_draft`` из 0001 и удаляет ``app_delete_account``.
+``agents_owner``, ``drafts_delete`` и ``audit_insert`` из 0001, определения
+``app_send_draft``, ``pipeline_deliver``, ``pipeline_withhold`` из 0001 и удаляет
+``app_delete_account``.
 """
 
 import importlib.util
@@ -125,28 +154,48 @@ CREATE FUNCTION app_delete_account() RETURNS void
         EXCEPTION WHEN SQLSTATE 'FB007' THEN
             NULL;  -- не в паре, или партнёр вышел раньше: пара уже распущена
         END;
-        -- 2. Ссылки партнёра на сообщения удаляемого — до каскада (строки партнёра первыми).
-        UPDATE public.partner_messages SET reply_to_id = NULL
-         WHERE reply_to_id IN (SELECT m.id FROM public.partner_messages m
-                                WHERE m.author_id = v_uid)
-           AND author_id <> v_uid;
+        -- 2. Все пары пользователя, включая распавшиеся, — до строк сообщений (АР-13, АР-23:
+        --    пользователь → приглашения → пары → сообщения). Удаления с общей парой идут по
+        --    очереди, конвейер (pipeline_deliver/withhold берут пару FOR KEY SHARE первой)
+        --    ждёт удаления или удаление ждёт его — без встречных блокировок сообщений.
+        PERFORM 1 FROM public.couples WHERE id = ANY (v_couples) ORDER BY id FOR UPDATE;
+        -- 3. Сообщения партнёра — одной командой, до каскада: получатель → NULL, ответ на
+        --    сообщение удаляемого → NULL, версия для получателя (адаптация, тон,
+        --    предупреждение) обнуляется — она делалась для удаляемого, автору лента отдаёт
+        --    оригинал (ТЗ §6.2, §9.1 п.2). Одна команда, а не каскад SET NULL после неё:
+        --    строку, уже изменённую в этой транзакции, PostgreSQL при повторном изменении
+        --    перепроверяет по всем FK, то есть взял бы FOR KEY SHARE строки партнёра в users,
+        --    а её держит его собственное одновременное удаление (обратный порядок, 40P01).
+        UPDATE public.partner_messages
+           SET recipient_id = NULL,
+               reply_to_id = CASE WHEN reply_to_id IN (SELECT m.id FROM public.partner_messages m
+                                                       WHERE m.author_id = v_uid)
+                                  THEN NULL ELSE reply_to_id END,
+               adapted_enc = NULL, is_adapted = false, tone_score = NULL,
+               harsh_tone_warning = false
+         WHERE author_id <> v_uid
+           AND (recipient_id = v_uid
+                OR reply_to_id IN (SELECT m.id FROM public.partner_messages m
+                                    WHERE m.author_id = v_uid));
         UPDATE public.message_drafts SET reply_to_id = NULL
          WHERE reply_to_id IN (SELECT m.id FROM public.partner_messages m
                                 WHERE m.author_id = v_uid);
         DELETE FROM public.memory_items
          WHERE source_message_id IN (SELECT m.id FROM public.partner_messages m
                                       WHERE m.author_id = v_uid);
-        -- 3. Журнал без персональных данных: id удаляемого не остаётся (ТЗ §9.1 п.5).
-        UPDATE public.audit_log SET actor_id = NULL WHERE actor_id = v_uid;
-        UPDATE public.audit_log SET object_id = NULL WHERE object_id = v_uid;
-        -- 4. Строка пользователя; остальное — каскадом FK (CASCADE / SET NULL).
+        -- 4. Журнал без персональных данных: id удаляемого не остаётся (ТЗ §9.1 п.5);
+        --    один проход по таблице.
+        UPDATE public.audit_log
+           SET actor_id = NULLIF(actor_id, v_uid), object_id = NULLIF(object_id, v_uid)
+         WHERE actor_id = v_uid OR object_id = v_uid;
+        -- 5. Строка пользователя; остальное — каскадом FK (CASCADE / SET NULL).
         DELETE FROM public.users WHERE id = v_uid;
-        -- 5. Пары, в которых не осталось участников (ожидавшая партнёра; партнёр удалил
+        -- 6. Пары, в которых не осталось участников (ожидавшая партнёра; партнёр удалил
         --    аккаунт раньше), — вместе с их подпиской и платежами (АР-23).
         DELETE FROM public.couples c
          WHERE c.id = ANY (v_couples)
            AND NOT EXISTS (SELECT 1 FROM public.couple_members cm WHERE cm.couple_id = c.id);
-        -- 6. Факт удаления, без указания, кого (АР-23).
+        -- 7. Факт удаления, без указания, кого (АР-23).
         INSERT INTO public.audit_log (actor_id, action, object_type, object_id)
         VALUES (NULL, 'account.delete', 'user', NULL);
     END $f$
@@ -211,6 +260,50 @@ CREATE OR REPLACE FUNCTION app_send_draft(p_draft uuid, p_expected_version integ
     END $f$
 """
 
+# Конвейер (0001; задача 3.2): первым шагом — пара сообщения FOR KEY SHARE (АР-13: пары →
+# сообщения). Слабейшая блокировка, которую ждёт FOR UPDATE пары у app_delete_account и
+# app_leave_couple; с другими доставками и с отправкой (ключевая блокировка пары при вставке)
+# совместима. После ожидания следующая команда видит удалённое сообщение — false.
+# Получателя нет (удалил аккаунт) — версия для получателя не сохраняется (АР-23).
+PIPELINE_DELIVER = r"""
+CREATE OR REPLACE FUNCTION pipeline_deliver(p_message uuid, p_for_recipient bytea,
+                                            p_is_adapted boolean, p_tone smallint,
+                                            p_harsh boolean) RETURNS boolean
+    LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    SELECT 1 FROM public.couples c
+     WHERE c.id = (SELECT m.couple_id FROM public.partner_messages m WHERE m.id = p_message)
+       FOR KEY SHARE;
+    WITH u AS (
+        UPDATE public.partner_messages
+           SET adapted_enc = CASE WHEN recipient_id IS NULL THEN NULL ELSE p_for_recipient END,
+               is_adapted = recipient_id IS NOT NULL AND p_is_adapted,
+               tone_score = CASE WHEN recipient_id IS NULL THEN NULL ELSE p_tone END,
+               harsh_tone_warning = recipient_id IS NOT NULL AND p_harsh,
+               status = 'delivered', delivered_at = now()
+         WHERE id = p_message AND status = 'processing' AND p_for_recipient IS NOT NULL
+        RETURNING reply_to_id),
+    answered AS (
+        UPDATE public.partner_messages m SET status = 'answered', answered_at = now()
+          FROM u WHERE m.id = u.reply_to_id AND m.status IN ('delivered', 'read')
+        RETURNING 1)
+    SELECT EXISTS (SELECT 1 FROM u) $f$
+"""
+
+PIPELINE_WITHHOLD = r"""
+CREATE OR REPLACE FUNCTION pipeline_withhold(p_message uuid) RETURNS boolean
+    LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    SELECT 1 FROM public.couples c
+     WHERE c.id = (SELECT m.couple_id FROM public.partner_messages m WHERE m.id = p_message)
+       FOR KEY SHARE;
+    WITH u AS (
+        UPDATE public.partner_messages SET status = 'withheld'
+         WHERE id = p_message AND status = 'processing'
+        RETURNING 1)
+    SELECT EXISTS (SELECT 1 FROM u) $f$
+"""
+
 UPGRADE_GRANTS = (
     "REVOKE ALL ON FUNCTION app_delete_account() FROM PUBLIC",
     "GRANT EXECUTE ON FUNCTION app_delete_account() TO feelings_app",
@@ -234,10 +327,21 @@ UPGRADE_GRANTS = (
     WITH CHECK (user_id = app_uid())""",
     """CREATE POLICY agents_update ON agents FOR UPDATE TO feelings_app
     USING (user_id = app_uid()) WITH CHECK (user_id = app_uid())""",
+    # Ревью 4.5-test M-1: запрос с ещё действующим app.user_id удалённого не возвращает его id
+    # в журнал. Строка пользователя берётся FOR KEY SHARE: идущее удаление (FOR UPDATE)
+    # дождётся записи или запись — удаления (и тогда строки нет — отказ RLS, 42501).
+    "DROP POLICY IF EXISTS audit_insert ON audit_log",
+    """CREATE POLICY audit_insert ON audit_log FOR INSERT TO feelings_app
+    WITH CHECK (actor_id IS NULL OR (actor_id = app_uid() AND EXISTS (
+        SELECT 1 FROM users u WHERE u.id = app_uid() AND u.deleted_at IS NULL
+           FOR KEY SHARE)))""",
 )
 
 # Права и политики 0001 — для downgrade (текст политики совпадает с 0001).
 DOWNGRADE_GRANTS = (
+    "DROP POLICY IF EXISTS audit_insert ON audit_log",
+    """CREATE POLICY audit_insert ON audit_log FOR INSERT TO feelings_app
+    WITH CHECK (actor_id IS NULL OR actor_id = app_uid())""",
     "DROP POLICY IF EXISTS agents_update ON agents",
     "DROP POLICY IF EXISTS agents_insert ON agents",
     "DROP POLICY IF EXISTS agents_select ON agents",
@@ -256,19 +360,21 @@ DOWNGRADE_GRANTS = (
 )
 
 
-def _send_draft_0001() -> str:
-    """Определение app_send_draft из SECURITY_SQL ревизии 0001 (CREATE OR REPLACE)."""
+def _func_0001(name: str) -> str:
+    """Определение функции из SECURITY_SQL ревизии 0001 (CREATE OR REPLACE)."""
     rev = _rev("0001_initial_schema.py")
     for stmt in rev._statements(rev.SECURITY_SQL):
-        if stmt.startswith("CREATE FUNCTION app_send_draft("):
+        if stmt.startswith(f"CREATE FUNCTION {name}("):
             return stmt.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1)
-    raise RuntimeError("в 0001 не найдено определение app_send_draft")
+    raise RuntimeError(f"в 0001 не найдено определение {name}")
 
 
 def upgrade() -> None:
     # По одной команде: asyncpg не выполняет несколько команд в одном запросе.
     op.execute(_rev("0003_couple_functions_fixes.py")._expand(DELETE_ACCOUNT))
     op.execute(SEND_DRAFT)
+    op.execute(PIPELINE_DELIVER)
+    op.execute(PIPELINE_WITHHOLD)
     for stmt in UPGRADE_GRANTS:
         op.execute(stmt)
 
@@ -276,4 +382,5 @@ def upgrade() -> None:
 def downgrade() -> None:
     for stmt in DOWNGRADE_GRANTS:
         op.execute(stmt)
-    op.execute(_send_draft_0001())
+    for name in ("app_send_draft", "pipeline_deliver", "pipeline_withhold"):
+        op.execute(_func_0001(name))

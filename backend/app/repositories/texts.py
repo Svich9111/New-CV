@@ -349,7 +349,9 @@ async def send_draft(
     expected_version: int,
 ) -> uuid.UUID:
     """«Отправить» (ФТ-08): `app_send_draft` переносит шифротекст черновика в оригинал
-    сообщения без расшифровки. Ошибки FA001…FA004 — как DBAPIError (обработка — задача 3.x)."""
+    сообщения без расшифровки. Ошибки — как DBAPIError (обработка — задача 3.x): FA001…FA004
+    (DECISIONS АР-13) и с миграции 0005 — 42501: нет входа, пользователь не найден или помечен
+    удалённым (раньше в этих случаях было FA001)."""
     async with user_scope(sm, user_id) as s:
         value = (
             await s.execute(
@@ -452,7 +454,9 @@ async def pipeline_deliver(
     harsh: bool,
 ) -> bool:
     """Доставка версии для получателя (адаптированной или копии оригинала) — шифруется с
-    контекстом `partner_messages|adapted_enc|<id сообщения>`."""
+    контекстом `partner_messages|adapted_enc|<id сообщения>`. False — сообщения нет или оно
+    уже не в конвейере (в т.ч. удалено вместе с аккаунтом автора, пока доставка ждала пару;
+    АР-23). Получатель удалил аккаунт — доставка проходит без версии для получателя."""
     res = await s.execute(
         text("SELECT pipeline_deliver(:m, :t, :ad, CAST(:tone AS smallint), :h)"),
         {
