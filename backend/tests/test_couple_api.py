@@ -101,8 +101,10 @@ async def _create(client: httpx.AsyncClient, user: User) -> str:
 def _error(resp: httpx.Response, status: int, code: str | None = None) -> None:
     assert resp.status_code == status, resp.text
     assert_matches(resp.json(), "Error")
-    if code is not None:
-        assert resp.json()["code"] == code, resp.json()
+    if code is None and status == 404:
+        code = "not_found"  # единый 404 (критерий 3): всегда один и тот же код
+    assert code is not None, "код ошибки проверяется всегда (ревью 1.3 MINOR-5)"
+    assert resp.json()["code"] == code, resp.json()
 
 
 async def _active_pair(client: httpx.AsyncClient) -> tuple[User, User, str]:
@@ -239,7 +241,7 @@ async def test_own_invite_cannot_be_accepted(client: httpx.AsyncClient) -> None:
     anna = await _person(client, "Анна")
     token = await _create(client, anna)
     resp = await client.post(f"/api/v1/invites/{token}/accept", headers=anna.headers)
-    _error(resp, 409)
+    _error(resp, 409, "own_invite")
     couple = (await client.get("/api/v1/couple", headers=anna.headers)).json()
     assert couple["status"] == "pending" and len(couple["members"]) == 1
 
@@ -272,7 +274,8 @@ async def test_reissue_without_couple_is_404(client: httpx.AsyncClient) -> None:
 async def test_reissue_for_active_couple_conflicts(client: httpx.AsyncClient) -> None:
     anna, igor, _ = await _active_pair(client)
     for user in (anna, igor):
-        _error(await client.post("/api/v1/couple/invite", headers=user.headers), 409)
+        resp = await client.post("/api/v1/couple/invite", headers=user.headers)
+        _error(resp, 409, "couple_not_pending")
 
 
 # --- Выход -------------------------------------------------------------------------------
@@ -320,17 +323,22 @@ async def test_leave_writes_audit_without_texts(
 
 # --- Доступ: сессия, онбординг, посторонний ----------------------------------------------
 
-COUPLE_ENDPOINTS = [
+# Требуют онбординга. Выход (АР-17) и просмотр приглашения — только входа.
+ONBOARDED_ENDPOINTS = [
     ("get", "/api/v1/couple"),
     ("post", "/api/v1/couple"),
     ("post", "/api/v1/couple/invite"),
-    ("post", "/api/v1/couple/leave"),
     ("post", "/api/v1/invites/{token}/accept"),
 ]
 
 
 @pytest.mark.parametrize(
-    ("method", "path"), [*COUPLE_ENDPOINTS, ("get", "/api/v1/invites/{token}")]
+    ("method", "path"),
+    [
+        *ONBOARDED_ENDPOINTS,
+        ("post", "/api/v1/couple/leave"),
+        ("get", "/api/v1/invites/{token}"),
+    ],
 )
 async def test_requires_session(client: httpx.AsyncClient, method: str, path: str) -> None:
     url = path.format(token=new_token())
@@ -339,7 +347,7 @@ async def test_requires_session(client: httpx.AsyncClient, method: str, path: st
     _error(resp, 401, "unauthorized")
 
 
-@pytest.mark.parametrize(("method", "path"), COUPLE_ENDPOINTS)
+@pytest.mark.parametrize(("method", "path"), ONBOARDED_ENDPOINTS)
 async def test_requires_onboarding(
     client: httpx.AsyncClient, engine: AsyncEngine, method: str, path: str
 ) -> None:
@@ -568,3 +576,137 @@ async def test_service_does_not_start_without_bot_username(
     finally:
         get_settings.cache_clear()
         app.state.sessionmaker = saved
+
+
+# --- Раунд 1 ревью 1.3 -------------------------------------------------------------------
+
+
+async def test_leave_allowed_after_age_revoked(client: httpx.AsyncClient) -> None:
+    """АР-17: снявший 18+ (ТЗ §9.3) может выйти из пары; пара распускается для обоих."""
+    anna, igor, _ = await _active_pair(client)
+    revoked = await client.put(
+        "/api/v1/me/onboarding",
+        headers=igor.headers,
+        json={
+            "name": "Игорь",
+            "address_form": "на ты",
+            "partner_name": "Анна",
+            "consent_terms": True,
+            "consent_data": True,
+            "consent_sensitive": True,
+            "age_confirmed": False,
+        },
+    )
+    _error(revoked, 403, "underage")
+    _error(await client.get("/api/v1/couple", headers=igor.headers), 403, "onboarding_required")
+    assert (await client.post("/api/v1/couple/leave", headers=igor.headers)).status_code == 204
+    _error(await client.get("/api/v1/couple", headers=anna.headers), 404)
+    _error(await client.post("/api/v1/couple/leave", headers=igor.headers), 404)
+    # Анна может создать новую пару.
+    await _create(client, anna)
+
+
+async def test_leave_before_onboarding_without_couple_is_404(client: httpx.AsyncClient) -> None:
+    newcomer = await _login(client)
+    _error(await client.post("/api/v1/couple/leave", headers=newcomer.headers), 404)
+
+
+async def test_db_onboarding_refusal_maps_to_403(
+    client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FB008 от функции БД → 403 onboarding_required (не 401), даже если проверка API устарела."""
+    from app.repositories import users
+
+    anna, igor = await _person(client, "Анна"), await _person(client, "Игорь")
+    token = await _create(client, anna)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE users SET age_confirmed_at = NULL WHERE id = :u"), {"u": igor.id}
+        )
+
+    async def _stale(*_: object) -> bool:
+        return True
+
+    monkeypatch.setattr(users, "is_onboarded", _stale)
+    resp = await client.post(f"/api/v1/invites/{token}/accept", headers=igor.headers)
+    _error(resp, 403, "onboarding_required")
+    async with engine.connect() as conn:
+        members = await conn.execute(
+            text("SELECT count(*) FROM couple_members WHERE user_id = :u"), {"u": igor.id}
+        )
+        assert members.scalar_one() == 0
+
+
+async def test_token_collision_rolls_back_couple(
+    client: httpx.AsyncClient,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Сбой app_issue_invite внутри POST /couple (23505 хеша токена) — не «уже в паре»:
+    500, пара не создаётся (одна транзакция), параметры запроса в текст ошибки не попадают."""
+    import app.api.couple as couple_api
+
+    anna, olga = await _person(client, "Анна"), await _person(client, "Ольга")
+    taken = await _create(client, anna)
+    monkeypatch.setattr(couple_api, "new_token", lambda: taken)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as raw:
+        resp = await raw.post("/api/v1/couple", headers=olga.headers)
+    assert resp.status_code == 500
+    assert "already_in_couple" not in resp.text
+    async with engine.connect() as conn:
+        members = await conn.execute(
+            text("SELECT count(*) FROM couple_members WHERE user_id = :u"), {"u": olga.id}
+        )
+        assert members.scalar_one() == 0
+        orphans = await conn.execute(
+            text(
+                "SELECT count(*) FROM couples c WHERE NOT EXISTS "
+                "(SELECT 1 FROM couple_members cm WHERE cm.couple_id = c.id)"
+            )
+        )
+        assert orphans.scalar_one() == 0
+
+    from sqlalchemy.exc import IntegrityError
+
+    from app.repositories import couples
+
+    with pytest.raises(IntegrityError) as ei:
+        await couples.create_with_invite(sessionmaker, olga.id, hash_token(taken))
+    assert "uq_invites_token_hash" in str(ei.value) or "token_hash" in str(ei.value)
+    assert hash_token(taken).hex() not in str(ei.value)
+    assert "hide_parameters=True" in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/api/v1/invites/"),
+        ("get", "/api/v1/invites/aaaa%2Fbbbb"),
+        ("get", "/api/v1/invites/aaaa/bbbb"),
+        ("post", "/api/v1/invites/a/b/accept"),
+        ("post", "/api/v1/invites//accept"),
+        ("post", "/api/v1/invites/aaaa%2Fbbbb/accept"),
+        ("get", "/api/v1/no-such-route"),
+    ],
+)
+async def test_unrouted_paths_answer_like_unknown_token(
+    client: httpx.AsyncClient, method: str, path: str
+) -> None:
+    """D-2 (1.3-test): пустой токен, «/» или %2F — тот же 404, что у неизвестного токена."""
+    igor = await _person(client, "Игорь")
+    reference = await client.get(f"/api/v1/invites/{new_token()}", headers=igor.headers)
+    resp = await client.request(method, path, headers=igor.headers)
+    _error(resp, 404)
+    assert resp.json() == reference.json()
+    assert resp.headers["content-type"] == reference.headers["content-type"]
+
+
+async def test_wrong_method_is_405_error_schema(client: httpx.AsyncClient) -> None:
+    resp = await client.delete("/api/v1/couple")
+    _error(resp, 405, "method_not_allowed")
+    assert "GET" in resp.headers["allow"]

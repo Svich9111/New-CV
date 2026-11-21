@@ -8,17 +8,12 @@ from fastapi import APIRouter, Response
 from app.api.deps import AppSettings, CurrentUser, OnboardedUser, SessionMaker, unauthorized
 from app.config import ConfigError, check_invite_config
 from app.core.invites import hash_token, invite_link, is_well_formed, new_token
-from app.errors import AppError
+from app.errors import AppError, not_found
 from app.repositories import couples
 from app.repositories.couples import CoupleError
 from app.schemas import Couple, InviteCreated, InvitePreview
 
 router = APIRouter(tags=["couple"])
-
-
-def not_found() -> AppError:
-    # Один ответ на «нет», «нет доступа» и «неверный формат» — ничего не раскрывается.
-    return AppError(404, "not_found", "Не найдено")
 
 
 def _gone_expired() -> AppError:
@@ -40,7 +35,7 @@ def _http_error(exc: CoupleError) -> AppError:
             return _gone_used()
         case "FB004":
             return AppError(409, "own_invite", "Это ваше приглашение — отправьте ссылку партнёру")
-        case "FB005" | "23505":
+        case "FB005":
             return AppError(409, "already_in_couple", "У вас уже есть пара")
         case "FB006":
             return AppError(409, "couple_not_pending", "Пара уже не ожидает партнёра")
@@ -106,7 +101,9 @@ async def reissue_invite(
 
 
 @router.post("/couple/leave", status_code=204)
-async def leave_couple(user_id: OnboardedUser, sm: SessionMaker) -> Response:
+async def leave_couple(user_id: CurrentUser, sm: SessionMaker) -> Response:
+    """Выйти может и снявший 18+ или согласие (АР-17, ТЗ §4.5 п.2): функция БД онбординга
+    не требует."""
     try:
         await couples.leave(sm, user_id)
     except CoupleError as exc:
