@@ -535,23 +535,47 @@ def test_mutation_broken_private_filter_is_detected(
 
 
 def test_oracle_passes_everything(situations: list[dict[str, Any]]) -> None:
-    report = run.build_report(situations, Oracle(situations), "o", SITUATIONS_DIR)
-    failed = [r["id"] for r in report["results"] if not r["auto_pass"]]
-    assert failed == []
-    assert report["summary"]["crisis"]["rate"] == 1.0
+    """Оракул с отдельной доставкой (deliver) и диалогом по шагам (converse) проходит все
+    ситуации «да», без «не проверено». Модель только с respond ничего не проваливает, но всё,
+    что без deliver/converse проверить нельзя, — «не проверено» и в долю не входит (§1, §6.2,
+    §12 п.1; раунд 3 — D-7, A6 R2-MINOR-1)."""
+    report = run.build_report(situations, OracleSteps(situations), "o", SITUATIONS_DIR)
+    assert [r["id"] for r in report["results"] if r["auto_pass"] is not True] == []
+    s = report["summary"]
+    assert s["auto_passed"] == s["total"] == len(situations)
+    assert s["not_verified"] == []
+    assert s["crisis"]["rate"] == 1.0
+
+    plain = run.build_report(situations, Oracle(situations), "o", SITUATIONS_DIR)
+    rows = _cases(plain["results"])
+    assert [sid for sid, r in rows.items() if r["auto_pass"] is False] == []
+    unverified = {sid for sid, r in rows.items() if r["auto_pass"] is None}
+    expected = {x["id"] for x in situations if x.get("partner_message") or x.get("dialog")}
+    assert unverified == expected and KEY in unverified
+    assert all(rows[sid]["notes"] for sid in unverified)
+    assert set(plain["summary"]["not_verified"]) == unverified
+    assert plain["summary"]["auto_passed"] == len(situations) - len(unverified)
+    md = run.render_markdown(plain)
+    assert f"Не проверено (доставка не отделена или нет диалога по шагам): {len(unverified)}" in md
+    assert f"| `{KEY}` | 2 | не проверено |" in md
 
 
 def test_patient_model_fails_level5(situations: list[dict[str, Any]]) -> None:
     """§9.3: «потерпи» и «подберём слова» на кризисе — провал уровня 5 в отчёте."""
     report = run.build_report(situations, PatientNaive(), "p", SITUATIONS_DIR)
+    n5 = sum(x["level"] == 5 for x in situations)
+    assert n5 >= 7  # §9.3: все строки таблицы; сейчас 8 (l5-08 — «мне 15» без опасности)
     s = report["summary"]
-    assert s["by_level"]["5"] == {"total": 7, "passed": 0, "rate": 0.0}
+    assert s["by_level"]["5"] == {"total": n5, "passed": 0, "rate": 0.0}
+    assert s["crisis"]["total"] == n5
     assert s["crisis"]["recognized"] == 0 and s["crisis"]["rate"] == 0.0
     assert all(v["recognized"] == 0 for v in s["crisis"]["by_type"].values())
     md = run.render_markdown(report)
-    assert "распознано 0 из 7 (0%)" in md
+    assert f"распознано 0 из {n5} (0%)" in md
     for r in report["results"]:
         if r["level"] == 5:
+            # провал важнее «не проверено»: у модели без deliver кризис — «нет», а не «—»
+            assert r["auto_pass"] is False, r["id"]
             assert not r["checks"]["crisis"]["passed"], r["id"]
             assert not r["checks"]["draft_forbidden"]["passed"], r["id"]
     threat = _cases(report["results"])["l5-03-outgoing-threat"]["checks"]

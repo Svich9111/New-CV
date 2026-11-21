@@ -508,6 +508,13 @@ def _owner_strings(s: dict[str, Any]) -> list[str]:
     ]
 
 
+def _json_or_none(text: Any) -> Any:
+    try:
+        return json.loads(text) if isinstance(text, str) else None
+    except json.JSONDecodeError:
+        return None
+
+
 @pytest.fixture(scope="module")
 def situations() -> list[dict[str, Any]]:
     loaded: list[dict[str, Any]] = run.load_situations()
@@ -586,7 +593,9 @@ def test_echo_requests_have_no_ids_or_foreign_context(situations: list[dict[str,
 def test_adapter_failure_is_failed_situation_not_pass(
     situations: list[dict[str, Any]], reply: Reply
 ) -> None:
-    """Ошибка модели в адаптере → ситуация «не прошла» с причиной (§10), не «пройдено»."""
+    """Ошибка модели в адаптере → ситуация «не прошла» с причиной (§10), не «пройдено».
+    Ответ, полученный от API (отказ, обрыв, пусто), оплачен: токены и стоимость в метриках
+    (§10 «контроль расходов», A6 MINOR-4); ошибка без ответа (529) — $0."""
     model = claude_adapter.Opus(provider=ClaudeProvider(OPUS, client=Wire(reply).client()))
     sample = [s for s in situations if s["id"] in {"l1-01-dishes", "l5-03-outgoing-threat"}]
     try:
@@ -598,9 +607,19 @@ def test_adapter_failure_is_failed_situation_not_pass(
         assert not row["auto_pass"], row["id"]
         assert "model_error" in row["checks"]
         assert row["checks"]["model_error"]["detail"]  # причина видна в отчёте
-        if row["metrics"]["calls"][0]["error"] is not None:  # ошибка на уровне API
-            assert row["metrics"]["errors"]
-            assert row["metrics"]["cost_usd"] == 0
+        m = row["metrics"]
+        calls = m["calls"]
+        assert calls
+        answered = sum(c["output_tokens"] > 0 for c in calls)  # API вернул ответ (usage 10/5)
+        if calls[0]["error"] is not None:  # ошибка на уровне слоя
+            assert m["errors"]
+        if calls[0]["error"] in {"unavailable", "model_not_found"}:  # ответа не было
+            assert answered == 0 and m["cost_usd"] == 0 and m["input_tokens"] == 0
+        else:  # ответ был и оплачен
+            assert answered == len(calls)
+            assert m["input_tokens"] == 10 * len(calls) and m["output_tokens"] == 5 * len(calls)
+            assert m["cost_usd"] > 0
+            assert m["cost_usd"] == pytest.approx(len(calls) * cost_usd(OPUS, Usage(10, 5)))
 
 
 def test_adapter_metrics_sum_owner_and_recipient(situations: list[dict[str, Any]]) -> None:
@@ -744,6 +763,395 @@ def test_echo_owner_steps_do_not_see_approved_original(situations: list[dict[str
     steps = owner[1:]  # первый вызов агента владельца — respond, дальше — шаги converse
     assert len(steps) == len(key[0]["owner_turns"])
     original = key[0]["partner_message"]["original"]
-    for body in steps:
+    for body in owner:  # и respond, и шаги converse (ТЗ §1: оригинал — результат шага 3)
         dumped = json.dumps(body["messages"], ensure_ascii=False)
         assert original not in dumped
+        payloads = [_json_or_none(m["content"]) for m in body["messages"]]
+        assert any(isinstance(x, dict) for x in payloads)  # данные владельца — JSON
+        for payload in payloads:
+            if isinstance(payload, dict):
+                assert payload.get("approved_partner_message") is None
+    recipient_bodies = [b for b in wire.bodies if b["system"] == recipient]
+    assert [json.loads(b["messages"][0]["content"]) for b in recipient_bodies] == [
+        {"original": original}
+    ]  # оригинал получает только агент получателя
+
+
+# =========================================================================== раунд 2 (0.4): исправления
+
+
+def _spend(status: int, code: str, kind: str = "rate_limit_error") -> httpx2.Response:
+    error = {"type": kind, "message": "x", "details": {"error_code": code}}
+    return httpx2.Response(status, json={"type": "error", "error": error})
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [
+        lambda r: _error(402, "billing_error"),
+        lambda r: _spend(402, "linked_organization_spend_limit_reached", "billing_error"),
+        lambda r: _spend(429, "enforced_spend_limit_reached"),
+        lambda r: _spend(429, "contract_spend_limit_reached"),
+    ],
+    ids=["402", "402-linked-org", "429-enforced-spend", "429-contract-spend"],
+)
+async def test_spend_limit_is_quota_without_fallback(primary: Reply) -> None:
+    """ТЗ §10 «контроль расходов» (A6 MINOR-1): исчерпан лимит расходов или нет оплаты — не
+    «временная недоступность»: резервную модель того же аккаунта не вызывают, ошибка — quota
+    с понятным сообщением, текст сохранён; в адаптере — фатальная (прогон останавливается)."""
+    from app.ai.llm import LLMQuotaError
+
+    main, spare = Wire(primary), Wire(lambda r: _json_reply({"ok": True}, model=HAIKU))
+    chain = FallbackProvider(
+        ClaudeProvider(OPUS, client=main.client()), ClaudeProvider(HAIKU, client=spare.client())
+    )
+    with pytest.raises(LLMQuotaError) as info:
+        await _ask(chain)
+    assert info.value.kind == "quota" and not info.value.fallback_ok
+    assert "сохранён" in info.value.user_message
+    assert FAKE_KEY not in _exc_text(info.value)
+    assert spare.bodies == []
+    assert "quota" in claude_adapter.FATAL_KINDS
+
+
+def test_spend_limit_stops_eval_run(situations: list[dict[str, Any]]) -> None:
+    """Лимит расходов в прогоне: RunAborted на первой ситуации, а не 30 оплаченных повторов."""
+    wire = Wire(lambda r: _spend(429, "enforced_spend_limit_reached"))
+    model = claude_adapter.Opus(provider=ClaudeProvider(OPUS, client=wire.client()))
+    try:
+        with pytest.raises(claude_adapter.RunAborted, match="quota"):
+            run.run_suite(situations, model)
+    finally:
+        model.close()
+    assert len(wire.bodies) == 1
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [
+        lambda r: _error(408, "timeout_error"),
+        lambda r: _spend(429, "ramp_limit_exceeded"),
+    ],
+    ids=["408", "429-ramp-limit"],
+)
+async def test_server_timeout_and_ramp_limit_go_to_fallback(primary: Reply) -> None:
+    """408 — тайм-аут поставщика, ramp limit — «повторить позже» (SDK: Retry after) — временная
+    недоступность: ответ резервной модели (ТЗ §10), а не ошибка запроса."""
+    main, spare = Wire(primary), Wire(lambda r: _json_reply({"ok": True}, model=HAIKU))
+    chain = FallbackProvider(
+        ClaudeProvider(OPUS, client=main.client()), ClaudeProvider(HAIKU, client=spare.client())
+    )
+    result = await _ask(chain)
+    assert result.model == HAIKU and result.fallback_used
+    assert len(spare.bodies) == 1
+
+
+async def test_refusal_without_fallback_keeps_paid_usage() -> None:
+    """АР-20 + §10: отказ не уходит на резервную; оплаченный отказ несёт usage и стоимость."""
+    usage = {"input_tokens": 1000, "output_tokens": 100}
+    refusal = httpx2.Response(200, json=_message([], stop_reason="refusal", usage=usage))
+    main, spare = Wire(lambda r: refusal), Wire(lambda r: _json_reply({"ok": True}, model=HAIKU))
+    chain = FallbackProvider(
+        ClaudeProvider(OPUS, client=main.client()), ClaudeProvider(HAIKU, client=spare.client())
+    )
+    with pytest.raises(LLMRefusal) as info:
+        await _ask(chain)
+    assert spare.bodies == []
+    assert info.value.usage == Usage(1000, 100)
+    assert info.value.cost_usd == pytest.approx(1000 * 4e-6 + 100 * 20e-6)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR 0.4 D-5: fallback.py FallbackProvider — оплаченная неудачная попытка основной "
+    "модели (обрыв max_tokens, испорченный JSON) теряется при переходе на резервную: "
+    "cost_usd результата — только резервной (ТЗ §10 «контроль расходов», A6 MINOR-4)",
+)
+async def test_paid_bad_output_before_fallback_is_counted() -> None:
+    """§10 «контроль расходов» (A6 MINOR-4): Opus оборвался на max_tokens (оплачено 16000
+    токенов), ответила резервная — в стоимости вызова должен быть и оплаченный обрыв."""
+    cut = httpx2.Response(
+        200,
+        json=_message(
+            [{"type": "text", "text": "{"}],
+            stop_reason="max_tokens",
+            usage={"input_tokens": 1000, "output_tokens": 16000},
+        ),
+    )
+    spare = Wire(lambda r: _json_reply({"ok": True}, model=HAIKU))
+    chain = FallbackProvider(
+        ClaudeProvider(OPUS, client=Wire(lambda r: cut).client()),
+        ClaudeProvider(HAIKU, client=spare.client()),
+    )
+    result = await _ask(chain)
+    assert result.model == HAIKU
+    opus_paid = 1000 * 4e-6 + 16000 * 20e-6  # 0,324 $
+    assert result.cost_usd >= opus_paid
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR 0.4 D-5: fallback.py — если не ответила ни одна модель, в ошибке только "
+    "расход последней попытки (ТЗ §10 «контроль расходов»)",
+)
+async def test_paid_failures_of_whole_chain_are_counted() -> None:
+    """Обе модели оборвались: стоимость в итоговой ошибке — сумма обеих попыток."""
+
+    def cut(model: str) -> Reply:
+        body = _message(
+            [{"type": "text", "text": "{"}],
+            model=model,
+            stop_reason="max_tokens",
+            usage={"input_tokens": 1000, "output_tokens": 1000},
+        )
+        return lambda r: httpx2.Response(200, json=body)
+
+    chain = FallbackProvider(
+        ClaudeProvider(OPUS, client=Wire(cut(OPUS)).client()),
+        ClaudeProvider(HAIKU, client=Wire(cut(HAIKU)).client()),
+    )
+    with pytest.raises(LLMBadOutput) as info:
+        await _ask(chain)
+    both = (cost_usd(OPUS, Usage(1000, 1000)) or 0) + (cost_usd(HAIKU, Usage(1000, 1000)) or 0)
+    assert info.value.cost_usd == pytest.approx(both)
+
+
+def test_unknown_model_has_no_price_and_is_config_error() -> None:
+    """D-4: модели без цены — «цены нет» (None) и ошибка настройки до сети, а не $0."""
+    assert cost_usd("claude-opus-5-5-20261101", Usage(1, 1)) is None
+    wire = Wire(lambda r: _json_reply({"ok": True}))
+    with pytest.raises(LLMConfigError, match="цены"):
+        ClaudeProvider("claude-opus-5-5-20261101", client=wire.client())
+    assert wire.bodies == []
+
+
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.NOTSET])
+async def test_debug_logs_have_no_texts_any_path(
+    caplog: pytest.LogCaptureFixture, level: int
+) -> None:
+    """CLAUDE.md «в журналах нет текстов» (D-2): ни complete_json, ни stream_text, ни повтор
+    SDK после 529 не пишут тело запроса; служебные записи SDK (метод, адрес, статус) остаются.
+    Уровень выставлен и на корень, и на сам журнал SDK."""
+    caplog.set_level(logging.DEBUG)
+    logging.getLogger("anthropic").setLevel(level)
+    logging.getLogger("anthropic._base_client").setLevel(level)
+    secret = "Секрет A8: мне страшно ему сказать"
+    talk = [ChatMessage("user", secret)]
+    calls = {"n": 0}
+
+    def flaky(request: httpx2.Request) -> httpx2.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _error(529, "overloaded_error")
+        return _json_reply({"ok": True})
+
+    wire = Wire(flaky)
+    client = anthropic.AsyncAnthropic(
+        api_key=FAKE_KEY,
+        base_url="http://a8-llm.invalid",
+        max_retries=1,
+        http_client=anthropic.DefaultAsyncHttpxClient(transport=httpx2.MockTransport(wire)),
+    )
+    try:
+        await ClaudeProvider(OPUS, client=client).complete_json(
+            system="s", messages=talk, schema=SCHEMA
+        )
+        stream = ClaudeProvider(
+            OPUS, client=Wire(lambda r: _sse(_stream(["да"], "end_turn"))).client()
+        )
+        assert [c async for c in stream.stream_text(system="s", messages=talk)] == ["да"]
+    finally:
+        logging.getLogger("anthropic").setLevel(logging.NOTSET)
+        logging.getLogger("anthropic._base_client").setLevel(logging.NOTSET)
+    assert len(wire.bodies) == 2  # был повтор SDK
+    assert any("HTTP Request" in r.getMessage() for r in caplog.records)
+    assert secret not in caplog.text
+    assert all(secret not in r.getMessage() for r in caplog.records)
+    assert FAKE_KEY not in caplog.text
+
+
+# --------------------------------------------------------------------- compare.py: коды 3/4, отчёты
+
+
+class _ModelApi(BaseHTTPRequestHandler):
+    """Локальный API: поведение задаётся по модели — ok / down (529 на всё) /
+    no_recipient (529 только агенту получателя) / auth (401)."""
+
+    plan: ClassVar[dict[str, str]] = {}
+    seen: ClassVar[list[str]] = []
+
+    def do_POST(self) -> None:  # имя метода задаёт http.server
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+        model = body["model"]
+        self.seen.append(model)
+        mode = self.plan.get(model, "ok")
+        first = _json_or_none(body["messages"][0]["content"])
+        recipient = isinstance(first, dict) and set(first) == {"original"}
+        if mode == "auth":
+            status, data = 401, {"type": "error", "error": {"type": "authentication_error"}}
+        elif mode == "down" or (mode == "no_recipient" and recipient):
+            status, data = 529, {"type": "error", "error": {"type": "overloaded_error"}}
+        else:
+            answer = (
+                {"safety": "none", "tone": 1, "adapted": first["original"], "reply_hint": "Ответь."}
+                if recipient
+                else OWNER_OK
+            )
+            status = 200
+            data = _message([{"type": "text", "text": json.dumps(answer)}], model=model)
+        raw = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("x-should-retry", "false")
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, *args: Any) -> None:
+        pass
+
+
+@pytest.fixture
+def model_api(request: pytest.FixtureRequest) -> Iterator[tuple[str, type[_ModelApi]]]:
+    handler = type("Api", (_ModelApi,), {"plan": dict(request.param), "seen": []})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", handler
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+TWO = ("--models", "adapters.claude:Opus", "adapters.claude:Haiku", "--label", "a8")
+
+
+def _compare(url: str, out: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+    env = _env(ANTHROPIC_API_KEY=FAKE_KEY, ANTHROPIC_BASE_URL=url)
+    return _cli("compare.py", *TWO, *extra, "--out-dir", str(out), env=env)
+
+
+@pytest.mark.parametrize("model_api", [{OPUS: "down"}], indirect=True)
+def test_compare_silent_model_code_3_others_reported(
+    tmp_path: Path, model_api: tuple[str, type[_ModelApi]]
+) -> None:
+    """A8 D-3 / A6 MINOR-6(а): модель не ответила ни разу — код 3, её отчёта нет, в сводке
+    «не ответили»; ответившая модель в сводке с отчётом (§10 «понятная ошибка»)."""
+    url, _ = model_api
+    out = tmp_path / "out"
+    proc = _compare(url, out)
+    assert proc.returncode == 3, proc.stderr[-500:]
+    names = sorted(p.name for p in out.iterdir())
+    assert names == sorted(["a8.json", "a8.md", f"a8_{HAIKU}.json", f"a8_{HAIKU}.md"]), names
+    md = (out / "a8.md").read_text(encoding="utf-8")
+    assert "Сравнение неполное" in md and f"`{OPUS}`" in md
+    summary = json.loads((out / "a8.json").read_text(encoding="utf-8"))
+    assert [r["model"] for r in summary["rows"]] == [HAIKU]
+    assert summary["not_answered"] == [OPUS]
+    assert FAKE_KEY not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("model_api", [{OPUS: "down"}], indirect=True)
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR 0.4 D-6: compare.py meta['incomplete'] = code == 3 — молчащая модель (без "
+    "фатальной ошибки) даёт в сводке «прогон прерван фатальной ошибкой»",
+)
+def test_compare_silent_model_is_not_called_fatal(
+    tmp_path: Path, model_api: tuple[str, type[_ModelApi]]
+) -> None:
+    """Модель молчит, но прогон не прерывался (Haiku прогнана целиком): сводка не должна
+    писать «прогон прерван фатальной ошибкой» — иначе читатель ищет несуществующий сбой."""
+    url, _ = model_api
+    out = tmp_path / "out"
+    proc = _compare(url, out)
+    assert proc.returncode == 3
+    md = (out / "a8.md").read_text(encoding="utf-8")
+    assert "прерван" not in md, md[:1500]
+
+
+@pytest.mark.parametrize("model_api", [{HAIKU: "auth"}], indirect=True)
+def test_compare_fatal_on_second_model_keeps_first_reports(
+    tmp_path: Path, model_api: tuple[str, type[_ModelApi]]
+) -> None:
+    """A6 MINOR-6(б): ключ отклонён на второй модели — уже оплаченный отчёт первой записан,
+    сводка помечена «прервано», код 3."""
+    url, handler = model_api
+    out = tmp_path / "out"
+    proc = _compare(url, out)
+    assert proc.returncode == 3, proc.stderr[-500:]
+    assert HAIKU in handler.seen
+    assert (out / f"a8_{OPUS}.json").exists() and (out / f"a8_{OPUS}.md").exists()
+    assert not (out / f"a8_{HAIKU}.json").exists()
+    md = (out / "a8.md").read_text(encoding="utf-8")
+    assert "прерван" in md
+    assert FAKE_KEY not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("model_api", [{HAIKU: "no_recipient"}], indirect=True)
+def test_compare_partial_answers_code_4(
+    tmp_path: Path, model_api: tuple[str, type[_ModelApi]]
+) -> None:
+    """Модель ответила не на все ситуации — код 4, отчёты обеих моделей и сводка есть."""
+    url, _ = model_api
+    out = tmp_path / "out"
+    proc = _compare(url, out)
+    assert proc.returncode == 4, proc.stderr[-500:]
+    assert (out / f"a8_{HAIKU}.json").exists() and (out / f"a8_{OPUS}.json").exists()
+    summary = json.loads((out / "a8.json").read_text(encoding="utf-8"))
+    errors = {r["model"]: r for r in summary["rows"]}
+    assert set(errors) == {OPUS, HAIKU}
+
+
+@pytest.mark.parametrize("model_api", [{}], indirect=True)
+def test_compare_all_ok_code_0(tmp_path: Path, model_api: tuple[str, type[_ModelApi]]) -> None:
+    url, _ = model_api
+    proc = _compare(url, tmp_path / "out")
+    assert proc.returncode == 0, proc.stderr[-500:]
+    assert "Сравнение неполное" not in (tmp_path / "out" / "a8.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("model_api", [{}], indirect=True)
+def test_compare_blind_hides_model_names(
+    tmp_path: Path, model_api: tuple[str, type[_ModelApi]]
+) -> None:
+    """--blind (A6 0.4 MINOR-5, 0.3 R2-MINOR-4): в именах файлов и во всех md нет имён моделей;
+    соответствие — только в json сводки (blind_key)."""
+    url, _ = model_api
+    out = tmp_path / "out"
+    proc = _compare(url, out, "--blind")
+    assert proc.returncode == 0, proc.stderr[-500:]
+    names = [p.name for p in out.iterdir()]
+    for name in names:
+        for model in (OPUS, HAIKU, "opus", "haiku", "sonnet"):
+            assert model not in name.lower(), name
+    for md in out.glob("*.md"):
+        text = md.read_text(encoding="utf-8").lower()
+        for model in ("opus", "haiku", "sonnet"):
+            assert model not in text, (md.name, model)
+    summary = json.loads((out / "a8.json").read_text(encoding="utf-8"))
+    assert set(summary["blind_key"].values()) == {OPUS, HAIKU}
+
+
+@pytest.mark.parametrize("model_api", [{}], indirect=True)
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR 0.4 D-7: compare.py --blind — model-A/B/C по порядку --models (порядок по "
+    "умолчанию известен), run.py --blind — метка blind-<sha256(имя)[:6]>: слепота снимается "
+    "без blind_key (A6 0.4 MINOR-5, 0.3 R2-MINOR-4)",
+)
+def test_compare_blind_aliases_do_not_follow_model_order(
+    tmp_path: Path, model_api: tuple[str, type[_ModelApi]]
+) -> None:
+    """Слепота не должна сниматься знанием порядка --models (по умолчанию он записан в
+    README: Opus, Sonnet, Haiku): если «model-A» — всегда первая модель, эксперт знает, кто это.
+    Ожидается: соответствие перемешано (и записано в blind_key)."""
+    url, _ = model_api
+    seen = set()
+    for i in range(6):
+        out = tmp_path / f"out{i}"
+        assert _compare(url, out, "--blind").returncode == 0
+        key = json.loads((out / "a8.json").read_text(encoding="utf-8"))["blind_key"]
+        seen.add(key["model-A"])
+    assert len(seen) > 1, seen
