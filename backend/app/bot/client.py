@@ -73,11 +73,14 @@ class BotApi:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def call(self, method: str, payload: dict[str, Any]) -> Any:
+    async def call(
+        self, method: str, payload: dict[str, Any], *, timeout: httpx.Timeout | None = None
+    ) -> Any:
+        """`timeout` — для отдельного вызова (долгий опрос getUpdates), иначе общий."""
         attempt = 0
         while True:
             try:
-                return await self._call_once(method, payload)
+                return await self._call_once(method, payload, timeout)
             except BotApiError as err:
                 retry = err.retry_after
                 if (
@@ -90,10 +93,12 @@ class BotApi:
                 attempt += 1
                 await self._sleep(retry)
 
-    async def _call_once(self, method: str, payload: dict[str, Any]) -> Any:
+    async def _call_once(
+        self, method: str, payload: dict[str, Any], timeout: httpx.Timeout | None
+    ) -> Any:
         url = f"{self._base}/bot{self._token.get_secret_value()}/{method}"
         try:
-            resp = await self._http.post(url, json=payload)
+            resp = await self._http.post(url, json=payload, timeout=timeout or self.timeout)
         except httpx.TimeoutException:
             raise BotApiError(method, "timeout", transient=True) from None
         except httpx.HTTPError:
@@ -140,3 +145,9 @@ class BotApi:
 def webapp_keyboard(text: str, webapp_url: str) -> dict[str, Any]:
     """Встроенная кнопка, открывающая Mini App (работает в личном чате с ботом)."""
     return {"inline_keyboard": [[{"text": text, "web_app": {"url": webapp_url}}]]}
+
+
+def describe_error(err: BotApiError) -> str:
+    """Текст для оператора (утилиты setup/check/poll): метод, код и описание от Telegram
+    (без токена). В журналы вебхука и опроса не идёт."""
+    return f"{err}: {err.description}" if err.description else str(err)

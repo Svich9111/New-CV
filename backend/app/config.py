@@ -60,18 +60,40 @@ def check_invite_config(settings: Settings) -> None:
 _WEBHOOK_SECRET = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 
 
+def _check_bot_token(settings: Settings) -> None:
+    if not settings.telegram_bot_token.get_secret_value():
+        raise ConfigError("FEELINGS_TELEGRAM_BOT_TOKEN is empty")
+
+
+def _check_webapp_url(settings: Settings) -> None:
+    url = urlsplit(settings.webapp_url)
+    if url.scheme != "https" or not url.hostname:
+        raise ConfigError("FEELINGS_WEBAPP_URL must be an https:// URL")
+
+
 def check_bot_config(settings: Settings) -> None:
     """Без токена, стойкого секрета вебхука и адреса Mini App бот не работает (задача 1.4).
     Значения секретов в текст ошибки не попадают."""
-    if not settings.telegram_bot_token.get_secret_value():
-        raise ConfigError("FEELINGS_TELEGRAM_BOT_TOKEN is empty")
+    _check_bot_token(settings)
     if not _WEBHOOK_SECRET.fullmatch(settings.telegram_webhook_secret.get_secret_value()):
         raise ConfigError(
             "FEELINGS_TELEGRAM_WEBHOOK_SECRET must be 32-256 characters of A-Z a-z 0-9 _ -"
         )
-    url = urlsplit(settings.webapp_url)
-    if url.scheme != "https" or not url.hostname:
-        raise ConfigError("FEELINGS_WEBAPP_URL must be an https:// URL")
+    _check_webapp_url(settings)
+
+
+def check_bot_token_config(settings: Settings) -> None:
+    """Для проверки токена (`python -m app.bot.check`) нужен только токен бота."""
+    _check_bot_token(settings)
+
+
+def check_dev_bot_config(settings: Settings) -> None:
+    """Бот без сервера: опрос getUpdates (`python -m app.bot.poll`, только разработка) и
+    настройка без вебхука (`python -m app.bot.setup --no-webhook`). Нужны токен и адрес
+    Mini App (https) для кнопки web_app; секрет вебхука и БД не нужны. Проверку сервера
+    (`check_bot_config`) не ослабляет."""
+    _check_bot_token(settings)
+    _check_webapp_url(settings)
 
 
 @lru_cache
