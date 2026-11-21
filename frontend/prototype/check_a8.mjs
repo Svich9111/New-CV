@@ -29,7 +29,7 @@ function ck(cond, crit, name, detail = "") {
   if (!quietPrefix || !ok) console.log("  " + (ok ? "✓" : "✗") + " " + crit + " " + fullName + (detail && !ok ? " — " + detail : ""));
 }
 const ONLY = process.env.A8_ONLY ? process.env.A8_ONLY.split(",") : null; // напр. A8_ONLY=1,7 — только разделы 1 и 7
-// Известные дефекты (см. docs/reviews/0.6-test.md) — аналог xfail(strict=True):
+// Известные дефекты (см. docs/reviews/0.6-test.md; раунд 2: D-3, N-1, N-2, N-3) — аналог xfail(strict=True):
 // пока дефект воспроизводится, проверка не роняет прогон; если он исправлен — XPASS считается провалом,
 // отметку нужно снять. A8_RUNXFAIL=1 — считать их обычными проверками.
 function xf(defect, cond, crit, name, detail = "") {
@@ -874,6 +874,9 @@ await section("10. Запись в памяти из одобренного со
     await persona(p, "Игорь"); await mainButton(p).click();
     for (const re of [/правила/, /персональных/, /чувствах/, /18/]) await p.getByRole("checkbox", { name: re }).check();
     await mainButton(p).click();
+    // Раунд 2: варианты ответа Игоря зависят от входящего (M3) — сначала Анна отправляет вариант агента
+    await persona(p, "Анна"); await jump(p, "Черновик"); await mainButton(p).click();
+    await persona(p, "Игорь");
     await jump(p, "Черновик");
     if (variant === 1) await btn(p, "Другой вариант").click();
     const sent = await p.getByLabel("Сообщение для Ани").inputValue();
@@ -881,7 +884,7 @@ await section("10. Запись в памяти из одобренного со
     await persona(p, "Анна"); await jump(p, "Память");
     const mem = await mainText(p);
     const entry = (mem.split("Из сообщений партнёра")[1] || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
-    const okMeaning = !forbidRe.test(entry) && expectRe.test(entry) && !/(Игорь|он)\s.*\bей важно/.test(entry);
+    const okMeaning = !forbidRe.test(entry) && expectRe.test(entry);
     if (!okMeaning) memoryFindings.push("Игорь отправил «" + sent.slice(0, 70) + "…», а в памяти Анны: «" + entry + "»");
     ck(okMeaning, "N", "вариант " + (variant + 1) + " ответа Игоря → запись памяти Анны передаёт смысл [D-4 исправлен]", "запись: «" + entry + "»");
     await p.context().close();
@@ -899,6 +902,269 @@ await section("11. Тексты на русском, тон агента (§2)",
   ck(moral.length === 0, "K7", "нет морализаторства", moral.join(", "));
   const formal = text.match(/(^|[\s«])(Вы|Вас|Вам|Ваш\w*)\s+(можете|должны|хотите|получите|нажмите)/g) || [];
   ck(formal.length === 0 && /\bты\b|тебе|тебя/i.test(text), "K7", "обращение на «ты»", formal.join(", "));
+});
+
+// ---------- Раунд 2: общие шаги для разделов 13–16 ----------
+// Пара создаётся только через интерфейс: Анна проходит знакомство, Игорь принимает приглашение. Итог — Анна на «Приглашении».
+async function pairUp(p) {
+  await mainButton(p).click(); await mainButton(p).click(); await mainButton(p).click();
+  for (const re of [/правила/, /персональных/, /чувствах/, /18/]) await p.getByRole("checkbox", { name: re }).check();
+  await mainButton(p).click();
+  await persona(p, "Игорь"); await mainButton(p).click();
+  for (const re of [/правила/, /персональных/, /чувствах/, /18/]) await p.getByRole("checkbox", { name: re }).check();
+  await mainButton(p).click();
+  await persona(p, "Анна");
+}
+// Личный разговор Анны с агентом: исповедь + уникальная метка, которой у Игоря быть не должно
+const PRIVATE_TOKEN = "[ЛИЧНОЕ-А8-5521]";
+async function annaConfides(p) {
+  await jump(p, "Чат с агентом");
+  const inp = p.getByRole("textbox", { name: "Сообщение агенту" });
+  await inp.fill("Ему вообще плевать на меня " + PRIVATE_TOKEN); await inp.press("Enter");
+  await waitText(p, /обидно/);
+  await inp.fill("Он третий раз за месяц отменяет наш вечер. Я чувствую, что я не на первом месте."); await inp.press("Enter");
+  await waitText(p, /Что тебе сейчас ближе/);
+}
+// Отправка от имени persona. variant — номер варианта агента (0/1); text — свой текст (заменяет), append — дописать к варианту
+async function sendAs(p, who, { variant = 0, text = null, append = null } = {}) {
+  await persona(p, who);
+  await jump(p, "Черновик");
+  const field = p.getByLabel(who === "Анна" ? "Сообщение для Игоря" : "Сообщение для Ани");
+  for (let i = 0; i < variant; i++) await btn(p, "Другой вариант").click();
+  if (text !== null) await field.fill(text);
+  if (append !== null) await field.fill((await field.inputValue()) + append);
+  const sent = (await field.inputValue()).trim();
+  await mainButton(p).click(); // черновик открыт не MainButton — защита M4 не включается
+  ck((await title(p)) === "Сообщения пары", "K5", who + ": «Отправить» → Сообщения пары");
+  return sent;
+}
+// Последняя входящая карточка у viewer: доставленный текст, оригинал (если есть), служебные тексты
+async function lastIncoming(p, viewer) {
+  await persona(p, viewer);
+  await jump(p, "Сообщения пары");
+  const card = mainArea(p).getByRole("article").last();
+  if (await card.getByRole("button", { name: "Показать оригинал" }).count()) await card.getByRole("button", { name: "Показать оригинал" }).click();
+  return card.evaluate((a) => {
+    const divs = [...a.querySelectorAll("div")];
+    const orig = divs.find((x) => x.firstElementChild && /^Оригинал/.test(x.firstElementChild.textContent));
+    const head = a.firstElementChild;
+    const delivered = head.nextElementSibling; // текст сразу после шапки карточки
+    // текст вне выделенных (<mark>) фраз; у оригинала без подписи «Оригинал — как …»
+    const outside = (el, skipLabel) => { const c = el.cloneNode(true); c.querySelectorAll("mark").forEach((m) => m.replaceWith("\u0000")); if (skipLabel) c.firstElementChild.remove(); return c.textContent; };
+    return {
+      delivered: delivered.textContent,
+      original: orig ? orig.textContent.slice(orig.firstElementChild.textContent.length) : null,
+      deliveredOutsideMarks: outside(delivered, false),
+      originalOutsideMarks: orig ? outside(orig, true) : null,
+      marks: delivered.querySelectorAll("mark").length,
+      card: a.innerText,
+    };
+  });
+}
+// Всё, что видит Игорь через интерфейс, включая пересказ агента и все варианты ответа
+async function igorSees(p) {
+  await persona(p, "Игорь");
+  const parts = {};
+  await jump(p, "Главный"); parts.home = await mainText(p);
+  await jump(p, "Сообщения пары");
+  while (await mainArea(p).getByRole("button", { name: "Показать оригинал" }).count()) await mainArea(p).getByRole("button", { name: "Показать оригинал" }).first().click();
+  parts.feed = await mainText(p);
+  await jump(p, "Память"); parts.memory = await mainText(p);
+  await jump(p, "Профиль и пара"); parts.profile = await mainText(p);
+  await jump(p, "Сообщения пары");
+  await mainArea(p).getByRole("article").last().getByRole("button", { name: "Ответить с агентом" }).click();
+  parts.recap = await mainArea(p).getByText(/прислала тебе сообщение/).last().innerText();
+  const inp = p.getByRole("textbox", { name: "Сообщение агенту" });
+  await inp.fill("Я не думал, что для неё это так важно."); await inp.press("Enter");
+  await waitText(p, /вживую|Слышу тебя/);
+  parts.chat = await mainText(p);
+  await mainButton(p).click(); await readDraft(p);
+  const drafts = [];
+  for (let i = 0; i < 2; i++) {
+    drafts.push((await p.getByLabel("Сообщение для Ани").inputValue()) + "\n" + (await mainText(p)));
+    await btn(p, "Другой вариант").click();
+  }
+  parts.drafts = drafts.join("\n---\n");
+  await btn(p, "Не отправлять").click();
+  parts.all = Object.values(parts).join("\n");
+  return parts;
+}
+// Слова, которые есть только в личном чате и памяти Анны (app.js SCRIPT.anna, INITIAL_MEMORY.anna) и в её исповеди выше
+const ANNA_ONLY = [PRIVATE_TOKEN, "плевать", "обидно", "не замечают", "первом месте", "ценн", "дизайнер", "по вторникам", "14 июня", "одовщин", "поздно вечером", "третий год", "Что задело", "Тяжело переживает", "третий раз за месяц", "главная", "выговориться"];
+
+// ---------- 13. M4: двойное касание MainButton не отправляет (§2 п.2) ----------
+await section("13. Двойное касание: «Подготовить сообщение» не превращается в «Отправить» (§2 п.2, M4)", async () => {
+  const fresh = async (label) => { const p = await openPage({ label }); await pairUp(p); await annaConfides(p); return p; };
+  // 13a. Двойной клик по MainButton в чате
+  let p = await fresh("m4-dbl");
+  ck((await mainBtnState(p)).text === "Подготовить сообщение Игорю", "K5", "в чате MainButton «Подготовить сообщение Игорю»");
+  await mainButton(p).dblclick();
+  ck((await title(p)) === "Черновик", "K5", "двойной клик «Подготовить сообщение» → человек остаётся на «Черновике»");
+  let v = await igorView(p);
+  ck(noIncoming(v), "K5", "после двойного клика у Игоря входящих 0", JSON.stringify(v));
+  // 13d. Защита не вечная: прочитав черновик, человек отправляет одним нажатием
+  await readDraft(p);
+  await mainButton(p).click();
+  ck((await title(p)) === "Сообщения пары", "K5", "после паузы > 600 мс одно нажатие «Отправить» срабатывает");
+  v = await igorView(p);
+  ck(v.cards === 1, "K5", "у Игоря ровно одно входящее", JSON.stringify({ cards: v.cards }));
+  await p.context().close();
+  // 13b. Тройной клик
+  p = await fresh("m4-triple");
+  await mainButton(p).click({ clickCount: 3 });
+  ck((await title(p)) === "Черновик" && noIncoming(await igorView(p)), "K5", "тройной клик «Подготовить сообщение» ничего не отправляет");
+  await p.context().close();
+  // 13c. Клавиатура: два быстрых Enter на MainButton
+  p = await fresh("m4-enter");
+  await mainButton(p).focus();
+  await p.keyboard.press("Enter"); await p.keyboard.press("Enter");
+  ck((await title(p)) === "Черновик" && noIncoming(await igorView(p)), "K5", "два быстрых Enter на «Подготовить сообщение» ничего не отправляют");
+  await p.context().close();
+  // 13f. Клавиатура: Enter зажат ~1,3 с (автоповтор клавиши)
+  p = await fresh("m4-hold");
+  await mainButton(p).focus();
+  await p.keyboard.down("Enter");
+  for (let i = 0; i < 40; i++) { await p.waitForTimeout(33); await p.keyboard.down("Enter"); }
+  await p.keyboard.up("Enter");
+  v = await igorView(p);
+  xf("N-2", (await title(p)) !== "Сообщения пары" && noIncoming(v), "K5", "зажатый Enter на «Подготовить сообщение» не отправляет черновик", "экран «" + (await title(p)) + "», у Игоря карточек: " + v.cards);
+  await p.context().close();
+  // 13e. Сторона Игоря: двойной клик «Подготовить ответ Ане»
+  p = await openPage({ label: "m4-igor" });
+  await pairUp(p);
+  await sendAs(p, "Анна");
+  await persona(p, "Игорь"); await jump(p, "Сообщения пары");
+  await mainArea(p).getByRole("article").first().getByRole("button", { name: "Ответить с агентом" }).click();
+  const iin = p.getByRole("textbox", { name: "Сообщение агенту" });
+  await iin.fill("Я не думал, что для неё это так важно."); await iin.press("Enter");
+  await waitText(p, /вживую/);
+  await mainButton(p).dblclick();
+  ck((await title(p)) === "Черновик", "K5", "Игорь: двойной клик «Подготовить ответ Ане» → «Черновик»");
+  await persona(p, "Анна"); await jump(p, "Сообщения пары");
+  ck((await mainArea(p).getByRole("article").count()) === 0, "K5", "у Анны входящих от Игоря 0");
+  await p.context().close();
+});
+
+// ---------- 14. M1: смягчение меняет форму, не смысл (§2 п.3, §6.2 п.5–6) ----------
+await section("14. Адаптация не трогает факты, отрицания, просьбы и «люблю» (§2 п.3, §6.2 п.5, M1)", async () => {
+  const p = await openPage({ label: "m1" });
+  await pairUp(p);
+  const UNCHANGED = [
+    "Ты никогда не предупреждаешь заранее. Я всегда тебя жду и всегда тебя люблю. Тебе плевать на меня.",
+    "Я тебя люблю и не хочу расставаться. Пожалуйста, не отменяй больше наши вечера. Мы договорились на субботу, 19:00.",
+    "Ты вечно опаздываешь. Ты всегда так делаешь. Никогда больше так не делай.",
+    "ты вечно всё отменяешь в последний момент",
+    "Ему плевать на меня",
+  ];
+  for (const t of UNCHANGED) {
+    await sendAs(p, "Анна", { text: t });
+    const m = await lastIncoming(p, "Игорь");
+    ck(m.delivered === t && /без изменений/.test(m.card) && m.original === null, "N", "дошло слово в слово, «без изменений»: «" + t.slice(0, 45) + "…»", JSON.stringify(m.delivered));
+  }
+  const CHANGED = [
+    ["Ты вечно всё отменяешь в последний момент. Но я тебя люблю и не хочу ссориться. Давай в субботу в 19:00?", ["Но я тебя люблю и не хочу ссориться. Давай в субботу в 19:00?", "отмены в последний момент"], /вечно/],
+    ["Ты опять меня не слышишь. Я никогда не прошу многого, просто выслушай.", ["ты меня не слышишь", "Я никогда не прошу многого, просто выслушай."], /опять/],
+    ["Я всегда тебя люблю. Ты вечно всё отменяешь в последний момент — уже 3 раза за неделю.", ["Я всегда тебя люблю.", "— уже 3 раза за неделю."], /вечно/],
+  ];
+  for (const [t, keepAll, goneRe] of CHANGED) {
+    await sendAs(p, "Анна", { text: t });
+    const m = await lastIncoming(p, "Игорь");
+    ck(/адаптировано/.test(m.card) && !goneRe.test(m.delivered), "N", "резкая фраза смягчена: «" + t.slice(0, 40) + "…»", m.delivered);
+    const lost = keepAll.filter((k) => !m.delivered.includes(k));
+    ck(lost.length === 0, "N", "факты, отрицания, просьбы и «люблю» дошли дословно: «" + t.slice(0, 40) + "…»", "потеряно: " + lost.join(" | ") + " в «" + m.delivered + "»");
+    ck(m.original === t, "N", "оригинал = одобренный текст", JSON.stringify(m.original));
+    ck(m.deliveredOutsideMarks === m.originalOutsideMarks && m.marks === 1, "N", "вне выделенной фразы доставленный текст и оригинал совпадают («Остальное — слово в слово» — правда)", JSON.stringify([m.deliveredOutsideMarks, m.originalOutsideMarks]));
+    ck(/фраз: 1/.test(m.card) && /слово в слово/.test(m.card), "N", "подписано, что изменена 1 фраза (m3)");
+  }
+  // Автор-мужчина: адаптированный текст и пересказ — в верном роде (M1, «важна»).
+  // К варианту агента Игоря дописана смягчаемая фраза — тогда пересказ строится из варианта + пояснение замены.
+  await sendAs(p, "Игорь", { variant: 0, append: " Ты вечно всё отменяешь в последний момент. Я тебя люблю." });
+  const mi = await lastIncoming(p, "Анна");
+  ck(/адаптировано/.test(mi.card) && mi.delivered.includes("Я тебя люблю.") && !/важна|сказала|написала/.test(mi.delivered), "N", "текст Игоря: смягчено без женского рода, «люблю» на месте", mi.delivered);
+  await mainArea(p).getByRole("article").last().getByRole("button", { name: "Ответить с агентом" }).click();
+  const recap = await mainArea(p).getByText(/прислал тебе сообщение/).last().innerText();
+  ck(/он пишет, что, как ему кажется/.test(recap) && !/она пишет|ей кажется/.test(recap), "N", "пересказ для Анны о сообщении Игоря — в мужском роде", recap);
+  await p.context().close();
+});
+
+// ---------- 15. M2/M3: у Игоря нет личного чата и памяти Анны — для любого варианта текста (§2 п.4, §6.3, §9.2) ----------
+await section("15. Игорь не видит исповеди и памяти Анны ни при каком варианте отправленного текста (§2 п.4, §9.2, M2/M3)", async () => {
+  const CASES = [
+    ["вариант 1", { variant: 0 }, { must: /грустно/, mustNot: /одиноко/ }],
+    ["вариант 2", { variant: 1 }, { must: /одиноко/, mustNot: /грустно|на этой неделе/ }],
+    ["вариант 1 + «Ты вечно…»", { variant: 0, append: " Ты вечно всё отменяешь в последний момент." }, { must: /как ей кажется/, mustNot: /одиноко/ }],
+    ["свой текст", { text: "Давай поговорим сегодня вечером, мне это важно." }, { must: /Пересказывать его своими словами не буду/, mustNot: /грустно|одиноко|Она пишет|просит/ }],
+    ["правка внутри варианта", { variant: 0, text: "Игорь, мне грустно. Давай просто поужинаем в пятницу." }, { must: /не буду/, mustNot: /три раза|на этой неделе|предупреждать/ }],
+  ];
+  for (const [name, how, exp] of CASES) {
+    const p = await openPage({ label: "приватность-" + name });
+    await pairUp(p);
+    await annaConfides(p);
+    const sent = await sendAs(p, "Анна", how);
+    const seen = await igorSees(p);
+    const leaks = ANNA_ONLY.filter((w) => seen.all.includes(w) && !sent.includes(w));
+    ck(leaks.length === 0, "N", name + ": у Игоря (главный, лента, память, профиль, чат с агентом, все варианты ответа) нет слов из личного чата и памяти Анны", "найдено: " + leaks.join(", "));
+    ck(exp.must.test(seen.recap) && !exp.mustNot.test(seen.recap), "N", name + ": пересказ агента Игоря соответствует отправленному тексту", seen.recap);
+    ck(!/обидно|главная|первом месте/.test(seen.drafts), "N", name + ": варианты ответа Игоря не опираются на исповедь Анны (M3)");
+    await p.context().close();
+  }
+  // Дописанный к варианту отказ от просьбы: пересказ и запись памяти Игоря не должны утверждать обратное
+  const p = await openPage({ label: "приватность-дописка" });
+  await pairUp(p);
+  const retract = " Хотя нет, предупреждать не нужно и вечер выбирать тоже не надо.";
+  await sendAs(p, "Анна", { variant: 0, append: retract });
+  const seen = await igorSees(p);
+  const memEntry = (seen.memory.split("Из сообщений партнёра")[1] || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
+  xf("N-1", !/просит предупреждать/.test(seen.recap) && !/просит предупреждать/.test(memEntry), "N", "к варианту дописан отказ от просьбы → пересказ и память Игоря не приписывают Ане эту просьбу (§9.2 п.2, §6.3)", "пересказ: «…" + (seen.recap.match(/Она просит[^.]*\./) || [""])[0] + "»; память: «" + memEntry + "»");
+  await p.context().close();
+});
+
+// ---------- 16. Исправления MINOR раунда 1: m1, m4, m5, m6, m8 ----------
+await section("16. MINOR раунда 1: память, помощь из чата, подписка до пары, «Другой вариант» после правки, подсказка", async () => {
+  // m5: до создания пары подписка не начата и оплатить нечего (§11 п.2–3); нет «без дневного лимита» (§10)
+  let p = await openPage({ label: "m5" });
+  await jump(p, "Подписка");
+  const sub0 = await mainText(p);
+  ck(/ещё не начался/.test(sub0) && /начнётся, когда пара будет создана/.test(sub0) && !/осталось 7 дней/i.test(sub0) && !(await mainBtnState(p)).visible, "N", "m5: до пары — «ещё не начался», без оплаты и обратного отсчёта", sub0.slice(0, 200));
+  ck(!/без дневного лимита/.test(sub0), "N", "m5: нет обещания «без дневного лимита» (§10)");
+  await p.context().close();
+
+  p = await openPage({ label: "minor" });
+  await pairUp(p);
+  // m4: «Помощь» из чата в один шаг, номера — ссылки tel:
+  await annaConfides(p);
+  const helpLink = mainArea(p).getByRole("button", { name: /Помощь/ });
+  ck((await helpLink.count()) === 1, "N", "m4: в чате есть вход в «Помощь»");
+  const inView = await helpLink.evaluate((el) => { const r = el.getBoundingClientRect(); const m = document.querySelector("main").getBoundingClientRect(); return r.bottom > m.top && r.top < m.bottom; });
+  xf("N-3", inView, "N", "m4: после разговора вход в «Помощь» виден без прокрутки (§9.3 — в один шаг)", "ссылка в начале ленты чата и уезжает вверх вместе с перепиской");
+  await helpLink.click();
+  ck((await title(p)) === "Помощь", "N", "m4: из чата → «Помощь»");
+  const tels = await mainArea(p).getByRole("link").evaluateAll((as) => as.map((a) => a.getAttribute("href")));
+  ck(tels.length >= 3 && tels.every((h) => /^tel:/.test(h)), "N", "m4: номера помощи оформлены ссылками tel:", tels.join(", "));
+  // m8: подсказка только для фраз, которые действительно смягчаются
+  await persona(p, "Анна"); await jump(p, "Черновик");
+  const f = p.getByLabel("Сообщение для Игоря");
+  const v1 = await f.inputValue();
+  await f.fill("Ему плевать на меня. Мне тоже плевать.");
+  ck(!/В тексте есть/.test(await mainText(p)), "N", "m8: «плевать» без смягчаемой фразы — подсказка не обещает смягчения");
+  await f.fill("Ты вечно всё отменяешь в последний момент.");
+  ck(/В тексте есть «вечно»/.test(await mainText(p)), "N", "m8: для смягчаемой фразы подсказка есть");
+  // m6: «Другой вариант» после правки спрашивает подтверждение
+  await f.fill(v1 + " Моя правка А8.");
+  await btn(p, "Другой вариант").click();
+  ck((await f.inputValue()).includes("Моя правка А8.") && /Твоя правка пропадёт/.test(await mainText(p)), "N", "m6: «Другой вариант» после правки — сначала вопрос, текст на месте");
+  await btn(p, "Оставить мой текст").click();
+  ck((await f.inputValue()).includes("Моя правка А8.") && !/Твоя правка пропадёт/.test(await mainText(p)), "N", "m6: «Оставить мой текст» — правка сохранена");
+  await btn(p, "Другой вариант").click();
+  await btn(p, "Заменить").click();
+  ck(!(await f.inputValue()).includes("Моя правка А8.") && /Вариант 2 из 2/.test(await mainText(p)), "N", "m6: «Заменить» — новый вариант агента");
+  // m1: неизвестный текст Игоря → запись памяти Анны без домыслов и с верным родом
+  await sendAs(p, "Игорь", { text: "Мне тоже плевать, всё нормально." });
+  await persona(p, "Анна"); await jump(p, "Память");
+  const mem = await mainText(p);
+  const entry = (mem.split("Из сообщений партнёра")[1] || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
+  ck(/Игорь прислал сообщение/.test(entry) && !/ей важно|время вместе|просил/.test(entry), "N", "m1: запись памяти из неизвестного текста нейтральна и в мужском роде", entry);
+  await p.context().close();
 });
 
 // ---------- итог ----------
