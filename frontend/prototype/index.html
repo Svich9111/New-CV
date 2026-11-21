@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Чувства AI — прототип</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- Панель прототипа: её нет в настоящем Mini App -->
+    <div class="proto-bar" role="toolbar" aria-label="Панель прототипа">
+      <span class="proto-bar__label">Прототип 0.6 · данные выдуманные</span>
+      <div class="seg" role="group" aria-label="Чья сторона">
+        <button type="button" data-persona="anna" aria-pressed="true">Анна</button>
+        <button type="button" data-persona="igor" aria-pressed="false">Игорь</button>
+      </div>
+      <div class="seg" role="group" aria-label="Тема">
+        <button type="button" data-theme-set="auto" aria-pressed="true">Авто</button>
+        <button type="button" data-theme-set="light" aria-pressed="false">Светлая</button>
+        <button type="button" data-theme-set="dark" aria-pressed="false">Тёмная</button>
+      </div>
+      <select id="jump" aria-label="Перейти к экрану">
+        <option value="">Экран…</option>
+        <option value="welcome">Приветствие</option>
+        <option value="onboarding">Онбординг</option>
+        <option value="invite">Приглашение</option>
+        <option value="home">Главный</option>
+        <option value="chat">Чат с агентом</option>
+        <option value="draft">Черновик</option>
+        <option value="messages">Сообщения пары</option>
+        <option value="memory">Память</option>
+        <option value="profile">Профиль и пара</option>
+        <option value="subscription">Подписка</option>
+        <option value="help">Помощь</option>
+      </select>
+    </div>
+
+    <div class="phone" id="phone">
+      <header class="tg-header" id="tg-header">
+        <button type="button" class="tg-back" id="tg-back" aria-label="Назад" hidden>‹ Назад</button>
+        <button type="button" class="tg-close" id="tg-close" aria-label="Закрыть">✕ Закрыть</button>
+        <div class="tg-title" id="tg-title">Чувства AI</div>
+        <span class="tg-menu" aria-hidden="true">⋯</span>
+      </header>
+      <main class="content" id="content" tabindex="-1"></main>
+      <div class="tg-main-wrap" id="tg-main-wrap" hidden>
+        <button type="button" class="tg-main" id="tg-main"></button>
+        <p class="tg-main__hint" id="tg-main-hint" hidden></p>
+      </div>
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
