@@ -166,9 +166,9 @@ async def test_partner_and_outsider_cannot_read_by_direct_id(
     target = getattr(w.a, attr)
     for reader in (w.b, w.c):
         async with user_scope(sessionmaker, reader.user_id) as s:
-            assert await _count(s, f"SELECT count(*) FROM {table} WHERE id = :i", i=target) == 0  # noqa: S608
+            assert await _count(s, f"SELECT count(*) FROM {table} WHERE id = :i", i=target) == 0
     async with user_scope(sessionmaker, w.a.user_id) as s:
-        assert await _count(s, f"SELECT count(*) FROM {table} WHERE id = :i", i=target) == 1  # noqa: S608
+        assert await _count(s, f"SELECT count(*) FROM {table} WHERE id = :i", i=target) == 1
 
 
 @pytest.mark.parametrize(
@@ -187,12 +187,12 @@ async def test_partner_cannot_update_or_delete_private_rows(
     """Чужие реплики, черновики, память, агент — ни изменить, ни удалить (ТЗ §7, §6.3)."""
     target = getattr(w.a, attr)
     async with user_scope(sessionmaker, w.b.user_id) as s:
-        upd = await s.execute(text(f"UPDATE {table} SET {setter} WHERE id = :i"), {"i": target})  # noqa: S608
-        dele = await s.execute(text(f"DELETE FROM {table} WHERE id = :i"), {"i": target})  # noqa: S608
+        upd = await s.execute(text(f"UPDATE {table} SET {setter} WHERE id = :i"), {"i": target})
+        dele = await s.execute(text(f"DELETE FROM {table} WHERE id = :i"), {"i": target})
         assert upd.rowcount == 0  # type: ignore[attr-defined]
         assert dele.rowcount == 0  # type: ignore[attr-defined]
     async with user_scope(sessionmaker, w.a.user_id) as s:
-        assert await _count(s, f"SELECT count(*) FROM {table} WHERE id = :i", i=target) == 1  # noqa: S608
+        assert await _count(s, f"SELECT count(*) FROM {table} WHERE id = :i", i=target) == 1
 
 
 async def test_cannot_move_own_rows_under_partner_agent(
