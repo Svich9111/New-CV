@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     # Максимальный возраст initData, секунд (ФТ-01)
     init_data_max_age_s: int = 86400
     session_secret: SecretStr = SecretStr("")
+    # Ключ шифрования текстов при хранении (ТЗ §9.1 п.3, задача 4.2)
+    encryption_key: SecretStr = SecretStr("")
     session_ttl_s: int = 3600
 
 

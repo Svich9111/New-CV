@@ -1,17 +1,17 @@
 .PHONY: install lint test db-up db-down backend-lint backend-test frontend-lint frontend-test
 
 install:
-	cd backend && uv sync
+	cd backend && uv sync --locked
 	cd frontend && npm ci
 
 lint: backend-lint frontend-lint
 test: backend-test frontend-test
 
 backend-lint:
-	cd backend && uv run ruff check . && uv run ruff format --check . && uv run mypy app
+	cd backend && uv run --locked ruff check . && uv run --locked ruff format --check . && uv run --locked mypy app
 
 backend-test:
-	cd backend && uv run pytest -q
+	cd backend && uv run --locked pytest -q
 
 frontend-lint:
 	cd frontend && npm run lint

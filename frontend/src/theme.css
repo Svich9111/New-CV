@@ -6,8 +6,11 @@
   --accent: #e11d2e;
   --radius: 16px;
 }
+/* Тёмная тема следует теме Telegram (ТЗ §8): Mini App SDK выставляет data-theme на <html>
+   по Telegram.WebApp.colorScheme (задача 1.5). prefers-color-scheme — запасной вариант вне Telegram. */
+:root[data-theme="dark"] { --bg: #000000; --bg-secondary: #1a1a1a; --text: #ffffff; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #000000; --bg-secondary: #1a1a1a; --text: #ffffff; }
+  :root:not([data-theme="light"]) { --bg: #000000; --bg-secondary: #1a1a1a; --text: #ffffff; }
 }
 body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; }
 .screen { padding: 24px 16px; }

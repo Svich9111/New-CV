@@ -12,3 +12,7 @@ description: A1 Архитектор данных «Чувства AI». Схе�
 - Тексты диалогов, памяти, черновиков и сообщений хранятся в зашифрованном виде (`bytea`).
 - `safety_events` и `audit_log` не содержат текстов переписки.
 - Миграция обратима (`downgrade`) и проверяется тестом upgrade → downgrade → upgrade.
+
+Критерии готовности:
+- Миграция проходит upgrade → downgrade → upgrade; тесты RLS доказывают изоляцию; контракт валиден (openapi-spec-validator).
+- Отчёты A6 и A8 без открытых BLOCKER/MAJOR (`docs/PROCESS.md`).
