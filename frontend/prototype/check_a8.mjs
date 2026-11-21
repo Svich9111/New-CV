@@ -679,10 +679,9 @@ for (const [w, scale, name] of [[320, 1, "320 px"], [240, 1.5, "360 px при м
       if (st === "draft-harsh" || st === "igor-messages-original") await p.screenshot({ path: join(SHOTS, "w" + w + "-" + st + ".png"), fullPage: true });
     });
     quietPrefix = null;
-    const knownD3 = (x) => w === 214 && /панель прототипа|main: scrollWidth|Давай познакомимся/.test(x);
-    const other = [...issues].filter((x) => !knownD3(x));
-    ck(other.length === 0, "K6", name + ": ничего не выходит за экран и не обрезается", other.slice(0, 8).join(" | "));
-    if (w === 214) xf("D-3", !([...issues].some(knownD3)), "K6", name + ": заголовок онбординга и панель прототипа помещаются", [...new Set([...issues].filter(knownD3).map((x) => x.replace(/^[^:]+: /, "")))].join(" | "));
+    const uniqIssues = [...new Set([...issues].map((x) => x.replace(/^[^:]+: /, "")))];
+    if (w === 214) xf("D-3", issues.size === 0, "K6", name + ": ничего не выходит за экран и не обрезается", uniqIssues.join(" | "));
+    else ck(issues.size === 0, "K6", name + ": ничего не выходит за экран и не обрезается", [...issues].slice(0, 8).join(" | "));
     if (info.size) console.log("    примечание: " + [...info].join("; "));
     await p.context().close();
   });
@@ -757,6 +756,14 @@ await section("7. Навигация с клавиатуры до главных
   const miss = reached.filter(([, ok]) => !ok).map(([n]) => n);
   ck(miss.length === 0, "A", "все " + reached.length + " целевых элементов достижимы Tab (всего нажатий Tab: " + tabs + ")", miss.join(", "));
   ck(unfocusVisible.length === 0, "A", "у сфокусированных элементов виден контур фокуса", unfocusVisible.join(", "));
+  await p.context().close();
+});
+
+await section("7b. Доступные имена переключателей и полей", async () => {
+  const p = await openPage({ label: "имена" });
+  await jump(p, "Профиль и пара");
+  const names = await mainArea(p).getByRole("switch").evaluateAll((els) => els.map((e) => e.getAttribute("aria-label") || (e.getAttribute("aria-labelledby") ? "labelledby" : e.innerText.trim())));
+  xf("D-5", names.every((n) => n.length > 5 && !/^(вкл|выкл)$/.test(n)), "A", "переключатели уведомлений названы по смыслу, а не только «вкл»", "имена: " + names.join(", "));
   await p.context().close();
 });
 
@@ -837,6 +844,12 @@ await section("9. Негатив: разметка и «инструкции» �
   ck(!ANNA_PRIVATE.some((s) => txt.includes(s)), "N", "«инструкция» в тексте не раскрыла личный чат Ани");
   const mem = await (async () => { await jump(p, "Память"); return mainText(p); })();
   ck(!/onerror|<img/.test(mem), "N", "в память Игоря не попала разметка из сообщения");
+  // Агент Игоря пересказывает только то, что Аня действительно отправила (§9.2 п.2)
+  await jump(p, "Сообщения пары");
+  await mainArea(p).getByRole("article").first().getByRole("button", { name: "Ответить с агентом" }).click();
+  const summary = await mainArea(p).getByText(/Аня прислала тебе сообщение/).innerText();
+  const invented = ["грустно", "отменённых вечеров", "предупреждать заранее", "вечер вдвоём"].filter((w) => summary.includes(w) && !evil.includes(w));
+  xf("D-6", invented.length === 0, "N", "агент Игоря не приписывает сообщению Ани того, чего в нём нет", "в пересказе: " + invented.join(", "));
   await p.context().close();
 });
 
