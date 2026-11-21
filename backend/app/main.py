@@ -24,10 +24,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         check_bot_config(settings)  # и без секрета вебхука и адреса Mini App (задача 1.4)
         engine = make_engine(settings.database_url)
         app.state.sessionmaker = make_sessionmaker(engine)
-        app.state.bot_api = BotApi(settings.telegram_bot_token)
-        yield
-        await app.state.bot_api.aclose()
-        await engine.dispose()
+        try:
+            app.state.bot_api = BotApi(settings.telegram_bot_token)
+            try:
+                yield
+            finally:
+                await app.state.bot_api.aclose()
+        finally:
+            await engine.dispose()
     else:
         yield
 

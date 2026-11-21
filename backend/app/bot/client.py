@@ -2,8 +2,9 @@
 
 Токен бота входит в URL Bot API (`/bot<токен>/<метод>`), поэтому:
 - URL собирается на каждый запрос и нигде не хранится; в `repr` клиента токена нет;
-- ошибки — только `BotApiError` с методом и кодом, без URL, описания от Telegram и исходного
-  исключения httpx (`raise ... from None`: в нём есть запрос с URL);
+- ошибки — только `BotApiError` с методом и кодом в тексте, без URL и исходного исключения
+  httpx (`raise ... from None`: в нём есть запрос с URL); описание от Telegram — отдельным полем
+  `description` (очищено от токена), его выводит только утилита оператора;
 - журнал httpx («HTTP Request: POST <url>») чистит фильтр `app.core.logging`.
 
 Повтор — только на 429 с `retry_after` (не дольше `max_retry_after` секунд, не больше
@@ -16,6 +17,8 @@ from typing import Any
 
 import httpx
 from pydantic import SecretStr
+
+from app.core.logging import redact
 
 API_BASE = "https://api.telegram.org"
 DEFAULT_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
@@ -32,8 +35,12 @@ class BotApiError(Exception):
         error_code: int | None = None,
         transient: bool = False,
         retry_after: int | None = None,
+        description: str | None = None,
     ) -> None:
         super().__init__(f"Bot API {method}: {reason}")
+        # Описание от Telegram — отдельным полем, не в str(): его показывает только утилита
+        # оператора (app/bot/setup.py), в журналы вебхука оно не идёт.
+        self.description = description
         self.method = method
         self.error_code = error_code
         self.transient = transient
@@ -110,13 +117,15 @@ class BotApi:
         retry_after = params.get("retry_after") if isinstance(params, dict) else None
         if not isinstance(retry_after, int):
             retry_after = None
-        # Описание от Telegram в ошибку не берём: в нём бывают фрагменты запроса.
+        description = body.get("description")
+        # Описание от Telegram — не в тексте ошибки: в нём бывают фрагменты запроса.
         raise BotApiError(
             method,
             f"error_code {code}",
             error_code=code,
             transient=code == 429 or code >= 500,
             retry_after=retry_after,
+            description=redact(description)[:300] if isinstance(description, str) else None,
         ) from None
 
     async def send_message(
