@@ -11,3 +11,6 @@ dist/
 *.tsbuildinfo
 coverage/
 .DS_Store
+
+# Рабочие каталоги параллельных агентов (git worktree)
+.claude/worktrees/
