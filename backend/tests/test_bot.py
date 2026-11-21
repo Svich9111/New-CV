@@ -423,6 +423,38 @@ async def test_processing_deadline_gives_503_and_allows_redelivery(
     assert len(fake.sent()) == 1
 
 
+async def test_cancelled_handler_releases_update(
+    client: httpx.AsyncClient, fake: FakeTelegram, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A8 1.4 D-3: отмена обработчика (CancelledError — не Exception) снимает отметку и не
+    глушится; ожидающий повтор получает 503 сразу, следующая доставка обрабатывается."""
+    import asyncio
+
+    started = asyncio.Event()
+
+    async def hang(api: BotApi, update: dict[str, Any], webapp_url: str) -> str:
+        started.set()
+        await asyncio.Event().wait()
+        return "start"
+
+    monkeypatch.setattr(webhook_module, "handle_update", hang)
+    update = _message("/start")
+    uid = update["update_id"]
+    first = asyncio.create_task(client.post(URL, json=update, headers=_hdr()))
+    await asyncio.wait_for(started.wait(), 5.0)
+    waiting = asyncio.create_task(client.post(URL, json=update, headers=_hdr()))
+    await asyncio.sleep(0.01)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not app.state.bot_updates.in_progress(uid)
+    # повтор, ждавший исхода, не дожидается срока (20 с) и не подтверждается
+    assert (await asyncio.wait_for(waiting, 5.0)).status_code == 503
+    monkeypatch.undo()
+    assert (await client.post(URL, json=update, headers=_hdr())).status_code == 200
+    assert len(fake.sent()) == 1
+
+
 def test_deadline_is_well_below_telegram_wait() -> None:
     assert 0 < webhook_module.HANDLE_DEADLINE_S <= 30
 

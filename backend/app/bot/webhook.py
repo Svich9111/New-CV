@@ -118,6 +118,13 @@ async def telegram_webhook(
         updates.complete(update_id)
         log.error("telegram update %d %s: handler failed", update_id, kind)
         return Response(status_code=200)
+    except BaseException:
+        # Отмена (asyncio.CancelledError — не Exception: клиент закрыл соединение, остановка
+        # сервера) — исхода нет: снимаем отметку, иначе update_id навсегда «в работе» и каждый
+        # повтор ждал бы срок и получал 503 (A8 1.4 D-3). Отмену не глушим.
+        updates.release(update_id)
+        log.warning("telegram update %d %s: handler cancelled", update_id, kind)
+        raise
     updates.complete(update_id)
     log.info("telegram update %d %s: %s", update_id, kind, outcome)
     return Response(status_code=200)
