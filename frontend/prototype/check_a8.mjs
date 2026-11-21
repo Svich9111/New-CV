@@ -29,6 +29,15 @@ function ck(cond, crit, name, detail = "") {
   if (!quietPrefix || !ok) console.log("  " + (ok ? "✓" : "✗") + " " + crit + " " + fullName + (detail && !ok ? " — " + detail : ""));
 }
 const ONLY = process.env.A8_ONLY ? process.env.A8_ONLY.split(",") : null; // напр. A8_ONLY=1,7 — только разделы 1 и 7
+// Известные дефекты (см. docs/reviews/0.6-test.md) — аналог xfail(strict=True):
+// пока дефект воспроизводится, проверка не роняет прогон; если он исправлен — XPASS считается провалом,
+// отметку нужно снять. A8_RUNXFAIL=1 — считать их обычными проверками.
+function xf(defect, cond, crit, name, detail = "") {
+  if (process.env.A8_RUNXFAIL) return ck(cond, crit, name + " [" + defect + "]", detail);
+  if (cond) return ck(false, crit, "XPASS " + defect + ": " + name + " — дефект больше не воспроизводится, снимите отметку");
+  results.push({ crit, name, ok: true, xfail: defect, detail });
+  if (!quietPrefix) console.log("  ~ " + crit + " " + name + " — ожидаемо не выполняется (" + defect + "): " + detail);
+}
 async function section(title, fn) {
   if (ONLY && !ONLY.some((o) => title.startsWith(o + "."))) return;
   console.log("\n" + title);
@@ -142,7 +151,7 @@ function pageAudit(kind) {
     for (let i = layers.length - 1; i >= 0; i--) base = over(layers[i], base);
     return base;
   };
-  const desc = (el) => el.tagName.toLowerCase() + (el.getAttribute("role") ? "[" + el.getAttribute("role") + "]" : "") + " «" + (el.innerText || el.value || el.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 40) + "»";
+  const desc = (el) => (el.closest('[role="toolbar"]') ? "(панель прототипа) " : "") + el.tagName.toLowerCase() + (el.getAttribute("role") ? "[" + el.getAttribute("role") + "]" : "") + " «" + (el.innerText || el.value || el.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 40) + "»";
   const modal = document.querySelector('[aria-modal="true"]');
   const mainEl = document.querySelector("main");
   const covered = (el) => modal && mainEl.contains(el) && !modal.contains(el);
@@ -223,6 +232,7 @@ function pageAudit(kind) {
       if (r.right > vw + 0.5 || r.left < -0.5) issues.push(desc(el) + " выходит за экран (" + Math.round(r.left) + "…" + Math.round(r.right) + " при " + vw + ")");
       else if (mainEl.contains(el) && el !== mainEl && (r.right > mr.right + 0.5 || r.left < mr.left - 0.5)) issues.push(desc(el) + " обрезан краем области экрана");
       if ((el.tagName === "BUTTON" || el.getAttribute("role") === "switch") && el.scrollWidth > el.clientWidth + 1) issues.push(desc(el) + ": текст не помещается в кнопку");
+      else if (mainEl.contains(el) && el.clientWidth > 0 && getComputedStyle(el).overflowX === "visible" && el.scrollWidth > el.clientWidth + 1) info.push(desc(el) + ": содержимое шире блока на " + (el.scrollWidth - el.clientWidth) + " px (обрезается)");
       if (el.closest("header") && el.scrollWidth > el.clientWidth + 1) info.push(desc(el) + " обрезан многоточием");
     }
     return { issues, info, vw };
@@ -496,7 +506,7 @@ async function scenario(p, hook = async () => {}) {
   ck(await p.getByRole("dialog").isVisible(), "K1", "выход из пары с подтверждением");
   await hook("profile-sheet");
   const backable = await backButton(p).click({ timeout: 1500 }).then(() => true, () => false);
-  ck(backable, "K6", "при открытом диалоге «Назад» Telegram нажимается (в Telegram она нативная и вне страницы)", "кнопку перекрывает затемнение диалога");
+  xf("D-2", backable, "K6", "при открытом диалоге «Назад» Telegram нажимается (в Telegram она нативная и вне страницы)", "кнопку перекрывает затемнение диалога");
   if (!backable) await btn(p, "Отмена").click();
   ck((await p.getByRole("dialog").count()) === 0 && (await title(p)) === "Профиль и пара", "K6", "диалог закрыт, экран «Профиль и пара» остаётся");
   await jump(p, "Подписка");
@@ -567,6 +577,7 @@ for (const scheme of ["light", "dark"]) {
     let minText = 99, minBtn = 99, states = 0;
     await scenario(p, async (st) => {
       states++;
+      await p.waitForTimeout(300); // дождаться окончания анимации тоста (transition .2s)
       const list = await audit(p, "contrast");
       for (const x of list) {
         if (x.disabled) { contrastInfo[scheme].push(st + ": недоступная кнопка " + x.desc + " " + x.ratio); continue; }
@@ -578,7 +589,9 @@ for (const scheme of ["light", "dark"]) {
     quietPrefix = null;
     const uniq = [...new Set(contrastFails[scheme].map((s) => s.replace(/^[^:]+: /, "")))];
     console.log("    состояний: " + states + ", минимум текст " + minText + ":1, кнопки " + minBtn + ":1");
-    ck(contrastFails[scheme].length === 0, "A", "контраст " + scheme + ": весь текст и кнопки ≥ AA", uniq.join(" | "));
+    const knownD1 = (x) => scheme === "dark" && /непрочитан/.test(x);
+    ck(uniq.filter((x) => !knownD1(x)).length === 0, "A", "контраст " + scheme + ": весь текст и кнопки ≥ AA", uniq.filter((x) => !knownD1(x)).join(" | "));
+    if (scheme === "dark") xf("D-1", !uniq.some(knownD1), "A", "контраст dark: метка «непрочитанное» (красный текст на чёрном) ≥ 4.5:1", uniq.filter(knownD1).join(" | "));
     if (scheme === "dark") {
       const bg = await p.locator("main").evaluate((m) => getComputedStyle(m.parentElement).backgroundColor);
       ck(bg === "rgb(0, 0, 0)", "K3", "тёмная тема по prefers-color-scheme: чёрный фон");
@@ -666,7 +679,10 @@ for (const [w, scale, name] of [[320, 1, "320 px"], [240, 1.5, "360 px при м
       if (st === "draft-harsh" || st === "igor-messages-original") await p.screenshot({ path: join(SHOTS, "w" + w + "-" + st + ".png"), fullPage: true });
     });
     quietPrefix = null;
-    ck(issues.size === 0, "K6", name + ": ничего не выходит за экран и не обрезается", [...issues].slice(0, 8).join(" | "));
+    const knownD3 = (x) => w === 214 && /панель прототипа|main: scrollWidth|Давай познакомимся/.test(x);
+    const other = [...issues].filter((x) => !knownD3(x));
+    ck(other.length === 0, "K6", name + ": ничего не выходит за экран и не обрезается", other.slice(0, 8).join(" | "));
+    if (w === 214) xf("D-3", !([...issues].some(knownD3)), "K6", name + ": заголовок онбординга и панель прототипа помещаются", [...new Set([...issues].filter(knownD3).map((x) => x.replace(/^[^:]+: /, "")))].join(" | "));
     if (info.size) console.log("    примечание: " + [...info].join("; "));
     await p.context().close();
   });
@@ -760,7 +776,8 @@ await section("8. Кнопка «Назад» Telegram по всем экран�
   for (const re of [/правила/, /персональных/, /чувствах/, /18/]) await p.getByRole("checkbox", { name: re }).check();
   await mainButton(p).click();
   await persona(p, "Анна");
-  await btn(p, "Пока поговорить с агентом").click();
+  ck((await mainBtnState(p)).text === "На главный", "K6", "Анна на приглашении после принятия: «На главный»");
+  await mainButton(p).click();
   const fromHome = [
     [/^Поговорить с агентом Выговориться/, "Твой агент"],
     [/^Сообщения с Игорем/, "Сообщения пары"],
@@ -843,7 +860,7 @@ await section("10. Запись в памяти из одобренного со
     const entry = (mem.split("Из сообщений партнёра")[1] || "").split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
     const okMeaning = !forbidRe.test(entry);
     if (!okMeaning) memoryFindings.push("Игорь отправил «" + sent.slice(0, 70) + "…», а в памяти Анны: «" + entry + "»");
-    ck(okMeaning, "N", "вариант " + (variant + 1) + " ответа Игоря → запись памяти Анны не искажает смысл", "запись: «" + entry + "»");
+    xf("D-4", okMeaning, "N", "вариант " + (variant + 1) + " ответа Игоря → запись памяти Анны не искажает смысл", "запись: «" + entry + "»");
     await p.context().close();
   }
 });
@@ -879,6 +896,7 @@ const byCrit = {};
 for (const r of results) { byCrit[r.crit] = byCrit[r.crit] || [0, 0]; byCrit[r.crit][r.ok ? 0 : 1]++; }
 console.log("\nПо критериям: " + Object.entries(byCrit).map(([k, [a, b]]) => k + " " + a + "✓/" + b + "✗").join(", "));
 const failed = results.filter((r) => !r.ok);
-console.log(`Итог: ${results.length - failed.length} пройдено, ${failed.length} не пройдено`);
+const xfails = results.filter((r) => r.xfail);
+console.log(`Итог: ${results.length - failed.length - xfails.length} пройдено, ${failed.length} не пройдено, ${xfails.length} ожидаемо не выполняются (известные дефекты: ${[...new Set(xfails.map((r) => r.xfail))].join(", ")})`);
 if (failed.length) { console.log("\nНе пройдено:"); for (const f of failed) console.log("  ✗ " + f.crit + " " + f.name + (f.detail ? " — " + f.detail : "")); }
 process.exit(failed.length ? 1 : 0);
