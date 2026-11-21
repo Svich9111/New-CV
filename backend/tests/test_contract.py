@@ -74,7 +74,49 @@ def test_implemented_routes_exist_in_contract() -> None:
 SERVED_STATUSES = {
     ("post", "/auth/telegram"): {"200", "401", "403", "422", "503"},
     ("put", "/me/onboarding"): {"200", "401", "403", "422"},
+    # 1.3 (app/api/couple.py; ревью 1.3 MAJOR-1, тест 1.3 D-1). 503 — нет имени бота.
+    ("get", "/couple"): {"200", "401", "403", "404"},
+    ("post", "/couple"): {"201", "401", "403", "409", "503"},
+    ("post", "/couple/invite"): {"201", "401", "403", "404", "409", "503"},
+    # АР-17: выход — после входа, без требования онбординга (403 не отдаётся).
+    ("post", "/couple/leave"): {"204", "401", "404"},
+    ("get", "/invites/{token}"): {"200", "401", "404", "410"},
+    ("post", "/invites/{token}/accept"): {"200", "401", "403", "404", "409", "410"},
 }
+
+
+def test_leave_does_not_declare_onboarding_required() -> None:
+    """АР-17: выход из пары не требует онбординга — 403 в контракте не объявлен."""
+    responses = _spec()["paths"]["/couple/leave"]["post"]["responses"]
+    assert "403" not in responses
+
+
+def test_couple_error_codes_are_listed() -> None:
+    """Коды ошибок, которые отдают эндпоинты пары (app/api/couple.py), — в Error.code и в
+    примерах соответствующих ответов (ревью 1.3 MINOR-1)."""
+    spec = _spec()
+    known = set(spec["components"]["schemas"]["Error"]["properties"]["code"]["examples"])
+    served = {
+        "not_found",
+        "own_invite",
+        "couple_not_pending",
+        "already_in_couple",
+        "invite_expired",
+        "invite_used",
+        "onboarding_required",
+        "unauthorized",
+        "service_unavailable",
+    }
+    assert served <= known, served - known
+    responses = spec["components"]["responses"]
+    by_response = {
+        "NotFound": ["not_found"],
+        "Conflict": ["already_in_couple", "own_invite", "couple_not_pending"],
+        "Gone": ["invite_expired", "invite_used"],
+        "InvitesUnavailable": ["service_unavailable"],
+    }
+    for name, codes in by_response.items():
+        assert _example_codes(responses[name]) == codes, name
 
 
 def _resolve(spec: dict[str, Any], obj: dict[str, Any]) -> dict[str, Any]:
