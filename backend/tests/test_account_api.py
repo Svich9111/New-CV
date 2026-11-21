@@ -647,10 +647,6 @@ async def test_export_lost_context_is_unavailable(
     assert got["text"] == sc.igor.marks["msg-for-recipient"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="safety_events: у feelings_app нет SELECT (0001) — нужна миграция A1 (отчёт 4.5 этап 2)",
-)
 async def test_export_includes_safety_events(client: httpx.AsyncClient) -> None:
     """ТЗ §7, §9.3, АР-25 п.6: срабатывания — только тип и время."""
     user = await _login(client)

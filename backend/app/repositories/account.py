@@ -374,12 +374,14 @@ async def _subscriptions(s: AsyncSession, user_id: uuid.UUID) -> list[ExportSubs
     ]
 
 
-async def _safety_events() -> list[ExportSafetyEvent]:
-    """`safety_events` — только тип и время (ТЗ §7, §9.3). У `feelings_app` на этой таблице
-    только INSERT (миграция 0001), ни SELECT, ни политики чтения нет: раздел нельзя прочитать
-    под RLS без миграции A1 (предложение — отчёт 4.5 этап 2, A2). До неё — пустой список;
-    страж — xfail(strict) в tests/test_account_api.py."""
-    return []
+async def _safety_events(s: AsyncSession) -> list[ExportSafetyEvent]:
+    """`safety_events` — только тип и время (ТЗ §7, §9.3). У `feelings_app` на таблице только
+    INSERT; свои события отдаёт функция `app_export_safety_events()` (миграция 0007) — без
+    id события и пользователя."""
+    rows = await s.execute(
+        text("SELECT type::text AS type, created_at FROM app_export_safety_events()")
+    )
+    return [ExportSafetyEvent(type=r.type, created_at=r.created_at) for r in rows]
 
 
 async def export_account(
@@ -411,5 +413,5 @@ async def export_account(
                 couple_messages=ExportCoupleMessages(sent=sent, received=received),
                 couples=await _couples(s, user_id),
                 subscriptions=await _subscriptions(s, user_id),
-                safety_events=await _safety_events(),
+                safety_events=await _safety_events(s),
             )

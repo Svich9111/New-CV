@@ -1,4 +1,5 @@
-"""4.5, этап 2: выгрузка сообщений пары функцией app_export_partner_messages() — миграция 0006.
+"""4.5, этап 2: функции выгрузки app_export_partner_messages() (миграция 0006) и
+app_export_safety_events() (миграция 0007).
 
 ФТ-21, ФТ-10; ТЗ §2 п.3, §7, §9.1 п.6, §9.3; DECISIONS.md АР-11, АР-13, АР-25.
 Данные заводит суперпользователь (`engine`) или слой доступа (шифрование 4.2), выгрузка — под
@@ -321,37 +322,143 @@ async def test_app_still_cannot_read_original_directly(
     assert _sqlstate(ei.value) == "42501"
 
 
-async def test_migration_0006_reversible(engine: AsyncEngine, app_engine: AsyncEngine) -> None:
-    """0006 → 0005 → 0006: downgrade убирает функцию, upgrade возвращает её с правами;
-    `alembic check` — модели и схема совпадают."""
+HEAD = "0007"
 
-    async def state() -> tuple[object, ...]:
-        async with engine.connect() as conn:
-            row = await conn.execute(
-                text(
-                    "SELECT to_regprocedure('app_export_partner_messages()') IS NOT NULL, "
-                    "(SELECT version_num FROM alembic_version)"
-                )
+
+async def _funcs_state(engine: AsyncEngine) -> tuple[object, ...]:
+    """(есть app_export_partner_messages, есть app_export_safety_events, ревизия)."""
+    async with engine.connect() as conn:
+        row = await conn.execute(
+            text(
+                "SELECT to_regprocedure('app_export_partner_messages()') IS NOT NULL, "
+                "to_regprocedure('app_export_safety_events()') IS NOT NULL, "
+                "(SELECT version_num FROM alembic_version)"
             )
-            return tuple(row.one())
+        )
+        return tuple(row.one())
 
+
+async def _downgrade_and_back(
+    engine: AsyncEngine, app_engine: AsyncEngine, target: str, expected: tuple[object, ...]
+) -> None:
     try:
-        assert await state() == (True, "0006")
-        alembic("downgrade", "0005")
+        assert await _funcs_state(engine) == (True, True, HEAD)
+        alembic("downgrade", target)
         await engine.dispose()
-        assert await state() == (False, "0005")
+        assert await _funcs_state(engine) == expected
     finally:
         alembic("upgrade", "head")
         await engine.dispose()
         await app_engine.dispose()
-    assert await state() == (True, "0006")
+    assert await _funcs_state(engine) == (True, True, HEAD)
     async with engine.connect() as conn:
-        assert (
+        for f in ("app_export_partner_messages()", "app_export_safety_events()"):
+            assert (
+                await conn.execute(
+                    text("SELECT has_function_privilege('feelings_app', :f, 'EXECUTE')"),
+                    {"f": f},
+                )
+            ).scalar_one() is True, f
+    alembic("check")
+
+
+async def test_migration_0006_reversible(engine: AsyncEngine, app_engine: AsyncEngine) -> None:
+    """head → 0005 → head: downgrade убирает обе функции выгрузки, upgrade возвращает их с
+    правами; `alembic check` — модели и схема совпадают."""
+    await _downgrade_and_back(engine, app_engine, "0005", (False, False, "0005"))
+
+
+# --- 0007: app_export_safety_events() ------------------------------------------------------
+
+SAFETY = "SELECT type::text AS type, created_at FROM app_export_safety_events()"
+
+
+async def _safety_event(engine: AsyncEngine, uid: uuid.UUID, kind: str, ago_s: int) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO safety_events (user_id, type, created_at) "
+                "VALUES (:u, CAST(:t AS safety_event_type), now() - make_interval(secs => :s))"
+            ),
+            {"u": uid, "t": kind, "s": ago_s},
+        )
+
+
+async def _safety(sm: SM, uid: uuid.UUID | None) -> list[tuple[str, object]]:
+    async with user_scope(sm, uid) as s:
+        return [(r.type, r.created_at) for r in await s.execute(text(SAFETY))]
+
+
+async def test_safety_events_only_own_type_and_time(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """ТЗ §7, §9.3, АР-25 п.6: только свои события, только тип и время, по времени; партнёр и
+    посторонний чужих не видят; без входа, неизвестный и помеченный удалённым — 42501."""
+    anna, igor = await _person(engine, "Анна"), await _person(engine, "Игорь")
+    olga = await _person(engine, "Ольга")
+    await _couple(sessionmaker, anna, igor)
+    await _safety_event(engine, anna.user_id, "self_harm", 10)
+    await _safety_event(engine, anna.user_id, "violence", 60)
+    await _safety_event(engine, igor.user_id, "threat_outgoing", 30)
+    got = await _safety(sessionmaker, anna.user_id)
+    assert [t for t, _ in got] == ["violence", "self_harm"]
+    assert [t for t, _ in await _safety(sessionmaker, igor.user_id)] == ["threat_outgoing"]
+    assert await _safety(sessionmaker, olga.user_id) == []
+    for uid in (None, uuid.uuid4()):
+        with pytest.raises(DBAPIError) as ei:
+            await _safety(sessionmaker, uid)
+        assert _sqlstate(ei.value) == "42501"
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE users SET deleted_at = now() WHERE id = :u"), {"u": anna.user_id}
+        )
+    with pytest.raises(DBAPIError) as ei:
+        await _safety(sessionmaker, anna.user_id)
+    assert _sqlstate(ei.value) == "42501"
+
+
+async def test_safety_events_table_stays_closed(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Чтение таблицы приложению не открыто: только INSERT, как в 0001."""
+    anna = await _person(engine, "Анна")
+    async with engine.connect() as conn:
+        privs = (
             await conn.execute(
                 text(
-                    "SELECT has_function_privilege('feelings_app', "
-                    "'app_export_partner_messages()', 'EXECUTE')"
+                    "SELECT has_table_privilege('feelings_app', 'safety_events', 'SELECT'), "
+                    "has_table_privilege('feelings_app', 'safety_events', 'INSERT')"
                 )
             )
-        ).scalar_one() is True
-    alembic("check")
+        ).one()
+    assert tuple(privs) == (False, True)
+    with pytest.raises(DBAPIError) as ei:
+        await _call(sessionmaker, anna.user_id, "SELECT count(*) FROM safety_events")
+    assert _sqlstate(ei.value) == "42501"
+
+
+async def test_safety_export_rights(engine: AsyncEngine) -> None:
+    async with engine.connect() as conn:
+        for role, allowed in (
+            ("feelings_app", True),
+            ("feelings_api", False),
+            ("feelings_worker", False),
+            ("feelings_admin", False),
+            ("public", False),
+        ):
+            row = await conn.execute(
+                text("SELECT has_function_privilege(:r, 'app_export_safety_events()', 'EXECUTE')"),
+                {"r": role},
+            )
+            assert row.scalar_one() is allowed, role
+        definer, config, result = (
+            await conn.execute(
+                text(
+                    "SELECT prosecdef, proconfig, pg_get_function_result(oid) FROM pg_proc "
+                    "WHERE oid = 'app_export_safety_events()'::regprocedure"
+                )
+            )
+        ).one()
+        assert definer is True and config == ["search_path=public, pg_temp"]
+        assert result == "TABLE(type safety_event_type, created_at timestamp with time zone)"
+
+
+async def test_migration_0007_reversible(engine: AsyncEngine, app_engine: AsyncEngine) -> None:
+    """0007 → 0006 → head: downgrade убирает только app_export_safety_events; `alembic check`."""
+    await _downgrade_and_back(engine, app_engine, "0006", (True, False, "0006"))
