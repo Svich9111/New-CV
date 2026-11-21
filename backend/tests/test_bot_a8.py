@@ -1215,3 +1215,554 @@ async def test_lifespan_body_error_closes_both(monkeypatch: pytest.MonkeyPatch) 
         async with lifespan(FastAPI()):
             raise KeyboardInterrupt
     assert log == ["bot_api", "aclose", "dispose"]
+
+
+# --- Доработка 1.4: режим разработки (опрос getUpdates, check, setup --no-webhook) -----------
+# ТЗ §9.1 п.5 (токен бота — только в окружении, не в журналах и выводе); карточка 1.4, раздел
+# «Живая проверка без сервера». Независимая подмена Bot API (свой стаб), без сети.
+
+import os  # noqa: E402
+import signal  # noqa: E402
+
+from app.bot import check as check_module  # noqa: E402
+from app.bot import poll as poll_module  # noqa: E402
+from app.bot import setup as a8_bot_setup  # noqa: E402
+from app.bot.processing import Delivery, process_update  # noqa: E402
+from app.config import check_dev_bot_config  # noqa: E402
+from app.core.logging import install_log_redaction  # noqa: E402
+
+
+def a8_dev_settings(**overrides: Any) -> Settings:
+    """Как у разработчика без сервера: нет секрета вебхука, секрета сессии и БД."""
+    base: dict[str, Any] = {
+        "telegram_bot_token": SecretStr(BOT_TOKEN),
+        "webapp_url": WEBAPP,
+        "bot_username": "FeelingsA8Bot",
+        "telegram_webhook_secret": SecretStr(""),
+        "session_secret": SecretStr(""),
+        "database_url": "postgresql+asyncpg://nobody:none@db.invalid:1/none",
+        "env": "dev",
+    }
+    base.update(overrides)
+    return Settings(**base)
+
+
+_A8_UID = [810_000]
+
+
+def a8_update(text: str = "/start") -> dict[str, Any]:
+    _A8_UID[0] += 1
+    return {
+        "update_id": _A8_UID[0],
+        "message": {
+            "message_id": 3,
+            "date": 1_700_000_100,
+            "chat": {"id": 77_000_002, "type": "private"},
+            "from": {"id": 77_000_002, "is_bot": False, "first_name": "Вера"},
+            "text": text,
+        },
+    }
+
+
+def _ok(result: Any) -> httpx.Response:
+    return httpx.Response(200, json={"ok": True, "result": result})
+
+
+class PollStub:
+    """getUpdates отвечает по сценарию `updates`; сценарий кончился — `stop` и пустой ответ
+    (или зависание, если `hang_when_empty`). sendMessage — по сценарию `sends`, затем успех.
+    `on_send` вызывается при каждом sendMessage до ответа."""
+
+    def __init__(self, stop: asyncio.Event | None = None) -> None:
+        self.stop = stop
+        self.updates: list[Any] = []
+        self.sends: list[httpx.Response | Exception] = []
+        self.confirm: httpx.Response | Exception | None = None
+        self.hang_when_empty = False
+        self.log: list[tuple[str, dict[str, Any], Any]] = []  # метод, тело, тайм-аут чтения
+        self.on_send: Any = None
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        method = request.url.path.rsplit("/", 1)[-1]
+        body = json.loads(request.content or b"{}")
+        self.log.append((method, body, request.extensions["timeout"]["read"]))
+        if method == "getUpdates":
+            if body.get("timeout") == 0:
+                item = self.confirm if self.confirm is not None else _ok([])
+            elif self.updates:
+                item = self.updates.pop(0)
+            elif self.hang_when_empty:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            else:
+                if self.stop is not None:
+                    self.stop.set()
+                return _ok([])
+            if isinstance(item, Exception):
+                raise item
+            return item if isinstance(item, httpx.Response) else _ok(item)
+        if method == "sendMessage":
+            if self.on_send is not None:
+                await self.on_send()
+            if self.sends:
+                item = self.sends.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+            return _ok({"message_id": 9})
+        return _ok(True)
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self)
+
+    def methods(self) -> list[str]:
+        return [m for m, _, _ in self.log]
+
+    def polls(self) -> list[dict[str, Any]]:
+        return [b for m, b, _ in self.log if m == "getUpdates"]
+
+
+async def _a8_run(stub: PollStub, stop: asyncio.Event, **kw: Any) -> int | None:
+    settings = kw.pop("settings", None) or a8_dev_settings()
+    kw.setdefault("retry_delays", (0.0,))
+    return await asyncio.wait_for(
+        poll_module.run(settings, stop=stop, transport=stub.transport(), **kw), 5.0
+    )
+
+
+def _clean(*texts: str) -> None:
+    for text in texts:
+        assert BOT_TOKEN not in text
+        assert TOKEN_TAIL not in text
+
+
+async def test_poll_offset_moves_only_after_update_processed() -> None:
+    """Карточка 1.4: offset — только после обработки. Запрос с offset=u+1 уходит позже ответа
+    пользователю, а не до него."""
+    stop = asyncio.Event()
+    stub = PollStub(stop)
+    u1, u2 = a8_update(), a8_update(f"/start {PAYLOAD_64}")
+    stub.updates = [[u1, u2]]
+    offset = await _a8_run(stub, stop)
+    seq = [(m, b.get("offset")) for m, b, _ in stub.log]
+    assert seq[0] == ("deleteWebhook", None)
+    assert seq[1] == ("getUpdates", None)
+    assert [m for m, _ in seq[2:4]] == ["sendMessage", "sendMessage"]
+    assert seq[4] == ("getUpdates", u2["update_id"] + 1)
+    assert offset == u2["update_id"] + 1
+    # ни один getUpdates до ответов не подтверждал u1/u2
+    assert all(b.get("offset") is None for m, b, _ in stub.log[:4] if m == "getUpdates")
+
+
+async def test_poll_stop_during_retry_pause_confirms_only_processed() -> None:
+    """Временный сбой на u2, затем остановка во время паузы: подтверждён только u1, u2 придёт
+    при следующем запуске (без потери)."""
+    stop = asyncio.Event()
+    stub = PollStub(stop)
+    u1, u2 = a8_update(), a8_update()
+    stub.updates = [[u1, u2]]
+    stub.sends = [
+        _ok({"message_id": 1}),
+        httpx.Response(503, json={"ok": False, "error_code": 503}),
+    ]
+    task = asyncio.create_task(_a8_run(stub, stop, retry_delays=(60.0,)))
+    for _ in range(200):
+        if stub.methods().count("sendMessage") == 2:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.02)
+    assert not task.done()  # ждёт 60 с перед повтором
+    stop.set()
+    offset = await asyncio.wait_for(task, 2.0)
+    assert offset == u1["update_id"] + 1
+    confirm = stub.polls()[-1]
+    assert confirm["timeout"] == 0 and confirm["offset"] == u1["update_id"] + 1
+
+
+async def test_poll_junk_items_in_batch_do_not_break_offset() -> None:
+    stop = asyncio.Event()
+    stub = PollStub(stop)
+    u = a8_update()
+    stub.updates = [["junk", {"no_id": 1}, {"update_id": True}, {"update_id": "5"}, u]]
+    offset = await _a8_run(stub, stop)
+    assert offset == u["update_id"] + 1
+    assert stub.methods().count("sendMessage") == 1
+
+
+async def test_poll_unexpected_result_is_ignored_without_crash() -> None:
+    stop = asyncio.Event()
+    stub = PollStub(stop)
+    stub.updates = [{"not": "a list"}]
+    offset = await _a8_run(stub, stop)
+    assert offset is None
+    assert "sendMessage" not in stub.methods()
+
+
+@pytest.mark.parametrize("code", [401, 404])
+async def test_poll_bad_token_exits_without_retry(code: int) -> None:
+    stop = asyncio.Event()
+    stub = PollStub(stop)
+    stub.updates = [httpx.Response(code, json={"ok": False, "error_code": code})]
+    with pytest.raises(poll_module.PollStopped) as info:
+        await _a8_run(stub, stop, retry_delays=(0.0,))
+    assert len(stub.polls()) == 1
+    _clean(str(info.value), "".join(traceback.format_exception(info.value)))
+
+
+async def test_poll_bad_token_on_delete_webhook_main_exit_clean(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stub = PollStub()
+
+    async def reject(request: httpx.Request) -> httpx.Response:
+        stub.log.append((request.url.path.rsplit("/", 1)[-1], {}, None))
+        return httpx.Response(
+            401, json={"ok": False, "error_code": 401, "description": f"bad bot{BOT_TOKEN}"}
+        )
+
+    monkeypatch.setattr(
+        poll_module,
+        "BotApi",
+        lambda token, **kw: BotApi(token, transport=httpx.MockTransport(reject)),
+    )
+    monkeypatch.setattr(poll_module, "get_settings", a8_dev_settings)
+    with pytest.raises(SystemExit) as info:
+        await asyncio.to_thread(poll_module.main, [])
+    out = capsys.readouterr()
+    assert "401" in str(info.value.code)
+    _clean(str(info.value.code), out.out, out.err)
+    assert stub.methods() == ["deleteWebhook"]
+
+
+async def test_poll_confirm_failure_is_logged_without_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    stop = asyncio.Event()
+    stub = PollStub()
+    stub.hang_when_empty = True
+    u = a8_update()
+    stub.updates = [[u]]
+    stub.confirm = httpx.ConnectError(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates")
+    task = asyncio.create_task(_a8_run(stub, stop))
+    for _ in range(200):
+        if len(stub.polls()) == 2:
+            break
+        await asyncio.sleep(0.01)
+    stop.set()
+    offset = await asyncio.wait_for(task, 2.0)
+    assert offset == u["update_id"] + 1
+    assert "confirming processed updates failed" in caplog.text
+    _clean(caplog.text)
+
+
+async def test_poll_httpx_request_log_redacted(caplog: pytest.LogCaptureFixture) -> None:
+    """Журнал httpx «HTTP Request: POST https://api.telegram.org/bot<токен>/getUpdates» — без
+    токена (ТЗ §9.1 п.5)."""
+    install_log_redaction()
+    caplog.set_level(logging.DEBUG)
+    stop = asyncio.Event()
+    stub = PollStub(stop)
+    stub.updates = [[a8_update(USER_TEXT)]]
+    await _a8_run(stub, stop)
+    assert "HTTP Request" in caplog.text and "getUpdates" in caplog.text
+    _clean(caplog.text)
+    assert USER_TEXT not in caplog.text
+
+
+async def test_poll_long_timeout_only_for_get_updates() -> None:
+    stop = asyncio.Event()
+    stub = PollStub(stop)
+    stub.updates = [[a8_update()]]
+    await _a8_run(stub, stop)
+    for method, body, read in stub.log:
+        if method == "getUpdates" and body.get("timeout") == 25:
+            assert read is not None and read > 25
+        elif method == "sendMessage":
+            assert read == 10.0  # обычный тайм-аут клиента, не 35 с
+
+
+def _patch_poll_api(monkeypatch: pytest.MonkeyPatch, stub: PollStub) -> None:
+    monkeypatch.setattr(
+        poll_module, "BotApi", lambda token, **kw: BotApi(token, transport=stub.transport())
+    )
+    monkeypatch.setattr(poll_module, "get_settings", a8_dev_settings)
+
+
+async def test_poll_real_sigterm_mid_update_finishes_it_and_confirms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SIGTERM во время ответа пользователю: ответ дорабатывается, offset подтверждается,
+    процесс завершается без отмены."""
+    stub = PollStub()
+    stub.hang_when_empty = True
+    u = a8_update()
+    stub.updates = [[u]]
+    gate = asyncio.Event()
+
+    async def on_send() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(0.05)
+        gate.set()
+        await gate.wait()
+
+    stub.on_send = on_send
+    _patch_poll_api(monkeypatch, stub)
+    await asyncio.wait_for(asyncio.create_task(poll_module._amain(False)), 3.0)
+    assert stub.methods() == ["deleteWebhook", "getUpdates", "sendMessage", "getUpdates"]
+    assert stub.polls()[-1]["offset"] == u["update_id"] + 1
+    assert stub.polls()[-1]["timeout"] == 0
+    assert not asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+
+
+async def test_poll_second_sigterm_cancels_hanging_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = PollStub()
+    u = a8_update()
+    stub.updates = [[u]]
+    reached = asyncio.Event()
+
+    async def on_send() -> None:
+        reached.set()
+        await asyncio.Event().wait()
+
+    stub.on_send = on_send
+    _patch_poll_api(monkeypatch, stub)
+    task = asyncio.create_task(poll_module._amain(False))
+    await asyncio.wait_for(reached.wait(), 3.0)
+    os.kill(os.getpid(), signal.SIGTERM)
+    await asyncio.sleep(0.05)
+    assert not task.done()  # первый сигнал — ждём окончания обработки
+    os.kill(os.getpid(), signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2.0)
+    assert not asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+
+
+@pytest.mark.parametrize("env", ["prod", "Production"])
+def test_poll_main_refuses_prod_from_environment(monkeypatch: pytest.MonkeyPatch, env: str) -> None:
+    """FEELINGS_ENV=prod из окружения: опрос не стартует и вебхук продуктива не удаляет."""
+    stub = PollStub()
+    monkeypatch.setattr(
+        poll_module, "BotApi", lambda token, **kw: BotApi(token, transport=stub.transport())
+    )
+    monkeypatch.setenv("FEELINGS_ENV", env)
+    monkeypatch.setenv("FEELINGS_TELEGRAM_BOT_TOKEN", BOT_TOKEN)
+    monkeypatch.setenv("FEELINGS_WEBAPP_URL", WEBAPP)
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(SystemExit) as info:
+            poll_module.main([])
+    finally:
+        get_settings.cache_clear()
+    assert "development only" in str(info.value.code)
+    _clean(str(info.value.code))
+    assert stub.log == []
+
+
+@pytest.mark.parametrize(
+    ("override", "field"),
+    [
+        ({"telegram_webhook_secret": SecretStr("")}, "WEBHOOK_SECRET"),
+        ({"telegram_webhook_secret": SecretStr("a" * 31)}, "WEBHOOK_SECRET"),
+        ({"telegram_webhook_secret": SecretStr("a" * 31 + "!")}, "WEBHOOK_SECRET"),
+        ({"webapp_url": "http://mini.feelings.example/"}, "WEBAPP_URL"),
+        ({"telegram_bot_token": SecretStr("")}, "BOT_TOKEN"),
+    ],
+)
+def test_server_bot_config_not_weakened(override: dict[str, Any], field: str) -> None:
+    """check_bot_config сервера (app.main) по-прежнему требует токен, стойкий секрет вебхука и
+    https-адрес Mini App; check_dev_bot_config — только токен и адрес."""
+    settings = a8_settings().model_copy(update=override)
+    with pytest.raises(ConfigError, match=field):
+        check_bot_config(settings)
+    if field == "WEBHOOK_SECRET":
+        check_dev_bot_config(settings)  # опросу секрет не нужен
+    check_bot_config(a8_settings())
+
+
+def test_server_lifespan_uses_server_check() -> None:
+    import app.main as main_module
+
+    src = inspect.getsource(main_module)
+    assert "check_bot_config(settings)" in src
+    assert "check_dev_bot_config" not in src
+
+
+async def test_process_update_outcomes_match_webhook_contract() -> None:
+    """Общий process_update: исходы, которые вебхук превращает в 200/503."""
+    api = BotApi(BOT_TOKEN, transport=httpx.MockTransport(lambda r: _ok(True)))
+    seen = UpdateDeduplicator()
+
+    async def ok(*_: Any) -> str:
+        return "start"
+
+    async def transient(*_: Any) -> str:
+        raise BotApiError("sendMessage", "x", error_code=502, transient=True)
+
+    async def permanent(*_: Any) -> str:
+        raise BotApiError("sendMessage", "x", error_code=403)
+
+    async def boom(*_: Any) -> str:
+        raise RuntimeError(USER_TEXT)
+
+    async def slow(*_: Any) -> str:
+        await asyncio.sleep(10)
+        return "start"
+
+    cases = [(ok, Delivery.ACK), (transient, Delivery.RETRY), (permanent, Delivery.ACK)]
+    cases += [(boom, Delivery.ACK), (slow, Delivery.RETRY)]
+    for handler, expected in cases:
+        u = a8_update()
+        got = await process_update(api, seen, u, WEBAPP, handler=handler, deadline_s=0.05)
+        assert got is expected, handler.__name__
+        if expected is Delivery.RETRY:
+            assert seen.claim(u["update_id"])  # отметка снята: повтор обработается
+        else:
+            again = await process_update(api, seen, u, WEBAPP, handler=boom, deadline_s=0.05)
+            assert again is Delivery.ACK  # дубль
+    assert await process_update(api, seen, {"x": 1}, WEBAPP, handler=boom) is Delivery.ACK
+    await api.aclose()
+
+
+class CheckStub:
+    def __init__(self, me: httpx.Response, hook: httpx.Response | None = None) -> None:
+        self.me, self.hook = me, hook
+        self.methods: list[str] = []
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        method = request.url.path.rsplit("/", 1)[-1]
+        self.methods.append(method)
+        if method == "getMe":
+            return self.me
+        if method == "getWebhookInfo" and self.hook is not None:
+            return self.hook
+        return _ok(True)
+
+
+async def test_check_reads_only_and_hides_id_token_and_webhook() -> None:
+    hook_url = f"https://hook-secret-host.example/api/v1/telegram/webhook?k={HOOK_SECRET}"
+    me = _ok({"id": int(BOT_ID), "is_bot": True, "first_name": "Ч", "username": "FeelingsA8Bot"})
+    hook = _ok(
+        {
+            "url": hook_url,
+            "pending_update_count": 3,
+            "ip_address": "203.0.113.9",
+            "last_error_message": f"Wrong response {USER_TEXT}",
+        }
+    )
+    stub = CheckStub(me, hook)
+    lines = await check_module.check_bot(
+        a8_dev_settings(webapp_url=""), transport=httpx.MockTransport(stub)
+    )
+    text = "\n".join(lines)
+    assert stub.methods == ["getMe", "getWebhookInfo"]  # только чтение, вебхук не трогается
+    assert "@FeelingsA8Bot" in text and "ожидают доставки: 3" in text
+    _clean(text)
+    for secret in (BOT_ID, "hook-secret-host", HOOK_SECRET, "203.0.113.9", USER_TEXT):
+        assert secret not in text
+
+
+async def test_check_rejects_non_bot_and_404() -> None:
+    me = _ok({"id": 1, "is_bot": False, "username": "human"})
+    with pytest.raises(BotApiError):
+        await check_module.check_bot(
+            a8_dev_settings(), transport=httpx.MockTransport(CheckStub(me))
+        )
+    gone = httpx.Response(404, json={"ok": False, "error_code": 404, "description": "Not Found"})
+    with pytest.raises(check_module.TokenRejected):
+        await check_module.check_bot(
+            a8_dev_settings(), transport=httpx.MockTransport(CheckStub(gone))
+        )
+
+
+def test_check_main_network_error_has_no_token_or_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"connect {request.url}")
+
+    monkeypatch.setattr(
+        check_module,
+        "BotApi",
+        lambda token, **kw: BotApi(token, transport=httpx.MockTransport(fail)),
+    )
+    monkeypatch.setattr(check_module, "get_settings", a8_dev_settings)
+    with pytest.raises(SystemExit) as info:
+        check_module.main()
+    out = capsys.readouterr()
+    _clean(str(info.value.code), out.out, out.err)
+    assert "Traceback" not in out.err
+
+
+class SetupStub:
+    def __init__(self) -> None:
+        self.methods: list[str] = []
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.methods.append(request.url.path.rsplit("/", 1)[-1])
+        return _ok(True)
+
+
+def test_setup_no_webhook_never_touches_webhook_even_with_secret(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stub = SetupStub()
+    monkeypatch.setattr(
+        a8_bot_setup,
+        "BotApi",
+        lambda token, **kw: BotApi(token, transport=httpx.MockTransport(stub)),
+    )
+    monkeypatch.setattr(a8_bot_setup, "get_settings", a8_settings)  # секрет есть, но не нужен
+    a8_bot_setup.main(["--no-webhook"])
+    assert sorted(stub.methods) == ["setChatMenuButton", "setMyCommands"]
+    out = capsys.readouterr()
+    _clean(out.out, out.err)
+    assert HOOK_SECRET not in out.out + out.err
+
+
+@pytest.mark.parametrize("webapp", ["", "http://mini.feelings.example/"])
+def test_setup_no_webhook_requires_https_webapp(
+    monkeypatch: pytest.MonkeyPatch, webapp: str
+) -> None:
+    stub = SetupStub()
+    monkeypatch.setattr(
+        a8_bot_setup,
+        "BotApi",
+        lambda token, **kw: BotApi(token, transport=httpx.MockTransport(stub)),
+    )
+    monkeypatch.setattr(a8_bot_setup, "get_settings", lambda: a8_dev_settings(webapp_url=webapp))
+    with pytest.raises(SystemExit) as info:
+        a8_bot_setup.main(["--no-webhook"])
+    assert "WEBAPP_URL" in str(info.value.code)
+    assert stub.methods == []
+
+
+@pytest.mark.parametrize("tool", ["poll", "check"])
+def test_dev_tools_install_log_redaction(monkeypatch: pytest.MonkeyPatch, tool: str) -> None:
+    """Утилиты режима разработки сами включают фильтр журналов: журнал httpx с URL Bot API
+    (в нём токен) чистится и при запуске из командной строки (ТЗ §9.1 п.5)."""
+    from app.core.logging import RedactInviteTokens
+
+    for name in ("httpx", "app.bot"):
+        lg = logging.getLogger(name)
+        for f in [f for f in lg.filters if isinstance(f, RedactInviteTokens)]:
+            monkeypatch.setattr(lg, "filters", [x for x in lg.filters if x is not f])
+    if tool == "poll":
+
+        async def fake_amain(drop_pending: bool) -> None:
+            return None
+
+        monkeypatch.setattr(poll_module, "_amain", fake_amain)
+        poll_module.main([])
+    else:
+
+        async def fake_check(settings: Settings, **kw: Any) -> list[str]:
+            return ["ok"]
+
+        monkeypatch.setattr(check_module, "check_bot", fake_check)
+        monkeypatch.setattr(check_module, "get_settings", a8_dev_settings)
+        check_module.main()
+    for name in ("httpx", "app.bot"):
+        assert any(isinstance(f, RedactInviteTokens) for f in logging.getLogger(name).filters)
