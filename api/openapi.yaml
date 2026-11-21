@@ -1,0 +1,832 @@
+openapi: 3.1.0
+info:
+  title: Чувства AI — API Mini App
+  version: 0.1.0
+  description: |
+    Контракт сервер ↔ клиент (задача 0.7, владелец A1). Изменяется только A1 через карточку.
+    Все эндпоинты, кроме входа, требуют `Authorization: Bearer <access_token>`, полученного
+    в `POST /auth/telegram`. Тексты переписки в ответах есть только у их законных читателей
+    (ТЗ §7 «Правила доступа»). Ссылки «ФТ-NN» — на `docs/TZ.md`, раздел 5.
+servers:
+  - url: /api/v1
+security:
+  - bearer: []
+tags:
+  - name: auth
+  - name: profile
+  - name: couple
+  - name: chat
+  - name: drafts
+  - name: messages
+  - name: memory
+  - name: subscription
+  - name: help
+  - name: admin
+
+paths:
+  /health:
+    get:
+      tags: [auth]
+      summary: Проверка доступности
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: ok }
+
+  /auth/telegram:
+    post:
+      tags: [auth]
+      summary: Вход по initData Telegram (ФТ-01)
+      description: Сервер проверяет подпись initData ключом бота и срок auth_date. Пароль не используется.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [init_data]
+              properties:
+                init_data: { type: string, description: "Строка Telegram.WebApp.initData как есть" }
+      responses:
+        "200":
+          description: Сессия создана
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Аккаунт удалён; повторная регистрация — задача 4.5
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "422": { $ref: "#/components/responses/Validation" }
+        "503":
+          description: Вход временно недоступен (сервис не настроен)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /me:
+    get:
+      tags: [profile]
+      summary: Профиль и состояние онбординга
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      tags: [profile]
+      summary: Удалить аккаунт и все данные (ФТ-21)
+      description: Личные данные удаляются сразу из рабочей БД и из резервных копий в течение 30 дней (ТЗ §7).
+      responses:
+        "204": { description: Удалено }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /me/onboarding:
+    put:
+      tags: [profile]
+      summary: Онбординг — имя, обращение, имя партнёра, согласия, 18+ (ФТ-02)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OnboardingRequest" }
+      responses:
+        "200":
+          description: Сохранено
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: >-
+            Код `underage`: возраст 18+ не подтверждён (`age_confirmed: false`) — доступ не
+            предоставляется, ранее данное подтверждение снимается (ТЗ §9.3). Код
+            `onboarding_required` этот эндпоинт не отдаёт: его отдают эндпоинты, требующие
+            завершённого онбординга (см. `components/responses/OnboardingRequired`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                underage:
+                  value: { code: underage, message: Сервис доступен только с 18 лет }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /me/export:
+    get:
+      tags: [profile]
+      summary: Выгрузка своих данных (ФТ-21)
+      description: Только данные владельца; память и личный чат партнёра не включаются.
+      responses:
+        "200":
+          description: Архив данных
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /couple:
+    get:
+      tags: [couple]
+      summary: Текущая пара и её статус
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Couple" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [couple]
+      summary: Создать пару и одноразовую ссылку-приглашение (ФТ-03)
+      responses:
+        "201":
+          description: Пара в статусе pending, ссылка на 7 дней
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InviteCreated" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+
+  /couple/invite:
+    post:
+      tags: [couple]
+      summary: Выпустить новую ссылку для ожидающей пары; прежняя отзывается (ФТ-03)
+      responses:
+        "201":
+          description: Новая ссылка
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InviteCreated" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /couple/leave:
+    post:
+      tags: [couple]
+      summary: Выйти из пары (ФТ-04)
+      description: Агенты и личная память сохраняются, обмен сообщениями прекращается (ТЗ §4.5 п.2).
+      responses:
+        "204": { description: Пара расторгнута }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /invites/{token}:
+    parameters:
+      - $ref: "#/components/parameters/InviteToken"
+    get:
+      tags: [couple]
+      summary: Проверить приглашение перед принятием
+      responses:
+        "200":
+          description: Приглашение действительно
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [inviter_name, expires_at]
+                properties:
+                  inviter_name: { type: [string, "null"] }
+                  expires_at: { type: string, format: date-time }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+  /invites/{token}/accept:
+    parameters:
+      - $ref: "#/components/parameters/InviteToken"
+    post:
+      tags: [couple]
+      summary: Принять приглашение — пара становится активной (ФТ-03)
+      responses:
+        "200":
+          description: Пара активна
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Couple" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "410": { $ref: "#/components/responses/Gone" }
+
+  /chat/messages:
+    get:
+      tags: [chat]
+      summary: История личного чата с агентом (видит только владелец)
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/ChatMessage" }
+                  next_cursor: { type: [string, "null"] }
+    post:
+      tags: [chat]
+      summary: Реплика владельца; ответ агента потоком (ФТ-05)
+      description: |
+        Ответ — Server-Sent Events. События: `delta` {text}, `done` {message_id, suggest_draft: bool},
+        `crisis` {contacts} — кризисный протокол (ФТ-17), `error` {code, message} — отказ модели,
+        текст реплики не теряется (ТЗ §10). Первый символ — до 5 с в 95% случаев.
+        Порядок проверок: сначала классификатор безопасности, потом подписка и лимиты. При признаках
+        кризиса ответ с контактами помощи идёт всегда — 402 и 429 в этом случае не возвращаются
+        (ТЗ §9.3, §11 п.5).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string, minLength: 1, maxLength: 4000 }
+      responses:
+        "200":
+          description: Поток SSE
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "402": { $ref: "#/components/responses/SubscriptionRequired" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /chat/voice:
+    post:
+      tags: [chat]
+      summary: Голосовое сообщение → расшифровка (ФТ-06)
+      description: Аудио после расшифровки не хранится. Текст возвращается для отправки через POST /chat/messages.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [audio]
+              properties:
+                audio: { type: string, format: binary }
+      responses:
+        "200":
+          description: Расшифровка
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [text]
+                properties:
+                  text: { type: string }
+        "413": { description: Слишком длинная запись }
+
+  /drafts:
+    post:
+      tags: [drafts]
+      summary: Сгенерировать черновик сообщения партнёру по текущему разговору (ФТ-07)
+      description: |
+        Схема «чувство — ситуация — потребность — просьба» (ТЗ §4.3). Ничего не отправляется партнёру.
+        `reply_to_id` — ответ на конкретное входящее («Ответить с агентом», ТЗ §4.4 п.5, §8): после
+        отправки входящее получает статус `answered` (ФТ-11).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reply_to_id: { type: [string, "null"], format: uuid }
+      responses:
+        "201":
+          description: Черновик
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Draft" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /drafts/{draft_id}:
+    parameters:
+      - $ref: "#/components/parameters/DraftId"
+    get:
+      tags: [drafts]
+      summary: Черновик (видит только автор)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Draft" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [drafts]
+      summary: Правка текста автором (ФТ-07)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string, minLength: 1, maxLength: 4000 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Draft" }
+
+  /drafts/{draft_id}/regenerate:
+    parameters:
+      - $ref: "#/components/parameters/DraftId"
+    post:
+      tags: [drafts]
+      summary: «Другой вариант» (ФТ-07)
+      responses:
+        "200":
+          description: Новая версия черновика
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Draft" }
+
+  /drafts/{draft_id}/reject:
+    parameters:
+      - $ref: "#/components/parameters/DraftId"
+    post:
+      tags: [drafts]
+      summary: «Не отправлять» (ФТ-07)
+      responses:
+        "204": { description: Черновик отклонён }
+
+  /drafts/{draft_id}/send:
+    parameters:
+      - $ref: "#/components/parameters/DraftId"
+    post:
+      tags: [drafts]
+      summary: «Отправить» — единственный путь сообщения к партнёру (ФТ-08)
+      description: |
+        Фиксирует оригинал (ТЗ §6.2 п.2) и запускает конвейер. `expected_version` защищает от
+        отправки не той версии, которую автор видел. При срабатывании проверки безопасности
+        сообщение не отправляется: 422 с кодом `blocked_by_safety` (ТЗ §9.3).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_version]
+              properties:
+                expected_version: { type: integer, minimum: 1 }
+      responses:
+        "202":
+          description: Принято в конвейер
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartnerMessage" }
+        "402": { $ref: "#/components/responses/SubscriptionRequired" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /couple/messages:
+    get:
+      tags: [messages]
+      summary: Лента сообщений пары со статусами (ФТ-11)
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/PartnerMessage" }
+                  next_cursor: { type: [string, "null"] }
+
+  /couple/messages/{message_id}/original:
+    parameters:
+      - $ref: "#/components/parameters/MessageId"
+    get:
+      tags: [messages]
+      summary: «Показать оригинал» — текст, одобренный автором (ФТ-10)
+      description: Просмотр фиксируется (`original_viewed_at`). Доступно получателю и автору.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [text]
+                properties:
+                  text: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /couple/messages/{message_id}/read:
+    parameters:
+      - $ref: "#/components/parameters/MessageId"
+    post:
+      tags: [messages]
+      summary: Отметить прочитанным (ФТ-11)
+      responses:
+        "204": { description: OK }
+
+  /memory:
+    get:
+      tags: [memory]
+      summary: «Что агент помнит» — записи по категориям (ФТ-13)
+      parameters:
+        - name: type
+          in: query
+          schema: { $ref: "#/components/schemas/MemoryType" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/MemoryItem" }
+  /memory/{memory_id}:
+    parameters:
+      - name: memory_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [memory]
+      summary: Удалить запись — не восстанавливается и не извлекается повторно (ФТ-13, ТЗ §6.3)
+      responses:
+        "204": { description: Удалено }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /subscription:
+    get:
+      tags: [subscription]
+      summary: Статус подписки пары — виден обоим (ФТ-19)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Subscription" }
+  /subscription/invoice:
+    post:
+      tags: [subscription]
+      summary: Счёт Telegram Stars на оплату подписки пары (ФТ-19, допущение Д9)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan]
+              properties:
+                plan: { type: string, enum: [month, year] }
+      responses:
+        "201":
+          description: Ссылка на счёт для Telegram.WebApp.openInvoice
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invoice_link]
+                properties:
+                  invoice_link: { type: string, format: uri }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /help/contacts:
+    get:
+      tags: [help]
+      summary: Контакты служб помощи — без подписки (ТЗ §9.3, §11 п.5)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/HelpContact" }
+
+  /admin/kb/documents:
+    get:
+      tags: [admin]
+      summary: Материалы базы знаний (ФТ-20)
+      security: [{ adminBearer: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/KbDocument" }
+    post:
+      tags: [admin]
+      summary: Загрузить PDF, EPUB, DOCX, TXT (ФТ-15)
+      security: [{ adminBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, title, rights_basis]
+              properties:
+                file: { type: string, format: binary }
+                title: { type: string }
+                author: { type: string }
+                approach: { type: string }
+                rights_basis: { type: string, description: "Основание прав на использование (ТЗ §6.4)" }
+      responses:
+        "202":
+          description: Принято к индексации
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/KbDocument" }
+  /admin/prompts:
+    get:
+      tags: [admin]
+      summary: Версии промптов (ФТ-20)
+      security: [{ adminBearer: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PromptVersion" }
+  /admin/prompts/{prompt_id}/activate:
+    parameters:
+      - name: prompt_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [admin]
+      summary: Сделать версию активной (только с приложенным прогоном эталонного набора)
+      security: [{ adminBearer: [] }]
+      responses:
+        "204": { description: OK }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /admin/metrics:
+    get:
+      tags: [admin]
+      summary: Обезличенные метрики — без текстов переписок (ФТ-20, ТЗ §1)
+      security: [{ adminBearer: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Metrics" }
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+    adminBearer: { type: http, scheme: bearer, description: Отдельная учётная запись администратора }
+
+  parameters:
+    InviteToken:
+      name: token
+      in: path
+      required: true
+      schema: { type: string, minLength: 32, maxLength: 64 }
+    DraftId:
+      name: draft_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MessageId:
+      name: message_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+
+  responses:
+    Unauthorized:
+      description: Нет сессии или неверная подпись initData
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    OnboardingRequired:
+      description: >-
+        Код `onboarding_required`: онбординг не завершён — нет всех трёх согласий или
+        подтверждения 18+ (ФТ-02, ТЗ §4.1 п.2, §9.3)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            onboarding_required:
+              value: { code: onboarding_required, message: Сначала завершите знакомство с сервисом }
+    NotFound:
+      description: Не найдено или нет доступа (не различаются, чтобы не раскрывать чужие данные)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Conflict:
+      description: Конфликт состояния (уже в паре, устаревшая версия, пара не активна)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Gone:
+      description: Приглашение истекло или уже использовано
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Validation:
+      description: Ошибка данных
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    SubscriptionRequired:
+      description: Подписка закончилась или исчерпан дневной лимит без подписки (ТЗ §11)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    RateLimited:
+      description: Превышен дневной лимит запросов (ТЗ §10)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, underage, already_in_couple, invite_expired,
+                     invite_used, couple_not_active, version_conflict, blocked_by_safety,
+                     subscription_required, rate_limited, llm_unavailable]
+        message: { type: string, description: Понятное пользователю сообщение на русском }
+
+    Session:
+      type: object
+      required: [access_token, expires_in, me]
+      properties:
+        access_token: { type: string }
+        expires_in: { type: integer, description: секунды }
+        me: { $ref: "#/components/schemas/Me" }
+
+    Me:
+      type: object
+      required: [id, onboarding_completed, has_active_couple]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: [string, "null"] }
+        address_form: { type: [string, "null"] }
+        partner_name: { type: [string, "null"] }
+        timezone: { type: string }
+        onboarding_completed: { type: boolean }
+        has_active_couple: { type: boolean }
+
+    OnboardingRequest:
+      type: object
+      required: [name, address_form, partner_name, consent_terms, consent_data, consent_sensitive, age_confirmed]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 64 }
+        address_form: { type: string, minLength: 1, maxLength: 64 }
+        partner_name: { type: string, minLength: 1, maxLength: 64 }
+        timezone: { type: string, maxLength: 64, default: Europe/Moscow, description: "Зона IANA" }
+        consent_terms: { type: boolean, const: true }
+        consent_data: { type: boolean, const: true }
+        consent_sensitive: { type: boolean, const: true }
+        age_confirmed: { type: boolean }
+
+    Couple:
+      type: object
+      required: [id, status, members]
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, active, dissolved] }
+        members:
+          type: array
+          maxItems: 2
+          items:
+            type: object
+            required: [role, is_me]
+            properties:
+              role: { type: string, enum: [initiator, partner] }
+              name: { type: [string, "null"] }
+              is_me: { type: boolean }
+
+    InviteCreated:
+      type: object
+      required: [couple_id, link, expires_at]
+      properties:
+        couple_id: { type: string, format: uuid }
+        link: { type: string, format: uri, description: "t.me/<бот>?startapp=<токен>; одноразовая" }
+        expires_at: { type: string, format: date-time }
+
+    ChatMessage:
+      type: object
+      required: [id, author, text, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        author: { type: string, enum: [owner, agent] }
+        text: { type: string }
+        created_at: { type: string, format: date-time }
+
+    Draft:
+      type: object
+      required: [id, text, version, status]
+      properties:
+        id: { type: string, format: uuid }
+        text: { type: string }
+        reply_to_id: { type: [string, "null"], format: uuid }
+        version: { type: integer, minimum: 1 }
+        status: { type: string, enum: [draft, approved, rejected, blocked, sent] }
+
+    PartnerMessage:
+      type: object
+      description: |
+        Для получателя `text` — итоговая версия (адаптированная или оригинал), для автора —
+        его оригинал. Оригинал получателю — только через /original (ФТ-10).
+      required: [id, direction, text, is_adapted, status, sent_at]
+      properties:
+        id: { type: string, format: uuid }
+        direction: { type: string, enum: [outgoing, incoming] }
+        text: { type: string }
+        is_adapted: { type: boolean, description: "Пометка «адаптировано» (ФТ-09)" }
+        harsh_tone_warning: { type: boolean, description: "ТЗ §6.2 п.6" }
+        status: { type: string, enum: [processing, withheld, delivered, read, answered], description: "Получателю — только delivered/read/answered. processing и withheld (остановлено безопасностью, ТЗ §9.3) видит только автор" }
+        reply_to_id: { type: [string, "null"], format: uuid }
+        sent_at: { type: string, format: date-time }
+        read_at: { type: [string, "null"], format: date-time }
+
+    MemoryType:
+      type: string
+      enum: [fact, date, preference, sensitive_topic, observation, from_partner]
+
+    MemoryItem:
+      type: object
+      required: [id, type, text, source, confidence, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        type: { $ref: "#/components/schemas/MemoryType" }
+        text: { type: string }
+        event_date: { type: [string, "null"], format: date }
+        source: { type: string, enum: [owner_dialog, agent_inference, partner_message] }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        created_at: { type: string, format: date-time }
+
+    Subscription:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [none, trial, active, expired, canceled] }
+        plan: { type: [string, "null"] }
+        period_end: { type: [string, "null"], format: date-time }
+        paid_by_me: { type: [boolean, "null"] }
+
+    HelpContact:
+      type: object
+      required: [name, phone, description]
+      properties:
+        name: { type: string }
+        phone: { type: string }
+        description: { type: string }
+        round_the_clock: { type: boolean }
+
+    KbDocument:
+      type: object
+      required: [id, title, rights_basis, index_status]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        author: { type: [string, "null"] }
+        approach: { type: [string, "null"] }
+        rights_basis: { type: string }
+        index_status: { type: string, enum: [uploaded, indexing, indexed, failed] }
+
+    PromptVersion:
+      type: object
+      required: [id, purpose, version, is_active, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        purpose: { type: string }
+        version: { type: integer }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    Metrics:
+      type: object
+      description: Только агрегаты; ни одного текста переписки и ни одного идентификатора пользователя
+      properties:
+        invites_accepted_share: { type: number }
+        couples_first_message_7d_share: { type: number }
+        messages_answered_share: { type: number }
+        retention_30d: { type: number }
+        heard_score_avg: { type: number }
+        first_token_p95_ms: { type: integer }
