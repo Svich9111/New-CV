@@ -5,15 +5,14 @@ import uuid
 
 import jwt
 
+from app.config import MIN_SESSION_SECRET_LEN as MIN_SECRET_LEN
+
 ALGORITHM = "HS256"
 AUDIENCE = "feelings-miniapp"
 
 
 class SessionError(Exception):
     pass
-
-
-MIN_SECRET_LEN = 32
 
 
 def _check_secret(secret: str) -> None:
