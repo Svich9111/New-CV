@@ -254,7 +254,8 @@ async def test_bad_response_is_typed_error_not_silent_result(
         await _ask(ClaudeProvider(OPUS, client=wire.client()))
     assert info.value.user_message  # есть понятный текст для пользователя
     assert info.value.model == OPUS
-    assert info.value.fallback_ok
+    if error is LLMBadOutput:
+        assert info.value.fallback_ok
 
 
 async def test_refusal_category_is_kept() -> None:
@@ -290,10 +291,9 @@ def _raise(exc: Exception) -> Reply:
         lambda r: _error(404, "not_found_error"),
         _raise(httpx2.ConnectError("нет сети")),
         _raise(httpx2.ReadTimeout("тайм-аут")),
-        lambda r: httpx2.Response(200, json=_message([], stop_reason="refusal")),
         lambda r: httpx2.Response(200, json=_message([], stop_reason="end_turn")),
     ],
-    ids=["429", "500", "502", "503", "529", "404", "сеть", "тайм-аут", "refusal", "пусто"],
+    ids=["429", "500", "502", "503", "529", "404", "сеть", "тайм-аут", "пусто"],
 )
 async def test_unavailable_goes_to_fallback(primary: Reply) -> None:
     """ТЗ §10: «Предусмотрена резервная модель»: 429/5xx/сеть/тайм-аут → ответ резервной."""
@@ -326,6 +326,23 @@ async def test_config_errors_do_not_fall_back(
         ClaudeProvider(OPUS, client=main.client()), ClaudeProvider(HAIKU, client=spare.client())
     )
     with pytest.raises(error):
+        await _ask(chain)
+    assert spare.bodies == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR: errors.py LLMRefusal.fallback_ok = True — отказ по безопасности уходит на "
+    "резервную модель вопреки DECISIONS.md АР-20 (резервная — только для недоступности)",
+)
+async def test_refusal_does_not_go_to_fallback() -> None:
+    """DECISIONS.md АР-20: отказ модели (refusal) не переадресуется резервной модели."""
+    refusal = httpx2.Response(200, json=_message([], stop_reason="refusal"))
+    main, spare = Wire(lambda r: refusal), Wire(lambda r: _json_reply({"ok": True}, model=HAIKU))
+    chain = FallbackProvider(
+        ClaudeProvider(OPUS, client=main.client()), ClaudeProvider(HAIKU, client=spare.client())
+    )
+    with pytest.raises(LLMRefusal):
         await _ask(chain)
     assert spare.bodies == []
 
@@ -734,3 +751,27 @@ def test_cli_with_rejected_key_or_outage_fails_without_report(
     assert proc.returncode == 3, (proc.returncode, proc.stderr[-500:])
     assert FAKE_KEY not in proc.stdout + proc.stderr
     assert not out.exists() or list(out.iterdir()) == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MAJOR (0.3 R2-MAJOR-1 / A6): run.py _call_model передаёт в converse запрос с "
+    "partner_message — на шагах 1–2 ключевого сценария модель видит одобренный оригинал "
+    "шага 3 (approved_partner_message), проверки шагов теряют смысл (ТЗ §1)",
+)
+def test_echo_owner_steps_do_not_see_approved_original(situations: list[dict[str, Any]]) -> None:
+    model, wire = _echo_adapter()
+    key = [s for s in situations if s.get("dialog")]
+    assert key
+    try:
+        run.run_suite(key, model)
+    finally:
+        model.close()
+    recipient = model.recipient_system
+    owner = [b for b in wire.bodies if b["system"] != recipient]
+    steps = owner[1:]  # первый вызов агента владельца — respond, дальше — шаги converse
+    assert len(steps) == len(key[0]["owner_turns"])
+    original = key[0]["partner_message"]["original"]
+    for body in steps:
+        dumped = json.dumps(body["messages"], ensure_ascii=False)
+        assert original not in dumped

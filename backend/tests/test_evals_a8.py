@@ -1112,7 +1112,7 @@ def test_r2_respond_only_author_leak_is_caught(situations: list[dict[str, Any]])
 
 @pytest.mark.xfail(
     strict=True,
-    reason="MAJOR D-7: run.py run_suite/score — у модели только с respond шаги диалога "
+    reason="MINOR D-7: run.py run_suite/score — у модели только с respond шаги диалога "
     "(converse) и подсказка получателю (reply_hint) не проверяются, но ситуация получает "
     "auto_pass=True («пройдено»), а не «не проверено»; ключевой сценарий §1 засчитывается",
 )
@@ -1123,3 +1123,20 @@ def test_r2_respond_only_key_scenario_is_not_passed(situations: list[dict[str, A
     assert key.get("notes")  # пометка есть …
     assert key["auto_pass"] is not True  # … но статус должен быть «не проверено»
     assert report["summary"]["auto_passed"] < len(situations)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MAJOR (R2-MAJOR-1 A6): run.py _call_model — converse получает запрос с "
+    "partner_message: шаги 1–2 ключевого сценария видят одобренный текст шага 3 (ТЗ §1)",
+)
+def test_r2_converse_request_has_no_approved_original(situations: list[dict[str, Any]]) -> None:
+    seen: list[Any] = []
+
+    class Spy(OracleSteps):
+        def converse(self, request: Any) -> list[Any]:
+            seen.append(request.partner_message)
+            return super().converse(request)
+
+    run.run_suite([s for s in situations if s.get("dialog")], Spy(situations))
+    assert seen and all(pm is None for pm in seen)
