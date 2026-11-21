@@ -124,6 +124,11 @@ class OpenRouterProvider:
     def model(self) -> str:
         return self._model
 
+    @property
+    def price(self) -> Price | None:
+        """Прайс модели (для оценки верхней границы вызова в потолке расходов)."""
+        return self._price
+
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
 
@@ -161,11 +166,18 @@ class OpenRouterProvider:
                 f"OpenRouter не вернул usage.cost, а прайса для {self._model} нет",
                 model=self._model,
             )
-        tokens_in = (
-            usage.input_tokens
-            + usage.cache_creation_input_tokens * 1.25
-            + usage.cache_read_input_tokens * 0.1
-        )
+        if self._model.startswith("anthropic/"):  # прайс кэша Anthropic: запись ×1,25, чтение ×0,1
+            tokens_in = (
+                usage.input_tokens
+                + usage.cache_creation_input_tokens * 1.25
+                + usage.cache_read_input_tokens * 0.1
+            )
+        else:  # у других поставщиков множители кэша свои — считаем по полной цене входа (сверху)
+            tokens_in = (
+                usage.input_tokens
+                + usage.cache_creation_input_tokens
+                + usage.cache_read_input_tokens
+            )
         return round(
             (
                 tokens_in * self._price.input_per_mtok
@@ -215,14 +227,17 @@ class OpenRouterProvider:
                 attempt += 1
                 await asyncio.sleep(self._retry_delay_s * attempt)
 
-    def _parse(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _content(self, data: dict[str, Any]) -> str:
+        """Текст ответа после проверки причины остановки (общая для JSON и текста)."""
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise LLMBadOutput("в ответе нет choices", model=self._model)
         choice = choices[0]
         if isinstance(choice.get("error"), dict):
             raise _status_error(502, {"error": choice["error"]}, self._model)
-        message = choice.get("message") or {}
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise LLMBadOutput("в ответе нет message", model=self._model)
         finish = choice.get("finish_reason")
         native = choice.get("native_finish_reason")
         if message.get("refusal") or finish == "content_filter" or native == "refusal":
@@ -234,6 +249,10 @@ class OpenRouterProvider:
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             raise LLMBadOutput("пустой ответ", model=self._model)
+        return content
+
+    def _parse(self, data: dict[str, Any]) -> dict[str, Any]:
+        content = self._content(data)
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError as exc:
@@ -259,7 +278,10 @@ class OpenRouterProvider:
         except LLMError as exc:  # ответ получен и оплачен — расход не теряется
             exc.usage = usage
             if data.get("usage") is not None:
-                exc.cost_usd = self._cost(data.get("usage"), usage)
+                try:
+                    exc.cost_usd = self._cost(data.get("usage"), usage)
+                except LLMConfigError:  # стоимость неизвестна — исходная ошибка важнее
+                    exc.cost_usd = None
             raise
         cost = self._cost(data.get("usage"), usage)
         return StructuredResult(
@@ -280,14 +302,7 @@ class OpenRouterProvider:
     ) -> AsyncIterator[str]:
         """Без потока: для сравнения моделей не нужен; ответ отдаётся одним фрагментом."""
         data = await self._post(self.request_body(system, messages, max_tokens))
-        choices = data.get("choices") or [{}]
-        message = choices[0].get("message") or {}
-        if message.get("refusal") or choices[0].get("native_finish_reason") == "refusal":
-            raise LLMRefusal("модель отказалась отвечать", model=self._model)
-        content = message.get("content")
-        if not isinstance(content, str):
-            raise LLMBadOutput("пустой ответ", model=self._model)
-        yield content
+        yield self._content(data)
 
 
 async def fetch_price(model: str, client: httpx.AsyncClient | None = None) -> Price:
@@ -306,8 +321,11 @@ async def fetch_price(model: str, client: httpx.AsyncClient | None = None) -> Pr
     for row in response.json().get("data", []):
         if row.get("id") == model:
             pricing = row.get("pricing") or {}
-            return Price(
-                float(pricing.get("prompt") or 0) * 1e6,
-                float(pricing.get("completion") or 0) * 1e6,
-            )
+            prompt, completion = pricing.get("prompt"), pricing.get("completion")
+            if prompt is None or completion is None:  # нет цены — не $0 (ТЗ §10)
+                raise LLMConfigError(f"в каталоге OpenRouter нет цены {model}", model=model)
+            try:
+                return Price(float(prompt) * 1e6, float(completion) * 1e6)
+            except (TypeError, ValueError) as exc:
+                raise LLMConfigError(f"цена {model} в каталоге не число", model=model) from exc
     raise LLMModelNotFound(f"модели {model} нет в каталоге OpenRouter", model=model)

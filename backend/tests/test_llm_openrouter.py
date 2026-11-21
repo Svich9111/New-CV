@@ -25,6 +25,7 @@ from app.ai.llm import (
     LLMAuthError,
     LLMBadOutput,
     LLMConfigError,
+    LLMError,
     LLMModelNotFound,
     LLMQuotaError,
     LLMRefusal,
@@ -527,6 +528,8 @@ def test_compare_budget_keeps_done_reports_and_exits_nonzero(tmp_path: Path) -> 
     assert not (tmp_path / f"cap_{run._safe_label(SPARE)}.json").exists()
     md = (tmp_path / "cap.md").read_text(encoding="utf-8")
     assert "потолком расходов" in md and "$ всего" in md and "Не проверено" in md
+    assert f"Потрачено всего (включая прерванную модель): ${summary['spent_usd']:.4f}" in md
+    assert summary["spent_usd"] > sum(r["cost_usd_total"] for r in summary["rows"])
 
 
 def test_compare_skips_model_with_bad_request(tmp_path: Path) -> None:
@@ -547,3 +550,182 @@ def test_compare_skips_model_with_bad_request(tmp_path: Path) -> None:
     assert [r["model"] for r in summary["rows"]] == [MODEL]
     assert "google/x" in summary["skipped"] and summary["not_answered"] == ["google/x"]
     assert "Модель пропущена" in (tmp_path / "skip.md").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- раунд 1 ревью 0.4b
+
+
+def test_budget_reserve_is_price_ceiling_not_only_observed() -> None:
+    """MINOR-1: следующий вызов может быть дороже наблюдённого — резерв по прайсу останавливает
+    прогон до него."""
+    budget = claude_adapter.CostBudget(1.0)
+    budget.add("m", 0.05)  # наблюдённый максимум — 0.05
+    budget.check("m")  # без прайса: 0.05 + 0.05 <= 1.0
+    budget.check("m", ceiling_usd=0.9)  # 0.05 + 0.9 <= 1.0
+    with pytest.raises(claude_adapter.BudgetExceeded):
+        budget.check("m", ceiling_usd=0.96)  # следующий вызов может стоить дороже наблюдённого
+    assert budget.reserve("m", 0.01) == pytest.approx(0.05)  # наблюдённый больше оценки
+
+
+def test_adapter_stops_before_call_that_could_exceed_limit() -> None:
+    """MINOR-1: первые вызовы дешёвые (0.001), но верхняя граница вызова по прайсу —
+    16000 × $10/млн = $0.16: при потолке $0.15 вызов не делается вовсе."""
+    calls: list[dict[str, Any]] = []
+    model = adapter.OpenRouterAdapter(MODEL, provider=provider(echo(calls), price=Price(1.0, 10.0)))
+    model.budget = claude_adapter.CostBudget(0.15)
+    with pytest.raises(claude_adapter.BudgetExceeded):
+        run.build_report(run.load_situations()[:1], model, "cap")
+    model.close()
+    assert calls == []
+    ceiling = model._call_ceiling("x" * 1000, [ChatMessage("user", "y" * 1000)])
+    assert ceiling == pytest.approx((6000 * 1.0 + 16000 * 10.0) / 1e6)
+
+
+def test_ceiling_unknown_without_price() -> None:
+    model = _adapter(echo([]))
+    assert model._call_ceiling("x", []) is None
+    model.close()
+
+
+async def test_fetch_price_without_price_is_config_error() -> None:
+    """MINOR-4: нет цены в каталоге — ошибка настройки, а не $0."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": MODEL, "pricing": {"prompt": "1e-7"}}]})
+
+    with pytest.raises(LLMConfigError, match="нет цены"):
+        await fetch_price(MODEL, client(handler))
+
+
+async def test_cache_multipliers_only_for_anthropic() -> None:
+    """MINOR-4: множители кэша Anthropic (×0,1 чтение) — только для anthropic/*; у других —
+    по полной цене входа (оценка сверху)."""
+    usage = {
+        "prompt_tokens": 1000,
+        "completion_tokens": 0,
+        "prompt_tokens_details": {"cached_tokens": 1000},
+    }
+    price = Price(1.0, 1.0)
+    anth = await ask(provider(lambda r: ok({"ok": True}, usage=usage), price=price))
+    other = await ask(provider(lambda r: ok({"ok": True}, usage=usage), model=SPARE, price=price))
+    assert anth.cost_usd == pytest.approx(1000 * 0.1 / 1e6)
+    assert other.cost_usd == pytest.approx(1000 / 1e6)
+
+
+async def test_original_error_kept_when_cost_unknown() -> None:
+    """MINOR-5: отказ без usage.cost и без прайса — остаётся отказом, стоимость None."""
+    usage = {"prompt_tokens": 10, "completion_tokens": 1}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=completion(None, refusal="no", usage=usage))
+
+    with pytest.raises(LLMRefusal) as info:
+        await ask(provider(handler))
+    assert info.value.cost_usd is None
+
+
+async def _stream(p: OpenRouterProvider) -> list[str]:
+    return [
+        chunk async for chunk in p.stream_text(system="s", messages=[ChatMessage("user", "Привет")])
+    ]
+
+
+async def test_stream_text_checks_finish_reason_and_choices() -> None:
+    """MINOR-6: stream_text разбирает ответ так же, как complete_json."""
+    assert await _stream(provider(lambda r: httpx.Response(200, json=completion("Текст")))) == [
+        "Текст"
+    ]
+    assert "response_format" not in provider(lambda r: ok({})).request_body("s", [], 10)
+    for kw, error in (
+        ({"finish": "length"}, LLMBadOutput),
+        ({"finish": "content_filter"}, LLMRefusal),
+        ({"native": "refusal"}, LLMRefusal),
+    ):
+        with pytest.raises(error):
+            await _stream(
+                provider(lambda r, kw=kw: httpx.Response(200, json=completion("x", **kw)))
+            )
+    for broken in ({"choices": []}, {"choices": ["x"]}, {"choices": [{"message": None}]}):
+        with pytest.raises(LLMBadOutput):
+            await _stream(provider(lambda r, b=broken: httpx.Response(200, json=b)))
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 429, 500])
+async def test_key_never_in_error_text(status: int) -> None:
+    """Ключ не попадает в текст ошибки, даже если сервис вернул его в сообщении."""
+    body = {"error": {"message": f"bad key {FAKE_KEY[:6]}", "code": status}}
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["authorization"])
+        return httpx.Response(status, json=body)
+
+    with pytest.raises(LLMError) as info:
+        await ask(provider(handler, retries=0))
+    assert seen == [f"Bearer {FAKE_KEY}"]
+    assert FAKE_KEY not in str(info.value) and FAKE_KEY not in repr(info.value.__dict__)
+
+
+async def test_key_never_in_network_error_text() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"boom {request.headers['authorization']}", request=request)
+
+    with pytest.raises(LLMUnavailable) as info:
+        await ask(provider(handler, retries=0))
+    assert FAKE_KEY not in str(info.value)
+
+
+# --------------------------------------------------------------------------- пересчёт (Б-35)
+
+
+def test_rescore_uses_saved_answers_without_calls(tmp_path: Path) -> None:
+    """Пересчёт сводки по сохранённым ответам: модели не вызываются, ответы и метрики те же,
+    проверки — текущие; пометка о пересчёте в сводке и отчётах."""
+    compare = _load("evals_compare_rescore", "compare.py")
+    assert (
+        compare.main(
+            ["--models", f"{__name__}:EchoCheap", "--out-dir", str(tmp_path), "--label", "r"]
+        )
+        == 0
+    )
+    report_path = tmp_path / f"r_{run._safe_label(MODEL)}.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    row = next(x for x in report["results"] if x["id"] == "l5-02-control")
+    row["response"]["reply"] = "Ты не обязан становиться «послушнее»."
+    row["checks"]["must_not_contain"] = {"passed": False, "detail": "найдено: послушн"}
+    bad = next(x for x in report["results"] if x["id"] == "l5-01-pushed-violence")
+    bad["response"]["reply"] = "Нет тебе надо потерпеть."
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    metrics_before = report["metrics"]
+
+    def no_calls(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("модель вызвана при пересчёте")
+
+    original = OpenRouterProvider.complete_json
+    OpenRouterProvider.complete_json = no_calls  # type: ignore[method-assign]
+    try:
+        assert compare.main(["--rescore", str(tmp_path / "r.json")]) == 0
+    finally:
+        OpenRouterProvider.complete_json = original  # type: ignore[method-assign]
+
+    new = json.loads(report_path.read_text(encoding="utf-8"))
+    rows = {x["id"]: x for x in new["results"]}
+    assert rows["l5-02-control"]["checks"]["must_not_contain"]["passed"] is True
+    assert rows["l5-01-pushed-violence"]["checks"]["must_not_contain"]["passed"] is False
+    assert rows["l5-01-pushed-violence"]["auto_pass"] is False
+    assert new["metrics"] == metrics_before and new["rescored"]["note"] == compare.RESCORE_NOTE
+    summary = json.loads((tmp_path / "r.json").read_text(encoding="utf-8"))
+    assert summary["rescored"] == compare.RESCORE_NOTE
+    assert summary["rows"][0]["auto_pass_rate"] == new["summary"]["auto_pass_rate"]
+    assert "Пересчитано после Б-35" in (tmp_path / "r.md").read_text(encoding="utf-8")
+    assert "Пересчитано после Б-35" in report_path.with_suffix(".md").read_text(encoding="utf-8")
+
+
+def test_rescore_refuses_changed_dataset(tmp_path: Path) -> None:
+    compare = _load("evals_compare_rescore2", "compare.py")
+    compare.main(["--models", f"{__name__}:EchoCheap", "--out-dir", str(tmp_path), "--label", "q"])
+    report_path = tmp_path / f"q_{run._safe_label(MODEL)}.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["dataset_hash"] = "0000"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    assert compare.main(["--rescore", str(tmp_path / "q.json")]) == 1

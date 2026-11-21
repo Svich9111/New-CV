@@ -43,6 +43,7 @@ from app.ai.llm import (
     ClaudeProvider,
     LLMError,
     LLMProvider,
+    Price,
     StructuredResult,
     Usage,
 )
@@ -59,6 +60,8 @@ STRATEGIES = (
     "crisis_protocol",
 )
 SAFETY = ("none", "threat_or_insult", "violence_signs")
+MAX_TOKENS = 16000  # ответ модели на один вызов (и верхняя граница выхода в потолке расходов)
+SCHEMA_RESERVE_CHARS = 4000  # схема ответа и служебные токены — запас к входу
 # Ошибки, при которых прогон бессмыслен: продолжать на остальных ситуациях нельзя.
 FATAL_KINDS = frozenset({"config", "auth", "bad_request", "quota"})
 
@@ -85,9 +88,11 @@ class BudgetExceeded(RunAborted):
 
 class CostBudget:
     """Потолок расходов прогона, общий для всех моделей. Перед каждым вызовом модели проверяет,
-    что потраченное плюс резерв на один вызов не больше потолка; резерв — самый дорогой вызов
-    этой модели в прогоне (до первого вызова — ``first_call_reserve_usd``). Так прогон
-    останавливается до превышения, а не после."""
+    что потраченное плюс резерв на этот вызов не больше потолка. Резерв — наибольшее из:
+    самый дорогой вызов этой модели в прогоне и верхняя граница вызова по прайсу (весь вход
+    по цене входа + ``max_tokens`` по цене выхода, ревью 0.4b MINOR-1). Если прайса нет —
+    наблюдённый максимум (до первого вызова — ``first_call_reserve_usd``); тогда превышение
+    возможно не больше чем на разницу одного вызова."""
 
     def __init__(self, limit_usd: float, *, first_call_reserve_usd: float = 0.5) -> None:
         self.limit_usd = limit_usd
@@ -95,14 +100,18 @@ class CostBudget:
         self.spent_usd = 0.0
         self._max_call: dict[str, float] = {}
 
-    def reserve(self, model: str) -> float:
-        return self._max_call.get(model, self.first_call_reserve_usd)
+    def reserve(self, model: str, ceiling_usd: float | None = None) -> float:
+        observed = self._max_call.get(model)
+        if ceiling_usd is not None:
+            return max(observed or 0.0, ceiling_usd)
+        return self.first_call_reserve_usd if observed is None else observed
 
-    def check(self, model: str) -> None:
-        if self.spent_usd + self.reserve(model) > self.limit_usd:
+    def check(self, model: str, ceiling_usd: float | None = None) -> None:
+        reserve = self.reserve(model, ceiling_usd)
+        if self.spent_usd + reserve > self.limit_usd:
             raise BudgetExceeded(
                 f"потолок расходов ${self.limit_usd:.2f}: потрачено ${self.spent_usd:.4f}, "
-                f"резерв на вызов {model} ${self.reserve(model):.4f}"
+                f"резерв на вызов {model} ${reserve:.4f}"
             )
 
     def add(self, model: str, cost: float) -> None:
@@ -239,9 +248,11 @@ class ClaudeAdapter:
         self, role: str, system: str, messages: list[ChatMessage], schema: dict[str, Any]
     ) -> dict[str, Any]:
         """Один вызов; результат или ошибка записываются в метрики (без текстов)."""
-        if self.budget is not None:
-            self.budget.check(self.provider.model)  # до вызова: потолок не превышается
-        coro = self.provider.complete_json(system=system, messages=messages, schema=schema)
+        if self.budget is not None:  # до вызова: потолок не превышается
+            self.budget.check(self.provider.model, self._call_ceiling(system, messages))
+        coro = self.provider.complete_json(
+            system=system, messages=messages, schema=schema, max_tokens=MAX_TOKENS
+        )
         try:
             result: StructuredResult = self._runner.run(coro)
         except LLMError as exc:
@@ -281,6 +292,15 @@ class ClaudeAdapter:
             }
         )
         return result.data
+
+    def _call_ceiling(self, system: str, messages: Sequence[ChatMessage]) -> float | None:
+        """Верхняя граница стоимости вызова по прайсу: вход — не больше одного токена на
+        символ (с запасом на схему), выход — ``MAX_TOKENS``. Нет прайса — ``None``."""
+        price = getattr(self.provider, "price", None)
+        if not isinstance(price, Price):
+            return None
+        chars = len(system) + sum(len(m.content) for m in messages) + SCHEMA_RESERVE_CHARS
+        return (chars * price.input_per_mtok + MAX_TOKENS * price.output_per_mtok) / 1e6
 
     def _owner_response(self, request: Any, data: dict[str, Any]) -> Any:
         crisis_type = data.get("crisis_type")

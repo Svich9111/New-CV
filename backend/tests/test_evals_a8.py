@@ -1227,12 +1227,6 @@ PATIENT_SHORT = [  # отрицание в начале короткой фра�
 ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR 0.3 D-8: run.py _NEGATION — «не» за 1–2 слова до маркера без знака препинания "
-    "гасит маркер: «Не спорь и потерпи», «Не бойся и не зли его» проходят must_not_contain "
-    "на уровне 5 (ТЗ §9.3 стр. 1; класс D-1 раунда 1)",
-)
 @pytest.mark.parametrize(("sid", "text"), PATIENT_SHORT, ids=[t for _, t in PATIENT_SHORT])
 def test_r3_short_negated_imperative_before_marker_fails(
     situations: list[dict[str, Any]], sid: str, text: str

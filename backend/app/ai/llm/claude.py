@@ -44,7 +44,7 @@ from app.ai.llm.errors import (
     LLMRequestError,
     LLMUnavailable,
 )
-from app.ai.llm.pricing import PRICES, cost_usd
+from app.ai.llm.pricing import PRICES, Price, cost_usd
 
 OPUS = "claude-opus-5-5"
 SONNET = "claude-sonnet-5-5"
@@ -157,6 +157,11 @@ class ClaudeProvider:
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def price(self) -> Price:
+        """Прайс модели (для оценки верхней границы вызова в потолке расходов)."""
+        return PRICES[self._model]
 
     def _params(
         self,

@@ -45,6 +45,47 @@ import run  # noqa: E402 — путь к evals добавлен выше
 from adapters.claude import BudgetExceeded, CostBudget  # noqa: E402
 
 DEFAULT_MAX_COST_USD = 15.0
+RESCORE_NOTE = "Пересчитано после Б-35 (ответы те же, модели не вызывались)."
+
+
+def rescore(summary_path: Path, situations_dir: Path, note: str) -> int:
+    """Пересчёт сводки и отчётов моделей по сохранённым ответам (без платных вызовов). Файлы
+    перезаписываются на месте — исходные остаются в истории git. Код выхода: 0 — пересчитано;
+    1 — нет файлов или набор изменился."""
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        situations = run.load_situations(situations_dir)
+    except (OSError, ValueError, run.SituationError) as exc:
+        print(f"Пересчёт невозможен: {exc}", file=sys.stderr)
+        return 1
+    out_dir = summary_path.parent
+    reports = []
+    for row in summary["rows"]:
+        path = out_dir / f"{row['report']}.json"
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+            report = run.rescore_report(report, situations, situations_dir, note=note)
+        except (OSError, ValueError, run.SituationError) as exc:
+            print(f"Пересчёт {path.name} невозможен: {exc}", file=sys.stderr)
+            return 1
+        reports.append(report)
+    for report in reports:
+        run.write_report(report, out_dir)
+    rows = [summary_row(r) for r in reports]
+    blind = summary.get("blind_key")
+    aliases = {name: alias for alias, name in blind.items()} if blind else {}
+    table_rows = [{**r, "model": aliases.get(r["model"], r["model"])} for r in rows]
+    meta = {k: v for k, v in summary.items() if k not in ("notice", "rows", "blind_key")}
+    meta["rescored"] = note
+    new_summary = {**summary, "rows": rows, "rescored": note}
+    summary_path.write_text(
+        json.dumps(new_summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    md_path = summary_path.with_suffix(".md")
+    md_path.write_text(render_table(table_rows, meta), encoding="utf-8")
+    print(f"Пересчитано: {md_path}")
+    return 0
+
 
 DEFAULT_MODELS = ("adapters.claude:Opus", "adapters.claude:Sonnet", "adapters.claude:Haiku")
 
@@ -146,6 +187,13 @@ def render_table(rows: Sequence[dict[str, Any]], meta: dict[str, Any]) -> str:
         )
     total = sum(float(r.get("cost_usd_total") or 0) for r in rows)
     lines += ["", f"Расходы прогона по моделям в таблице: ${total:.4f}."]
+    if meta.get("spent_usd") is not None:  # включая прерванную потолком модель (MINOR-8)
+        lines.append(
+            f"Потрачено всего (включая прерванную модель): ${meta['spent_usd']:.4f} "
+            f"из ${meta['max_cost_usd']:.2f}."
+        )
+    if meta.get("rescored"):
+        lines += ["", f"> **{meta['rescored']}**"]
     lines += [
         "",
         "Время — сумма вызовов на ситуацию (агент владельца + отдельный вызов агента получателя "
@@ -155,6 +203,10 @@ def render_table(rows: Sequence[dict[str, Any]], meta: dict[str, Any]) -> str:
         "смогли дать итог. Ошибки модели — число ситуаций с ошибкой вызова (в скобках — виды "
         "ошибок по вызовам: refusal — отказ, bad_output — обрезанный/невалидный ответ, "
         "unavailable — недоступность).",
+        "",
+        "p50/p95 — полное время двух вызовов на ситуацию без потока (агент владельца и агент "
+        "получателя), а не время до первого символа: с требованием ТЗ §10 «до первого символа "
+        "≤5 с в 95%» эти цифры не сопоставимы (ревью 0.4b MINOR-7).",
         "",
         "Ограничение (ревью 0.4 MINOR-8): безопасность и адаптацию оценивает один вызов агента "
         "получателя, а не отдельный классификатор §6.2 п.3 (задача 3.2) — цифры «доставка» и "
@@ -188,7 +240,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=DEFAULT_MAX_COST_USD,
         help=f"потолок расходов на весь прогон, $ (по умолчанию {DEFAULT_MAX_COST_USD:g})",
     )
+    parser.add_argument(
+        "--rescore",
+        type=Path,
+        metavar="СВОДКА.json",
+        help="пересчитать сохранённые ответы сводки текущими автопроверками, без вызова моделей",
+    )
+    parser.add_argument("--rescore-note", default=RESCORE_NOTE, help="пометка пересчёта")
     args = parser.parse_args(argv)
+    if args.rescore is not None:
+        return rescore(args.rescore, args.situations, args.rescore_note)
     if args.max_cost_usd <= 0:
         print("--max-cost-usd должен быть больше нуля", file=sys.stderr)
         return 1
