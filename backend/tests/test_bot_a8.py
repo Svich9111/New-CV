@@ -928,12 +928,6 @@ async def test_deadline_cuts_long_429_backoff(rig: Rig, monkeypatch: pytest.Monk
         await api.aclose()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR D-3 (раунд 2): при отмене обработчика первой доставки (CancelledError) "
-    "ни complete(), ни release() не вызываются — update_id навсегда «в работе», каждый повтор "
-    "ждёт HANDLE_DEADLINE_S и получает 503, ответ на /start теряется",
-)
 async def test_cancelled_first_delivery_does_not_block_update_forever(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
