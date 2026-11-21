@@ -114,7 +114,22 @@ SERVED_STATUSES = {
     ("post", "/couple/leave"): {"204", "401", "404"},
     ("get", "/invites/{token}"): {"200", "401", "404", "410"},
     ("post", "/invites/{token}/accept"): {"200", "401", "403", "404", "409", "410"},
+    # 4.5 этап 2 (app/api/account.py): без требования онбординга (АР-17, АР-25) — 403 нет;
+    # 409 conflict_retry — 40P01/40001 (АР-24, общий обработчик app/errors.py).
+    ("delete", "/me"): {"204", "401", "409"},
+    ("get", "/me/export"): {"200", "401", "409"},
 }
+
+
+def test_account_endpoints_do_not_declare_onboarding_required() -> None:
+    """АР-25: удаление и выгрузка доступны без онбординга; 409 — ответ ConflictRetry."""
+    paths = _spec()["paths"]
+    for method, path in (("delete", "/me"), ("get", "/me/export")):
+        responses = paths[path][method]["responses"]
+        assert "403" not in responses, path
+        assert responses["409"] == {"$ref": "#/components/responses/ConflictRetry"}, path
+    export_200 = paths["/me/export"]["get"]["responses"]["200"]
+    assert export_200["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
 
 
 def test_leave_does_not_declare_onboarding_required() -> None:

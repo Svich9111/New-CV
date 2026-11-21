@@ -3,7 +3,10 @@
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.db import RETRYABLE_SQLSTATES, sqlstate
 
 NOT_FOUND_CODE = "not_found"
 NOT_FOUND_MESSAGE = "Не найдено"
@@ -38,6 +41,21 @@ def install_error_handlers(app: FastAPI) -> None:
         # Тело запроса в ответ не возвращается: в нём может быть личный текст.
         return JSONResponse(
             status_code=422, content={"code": "validation_error", "message": "Проверьте данные"}
+        )
+
+    @app.exception_handler(DBAPIError)
+    async def _db_conflict(_: Request, exc: DBAPIError) -> JSONResponse:
+        # АР-24: 40P01/40001 — транзакция отменена целиком, повтор безопасен: 409, не 500.
+        # Ни SQL, ни параметров, ни текста драйвера в ответе нет. Прочие ошибки БД — как были
+        # (необработанное исключение → 500).
+        if sqlstate(exc) not in RETRYABLE_SQLSTATES:
+            raise exc
+        return JSONResponse(
+            status_code=409,
+            content={
+                "code": "conflict_retry",
+                "message": "Не получилось с первого раза — повторите, пожалуйста",
+            },
         )
 
     @app.exception_handler(StarletteHTTPException)

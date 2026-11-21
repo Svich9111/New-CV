@@ -74,7 +74,7 @@ def _uuid(value: object) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
 
-def _open_row(
+def open_row(
     keys: Keyring, field: crypto.Field, row_id: uuid.UUID | None, blob: bytes
 ) -> tuple[str | None, str | None]:
     """Чтение одной строки из многих: отказ расшифровки не роняет весь список.
@@ -141,7 +141,7 @@ async def list_conversation_messages(
         result = []
         for r in rows:
             row_id = _uuid(r.id)
-            body, reason = _open_row(keys, crypto.CONVERSATION_MESSAGE_TEXT, row_id, r.text_enc)
+            body, reason = open_row(keys, crypto.CONVERSATION_MESSAGE_TEXT, row_id, r.text_enc)
             result.append(ConversationText(row_id, r.author, body, r.created_at, reason))
         return result
 
@@ -262,7 +262,7 @@ async def list_memory_items(
         result = []
         for r in rows:
             row_id = _uuid(r.id)
-            body, reason = _open_row(keys, crypto.MEMORY_TEXT, row_id, r.text_enc)
+            body, reason = open_row(keys, crypto.MEMORY_TEXT, row_id, r.text_enc)
             result.append(MemoryText(row_id, r.type, r.source, body, reason))
         return result
 
@@ -386,11 +386,11 @@ async def read_feed(
             if r.text_enc is None:
                 pass
             elif not r.outgoing:
-                body, reason = _open_row(keys, crypto.MESSAGE_ADAPTED, msg_id, r.text_enc)
+                body, reason = open_row(keys, crypto.MESSAGE_ADAPTED, msg_id, r.text_enc)
             else:
                 # Оригинал — с контекстом черновика; черновик удалён → `context` (Б-38).
                 draft = None if r.draft_id is None else _uuid(r.draft_id)
-                body, reason = _open_row(keys, crypto.MESSAGE_ORIGINAL, draft, r.text_enc)
+                body, reason = open_row(keys, crypto.MESSAGE_ORIGINAL, draft, r.text_enc)
             result.append(
                 FeedText(msg_id, r.outgoing, body, r.is_adapted, r.status, r.sent_at, reason)
             )

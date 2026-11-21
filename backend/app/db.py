@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -19,6 +20,17 @@ from sqlalchemy.ext.asyncio import (
 )
 
 APP_ROLE = "feelings_app"
+
+# Транзакция отменена из-за одновременного изменения тех же строк: взаимоблокировка (40P01)
+# или конфликт сериализации (40001). Ничего не изменено, запрос можно повторить (АР-24).
+RETRYABLE_SQLSTATES = frozenset({"40P01", "40001"})
+
+
+def sqlstate(exc: DBAPIError) -> str | None:
+    """SQLSTATE ошибки БД: у asyncpg — `sqlstate` исходного исключения драйвера."""
+    orig = exc.orig
+    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return str(code) if code is not None else None
 
 
 def make_engine(url: str) -> AsyncEngine:

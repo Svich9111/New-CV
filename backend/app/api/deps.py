@@ -8,6 +8,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings, get_settings
+from app.core.crypto import Keyring
 from app.core.session import SessionError, read_token
 from app.errors import AppError
 from app.repositories import users
@@ -18,6 +19,14 @@ _bearer = HTTPBearer(auto_error=False)
 def get_sessionmaker(request: Request) -> async_sessionmaker[AsyncSession]:
     sm: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
     return sm
+
+
+def get_keyring(request: Request) -> Keyring:
+    """Набор ключей шифрования текстов (создаётся при старте, `app.main.lifespan`)."""
+    keys: Keyring | None = request.app.state.keyring
+    if keys is None:
+        raise RuntimeError("encryption keyring is not loaded")
+    return keys
 
 
 def unauthorized() -> AppError:
@@ -55,3 +64,4 @@ SessionMaker = Annotated[async_sessionmaker[AsyncSession], Depends(get_sessionma
 CurrentUser = Annotated[uuid.UUID, Depends(current_user_id)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
 OnboardedUser = Annotated[uuid.UUID, Depends(onboarded_user_id)]
+Keys = Annotated[Keyring, Depends(get_keyring)]

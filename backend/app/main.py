@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import auth, couple
+from app.api import account, auth, couple
 from app.bot import webhook as bot_webhook
 from app.bot.client import BotApi
 from app.bot.dedup import UpdateDeduplicator
@@ -51,6 +51,7 @@ app.state.bot_updates = UpdateDeduplicator()  # идемпотентность �
 install_error_handlers(app)
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(couple.router, prefix="/api/v1")
+app.include_router(account.router, prefix="/api/v1")
 # Служебный маршрут для Telegram, вне контракта клиента (tests/test_contract.py, SERVICE_ROUTES).
 app.include_router(bot_webhook.router, prefix="/api/v1")
 

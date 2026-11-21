@@ -15,7 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db import user_scope
+from app.db import sqlstate, user_scope
 from app.schemas import Couple, CoupleMember
 
 
@@ -38,12 +38,6 @@ KNOWN_SQLSTATES = frozenset(
 ONE_ACTIVE_COUPLE_INDEX = "uq_couple_members_one_active_per_user"
 
 
-def _sqlstate(exc: DBAPIError) -> str | None:
-    orig = exc.orig
-    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
-    return str(code) if code is not None else None
-
-
 def _constraint(exc: DBAPIError) -> str | None:
     """Имя нарушенного ограничения: у asyncpg — в исходном исключении драйвера."""
     for err in (exc.orig, getattr(exc.orig, "__cause__", None)):
@@ -59,7 +53,7 @@ def _db_errors() -> Iterator[None]:
     try:
         yield
     except DBAPIError as exc:
-        code = _sqlstate(exc)
+        code = sqlstate(exc)
         if code in KNOWN_SQLSTATES:
             raise CoupleError(code) from exc
         if code == "23505" and _constraint(exc) == ONE_ACTIVE_COUPLE_INDEX:
