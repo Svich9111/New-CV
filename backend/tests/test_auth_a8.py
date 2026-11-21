@@ -706,6 +706,9 @@ async def test_service_starts_with_good_keys(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("FEELINGS_SESSION_SECRET", SECRET)
     # Задача 1.3: без имени бота сервис тоже не стартует (ссылки-приглашения).
     monkeypatch.setenv("FEELINGS_BOT_USERNAME", "FeelingsTestBot")
+    # Задача 1.4: и без секрета вебхука и адреса Mini App.
+    monkeypatch.setenv("FEELINGS_TELEGRAM_WEBHOOK_SECRET", "w" * 40)
+    monkeypatch.setenv("FEELINGS_WEBAPP_URL", "https://app.example.test/")
     saved = app.state.sessionmaker
     app.state.sessionmaker = None
     get_settings.cache_clear()

@@ -1,5 +1,6 @@
 """0.7: контракт api/openapi.yaml валиден и покрывает пользовательские ФТ первой очереди."""
 
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -57,16 +58,47 @@ def test_only_auth_and_health_are_public() -> None:
     assert sorted(public) == [("get", "/health"), ("post", "/auth/telegram")]
 
 
+# Служебные маршруты вне контракта клиента Mini App: их вызывает не клиент, а внешняя система.
+# Вебхук Telegram (задача 1.4) — подлинность по секретному заголовку
+# X-Telegram-Bot-Api-Secret-Token (app/bot/webhook.py). Новые — только явным добавлением сюда.
+SERVICE_ROUTES = {("POST", "/api/v1/telegram/webhook")}
+
+
+def _served_routes(routes: Any, prefix: str = "") -> Iterator[tuple[str, frozenset[str]]]:
+    """Все маршруты приложения с полными путями. FastAPI ≥ 0.165 не разворачивает
+    include_router в app.routes (объект _IncludedRouter без path) — без обхода проверка
+    видела бы только /health."""
+    for route in routes:
+        ctx = getattr(route, "include_context", None)
+        if ctx is not None:
+            yield from _served_routes(ctx.included_router.routes, prefix + ctx.prefix)
+        elif hasattr(route, "path"):
+            yield prefix + route.path, frozenset(getattr(route, "methods", None) or ())
+
+
 def test_implemented_routes_exist_in_contract() -> None:
-    """Сервер не публикует ничего сверх контракта."""
+    """Сервер не публикует ничего сверх контракта, кроме явно перечисленных служебных маршрутов."""
     paths = _spec()["paths"]
-    for route in app.routes:
-        path = getattr(route, "path", "")
+    seen_service = set()
+    served = list(_served_routes(app.routes))
+    assert ("/api/v1/auth/telegram", frozenset({"POST"})) in served  # обход видит include_router
+    for path, methods in served:
         if not path.startswith("/api/v1"):
             continue
         rel = path.removeprefix("/api/v1")
-        for method in getattr(route, "methods", set()) - {"HEAD", "OPTIONS"}:
+        for method in methods - {"HEAD", "OPTIONS"}:
+            if (method, path) in SERVICE_ROUTES:
+                seen_service.add((method, path))
+                continue
             assert method.lower() in paths.get(rel, {}), (method, path)
+    # Список не устаревает: каждый служебный маршрут действительно есть на сервере.
+    assert seen_service == SERVICE_ROUTES
+
+
+def test_service_routes_are_not_in_client_contract() -> None:
+    paths = _spec()["paths"]
+    for _, path in SERVICE_ROUTES:
+        assert path.removeprefix("/api/v1") not in paths
 
 
 # Коды, которые сервер реально отдаёт (app/api/auth.py, app/api/deps.py; тесты test_auth_api.py,
