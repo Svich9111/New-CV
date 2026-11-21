@@ -67,8 +67,13 @@ class W:
 async def _person(s: AsyncSession, name: str) -> P:
     p = P(*(uuid.uuid4() for _ in range(6)))
     tg = next(_tg)
+    # Онбординг пройден (согласия и 18+, ТЗ §4.1 п.2): иначе пара — FB008 (миграция 0003).
     await s.execute(
-        text("INSERT INTO users (id, telegram_id, name) VALUES (:i, :t, :n)"),
+        text(
+            "INSERT INTO users (id, telegram_id, name, consent_terms_at, consent_data_at, "
+            "consent_sensitive_at, age_confirmed_at) "
+            "VALUES (:i, :t, :n, now(), now(), now(), now())"
+        ),
         {"i": p.user_id, "t": tg, "n": name},
     )
     await s.execute(

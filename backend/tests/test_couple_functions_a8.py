@@ -37,14 +37,26 @@ def _sqlstate(exc: BaseException) -> str | None:
     return getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
 
 
-async def _user(engine: AsyncEngine, name: str) -> uuid.UUID:
-    """Пользователь с агентом и одной записью памяти."""
+# Онбординг пройден: все согласия и подтверждение 18+ (ТЗ §4.1 п.2; FB008, миграция 0003).
+ONBOARDING_COLUMNS = (
+    "consent_terms_at",
+    "consent_data_at",
+    "consent_sensitive_at",
+    "age_confirmed_at",
+)
+
+
+async def _user(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> uuid.UUID:
+    """Пользователь с агентом и одной записью памяти; по умолчанию прошёл онбординг."""
     uid = uuid.uuid4()
+    stamps = ", ".join(f"{c} = now()" for c in ONBOARDING_COLUMNS)
     async with engine.begin() as conn:
         await conn.execute(
             text("INSERT INTO users (id, telegram_id, name) VALUES (:id, :tg, :n)"),
             {"id": uid, "tg": 9_000_000_000 + uuid.uuid4().int % 10**9, "n": name},
         )
+        if onboarded:
+            await conn.execute(text(f"UPDATE users SET {stamps} WHERE id = :u"), {"u": uid})
         aid = (
             await conn.execute(
                 text("INSERT INTO agents (user_id) VALUES (:u) RETURNING id"), {"u": uid}
@@ -548,10 +560,133 @@ async def test_calls_under_other_roles(
 async def test_forged_user_id_cannot_join(sessionmaker: SM, engine: AsyncEngine) -> None:
     """Поддельный app.user_id (нет такого пользователя) не вступает в пару."""
     _, couple, token = await _pending(sessionmaker, engine, "Подделка")
-    with pytest.raises(DBAPIError):
-        await _call(sessionmaker, uuid.uuid4(), ACCEPT, h=token)
+    # Раунд 2 (D-3 исправлен в 0003): отказ именно 42501, а не ошибка FK.
+    await _fails(sessionmaker, uuid.uuid4(), "42501", ACCEPT, h=token)
     assert await _state(engine, couple) == {
         "status": "pending",
         "active_members": 1,
         "active_invites": 1,
     }
+
+
+# --- Раунд 2: FB008 — пара только после онбординга (ТЗ §4.1 п.2, п.4, §9.3; АР-13, 0003) ---
+
+
+async def _unset(engine: AsyncEngine, uid: uuid.UUID, *cols: str) -> None:
+    async with engine.begin() as conn:
+        sets = ", ".join(f"{c} = NULL" for c in cols)
+        await conn.execute(text(f"UPDATE users SET {sets} WHERE id = :u"), {"u": uid})
+
+
+async def test_fb008_new_user_cannot_create_or_join_until_onboarded(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Только что вошедший (ни согласий, ни 18+) не создаёт пару и не принимает ссылку;
+    ссылка остаётся действующей и принимается, как только онбординг пройден."""
+    _, couple, token = await _pending(sessionmaker, engine, "FB8-Инициатор")
+    newbie = await _user(engine, "FB8-Новичок", onboarded=False)
+    await _fails(sessionmaker, newbie, "FB008", CREATE)
+    await _fails(sessionmaker, newbie, "FB008", ACCEPT, h=token)
+    # Неизвестная ссылка тоже FB008, а не FB001: до онбординга о ссылках ничего не сообщается.
+    await _fails(sessionmaker, newbie, "FB008", ACCEPT, h=_token())
+    assert await _state(engine, couple) == {
+        "status": "pending",
+        "active_members": 1,
+        "active_invites": 1,
+    }
+    assert (
+        await _one(engine, "SELECT count(*) FROM couple_members WHERE user_id = :u", u=newbie) == 0
+    )
+    async with engine.begin() as conn:
+        stamps = ", ".join(f"{c} = now()" for c in ONBOARDING_COLUMNS)
+        await conn.execute(text(f"UPDATE users SET {stamps} WHERE id = :u"), {"u": newbie})
+    assert await _call(sessionmaker, newbie, ACCEPT, h=token) == couple
+    assert (await _state(engine, couple))["status"] == "active"
+
+
+@pytest.mark.parametrize("missing", ONBOARDING_COLUMNS)
+async def test_fb008_each_missing_item_blocks_accept(
+    sessionmaker: SM, engine: AsyncEngine, missing: str
+) -> None:
+    """Каждое согласие и 18+ обязательны по отдельности (ТЗ §4.1 п.2)."""
+    _, couple, token = await _pending(sessionmaker, engine, "FB8-Каждый")
+    guest = await _user(engine, "FB8-Гость")
+    await _unset(engine, guest, missing)
+    await _fails(sessionmaker, guest, "FB008", ACCEPT, h=token)
+    await _fails(sessionmaker, guest, "FB008", CREATE)
+    assert (await _state(engine, couple))["active_invites"] == 1
+
+
+async def test_fb008_check_order(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Порядок проверок: 22023 (хеш) → 42501 (нет/удалён) → FB008 (онбординг)."""
+    newbie = await _user(engine, "FB8-Порядок", onboarded=False)
+    await _fails(sessionmaker, newbie, "22023", ACCEPT, h=b"short")
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE users SET deleted_at = now() WHERE id = :u"), {"u": newbie})
+    await _fails(sessionmaker, newbie, "42501", ACCEPT, h=_token())
+    await _fails(sessionmaker, newbie, "42501", CREATE)
+
+
+@pytest.mark.parametrize("who", ["partner", "initiator"])
+async def test_age_revoked_member_can_still_leave(
+    sessionmaker: SM, engine: AsyncEngine, who: str
+) -> None:
+    """Ответ «мне нет 18» (record_underage снимает age_confirmed_at) не запирает в паре:
+    выход работает, пара распускается для обоих, журнал пишет вышедшего; второй участник
+    создаёт новую пару, а не подтвердивший возраст — нет (FB008)."""
+    initiator, couple, token = await _pending(sessionmaker, engine, "FB8-Выход-И")
+    partner = await _user(engine, "FB8-Выход-П")
+    await _call(sessionmaker, partner, ACCEPT, h=token)
+    leaver, other = (partner, initiator) if who == "partner" else (initiator, partner)
+    await _unset(engine, leaver, "age_confirmed_at")
+    assert await _call(sessionmaker, leaver, LEAVE) == couple
+    assert await _state(engine, couple) == {
+        "status": "dissolved",
+        "active_members": 0,
+        "active_invites": 0,
+    }
+    actor = await _one(
+        engine,
+        "SELECT actor_id FROM audit_log WHERE object_id = :c AND action = 'couple.leave'",
+        c=couple,
+    )
+    assert actor == leaver
+    await _fails(sessionmaker, leaver, "FB008", CREATE)
+    await _call(sessionmaker, other, CREATE)
+
+
+@pytest.mark.parametrize("outcome", ["commit", "rollback"])
+async def test_race_age_revocation_vs_accept(
+    sessionmaker: SM, engine: AsyncEngine, outcome: str
+) -> None:
+    """Отзыв 18+ и принятие одновременно: принятие ждёт строку users и видит итог отзыва
+    (зафиксирован — FB008; откатан — вступает)."""
+    _, couple, token = await _pending(sessionmaker, engine, "FB8-Гонка-И")
+    guest = await _user(engine, "FB8-Гонка-Г")
+    async with engine.connect() as holder:
+        await holder.execute(
+            text("UPDATE users SET age_confirmed_at = NULL WHERE id = :u"), {"u": guest}
+        )
+        task = asyncio.ensure_future(_try(sessionmaker, guest, ACCEPT, h=token))
+        try:
+            await _wait_locked(engine, 1)
+        finally:
+            await (holder.commit() if outcome == "commit" else holder.rollback())
+        res = await asyncio.wait_for(task, RACE_TIMEOUT)
+    if outcome == "commit":
+        assert res == "FB008"
+        assert (await _state(engine, couple))["status"] == "pending"
+    else:
+        assert res == couple
+        assert (await _state(engine, couple))["status"] == "active"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="D-4 (A8, раунд 2): app_issue_invite не требует онбординга — после ответа "
+    "«мне нет 18» участник ожидающей пары продолжает выдавать ссылки (ТЗ §9.3)",
+)
+async def test_issue_invite_requires_onboarding(sessionmaker: SM, engine: AsyncEngine) -> None:
+    uid, _, _ = await _pending(sessionmaker, engine, "FB8-Ссылка")
+    await _unset(engine, uid, "age_confirmed_at")
+    await _fails(sessionmaker, uid, "FB008", ISSUE, h=_token())

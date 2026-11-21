@@ -2,7 +2,7 @@
 // Запуск: node frontend/prototype/check_a8.mjs
 // Не использует функции и хелперы check.mjs: элементы ищутся по видимому тексту, ролям и подписям.
 // Скриншоты — только во временный каталог ОС (не в репозиторий).
-// A8_PROTO_DIR=<каталог> — прогон на копии прототипа (мутационная проверка).
+// A8_PROTO_DIR=<каталог> — прогон на копии прототипа (мутационная проверка); A8_ONLY=1,7 — только указанные разделы.
 // Критерии: K1…K7 — пункты «Критерии готовности» docs/tasks/0.6.md; N — негативные сценарии; A — доступность.
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -28,10 +28,17 @@ function ck(cond, crit, name, detail = "") {
   results.push({ crit, name: fullName, ok, detail });
   if (!quietPrefix || !ok) console.log("  " + (ok ? "✓" : "✗") + " " + crit + " " + fullName + (detail && !ok ? " — " + detail : ""));
 }
+const ONLY = process.env.A8_ONLY ? process.env.A8_ONLY.split(",") : null; // напр. A8_ONLY=1,7 — только разделы 1 и 7
 async function section(title, fn) {
+  if (ONLY && !ONLY.some((o) => title.startsWith(o + "."))) return;
   console.log("\n" + title);
   try { await fn(); }
-  catch (e) { ck(false, "EXC", "исключение в разделе «" + title + "»", (e && e.message ? e.message.split("\n")[0] : String(e))); }
+  catch (e) {
+    const lines = e && e.message ? e.message.split("\n") : [String(e)];
+    const where = lines.find((l) => /waiting for|locator\(|getBy/.test(l)) || "";
+    ck(false, "EXC", "исключение в разделе «" + title + "»", lines[0] + (where ? " | " + where.trim() : ""));
+  }
+  quietPrefix = null;
 }
 
 const browser = await chromium.launch();
@@ -488,8 +495,10 @@ async function scenario(p, hook = async () => {}) {
   await mainArea(p).getByRole("button", { name: /^Выйти из пары/ }).click();
   ck(await p.getByRole("dialog").isVisible(), "K1", "выход из пары с подтверждением");
   await hook("profile-sheet");
-  await backButton(p).click();
-  ck((await p.getByRole("dialog").count()) === 0 && (await title(p)) === "Профиль и пара", "K6", "«Назад» закрывает диалог, экран остаётся");
+  const backable = await backButton(p).click({ timeout: 1500 }).then(() => true, () => false);
+  ck(backable, "K6", "при открытом диалоге «Назад» Telegram нажимается (в Telegram она нативная и вне страницы)", "кнопку перекрывает затемнение диалога");
+  if (!backable) await btn(p, "Отмена").click();
+  ck((await p.getByRole("dialog").count()) === 0 && (await title(p)) === "Профиль и пара", "K6", "диалог закрыт, экран «Профиль и пара» остаётся");
   await jump(p, "Подписка");
   const sub = await mainText(p);
   ck(/Тариф/.test(sub) && /пробный период/.test(sub) && /Статус/.test(sub) && /Оплатить/.test((await mainBtnState(p)).text), "K1", "подписка: тариф, пробный период, статус, оплата");
@@ -717,6 +726,8 @@ await section("7. Навигация с клавиатуры до главных
   await press(/^Не отправлять$/);
   ck((await title(p)) === "Твой агент", "A", "клавиатура: «Не отправлять»");
   await press(/^Подготовить сообщение Игорю$/);
+  if (await tabTo(/^Сообщение для Игоря$/)) { await p.keyboard.press("Control+End"); await p.keyboard.type(" Ты вечно всё отменяешь в последний момент."); }
+  ck(/изменено тобой/.test(await mainText(p)), "A", "клавиатура: правка черновика");
   await press(/^Отправить Игорю$/);
   ck((await title(p)) === "Сообщения пары", "A", "клавиатура: «Отправить Игорю»");
   await press(/^Назад$/);
@@ -839,8 +850,8 @@ await section("10. Запись в памяти из одобренного со
 
 // ---------- 11. Язык и тон (K7) ----------
 await section("11. Тексты на русском, тон агента (§2)", async () => {
-  const text = [...allTexts.values()].join("\n");
-  const latin = new Set((text.match(/[A-Za-z][A-Za-z_]+/g) || []).filter((w) => !/^(AI|Telegram|Stars|t|me|chuvstva|ai|bot|start|inv_7Kq2xP|inv)$/.test(w)));
+  const text = [...allTexts.values()].join("\n").replace(/t\.me\/\S+/g, "");
+  const latin = new Set((text.match(/[A-Za-z][A-Za-z_]+/g) || []).filter((w) => !/^(AI|Telegram|Stars)$/.test(w)));
   ck(latin.size === 0, "K7", "нет нерусских слов, кроме названий (AI, Telegram, Stars, ссылка)", [...latin].join(", "));
   const kanc = text.match(/осуществля|в целях|в рамках|является|необходимо|производится|данн(ый|ая|ое) (функционал|сервис)|уважаем/gi) || [];
   ck(kanc.length === 0, "K7", "нет канцелярита", kanc.join(", "));
