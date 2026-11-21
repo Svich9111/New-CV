@@ -565,7 +565,7 @@ async def _all_rows_dump(engine: AsyncEngine) -> str:
                 )
             )
         ).scalars()
-        chunks = []
+        chunks: list[str] = []
         for t in list(tables):
             rows = await conn.execute(text(f"SELECT row_to_json(x)::text FROM {t} x"))
             chunks.extend(r for r in rows.scalars())
@@ -1061,3 +1061,32 @@ def test_served_error_codes_listed_in_contract() -> None:
         "service_unavailable",
     }
     assert served <= known, served - known
+
+
+# --- Защита в глубину: проверка онбординга устарела (гонка с отзывом 18+) — отказ из БД -----
+
+
+async def test_db_onboarding_check_maps_to_403_when_api_check_is_stale(
+    api: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Если между проверкой зависимости и вызовом функции человек ответил «мне нет 18»,
+    функция БД отвечает FB008 — по HTTP это 403 onboarding_required (не 401 и не 500)."""
+    anna = await _adult(api, "Анна")
+    _, token = await _create(api, anna)
+    late = await _enter(api, "Поздний")  # онбординг не пройден
+    pending = await _adult(api, "Ожидающая")
+    await _create(api, pending)
+    _err(await _onboard(api, pending, age=False), 403, "underage")
+
+    async def stale(*_: object) -> bool:
+        return True
+
+    monkeypatch.setattr("app.api.deps.users.is_onboarded", stale)
+    _err(await api.post(f"{API}/couple", headers=late.h), 403, "onboarding_required")
+    _err(
+        await api.post(f"{API}/invites/{token}/accept", headers=late.h), 403, "onboarding_required"
+    )
+    _err(await api.post(f"{API}/couple/invite", headers=pending.h), 403, "onboarding_required")
+    assert (
+        await _db(engine, "SELECT count(*) FROM couple_members WHERE user_id = :u", u=late.id) == 0
+    )
