@@ -897,6 +897,7 @@ APP_FUNCS = [
     "app_accept_invite(bytea)",
     "app_leave_couple()",
     "app_delete_account()",  # 0005, задача 4.5
+    "app_export_partner_messages()",  # 0006, задача 4.5 этап 2
 ]
 PIPELINE_FUNCS = [
     "pipeline_original(uuid)",
