@@ -1,0 +1,150 @@
+{
+  "label": "2026-11-21_compare_openrouter",
+  "generated_on": "2026-11-21",
+  "dataset_hash": "b2dcc6f5241fa67a",
+  "dataset_status": "draft",
+  "situations": 31,
+  "prompt": "compare.v1",
+  "not_answered": [],
+  "incomplete": false,
+  "max_cost_usd": 15.0,
+  "spent_usd": 3.151998,
+  "budget_stopped": false,
+  "not_run": [],
+  "skipped": {},
+  "notice": "Предварительно (АР-19)",
+  "rows": [
+    {
+      "model": "anthropic/claude-opus-5.5",
+      "report": "2026-11-21_compare_openrouter_anthropic-claude-opus-5.5",
+      "auto_pass_rate": 0.7742,
+      "by_level": {
+        "1": 0.6667,
+        "2": 0.6667,
+        "3": 0.8333,
+        "4": 0.8,
+        "5": 0.875
+      },
+      "crisis_auto": "7/8",
+      "false_crisis": 0,
+      "latency_p50_s": 15.266,
+      "latency_p95_s": 28.145,
+      "cost_usd_per_situation": 0.036496,
+      "cost_usd_per_30": 1.0949,
+      "cost_usd_total": 1.131384,
+      "with_errors": 0,
+      "not_verified": 0,
+      "error_kinds": {}
+    },
+    {
+      "model": "anthropic/claude-sonnet-5.5",
+      "report": "2026-11-21_compare_openrouter_anthropic-claude-sonnet-5.5",
+      "auto_pass_rate": 0.8065,
+      "by_level": {
+        "1": 0.6667,
+        "2": 0.8333,
+        "3": 0.8333,
+        "4": 0.8,
+        "5": 0.875
+      },
+      "crisis_auto": "7/8",
+      "false_crisis": 0,
+      "latency_p50_s": 9.031,
+      "latency_p95_s": 20.766,
+      "cost_usd_per_situation": 0.018006,
+      "cost_usd_per_30": 0.5402,
+      "cost_usd_total": 0.558184,
+      "with_errors": 0,
+      "not_verified": 0,
+      "error_kinds": {}
+    },
+    {
+      "model": "anthropic/claude-haiku-5.5",
+      "report": "2026-11-21_compare_openrouter_anthropic-claude-haiku-5.5",
+      "auto_pass_rate": 0.8387,
+      "by_level": {
+        "1": 0.6667,
+        "2": 1.0,
+        "3": 0.8333,
+        "4": 0.8,
+        "5": 0.875
+      },
+      "crisis_auto": "7/8",
+      "false_crisis": 0,
+      "latency_p50_s": 6.809,
+      "latency_p95_s": 14.031,
+      "cost_usd_per_situation": 0.000908,
+      "cost_usd_per_30": 0.0273,
+      "cost_usd_total": 0.02816,
+      "with_errors": 0,
+      "not_verified": 0,
+      "error_kinds": {}
+    },
+    {
+      "model": "openai/gpt-5.6-terra",
+      "report": "2026-11-21_compare_openrouter_openai-gpt-5.6-terra",
+      "auto_pass_rate": 0.7419,
+      "by_level": {
+        "1": 0.5,
+        "2": 1.0,
+        "3": 0.6667,
+        "4": 0.6,
+        "5": 0.875
+      },
+      "crisis_auto": "7/8",
+      "false_crisis": 1,
+      "latency_p50_s": 3.893,
+      "latency_p95_s": 7.846,
+      "cost_usd_per_situation": 0.00513,
+      "cost_usd_per_30": 0.1539,
+      "cost_usd_total": 0.159022,
+      "with_errors": 0,
+      "not_verified": 0,
+      "error_kinds": {}
+    },
+    {
+      "model": "google/gemini-3.1-pro-preview",
+      "report": "2026-11-21_compare_openrouter_google-gemini-3.1-pro-preview",
+      "auto_pass_rate": 0.7419,
+      "by_level": {
+        "1": 0.5,
+        "2": 0.8333,
+        "3": 0.8333,
+        "4": 0.6,
+        "5": 0.875
+      },
+      "crisis_auto": "7/8",
+      "false_crisis": 0,
+      "latency_p50_s": 32.443,
+      "latency_p95_s": 46.625,
+      "cost_usd_per_situation": 0.037919,
+      "cost_usd_per_30": 1.1376,
+      "cost_usd_total": 1.175476,
+      "with_errors": 0,
+      "not_verified": 0,
+      "error_kinds": {}
+    },
+    {
+      "model": "deepseek/deepseek-v4-pro",
+      "report": "2026-11-21_compare_openrouter_deepseek-deepseek-v4-pro",
+      "auto_pass_rate": 0.6774,
+      "by_level": {
+        "1": 0.6667,
+        "2": 0.5,
+        "3": 0.6667,
+        "4": 0.8,
+        "5": 0.75
+      },
+      "crisis_auto": "6/8",
+      "false_crisis": 1,
+      "latency_p50_s": 29.235,
+      "latency_p95_s": 99.095,
+      "cost_usd_per_situation": 0.003218,
+      "cost_usd_per_30": 0.0966,
+      "cost_usd_total": 0.099772,
+      "with_errors": 0,
+      "not_verified": 0,
+      "error_kinds": {}
+    }
+  ]
+}
