@@ -84,10 +84,24 @@ paths:
     delete:
       tags: [profile]
       summary: Удалить аккаунт и все данные (ФТ-21)
-      description: Личные данные удаляются сразу из рабочей БД и из резервных копий в течение 30 дней (ТЗ §7).
+      description: |
+        Удаление полное и сразу (ТЗ §4.5 п.3, §9.1 п.6; АР-23): активная или ожидающая пара
+        распускается для обоих, как при выходе (`POST /couple/leave`); агент, диалоги, память,
+        черновики, приглашения, события безопасности и сообщения, которые написал пользователь,
+        удаляются из рабочей БД. Сообщения, которые партнёр написал удаляемому, остаются у
+        партнёра. Резервные копии очищаются по истечении срока хранения 30 дней (ТЗ §7);
+        повторное удаление после восстановления копии — BACKLOG Б-43 (задача 4.7).
+
+        Доступно после входа без завершённого онбординга (как выход из пары, АР-17): код
+        `onboarding_required` (403) этот эндпоинт не отдаёт.
+
+        После 204 сессия недействительна: любой запрос с тем же токеном, включая повтор
+        `DELETE /me`, — 401. Повторный вход тем же Telegram ID создаёт нового пользователя
+        без следов прежнего. Тело запроса не нужно; подтверждение действия — на клиенте.
       responses:
-        "204": { description: Удалено }
+        "204": { description: Аккаунт и данные удалены; сессия недействительна }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
 
   /me/onboarding:
     put:
@@ -123,13 +137,33 @@ paths:
     get:
       tags: [profile]
       summary: Выгрузка своих данных (ФТ-21)
-      description: Только данные владельца; память и личный чат партнёра не включаются.
+      description: |
+        Все данные владельца одним документом JSON, тексты расшифрованы (ТЗ §9.1 п.6, ФТ-21;
+        состав и толкования — АР-25). Только данные владельца: память, личный чат, профиль
+        агента и `tone_settings` партнёра, его id и Telegram ID не включаются; партнёр
+        представлен только именем, которым его назвал сам пользователь (`profile.partner_name`).
+        Сообщения пары, которые получатель не видел (`processing`, `withheld`), в его выгрузку
+        не входят.
+
+        Доступно после входа без завершённого онбординга (как выход из пары, АР-17): код
+        `onboarding_required` (403) этот эндпоинт не отдаёт.
+
+        Текст, который не удалось расшифровать, не роняет выгрузку: на его месте объект
+        `UnavailableText` с кодом причины (в журнал — только код причины и колонка, без текста
+        и id). Ответ не кэшируется (`Cache-Control: no-store`).
       responses:
         "200":
-          description: Архив данных
+          description: Выгрузка данных; версия формата — `export_version`
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/AccountExport" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
 
   /couple:
     get:
@@ -688,6 +722,17 @@ components:
               value: { code: own_invite, message: Это ваше приглашение — отправьте ссылку партнёру }
             couple_not_pending:
               value: { code: couple_not_pending, message: Пара уже не ожидает партнёра }
+    ConflictRetry:
+      description: >-
+        Код `conflict_retry`: транзакция отменена из-за одновременного изменения тех же данных
+        (взаимоблокировка 40P01 или конфликт сериализации 40001; АР-24). Ничего не изменено —
+        запрос можно повторить. Не 500.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            conflict_retry:
+              value: { code: conflict_retry, message: Не получилось с первого раза — повторите, пожалуйста }
     Gone:
       description: >-
         Приглашение недействительно. Коды: `invite_expired` — срок 7 дней истёк;
@@ -729,7 +774,7 @@ components:
           type: string
           examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, underage, not_found, already_in_couple, own_invite,
                      couple_not_pending, invite_expired, invite_used, couple_not_active, version_conflict, blocked_by_safety,
-                     subscription_required, rate_limited, llm_unavailable]
+                     subscription_required, rate_limited, llm_unavailable, conflict_retry]
         message: { type: string, description: Понятное пользователю сообщение на русском }
 
     Session:
@@ -891,3 +936,265 @@ components:
         retention_30d: { type: number }
         heard_score_avg: { type: number }
         first_token_p95_ms: { type: integer }
+
+    UnavailableText:
+      type: object
+      description: >-
+        Текст не удалось расшифровать (повреждённая строка, неизвестный ключ и т. п.; задача 4.2).
+        Ни текста, ни шифротекста — только код причины `DecryptionError.reason`.
+      required: [unavailable, reason]
+      additionalProperties: false
+      properties:
+        unavailable: { type: boolean, const: true }
+        reason: { type: string, enum: [format, unknown_key, auth, encoding, context] }
+
+    ExportText:
+      description: Расшифрованный текст или отметка о его недоступности
+      oneOf:
+        - { type: string }
+        - { $ref: "#/components/schemas/UnavailableText" }
+
+    AccountExport:
+      type: object
+      description: |
+        Выгрузка своих данных (ФТ-21, ТЗ §9.1 п.6; АР-25). Только строки владельца: RLS и
+        функции БД, как в остальном API. Массивы упорядочены по времени (старые первыми).
+        Входит и `telegram_id` — он собран у пользователя (ТЗ §9.1 п.2). Не входят: служебные
+        и производные данные (векторы, отпечатки удалённых записей памяти, хеши приглашений,
+        версия промпта агента, оценка тона, `audit_log`) и данные партнёра (имя из его профиля,
+        id, Telegram ID, память, личный чат, агент и `tone_settings`).
+      required: [export_version, exported_at, profile, agent, conversations, memory, drafts,
+                 couple_messages, couples, subscriptions, safety_events]
+      additionalProperties: false
+      properties:
+        export_version:
+          type: integer
+          const: 1
+          description: Версия формата; меняется при несовместимом изменении состава или полей
+        exported_at: { type: string, format: date-time }
+        profile: { $ref: "#/components/schemas/ExportProfile" }
+        agent:
+          description: Свой агент; null — агент ещё не создан
+          oneOf:
+            - { type: "null" }
+            - { $ref: "#/components/schemas/ExportAgent" }
+        conversations:
+          type: array
+          items: { $ref: "#/components/schemas/ExportConversation" }
+        memory:
+          type: array
+          description: Действующие записи памяти своего агента; удалённые (ФТ-13) текста не имеют и не выгружаются
+          items: { $ref: "#/components/schemas/ExportMemoryItem" }
+        drafts:
+          type: array
+          description: Свои черновики во всех статусах
+          items: { $ref: "#/components/schemas/ExportDraft" }
+        couple_messages:
+          type: object
+          required: [sent, received]
+          additionalProperties: false
+          properties:
+            sent:
+              type: array
+              items: { $ref: "#/components/schemas/ExportSentMessage" }
+            received:
+              type: array
+              description: Только доставленные получателю (delivered, read, answered)
+              items: { $ref: "#/components/schemas/ExportReceivedMessage" }
+        couples:
+          type: array
+          description: Все пары, где пользователь был участником, включая распавшиеся
+          items: { $ref: "#/components/schemas/ExportCouple" }
+        subscriptions:
+          type: array
+          description: Подписки, где пользователь — плательщик, с их платежами
+          items: { $ref: "#/components/schemas/ExportSubscription" }
+        safety_events:
+          type: array
+          description: Срабатывания кризисного протокола — только тип и время (ТЗ §7, §9.3)
+          items: { $ref: "#/components/schemas/ExportSafetyEvent" }
+
+    ExportProfile:
+      type: object
+      required: [id, telegram_id, name, address_form, partner_name, timezone, created_at,
+                 consent_terms_at, consent_data_at, consent_sensitive_at, age_confirmed_at,
+                 onboarding_completed]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        telegram_id: { type: integer }
+        name: { type: [string, "null"] }
+        address_form: { type: [string, "null"] }
+        partner_name:
+          type: [string, "null"]
+          description: Имя партнёра, которое пользователь сам указал в онбординге (ФТ-02); единственное, что выгрузка говорит о партнёре
+        timezone: { type: string }
+        created_at: { type: string, format: date-time }
+        consent_terms_at: { type: [string, "null"], format: date-time }
+        consent_data_at: { type: [string, "null"], format: date-time }
+        consent_sensitive_at: { type: [string, "null"], format: date-time }
+        age_confirmed_at: { type: [string, "null"], format: date-time }
+        onboarding_completed: { type: boolean }
+
+    ExportAgent:
+      type: object
+      required: [created_at, profile_summary, tone_settings]
+      additionalProperties: false
+      properties:
+        created_at: { type: string, format: date-time }
+        profile_summary:
+          description: Сводка профиля владельца, которую ведёт агент; null — ещё не составлена
+          oneOf:
+            - { type: "null" }
+            - { $ref: "#/components/schemas/ExportText" }
+        tone_settings: { type: object, additionalProperties: true, description: "Свои настройки тона" }
+
+    ExportConversation:
+      type: object
+      required: [id, started_at, summary, messages]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        started_at: { type: string, format: date-time }
+        summary:
+          oneOf:
+            - { type: "null" }
+            - { $ref: "#/components/schemas/ExportText" }
+        messages:
+          type: array
+          items:
+            type: object
+            required: [id, author, text, created_at]
+            additionalProperties: false
+            properties:
+              id: { type: string, format: uuid }
+              author: { type: string, enum: [owner, agent] }
+              text: { $ref: "#/components/schemas/ExportText" }
+              created_at: { type: string, format: date-time }
+
+    ExportMemoryItem:
+      type: object
+      required: [id, type, text, event_date, source, source_message_id, confidence, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        type: { $ref: "#/components/schemas/MemoryType" }
+        text: { $ref: "#/components/schemas/ExportText" }
+        event_date: { type: [string, "null"], format: date }
+        source: { type: string, enum: [owner_dialog, agent_inference, partner_message] }
+        source_message_id:
+          type: [string, "null"]
+          format: uuid
+          description: Для `partner_message` — id сообщения из `couple_messages.received`
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: [string, "null"], format: date-time }
+
+    ExportDraft:
+      type: object
+      required: [id, text, reply_to_id, version, status, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        text: { $ref: "#/components/schemas/ExportText" }
+        reply_to_id: { type: [string, "null"], format: uuid }
+        version: { type: integer, minimum: 1 }
+        status: { type: string, enum: [draft, approved, rejected, blocked, sent] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: [string, "null"], format: date-time }
+
+    ExportSentMessage:
+      type: object
+      description: >-
+        Сообщение, которое написал пользователь: его оригинал (одобренный текст, ФТ-08) и статус.
+        Версия, которую агент получателя сделал для получателя (ФТ-09), не выгружается — её
+        автор не видит и в ленте (АР-25 п.3); выгружается только признак `is_adapted`.
+      required: [id, couple_id, reply_to_id, original, is_adapted, harsh_tone_warning, status,
+                 sent_at, delivered_at, read_at, answered_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        couple_id: { type: string, format: uuid }
+        reply_to_id: { type: [string, "null"], format: uuid }
+        original: { $ref: "#/components/schemas/ExportText" }
+        is_adapted: { type: boolean }
+        harsh_tone_warning: { type: boolean }
+        status: { type: string, enum: [processing, withheld, delivered, read, answered] }
+        sent_at: { type: string, format: date-time }
+        delivered_at: { type: [string, "null"], format: date-time }
+        read_at: { type: [string, "null"], format: date-time }
+        answered_at: { type: [string, "null"], format: date-time }
+
+    ExportReceivedMessage:
+      type: object
+      description: >-
+        Сообщение партнёра пользователю, доставленное ему. `text` — версия, показанная
+        получателю (адаптированная, если `is_adapted`, иначе оригинал), как в ленте.
+        `original` — текст, одобренный автором: выгрузка — запрос владельца, оригинал по
+        запросу (ТЗ §2 п.3, ФТ-10); выдача фиксируется как просмотр — `original_viewed_at`
+        в ответе уже учитывает эту выгрузку (ТЗ §7; АР-25 п.2).
+      required: [id, couple_id, reply_to_id, text, is_adapted, harsh_tone_warning, original,
+                 original_viewed_at, status, sent_at, read_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        couple_id: { type: string, format: uuid }
+        reply_to_id: { type: [string, "null"], format: uuid }
+        text: { $ref: "#/components/schemas/ExportText" }
+        is_adapted: { type: boolean, description: "Пометка «адаптировано» (ФТ-09)" }
+        harsh_tone_warning: { type: boolean, description: "ТЗ §6.2 п.6" }
+        original: { $ref: "#/components/schemas/ExportText" }
+        original_viewed_at: { type: string, format: date-time }
+        status: { type: string, enum: [delivered, read, answered] }
+        sent_at: { type: string, format: date-time }
+        read_at: { type: [string, "null"], format: date-time }
+
+    ExportCouple:
+      type: object
+      description: Своё участие в паре; о партнёре — ничего, кроме `profile.partner_name`
+      required: [id, status, role, created_at, activated_at, dissolved_at, joined_at, left_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, active, dissolved] }
+        role: { type: string, enum: [initiator, partner], description: "Своя роль в паре" }
+        created_at: { type: string, format: date-time }
+        activated_at: { type: [string, "null"], format: date-time }
+        dissolved_at: { type: [string, "null"], format: date-time }
+        joined_at: { type: string, format: date-time }
+        left_at: { type: [string, "null"], format: date-time }
+
+    ExportSubscription:
+      type: object
+      required: [id, couple_id, plan, status, period_start, period_end, created_at, payments]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        couple_id: { type: string, format: uuid }
+        plan: { type: string }
+        status: { type: string, enum: [trial, active, expired, canceled] }
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        payments:
+          type: array
+          items:
+            type: object
+            required: [id, amount, currency, provider, provider_charge_id, status, created_at]
+            additionalProperties: false
+            properties:
+              id: { type: string, format: uuid }
+              amount: { type: integer, minimum: 1, description: "В минимальных единицах валюты / Stars" }
+              currency: { type: string }
+              provider: { type: string }
+              provider_charge_id: { type: [string, "null"], description: "Идентификатор платежа у провайдера — для обращений о возврате" }
+              status: { type: string, enum: [pending, succeeded, failed, refunded] }
+              created_at: { type: string, format: date-time }
+
+    ExportSafetyEvent:
+      type: object
+      required: [type, created_at]
+      additionalProperties: false
+      properties:
+        type: { type: string, enum: [violence, threat_outgoing, self_harm, life_threat, underage] }
+        created_at: { type: string, format: date-time }
