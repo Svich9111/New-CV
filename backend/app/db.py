@@ -22,7 +22,9 @@ APP_ROLE = "feelings_app"
 
 
 def make_engine(url: str) -> AsyncEngine:
-    return create_async_engine(url, pool_pre_ping=True)
+    # hide_parameters: параметры запросов (хеши токенов, а позже и тексты) не попадают в
+    # текст исключений и журналы (ТЗ §9.1 п.5).
+    return create_async_engine(url, pool_pre_ping=True, hide_parameters=True)
 
 
 def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

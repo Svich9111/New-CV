@@ -20,7 +20,8 @@ from app.schemas import Couple, CoupleMember
 
 
 class CoupleError(Exception):
-    """Отказ функции БД; `sqlstate` — код из АР-13 (FB001…FB008, 42501, 22023, 23505)."""
+    """Отказ функции БД; `sqlstate` — код из АР-13 (FB001…FB008, 42501, 22023).
+    23505 индекса одной активной пары приходит как FB005."""
 
     def __init__(self, sqlstate: str) -> None:
         super().__init__(sqlstate)
@@ -31,14 +32,25 @@ class CoupleError(Exception):
 # бизнес-отказ и пробрасываются как есть.
 KNOWN_SQLSTATES = frozenset(
     {"FB001", "FB002", "FB003", "FB004", "FB005", "FB006", "FB007", "FB008", "42501", "22023"}
-    | {"23505"}  # app_create_couple при уже активном членстве (индекс одной активной пары)
 )
+# app_create_couple при уже активном членстве отвечает 23505 этого индекса (АР-13). Другие
+# нарушения уникальности (например, коллизия хеша токена) — не «уже в паре» и пробрасываются.
+ONE_ACTIVE_COUPLE_INDEX = "uq_couple_members_one_active_per_user"
 
 
 def _sqlstate(exc: DBAPIError) -> str | None:
     orig = exc.orig
     code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
     return str(code) if code is not None else None
+
+
+def _constraint(exc: DBAPIError) -> str | None:
+    """Имя нарушенного ограничения: у asyncpg — в исходном исключении драйвера."""
+    for err in (exc.orig, getattr(exc.orig, "__cause__", None)):
+        name = getattr(err, "constraint_name", None)
+        if name:
+            return str(name)
+    return None
 
 
 @contextmanager
@@ -50,6 +62,8 @@ def _db_errors() -> Iterator[None]:
         code = _sqlstate(exc)
         if code in KNOWN_SQLSTATES:
             raise CoupleError(code) from exc
+        if code == "23505" and _constraint(exc) == ONE_ACTIVE_COUPLE_INDEX:
+            raise CoupleError("FB005") from exc
         raise
 
 
