@@ -23,11 +23,11 @@ PRICES: dict[str, Price] = {
 }
 
 
-def cost_usd(model: str, usage: Usage) -> float:
-    """Стоимость вызова; для модели без прайса — 0.0 (видно в отчёте как «$0»)."""
+def cost_usd(model: str, usage: Usage) -> float | None:
+    """Стоимость вызова; для модели без прайса — ``None`` («цены нет»), а не $0 (ТЗ §10)."""
     price = PRICES.get(model)
     if price is None:
-        return 0.0
+        return None
     tokens_in = (
         usage.input_tokens
         + usage.cache_creation_input_tokens * 1.25

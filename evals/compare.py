@@ -68,6 +68,16 @@ def render_table(rows: Sequence[dict[str, Any]], meta: dict[str, Any]) -> str:
         "окончательный выбор основной и резервной модели — после утверждения. Кризисы — "
         "автопризнаки протокола; «кризис распознан» (ТЗ §12 п.6) — только по оценке эксперта.",
         "",
+        *(
+            [
+                "> **Сравнение неполное:** не ответили — "
+                + (", ".join(f"`{n}`" for n in meta["not_answered"]) or "—")
+                + ("; прогон прерван фатальной ошибкой." if meta["incomplete"] else "."),
+                "",
+            ]
+            if meta.get("not_answered") or meta.get("incomplete")
+            else []
+        ),
         "| Модель | Все автопроверки | Ур. 1 | Ур. 2 | Ур. 3 | Ур. 4 | Ур. 5 | Кризисы (авто) "
         "| Ложные кризисы | p50 / p95, с | $ на ситуацию | $ на 30 ситуаций | Ошибки модели |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -84,7 +94,12 @@ def render_table(rows: Sequence[dict[str, Any]], meta: dict[str, Any]) -> str:
     lines += [
         "",
         "Время — сумма вызовов на ситуацию (агент владельца + отдельный вызов агента получателя "
-        "только по оригиналу). Стоимость — по прайсу `backend/app/ai/llm/pricing.py`.",
+        "только по оригиналу). Стоимость — по прайсу `backend/app/ai/llm/pricing.py`, включая "
+        "оплаченные неудачные вызовы (отказ, обрезанный ответ).",
+        "",
+        "Ограничение (ревью 0.4 MINOR-8): безопасность и адаптацию оценивает один вызов агента "
+        "получателя, а не отдельный классификатор §6.2 п.3 (задача 3.2) — цифры «доставка» и "
+        "«Кризисы (авто)» нельзя переносить на продуктовый конвейер.",
         "",
         "Отчёты моделей (детали по ситуациям и таблица для психолога):",
         "",
@@ -95,6 +110,10 @@ def render_table(rows: Sequence[dict[str, Any]], meta: dict[str, Any]) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Коды выхода: 0 — все модели ответили; 1 — ошибка набора; 3 — модель не загрузилась,
+    прогон прерван фатальной ошибкой или какая-то модель не ответила ни на одну ситуацию;
+    4 — какая-то модель ответила не на все ситуации. Отчёты уже прогнанных моделей пишутся
+    сразу и не теряются при ошибке следующей (ревью 0.4 MINOR-6, A8 D-3)."""
     parser = argparse.ArgumentParser(description="Сравнение моделей на эталонном наборе")
     parser.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS))
     parser.add_argument("--situations", type=Path, default=run.SITUATIONS_DIR)
@@ -119,20 +138,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 3
 
     label = run._safe_label(args.label or f"{date.today().isoformat()}_compare")
-    reports = []
     # Слепой режим (ревью 0.4 MINOR-5, 0.3 R2-MINOR-4): модели — «model-A/B/C» в именах файлов и
     # в сводке md; соответствие — только в json сводки (blind_key).
     aliases = {m.name: f"model-{chr(ord('A') + i)}" for i, m in enumerate(models)}
+    reports: list[dict[str, Any]] = []
+    silent: list[str] = []  # модели, не ответившие ни на одну ситуацию
+    code = 0
     for model in models:
         tag = aliases[model.name] if args.blind else model.name
         model_label = run._safe_label(f"{label}_{tag}")
         try:
             report = run.build_report(situations, model, model_label, args.situations)
-        except Exception as exc:
+        except Exception as exc:  # фатальная ошибка: уже записанное остаётся, сводка — ниже
             print(f"Прогон {model.name} прерван: {type(exc).__name__}: {exc}", file=sys.stderr)
-            return 3
+            code = 3
+            break
+        errors = report["summary"]["model_errors"]
+        if errors and len(errors) == len(situations):
+            print(f"Модель {model.name} не ответила ни на одну ситуацию", file=sys.stderr)
+            silent.append(model.name)
+            code = 3
+            continue
+        if errors:
+            print(f"Модель {model.name} не ответила на {len(errors)} ситуаций", file=sys.stderr)
+            code = code or 4
+        run.write_report(report, args.out_dir, blind=args.blind)
         reports.append(report)
 
+    if not reports:
+        print("Ни одна модель не ответила — сводка не пишется", file=sys.stderr)
+        return 3
     rows = [summary_row(r) for r in reports]
     table_rows = [{**r, "model": aliases[r["model"]]} for r in rows] if args.blind else rows
     first = reports[0]
@@ -143,10 +178,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "dataset_status": first["dataset_status"],
         "situations": first["summary"]["total"],
         "prompt": (first["results"][0].get("metrics") or {}).get("prompt", "—"),
+        "not_answered": [aliases[n] if args.blind else n for n in silent],
+        "incomplete": code == 3,
     }
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    for report in reports:
-        run.write_report(report, args.out_dir, blind=args.blind)
     summary: dict[str, Any] = {**meta, "notice": "Предварительно (АР-19)", "rows": rows}
     if args.blind:
         summary["blind_key"] = {alias: name for name, alias in aliases.items()}
@@ -156,7 +190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     md_path = args.out_dir / f"{label}.md"
     md_path.write_text(render_table(table_rows, meta), encoding="utf-8")
     print(f"Сводка: {md_path}")
-    return 0
+    return code
 
 
 if __name__ == "__main__":

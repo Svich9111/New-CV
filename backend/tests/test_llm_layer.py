@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from app.ai.llm import (
     LLMBadOutput,
     LLMConfigError,
     LLMModelNotFound,
+    LLMQuotaError,
     LLMRefusal,
     LLMRequestError,
     LLMUnavailable,
@@ -153,7 +155,7 @@ def test_pricing() -> None:
     assert cost_usd(HAIKU, million) == pytest.approx(0.60)
     cached = Usage(cache_read_input_tokens=1_000_000, cache_creation_input_tokens=1_000_000)
     assert cost_usd(OPUS, cached) == pytest.approx(4.0 * 0.1 + 4.0 * 1.25)
-    assert cost_usd("unknown-model", million) == 0.0
+    assert cost_usd("unknown-model", million) is None  # «цены нет», а не $0 (A8 D-4)
 
 
 # --------------------------------------------------------------------------- stop_reason и ответ
@@ -173,7 +175,8 @@ async def test_refusal_is_typed_error_before_reading_content() -> None:
     with pytest.raises(LLMRefusal) as info:
         await provider.complete_json(system="", messages=MSG, schema=SCHEMA)
     assert info.value.category == "cyber"
-    assert info.value.fallback_ok
+    assert not info.value.fallback_ok  # АР-20: отказ не уходит на резервную модель
+    assert info.value.cost_usd == pytest.approx((100 * 4 + 20 * 20) / 1e6)  # отказ оплачен
     assert info.value.user_message == USER_MESSAGE_REFUSAL
 
 
@@ -238,7 +241,8 @@ async def test_network_errors_are_unavailable(exc: type[Exception]) -> None:
 # --------------------------------------------------------------------------- резервная модель
 
 
-async def test_fallback_on_unavailable_and_refusal() -> None:
+async def test_fallback_on_unavailable_not_on_refusal() -> None:
+    """Резерв — при недоступности; отказ по безопасности останавливает цепочку (АР-20)."""
     calls: list[str] = []
 
     def failing(request: httpx2.Request) -> httpx2.Response:
@@ -258,12 +262,21 @@ async def test_fallback_on_unavailable_and_refusal() -> None:
         ClaudeProvider(SONNET, client=make_client(refusing)),
         ClaudeProvider(HAIKU, client=make_client(healthy)),
     )
+    with pytest.raises(LLMRefusal):
+        await chain.complete_json(system="", messages=MSG, schema=SCHEMA)
+    assert calls == ["primary", "second"]  # до третьей модели дело не дошло
+
+    calls.clear()
+    chain = FallbackProvider(
+        ClaudeProvider(OPUS, client=make_client(failing)),
+        ClaudeProvider(HAIKU, client=make_client(healthy)),
+    )
     result = await chain.complete_json(system="", messages=MSG, schema=SCHEMA)
     assert result.data == {"x": 3}
     assert result.model == HAIKU
     assert result.fallback_used
-    assert result.attempts == (OPUS, SONNET, HAIKU)
-    assert calls == ["primary", "second", "third"]
+    assert result.attempts == (OPUS, HAIKU)
+    assert calls == ["primary", "third"]
 
 
 async def test_fallback_not_used_for_auth_and_bad_request() -> None:
@@ -773,3 +786,161 @@ def test_compare_table(tmp_path: Path) -> None:
     for part in ("Ур. 5", "Кризисы (авто)", "p50 / p95", "$ на 30 ситуаций", "АР-19", "§12 п.6"):
         assert part in md, part
     assert (tmp_path / f"cmp_{OPUS}.json").exists() and (tmp_path / f"cmp_{HAIKU}.md").exists()
+
+
+# --------------------------------------------------------------------------- раунд 1 ревью 0.4
+
+
+def spend_limit(code: str) -> httpx2.Response:
+    error = {"type": "rate_limit_error", "message": "x", "details": {"error_code": code}}
+    return httpx2.Response(429, json={"type": "error", "error": error})
+
+
+@pytest.mark.parametrize(
+    ("response", "error", "fallback"),
+    [
+        (lambda: api_error(408, "timeout_error"), LLMUnavailable, True),
+        (lambda: api_error(402, "billing_error"), LLMQuotaError, False),
+        (lambda: spend_limit("enforced_spend_limit_reached"), LLMQuotaError, False),
+        (lambda: spend_limit("contract_spend_limit_reached"), LLMQuotaError, False),
+    ],
+    ids=["408", "402", "enforced-spend", "contract-spend"],
+)
+async def test_timeout_and_spend_limits(
+    response: Callable[[], httpx2.Response], error: type[Exception], fallback: bool
+) -> None:
+    """A6 MINOR-1, 7: 408 — временная ошибка (резервная модель); 402 и лимит расходов — не
+    резерв, а остановка с понятной ошибкой."""
+    spare: list[str] = []
+
+    def healthy(request: httpx2.Request) -> httpx2.Response:
+        spare.append("spare")
+        return ok(HAIKU, {"x": 1})
+
+    chain = FallbackProvider(
+        ClaudeProvider(OPUS, client=make_client(lambda r: response())),
+        ClaudeProvider(HAIKU, client=make_client(healthy)),
+    )
+    if fallback:
+        assert (await chain.complete_json(system="", messages=MSG, schema=SCHEMA)).model == HAIKU
+    else:
+        with pytest.raises(error) as info:
+            await chain.complete_json(system="", messages=MSG, schema=SCHEMA)
+        assert "лимит" in info.value.user_message and "сохранён" in info.value.user_message
+        assert info.value.kind in adapter.FATAL_KINDS
+    assert spare == (["spare"] if fallback else [])
+
+
+async def test_response_validation_error_is_layer_error() -> None:
+    """A6 MINOR-2: APIResponseValidationError и прочие APIError без статуса — ошибка слоя."""
+
+    async def raising(*args: Any, **kwargs: Any) -> Any:
+        raise anthropic.APIResponseValidationError(
+            response=httpx2.Response(200, request=httpx2.Request("POST", "http://llm.test")),
+            body=None,
+        )
+
+    client = make_client(lambda r: ok(OPUS, {"x": 1}))
+    client.messages.create = raising  # type: ignore[method-assign]
+    with pytest.raises(LLMBadOutput):
+        await ClaudeProvider(OPUS, client=client).complete_json(
+            system="", messages=MSG, schema=SCHEMA
+        )
+
+
+def test_model_without_price_is_config_error() -> None:
+    """A8 D-4, A6 MINOR-4: модель без цены — ошибка настройки, а не $0."""
+    with pytest.raises(LLMConfigError, match="цены"):
+        ClaudeProvider("claude-opus-5-5-20261101", client=make_client(lambda r: ok(OPUS, {})))
+
+
+async def test_request_text_not_in_debug_logs(caplog: pytest.LogCaptureFixture) -> None:
+    """A8 D-2: даже при DEBUG корневого журнала тело запроса (тексты) не попадает в журнал."""
+    caplog.set_level(logging.DEBUG)
+    secret = "Мне обидно, что вечер снова отменился"
+    provider = ClaudeProvider(OPUS, client=make_client(lambda r: ok(OPUS, {"x": 1})))
+    await provider.complete_json(system="", messages=[ChatMessage("user", secret)], schema=SCHEMA)
+    assert caplog.records  # SDK пишет в журнал, но без тела запроса
+    assert secret not in caplog.text
+    assert "не журналируется" in caplog.text
+
+
+def test_failed_calls_are_paid_in_metrics() -> None:
+    """A6 MINOR-4: оплаченный отказ (refusal) учитывается в токенах и стоимости ситуации."""
+    sit = next(s for s in run.load_situations() if s["id"] == "l1-03-secret-chats")
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body = message_json(OPUS, None, stop_reason="refusal", usage=(1000, 100))
+        return httpx2.Response(200, json=body)
+
+    model = _adapter(handler)
+    (row,) = run.run_suite([sit], model)
+    model.close()
+    assert row["auto_pass"] is False
+    m = row["metrics"]
+    assert m["errors"] == ["refusal"]
+    assert (m["input_tokens"], m["output_tokens"]) == (1000, 100)
+    assert m["cost_usd"] == pytest.approx((1000 * 4 + 100 * 20) / 1e6)
+
+
+class SilentHaiku(adapter.Haiku):
+    """Haiku, которая не отвечает ни на одну ситуацию (перегрузка)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            provider=ClaudeProvider(
+                HAIKU, client=make_client(lambda r: api_error(529, "overloaded_error"))
+            )
+        )
+
+
+class RejectedSonnet(adapter.Sonnet):
+    def __init__(self) -> None:
+        super().__init__(
+            provider=ClaudeProvider(
+                SONNET, client=make_client(lambda r: api_error(401, "authentication_error"))
+            )
+        )
+
+
+def test_compare_marks_silent_model_and_keeps_done_reports(tmp_path: Path) -> None:
+    """A8 D-3, A6 MINOR-6: модель, не ответившая ни разу, — код 3 и пометка в сводке; отчёт
+    уже прогнанной модели не теряется при фатальной ошибке следующей."""
+    compare = _load_compare()
+    code = compare.main(
+        [
+            "--models",
+            f"{__name__}:EchoOpus",
+            f"{__name__}:SilentHaiku",
+            f"{__name__}:RejectedSonnet",
+            "--out-dir",
+            str(tmp_path),
+            "--label",
+            "cmp",
+        ]
+    )
+    assert code == 3
+    assert (tmp_path / f"cmp_{OPUS}.json").exists()
+    assert not (tmp_path / f"cmp_{HAIKU}.json").exists()
+    assert not (tmp_path / f"cmp_{SONNET}.json").exists()
+    summary = json.loads((tmp_path / "cmp.json").read_text(encoding="utf-8"))
+    assert [r["model"] for r in summary["rows"]] == [OPUS]
+    assert summary["not_answered"] == [HAIKU] and summary["incomplete"] is True
+    md = (tmp_path / "cmp.md").read_text(encoding="utf-8")
+    assert "Сравнение неполное" in md and HAIKU in md and "§6.2 п.3" in md
+
+
+def test_compare_blind_hides_model_names(tmp_path: Path) -> None:
+    """Ревью 0.4 MINOR-5: в слепом режиме — model-A/B, соответствие только в json."""
+    compare = _load_compare()
+    args = ["--models", f"{__name__}:EchoOpus", f"{__name__}:EchoHaiku", "--blind"]
+    assert compare.main([*args, "--out-dir", str(tmp_path), "--label", "b"]) == 0
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert not any(OPUS in n or HAIKU in n for n in names)
+    assert "b_model-A.md" in names and "b_model-B.md" in names
+    summary = json.loads((tmp_path / "b.json").read_text(encoding="utf-8"))
+    assert summary["blind_key"] == {"model-A": OPUS, "model-B": HAIKU}
+    for name in names:
+        if name.endswith(".md"):
+            text = (tmp_path / name).read_text(encoding="utf-8")
+            assert OPUS not in text and HAIKU not in text, name

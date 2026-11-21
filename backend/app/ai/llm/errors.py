@@ -6,8 +6,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.ai.llm.base import Usage
+
 USER_MESSAGE_UNAVAILABLE = (
     "Агент сейчас не может ответить. Твой текст сохранён — попробуй ещё раз через минуту."
+)
+USER_MESSAGE_QUOTA = (
+    "Агент временно недоступен: исчерпан лимит сервиса. Твой текст сохранён — мы уже разбираемся."
 )
 USER_MESSAGE_REFUSAL = (
     "Агент не смог обработать это сообщение. Текст сохранён — его можно изменить или отправить "
@@ -26,6 +34,9 @@ class LLMError(Exception):
         super().__init__(detail)
         self.detail = detail
         self.model = model
+        # Если ответ был получен (отказ, обрезанный ответ) — оплаченный расход (ТЗ §10).
+        self.usage: Usage | None = None
+        self.cost_usd: float | None = None
 
 
 class LLMConfigError(LLMError):
@@ -46,6 +57,14 @@ class LLMRequestError(LLMError):
     kind = "bad_request"
 
 
+class LLMQuotaError(LLMError):
+    """Исчерпан лимит расходов аккаунта или нет оплаты (402, spend limit). Резервная модель того
+    же аккаунта не поможет; прогон останавливается с понятной ошибкой."""
+
+    kind = "quota"
+    user_message = USER_MESSAGE_QUOTA
+
+
 class LLMModelNotFound(LLMError):
     """Модель с таким идентификатором недоступна (404) — пробуем резервную."""
 
@@ -61,10 +80,11 @@ class LLMUnavailable(LLMError):
 
 
 class LLMRefusal(LLMError):
-    """Модель отказалась отвечать (stop_reason = refusal)."""
+    """Модель отказалась отвечать (stop_reason = refusal). На резервную модель не уходит
+    (DECISIONS.md АР-20): в продукте — кризисный путь или понятное сообщение."""
 
     kind = "refusal"
-    fallback_ok = True
+    fallback_ok = False
     user_message = USER_MESSAGE_REFUSAL
 
     def __init__(

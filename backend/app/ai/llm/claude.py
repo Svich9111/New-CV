@@ -1,17 +1,23 @@
 """Реализация ``LLMProvider`` для Claude API (официальный SDK ``anthropic``).
 
 - Ключ — только из окружения ``ANTHROPIC_API_KEY`` (SDK читает его сам); без ключа —
-  ``LLMConfigError`` до любого сетевого запроса.
+  ``LLMConfigError`` до любого сетевого запроса. Модель без цены в ``pricing.py`` — тоже
+  ``LLMConfigError``: расходы не должны считаться как $0 (ТЗ §10).
 - Адаптивное мышление (``thinking: adaptive``); ``temperature``/``top_p`` не передаются.
 - Структурированный ответ — ``output_config.format`` с JSON Schema.
 - ``stop_reason`` проверяется до чтения ``content`` (в т. ч. ``refusal``).
-- Ошибки SDK переводятся в типизированные ``LLMError`` цепочкой от частных к общим.
+- Ошибки SDK переводятся в типизированные ``LLMError`` цепочкой от частных к общим. Ошибка
+  после полученного ответа (отказ, обрезанный или испорченный ответ) несёт оплаченные
+  ``usage`` и ``cost_usd``.
 - В запрос не добавляются ``metadata``/идентификаторы пользователя (ТЗ §9.1 п.4).
+- На DEBUG SDK пишет тело запроса с текстами — фильтр ``RedactRequestBody`` его вырезает
+  (CLAUDE.md: «в журналах нет текстов сообщений»).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -31,12 +37,14 @@ from app.ai.llm.errors import (
     LLMAuthError,
     LLMBadOutput,
     LLMConfigError,
+    LLMError,
     LLMModelNotFound,
+    LLMQuotaError,
     LLMRefusal,
     LLMRequestError,
     LLMUnavailable,
 )
-from app.ai.llm.pricing import cost_usd
+from app.ai.llm.pricing import PRICES, cost_usd
 
 OPUS = "claude-opus-5-5"
 SONNET = "claude-sonnet-5-5"
@@ -44,6 +52,40 @@ HAIKU = "claude-haiku-5-5"
 API_KEY_ENV = "ANTHROPIC_API_KEY"
 
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
+
+
+class RedactRequestBody(logging.Filter):
+    """На DEBUG SDK пишет «Request options: {… json_data: …}» — тело запроса с репликами и
+    памятью. Фильтр заменяет такую запись служебной строкой; остальные записи SDK (метод, адрес,
+    статус) остаются (A8 D-2, CLAUDE.md: «в журналах нет текстов сообщений»)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        text = str(record.msg)
+        if text.startswith("Request options") or "json_data" in repr(record.args):
+            record.msg = "Request options: <тело запроса не журналируется>"
+            record.args = ()
+        return True
+
+
+_REDACT = RedactRequestBody()
+
+
+def redact_sdk_logs() -> None:
+    """Фильтр на журнал, который пишет параметры запроса (и на корневой журнал SDK)."""
+    for name in ("anthropic._base_client", "anthropic"):
+        logger = logging.getLogger(name)
+        if _REDACT not in logger.filters:
+            logger.addFilter(_REDACT)
+
+
+redact_sdk_logs()
+
+# Исчерпан лимит расходов или нет оплаты: резервная модель того же аккаунта не поможет.
+_SPEND_LIMIT = (
+    anthropic.PaymentRequiredError,  # 402, в т. ч. LinkedOrganization*
+    anthropic.ContractSpendLimitReachedError,
+    anthropic.EnforcedSpendLimitReachedError,
+)
 
 
 def _client_from_env() -> anthropic.AsyncAnthropic:
@@ -54,21 +96,27 @@ def _client_from_env() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic()
 
 
-def _translate(exc: Exception, model: str) -> NoReturn:
+def _translate(exc: anthropic.APIError, model: str) -> NoReturn:
     """Ошибка SDK → ``LLMError``. Порядок важен: подклассы раньше базовых."""
     if isinstance(exc, anthropic.AuthenticationError | anthropic.PermissionDeniedError):
         raise LLMAuthError(f"ключ отклонён ({exc.status_code})", model=model) from exc
     if isinstance(exc, anthropic.NotFoundError):
         raise LLMModelNotFound(f"модель {model} не найдена (404)", model=model) from exc
+    if isinstance(exc, _SPEND_LIMIT):
+        raise LLMQuotaError(f"лимит расходов или оплата ({exc.status_code})", model=model) from exc
     if isinstance(exc, anthropic.RateLimitError):
         raise LLMUnavailable("лимит запросов (429)", model=model) from exc
+    if isinstance(exc, anthropic.RequestTimeoutError):  # 408 — временная недоступность
+        raise LLMUnavailable("тайм-аут на стороне поставщика (408)", model=model) from exc
     if isinstance(exc, anthropic.APIStatusError):
         if exc.status_code >= 500:
             raise LLMUnavailable(f"ошибка поставщика ({exc.status_code})", model=model) from exc
         raise LLMRequestError(f"запрос отклонён ({exc.status_code})", model=model) from exc
     if isinstance(exc, anthropic.APIConnectionError):  # включает APITimeoutError
         raise LLMUnavailable("нет связи с поставщиком", model=model) from exc
-    raise exc
+    if isinstance(exc, anthropic.APIResponseValidationError):
+        raise LLMBadOutput("ответ поставщика не прошёл проверку SDK", model=model) from exc
+    raise LLMUnavailable(f"ошибка SDK ({type(exc).__name__})", model=model) from exc
 
 
 def _usage(message: Message) -> Usage:
@@ -100,6 +148,8 @@ class ClaudeProvider:
         client: anthropic.AsyncAnthropic | None = None,
         effort: Effort | None = None,
     ) -> None:
+        if model not in PRICES:
+            raise LLMConfigError(f"Нет цены для модели {model} в app/ai/llm/pricing.py")
         self._model = model
         self._client = client if client is not None else _client_from_env()
         self._effort = effort
@@ -137,6 +187,25 @@ class ClaudeProvider:
             params["output_config"] = config
         return params
 
+    def _cost(self, usage: Usage) -> float:
+        cost = cost_usd(self._model, usage)
+        if cost is None:  # не бывает: цена проверена в конструкторе
+            raise LLMConfigError(f"Нет цены для модели {self._model}", model=self._model)
+        return cost
+
+    def _parse(self, message: Message) -> dict[str, Any]:
+        _check_stop(message, self._model)
+        text = next((b.text for b in message.content if b.type == "text"), None)
+        if text is None:
+            raise LLMBadOutput("в ответе нет текстового блока", model=self._model)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise LLMBadOutput("ответ не разбирается как JSON", model=self._model) from exc
+        if not isinstance(data, dict):
+            raise LLMBadOutput("ответ — не JSON-объект", model=self._model)
+        return data
+
     async def complete_json(
         self,
         *,
@@ -153,23 +222,18 @@ class ClaudeProvider:
         except anthropic.APIError as exc:
             _translate(exc, self._model)
         latency = time.monotonic() - started
-        _check_stop(message, self._model)
-        text = next((b.text for b in message.content if b.type == "text"), None)
-        if text is None:
-            raise LLMBadOutput("в ответе нет текстового блока", model=self._model)
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise LLMBadOutput("ответ не разбирается как JSON", model=self._model) from exc
-        if not isinstance(data, dict):
-            raise LLMBadOutput("ответ — не JSON-объект", model=self._model)
         usage = _usage(message)
+        try:
+            data = self._parse(message)
+        except LLMError as exc:  # ответ получен и оплачен — расход не теряется (MINOR-4)
+            exc.usage, exc.cost_usd = usage, self._cost(usage)
+            raise
         return StructuredResult(
             data=data,
             model=message.model or self._model,
             usage=usage,
             latency_s=round(latency, 3),
-            cost_usd=cost_usd(self._model, usage),
+            cost_usd=self._cost(usage),
             attempts=(self._model,),
         )
 

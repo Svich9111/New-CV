@@ -44,6 +44,7 @@ from app.ai.llm import (
     LLMError,
     LLMProvider,
     StructuredResult,
+    Usage,
 )
 
 EVALS_DIR = Path(__file__).resolve().parent.parent
@@ -59,7 +60,7 @@ STRATEGIES = (
 )
 SAFETY = ("none", "threat_or_insult", "violence_signs")
 # Ошибки, при которых прогон бессмыслен: продолжать на остальных ситуациях нельзя.
-FATAL_KINDS = frozenset({"config", "auth", "bad_request"})
+FATAL_KINDS = frozenset({"config", "auth", "bad_request", "quota"})
 
 
 class ModelCallFailed(Exception):
@@ -161,6 +162,12 @@ def _as_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _tokens_in(usage: Usage | None) -> int:
+    if usage is None:
+        return 0
+    return usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+
+
 def _run_module(request: Any) -> ModuleType:
     """Модуль run.py, из которого пришёл запрос (``__main__`` или загруженный в тестах)."""
     return sys.modules[type(request).__module__]
@@ -195,7 +202,18 @@ class ClaudeAdapter:
         try:
             result: StructuredResult = self._runner.run(coro)
         except LLMError as exc:
-            self._calls.append({"role": role, "model": self.provider.model, "error": exc.kind})
+            # Ответ мог быть получен и оплачен (отказ, обрезанный ответ) — расход учитывается.
+            usage, cost = exc.usage, exc.cost_usd
+            self._calls.append(
+                {
+                    "role": role,
+                    "model": self.provider.model,
+                    "error": exc.kind,
+                    "input_tokens": _tokens_in(usage),
+                    "output_tokens": usage.output_tokens if usage else 0,
+                    "cost_usd": cost or 0.0,
+                }
+            )
             if exc.kind in FATAL_KINDS:
                 raise RunAborted(f"{exc.kind}: {exc.detail}") from exc
             raise ModelCallFailed(f"{role}: {exc.kind}") from exc
@@ -204,9 +222,7 @@ class ClaudeAdapter:
                 "role": role,
                 "model": result.model,
                 "latency_s": result.latency_s,
-                "input_tokens": result.usage.input_tokens
-                + result.usage.cache_read_input_tokens
-                + result.usage.cache_creation_input_tokens,
+                "input_tokens": _tokens_in(result.usage),
                 "output_tokens": result.usage.output_tokens,
                 "cost_usd": result.cost_usd,
                 "fallback_used": result.fallback_used,
@@ -277,9 +293,10 @@ class ClaudeAdapter:
             "prompt": PROMPT_VERSION,
             "calls": calls,
             "latency_s": round(sum(c["latency_s"] for c in ok), 3),
-            "input_tokens": sum(c["input_tokens"] for c in ok),
-            "output_tokens": sum(c["output_tokens"] for c in ok),
-            "cost_usd": round(sum(c["cost_usd"] for c in ok), 8),
+            # Токены и стоимость — по всем вызовам, включая неудачные (оплаченный отказ и т. п.).
+            "input_tokens": sum(c["input_tokens"] for c in calls),
+            "output_tokens": sum(c["output_tokens"] for c in calls),
+            "cost_usd": round(sum(c["cost_usd"] for c in calls), 8),
             "errors": [c["error"] for c in calls if c["error"] is not None],
         }
 
