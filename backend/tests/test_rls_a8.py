@@ -159,6 +159,18 @@ async def _count(s: AsyncSession, sql: str, **params: object) -> int:
     return int((await s.execute(text(sql), params)).scalar_one())
 
 
+async def _leave(sm: async_sessionmaker[AsyncSession], uid: uuid.UUID) -> None:
+    """Выход только функцией (Б-13, миграция 0004): прямых UPDATE пары у приложения нет."""
+    async with user_scope(sm, uid) as s:
+        await s.execute(text("SELECT app_leave_couple()"))
+
+
+async def _su_scalar(engine: AsyncEngine, sql: str, **params: object) -> Any:
+    """Проверка итога суперпользователем (в обход RLS)."""
+    async with engine.connect() as conn:
+        return (await conn.execute(text(sql), params)).scalar_one()
+
+
 # --- Личные данные по прямому id: ТЗ §7 «Правила доступа», §2 п.4, §6.3, §9.2 п.1 ---------
 
 DIRECT = {
@@ -535,11 +547,7 @@ async def test_feed_for_outsider_former_member_and_anonymous(
     отправляет; оставшийся партнёр тоже не отправляет в распавшуюся пару (ТЗ §4.5 п.2)."""
     assert await _feed_ids(sessionmaker, w.c.user_id) == set()
     assert await _feed_ids(sessionmaker, None) == set()
-    async with user_scope(sessionmaker, w.a.user_id) as s:
-        await s.execute(
-            text("UPDATE couple_members SET active = false, left_at = now() WHERE user_id = :a"),
-            {"a": w.a.user_id},
-        )
+    await _leave(sessionmaker, w.a.user_id)
     assert w.message_id in await _feed_ids(sessionmaker, w.a.user_id)
     assert w.message_id in await _feed_ids(sessionmaker, w.b.user_id)
     for p in (w.a, w.b):
@@ -643,9 +651,10 @@ async def test_find_invite_reveals_only_by_exact_token(
 
 
 async def test_outsider_cannot_create_invite_into_foreign_couple(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    with pytest.raises(ProgrammingError, match=RLS_DENIED):
+    """Б-13 (0004): INSERT invites у приложения отозван — только app_issue_invite."""
+    with pytest.raises(ProgrammingError, match=DENIED):
         async with user_scope(sessionmaker, w.c.user_id) as s:
             await s.execute(
                 text(
@@ -654,12 +663,16 @@ async def test_outsider_cannot_create_invite_into_foreign_couple(
                 ),
                 {"k": w.couple_id, "c": w.c.user_id},
             )
+    assert (
+        await _su_scalar(engine, "SELECT count(*) FROM invites WHERE couple_id = :k", k=w.couple_id)
+        == 0
+    )
 
 
 async def test_cannot_create_invite_in_someone_elses_name(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    with pytest.raises(ProgrammingError, match=RLS_DENIED):
+    with pytest.raises(ProgrammingError, match=DENIED):
         async with user_scope(sessionmaker, w.b.user_id) as s:
             await s.execute(
                 text(
@@ -668,16 +681,28 @@ async def test_cannot_create_invite_in_someone_elses_name(
                 ),
                 {"k": w.couple_id, "a": w.a.user_id},
             )
+    assert (
+        await _su_scalar(engine, "SELECT count(*) FROM invites WHERE couple_id = :k", k=w.couple_id)
+        == 0
+    )
 
 
 async def test_partner_cannot_see_or_revoke_invites_of_other(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
+    """Чужие приглашения не видны; отозвать их прямым UPDATE нельзя никому, даже автору
+    (Б-13, 0004: UPDATE invites отозван — только app_issue_invite/app_leave_couple)."""
     for p in (w.a, w.b):
         async with user_scope(sessionmaker, p.user_id) as s:
             assert await _count(s, "SELECT count(*) FROM invites") == 0
-            res = await s.execute(text("UPDATE invites SET status = 'revoked'"))
-            assert res.rowcount == 0  # type: ignore[attr-defined]
+    for p in (w.a, w.b, w.c):
+        with pytest.raises(ProgrammingError, match=DENIED):
+            async with user_scope(sessionmaker, p.user_id) as s:
+                await s.execute(text("UPDATE invites SET status = 'revoked'"))
+    status = await _su_scalar(
+        engine, "SELECT status::text FROM invites WHERE token_hash = :h", h=w.invite_token_hash
+    )
+    assert status == "active"
 
 
 async def test_cannot_move_own_membership_into_foreign_couple(
@@ -734,36 +759,37 @@ async def test_former_member_cannot_invite_into_or_dissolve_former_couple(
     w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
     """D-4: после выхода обмен прекращается (ТЗ §4.5 п.2): бывший участник не приглашает в
-    пару и не меняет её статус."""
-    async with user_scope(sessionmaker, w.a.user_id) as s:
-        await s.execute(
-            text("UPDATE couple_members SET active = false, left_at = now() WHERE user_id = :a"),
-            {"a": w.a.user_id},
-        )
-    with pytest.raises(ProgrammingError, match=RLS_DENIED):
+    пару, не меняет её статус и не возвращается в неё (ни функцией, ни прямой записью)."""
+    await _leave(sessionmaker, w.a.user_id)
+    with pytest.raises(DBAPIError) as ei:
         async with user_scope(sessionmaker, w.a.user_id) as s:
-            await s.execute(
-                text(
-                    "INSERT INTO invites (token_hash, couple_id, created_by, expires_at) "
-                    "VALUES ('\\x03', :k, :a, now() + interval '7 days')"
-                ),
-                {"k": w.couple_id, "a": w.a.user_id},
-            )
-    async with user_scope(sessionmaker, w.a.user_id) as s:
-        res = await s.execute(
-            text("UPDATE couples SET status = 'dissolved' WHERE id = :k"), {"k": w.couple_id}
+            await s.execute(text("SELECT app_issue_invite(:h)"), {"h": b"\x05" * 32})
+    assert getattr(ei.value.orig, "sqlstate", None) == "FB007"
+    for sql in (
+        "INSERT INTO invites (token_hash, couple_id, created_by, expires_at) "
+        "VALUES ('\\x03', :k, :a, now() + interval '7 days')",
+        "UPDATE couples SET status = 'active', dissolved_at = NULL WHERE id = :k",
+        "UPDATE couple_members SET active = true, left_at = NULL WHERE user_id = :a",
+    ):
+        with pytest.raises(ProgrammingError, match=DENIED):
+            async with user_scope(sessionmaker, w.a.user_id) as s:
+                await s.execute(text(sql), {"k": w.couple_id, "a": w.a.user_id})
+    assert (
+        await _su_scalar(engine, "SELECT status::text FROM couples WHERE id = :k", k=w.couple_id)
+        == "dissolved"
+    )
+    assert (
+        await _su_scalar(
+            engine,
+            "SELECT count(*) FROM couple_members WHERE couple_id = :k AND active",
+            k=w.couple_id,
         )
-        assert res.rowcount == 0  # type: ignore[attr-defined]
-        # и вернуться в пару обновлением своей записи нельзя
-        res = await s.execute(
-            text("UPDATE couple_members SET active = true WHERE user_id = :a"), {"a": w.a.user_id}
-        )
-        assert res.rowcount == 0  # type: ignore[attr-defined]
-    async with engine.connect() as conn:
-        st = await conn.execute(
-            text("SELECT status FROM couples WHERE id = :k"), {"k": w.couple_id}
-        )
-        assert st.scalar_one() == "active"
+        == 0
+    )
+    assert (
+        await _su_scalar(engine, "SELECT count(*) FROM invites WHERE couple_id = :k", k=w.couple_id)
+        == 0
+    )
 
 
 async def test_create_couple_when_already_in_couple(
@@ -782,11 +808,7 @@ async def test_create_couple_when_already_in_couple(
             async with user_scope(sessionmaker, p.user_id) as s:
                 await s.execute(text("SELECT app_create_couple()"))
     assert await couples_total() == before
-    async with user_scope(sessionmaker, w.a.user_id) as s:
-        await s.execute(
-            text("UPDATE couple_members SET active = false, left_at = now() WHERE user_id = :a"),
-            {"a": w.a.user_id},
-        )
+    await _leave(sessionmaker, w.a.user_id)
     async with user_scope(sessionmaker, w.a.user_id) as s:
         new = (await s.execute(text("SELECT app_create_couple()"))).scalar_one()
         st = await s.execute(text("SELECT status FROM couples WHERE id = :k"), {"k": new})
@@ -795,13 +817,27 @@ async def test_create_couple_when_already_in_couple(
 
 
 async def test_invite_lifetime_is_limited_to_seven_days(
-    w: W, sessionmaker: async_sessionmaker[AsyncSession]
+    w: W, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
-    """ТЗ §4.1 п.6, ФТ-03: ссылка действует 7 дней. Продлить её обновлением нельзя (m5), но
-    создать сразу «вечную» — можно."""
+    """ТЗ §4.1 п.6, ФТ-03: ссылка действует 7 дней. Ни продлить, ни создать «вечную» прямой
+    записью нельзя (Б-13, 0004); срок ставит app_issue_invite — ровно 7 дней."""
+    async with engine.begin() as conn:  # прежняя ссылка не мешает (индекс одной активной)
+        await conn.execute(
+            text("UPDATE invites SET status = 'revoked' WHERE couple_id = :k"), {"k": w.c_couple_id}
+        )
+    for sql in (
+        "UPDATE invites SET expires_at = now() + interval '10 years'",
+        "UPDATE invites SET status = 'active'",
+    ):
+        with pytest.raises(ProgrammingError, match=DENIED):
+            async with user_scope(sessionmaker, w.c.user_id) as s:
+                await s.execute(text(sql))
     async with user_scope(sessionmaker, w.c.user_id) as s:
-        await s.execute(text("UPDATE invites SET status = 'revoked'"))
-    with pytest.raises(DBAPIError):
+        expires, now = (
+            await s.execute(text("SELECT app_issue_invite(:h), now()"), {"h": b"\x06" * 32})
+        ).one()
+    assert expires - now == timedelta(days=7)
+    with pytest.raises(ProgrammingError, match=DENIED):
         async with user_scope(sessionmaker, w.c.user_id) as s:
             await s.execute(
                 text(
