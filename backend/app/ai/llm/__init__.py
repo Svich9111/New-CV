@@ -16,7 +16,8 @@ from app.ai.llm.errors import (
     LLMUnavailable,
 )
 from app.ai.llm.fallback import FallbackProvider
-from app.ai.llm.pricing import PRICES, cost_usd
+from app.ai.llm.openrouter import OpenRouterProvider, fetch_price
+from app.ai.llm.pricing import PRICES, Price, cost_usd
 
 __all__ = [
     "HAIKU",
@@ -36,7 +37,10 @@ __all__ = [
     "LLMRefusal",
     "LLMRequestError",
     "LLMUnavailable",
+    "OpenRouterProvider",
+    "Price",
     "StructuredResult",
     "Usage",
     "cost_usd",
+    "fetch_price",
 ]

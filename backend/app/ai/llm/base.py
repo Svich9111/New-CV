@@ -44,7 +44,8 @@ class StructuredResult:
 
 @runtime_checkable
 class LLMProvider(Protocol):
-    """Поставщик модели. Реализации: ``ClaudeProvider``, ``FallbackProvider``, тестовые."""
+    """Поставщик модели. Реализации: ``ClaudeProvider``, ``OpenRouterProvider``,
+    ``FallbackProvider``, тестовые."""
 
     @property
     def model(self) -> str: ...

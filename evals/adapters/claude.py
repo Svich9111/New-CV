@@ -68,9 +68,46 @@ class ModelCallFailed(Exception):
 
 
 class RunAborted(Exception):
-    """Фатальная ошибка: прогон останавливается (run.py проверяет ``abort_run``)."""
+    """Фатальная ошибка: прогон останавливается (run.py проверяет ``abort_run``).
+    ``skip_model`` — ошибка касается только этой модели (compare.py переходит к следующей)."""
 
     abort_run = True
+
+    def __init__(self, detail: str, *, kind: str | None = None, skip_model: bool = False) -> None:
+        super().__init__(detail)
+        self.kind = kind
+        self.skip_model = skip_model
+
+
+class BudgetExceeded(RunAborted):
+    """Следующий вызов может превысить потолок расходов прогона (compare.py ``--max-cost-usd``)."""
+
+
+class CostBudget:
+    """Потолок расходов прогона, общий для всех моделей. Перед каждым вызовом модели проверяет,
+    что потраченное плюс резерв на один вызов не больше потолка; резерв — самый дорогой вызов
+    этой модели в прогоне (до первого вызова — ``first_call_reserve_usd``). Так прогон
+    останавливается до превышения, а не после."""
+
+    def __init__(self, limit_usd: float, *, first_call_reserve_usd: float = 0.5) -> None:
+        self.limit_usd = limit_usd
+        self.first_call_reserve_usd = first_call_reserve_usd
+        self.spent_usd = 0.0
+        self._max_call: dict[str, float] = {}
+
+    def reserve(self, model: str) -> float:
+        return self._max_call.get(model, self.first_call_reserve_usd)
+
+    def check(self, model: str) -> None:
+        if self.spent_usd + self.reserve(model) > self.limit_usd:
+            raise BudgetExceeded(
+                f"потолок расходов ${self.limit_usd:.2f}: потрачено ${self.spent_usd:.4f}, "
+                f"резерв на вызов {model} ${self.reserve(model):.4f}"
+            )
+
+    def add(self, model: str, cost: float) -> None:
+        self.spent_usd += cost
+        self._max_call[model] = max(self._max_call.get(model, 0.0), cost)
 
 
 def _schema_enum(*path: str) -> list[str]:
@@ -178,6 +215,9 @@ class ClaudeAdapter:
 
     model_id: str = OPUS
     name: str = "claude"
+    # Фатальные ошибки, которые касаются только этой модели (у одного поставщика — никакие:
+    # некорректный запрос — ошибка кода, одинаковая для всех моделей).
+    model_specific_fatal: frozenset[str] = frozenset()
 
     def __init__(
         self,
@@ -191,6 +231,7 @@ class ClaudeAdapter:
         self.recipient_system = load_prompt("recipient")
         self._runner = asyncio.Runner()
         self._calls: list[dict[str, Any]] = []
+        self.budget: CostBudget | None = None  # задаёт compare.py (--max-cost-usd)
 
     # ------------------------------------------------------------------ вызовы модели
 
@@ -198,12 +239,16 @@ class ClaudeAdapter:
         self, role: str, system: str, messages: list[ChatMessage], schema: dict[str, Any]
     ) -> dict[str, Any]:
         """Один вызов; результат или ошибка записываются в метрики (без текстов)."""
+        if self.budget is not None:
+            self.budget.check(self.provider.model)  # до вызова: потолок не превышается
         coro = self.provider.complete_json(system=system, messages=messages, schema=schema)
         try:
             result: StructuredResult = self._runner.run(coro)
         except LLMError as exc:
             # Ответ мог быть получен и оплачен (отказ, обрезанный ответ) — расход учитывается.
             usage, cost = exc.usage, exc.cost_usd
+            if self.budget is not None:
+                self.budget.add(self.provider.model, cost or 0.0)
             self._calls.append(
                 {
                     "role": role,
@@ -215,8 +260,14 @@ class ClaudeAdapter:
                 }
             )
             if exc.kind in FATAL_KINDS:
-                raise RunAborted(f"{exc.kind}: {exc.detail}") from exc
+                raise RunAborted(
+                    f"{exc.kind}: {exc.detail}",
+                    kind=exc.kind,
+                    skip_model=exc.kind in self.model_specific_fatal,
+                ) from exc
             raise ModelCallFailed(f"{role}: {exc.kind}") from exc
+        if self.budget is not None:
+            self.budget.add(self.provider.model, result.cost_usd)
         self._calls.append(
             {
                 "role": role,
