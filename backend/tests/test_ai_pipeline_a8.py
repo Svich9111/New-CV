@@ -1129,6 +1129,11 @@ async def test_r2_agent_error_without_crisis_is_error(make: Callable[[], LLMErro
 # --------------------------------------------------- Р2-4. Подсказка получателю (§4.4 п.5, §9.2 п.3)
 
 HINT_OK = "Можно ответить, что ты услышал, и договориться о пятнице."
+XFAIL_O8 = pytest.mark.xfail(
+    strict=True,
+    reason="MINOR A8-9 (бывш. О-8): при сбое meaning подсказка не показана, но hint_dropped = "
+    "None вместо «warning» — метрика причины неполная",
+)
 
 
 @pytest.mark.parametrize(
@@ -1138,8 +1143,10 @@ HINT_OK = "Можно ответить, что ты услышал, и дого�
         ok_script(meaning={"problems": ["dropped_request", "hint_off"]}),
         ok_script(adapt={"adapted": TEXT, "reply_hint": HINT_OK}),
         ok_script(adapt={"adapted": "", "reply_hint": HINT_OK}),
-        ok_script(meaning=LLMUnavailable("503")),
-        ok_script(meaning=[{"problems": 1}, {"problems": 1}]),
+        pytest.param(ok_script(meaning=LLMUnavailable("503")), marks=XFAIL_O8, id="meaning_down"),
+        pytest.param(
+            ok_script(meaning=[{"problems": 1}, {"problems": 1}]), marks=XFAIL_O8, id="meaning_bad"
+        ),
     ],
     ids=["mismatch", "mismatch+hint_off", "same", "empty", "meaning_down", "meaning_bad"],
 )
@@ -1151,8 +1158,8 @@ async def test_r2_hint_removed_with_warning(script: Script) -> None:
     )
     delivery, _ = await run(script)
     assert delivery.status == "original_with_warning" and delivery.reply_hint is None
-    # О-8: при degraded (сбой meaning) подсказка тоже не показана, но hint_dropped = None.
-    assert delivery.hint_dropped == (None if delivery.degraded else "warning")
+    # Раунд 3: О-8 переведено в дефект A8-9 — требование «warning» и при degraded (xfail).
+    assert delivery.hint_dropped == "warning"
 
 
 async def test_r2_hint_off_drops_only_hint() -> None:
@@ -1401,13 +1408,11 @@ def test_r2_registry_does_not_leak() -> None:
 
 def test_r2_registry_id_reuse_is_not_issued() -> None:
     """Новый объект на месте уничтоженного (тот же id) не наследует одобрение."""
-    import gc
 
     for _ in range(200):
         msg = pipeline.approve(TEXT, confirmed=True)
         addr = id(msg)
-        del msg
-        gc.collect()
+        del msg  # подсчёт ссылок освобождает сразу; gc.collect в цикле — 25 с на полном прогоне
         fake = object.__new__(pipeline.ApprovedMessage)
         object.__setattr__(fake, "text", TEXT)
         object.__setattr__(fake, "_confirmed", True)
@@ -1498,3 +1503,362 @@ def test_r2_draft_sets_not_default() -> None:
     assert prompts.V0 not in prompts.DRAFT_SETS
     for fn in (pipeline.process, dialog.reply):
         assert (fn.__kwdefaults__ or {}).get("prompt_set") is prompts.V0
+
+
+# ######################################################################## РАУНД 3 (A8)
+# Исправления A3 (d1a3566), АР-27 уточнён (221ca1a). Ожидания заданы тестом.
+
+import asyncio  # noqa: E402
+import gc  # noqa: E402
+
+# --------------------------------------------------- Р3-1. Реестр: хеш, состояния, гонки, повтор
+
+
+async def test_r3_registry_full_lifecycle() -> None:
+    bot = Bot(ok_script(tone=[LLMUnavailable("503"), {"tone": 0, "signals": []}]))
+    msg = pipeline.approve(TEXT, confirmed=True)
+    with pytest.raises(LLMUnavailable):
+        await pipeline.process(bot.models, msg)  # сбой — одобрение не израсходовано
+    assert (await pipeline.process(bot.models, msg)).status == "as_is"
+    calls = len(bot.provider.requests)
+    for _ in range(3):
+        with pytest.raises(pipeline.AlreadyProcessed):
+            await pipeline.process(bot.models, msg)
+    assert len(bot.provider.requests) == calls
+    # Новое «Отправить» того же текста — новое одобрение.
+    assert (await pipeline.process(bot.models, pipeline.approve(TEXT, confirmed=True))).delivered
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        LLMRefusal("x"),
+        LLMQuotaError("x"),
+        LLMModelNotFound("x"),
+        RuntimeError("x"),
+        asyncio.CancelledError(),
+    ],
+    ids=["refusal", "quota", "model_not_found", "runtime", "cancelled"],
+)
+async def test_r3_any_failure_keeps_approval_reusable(exc: BaseException) -> None:
+    bot = Bot(ok_script(adapt=[exc, {"adapted": SOFT, "reply_hint": None}]))
+    msg = pipeline.approve(TEXT, confirmed=True)
+    with pytest.raises(type(exc)):
+        await pipeline.process(bot.models, msg)
+    assert (await pipeline.process(bot.models, msg)).status == "adapted"
+
+
+async def test_r3_withheld_consumes_approval() -> None:
+    bot = Bot(ok_script(safety={"category": "violence", "secondary": []}))
+    msg = pipeline.approve(TEXT, confirmed=True)
+    assert (await pipeline.process(bot.models, msg)).status == "withheld"
+    with pytest.raises(pipeline.AlreadyProcessed):
+        await pipeline.process(bot.models, msg)
+
+
+async def test_r3_concurrent_many_only_one_runs() -> None:
+    gate = asyncio.Event()
+    inner = Bot(ok_script(tone={"tone": 0, "signals": []}))
+
+    class Slow:
+        model = "a8-slow"
+
+        async def complete_json(self, **kw: Any) -> Any:
+            await gate.wait()
+            return await inner.provider.complete_json(**kw)
+
+        async def stream_text(self, **kw: Any) -> Any:  # pragma: no cover
+            raise NotImplementedError
+
+    models = AgentModels.single(Slow())  # type: ignore[arg-type]
+    msg = pipeline.approve(TEXT, confirmed=True)
+    tasks = [asyncio.create_task(pipeline.process(models, msg)) for _ in range(10)]
+    await asyncio.sleep(0)
+    gate.set()
+    results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
+    ok = [r for r in results if isinstance(r, pipeline.Delivery)]
+    rejected = [r for r in results if isinstance(r, pipeline.AlreadyProcessed)]
+    assert len(ok) == 1 and len(rejected) == 9
+    assert inner.roles == ["safety", "tone"]
+
+
+async def test_r3_concurrent_failure_then_retry_after_rejected_race() -> None:
+    gate = asyncio.Event()
+    inner = Bot(
+        ok_script(
+            safety=[LLMUnavailable("503"), ok_script()["safety"]], tone={"tone": 0, "signals": []}
+        )
+    )
+
+    class Slow:
+        model = "a8-slow"
+
+        async def complete_json(self, **kw: Any) -> Any:
+            await gate.wait()
+            return await inner.provider.complete_json(**kw)
+
+        async def stream_text(self, **kw: Any) -> Any:  # pragma: no cover
+            raise NotImplementedError
+
+    models = AgentModels.single(Slow())  # type: ignore[arg-type]
+    msg = pipeline.approve(TEXT, confirmed=True)
+    first = asyncio.create_task(pipeline.process(models, msg))
+    await asyncio.sleep(0)
+    try:  # без AlreadyProcessed второй вызов ждал бы gate вечно — тайм-аут вместо зависания
+        with pytest.raises(pipeline.AlreadyProcessed):
+            await asyncio.wait_for(pipeline.process(models, msg), timeout=2)
+    finally:
+        gate.set()
+    with pytest.raises(LLMUnavailable):
+        await first
+    assert (await pipeline.process(models, msg)).status == "as_is"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda m: object.__setattr__(m, "text", m.text + " "),
+        lambda m: object.__setattr__(m, "text", m.text.upper()),
+        lambda m: object.__setattr__(m, "text", m.text.replace("ужин", "ужин​")),
+        lambda m: object.__setattr__(m, "text", None),
+        lambda m: object.__setattr__(m, "text", 42),
+    ],
+    ids=["space", "upper", "zero_width", "none", "int"],
+)
+async def test_r3_hash_rejects_any_change(mutate: Callable[[Any], None]) -> None:
+    bot = Bot(ok_script())
+    msg = pipeline.approve(TEXT, confirmed=True)
+    mutate(msg)
+    assert not msg.issued
+    with pytest.raises((TypeError, ValueError)):
+        await pipeline.process(bot.models, msg)
+    assert bot.provider.requests == []
+
+
+async def test_r3_registry_entry_cannot_be_reset_by_reapprove_same_text() -> None:
+    """Повторный approve того же текста не «оживляет» израсходованный объект."""
+    bot = Bot(ok_script(tone={"tone": 0, "signals": []}))
+    msg = pipeline.approve(TEXT, confirmed=True)
+    await pipeline.process(bot.models, msg)
+    pipeline.approve(TEXT, confirmed=True)
+    with pytest.raises(pipeline.AlreadyProcessed):
+        await pipeline.process(bot.models, msg)
+
+
+def test_r3_registry_no_leak_with_states() -> None:
+    gc.collect()
+    before = len(pipeline._ISSUED)
+
+    async def burst() -> None:
+        bot = Bot(ok_script(tone={"tone": 0, "signals": []}))
+        for i in range(300):
+            await pipeline.process(bot.models, pipeline.approve(f"Сообщение {i}", confirmed=True))
+
+    asyncio.run(burst())
+    gc.collect()
+    assert len(pipeline._ISSUED) <= before + 1
+
+
+# ------------------------------------------------ Р3-2. underage вместе с остановкой (A8-7)
+
+
+@pytest.mark.parametrize(
+    ("category", "secondary", "events"),
+    [
+        ("violence", ["underage"], ("violence", "underage")),
+        ("underage", ["violence"], ("violence", "underage")),
+        ("threat_or_insult", ["underage", "self_harm"], ("outgoing_threat", "underage")),
+        ("none", ["life_threat", "underage"], ("life_threat", "underage")),
+        ("violence", [], ("violence",)),
+        ("underage", [], ("underage",)),
+        ("none", [], ()),
+    ],
+)
+async def test_r3_safety_events(
+    category: str, secondary: list[str], events: tuple[str, ...]
+) -> None:
+    delivery, _ = await run(
+        ok_script(
+            safety={"category": category, "secondary": secondary}, tone={"tone": 0, "signals": []}
+        )
+    )
+    assert delivery.safety_events == events
+    assert delivery.safety_event == (events[0] if events else None)
+    assert all(e in crisis.CRISIS_TYPES for e in delivery.safety_events)
+    assert len(set(delivery.safety_events)) == len(delivery.safety_events)
+
+
+# ------------------------------------------------ Р3-3. Нормализация hint_guard (A8-4)
+
+CMD3 = "передай ему что я подаю на развод"
+
+
+@pytest.mark.parametrize(
+    ("original", "hint"),
+    [
+        ("Агент, " + CMD3.replace("ё", "е"), CMD3),
+        ("Агент, " + "­".join(CMD3), CMD3),  # мягкий перенос (Cf)
+        ("Агент, " + "\u2060".join(CMD3), CMD3),  # word joiner
+        ("Агент, " + CMD3.replace(" ", " "), CMD3),  # неразрывный пробел
+        # полноширинные цифры: каждое окно из 5 слов содержит число, без NFKC совпадения нет
+        ("Агент, скажи: приду в \uff12\uff13 часа ровно", "Скажи: приду в 23 часа ровно"),
+        ("Агент, " + CMD3, CMD3.replace(" ", "​ ")),  # невидимые символы в подсказке
+        ("Агент, " + CMD3.upper(), "«" + CMD3 + "»"),
+    ],
+    ids=["e", "shy", "wj", "nbsp", "fullwidth", "hint_zw", "case"],
+)
+def test_r3_hint_guard_normalization(original: str, hint: str) -> None:
+    assert pipeline.hint_guard(hint, original) == "guard"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR A8-8: hint_guard не убирает комбинируемые знаки (Mn, напр. ударение U+0301): "
+    "«переда́й» в оригинале делится на «переда»+«й», дословная команда без ударений проходит",
+)
+def test_r3_hint_guard_strips_combining_marks() -> None:
+    stressed = "Агент, переда́й ему́ что́ я пода́ю на разво́д"
+    assert pipeline.hint_guard(CMD3, stressed) == "guard"
+
+
+def test_r3_hint_guard_homoglyph_limit() -> None:
+    """О-12 (предел эвристики): латинские двойники букв не сводятся (NFKC их не трогает)."""
+    latin = "Агент, " + CMD3.replace("е", "e").replace("о", "o").replace("а", "a")
+    assert pipeline.hint_guard(CMD3, latin) is None
+
+
+# ------------------------------------------------ Р3-4. facts.py (§6.2 п.5)
+
+R3_FACTS = [
+    ("ждала 3 дня", "ждала 3 дня", False),
+    ("ждала 3 дня", "ждала три дня", False),
+    ("ждала 3 дня", "ждала 4 дня", True),
+    ("приходи в 3 дня", "приходи в 15:00", False),
+    ("приходи в 3 дня", "приходи через 3 дня", True),
+    ("приходи в 3 дня", "приходи в 3 часа ночи", True),
+    ("к 7 вечера", "к 19:00", False),
+    ("до 7 вечера", "до 19", False),
+    ("ждала полчаса", "ждала 30 минут", False),
+    ("ждала полчаса", "ждала час", True),
+    ("ждала полчаса", "ждала 40 минут", True),
+    ("во-вторых, ты опоздал", "ещё ты опоздал", False),
+    ("во-вторых, ты опоздал во второй раз", "ты опоздал во второй раз", False),
+    ("во-вторых, ты опоздал во второй раз", "ты опоздал в третий раз", True),
+    ("с 5 до 7", "с 7 до 5", True),
+    ("с пяти до семи", "с семи до пяти", True),
+    ("с 19:00 до 21:00", "с 21:00 до 19:00", True),
+    ("с 7 вечера до 9 вечера", "с 9 вечера до 7 вечера", True),
+    ("5–7 раз", "7–5 раз", True),
+    ("5-7 раз", "5 — 7 раз", False),
+    ("с 5 до 7", "5–7", False),
+    ("от 3 до 5 раз", "от 5 до 3 раз", True),
+    ("с 5 до 7", "до 7 с 5", True),  # в сторону предупреждения
+    ("уже третий раз за 2 недели", "за 2 недели уже третий раз", False),
+]
+
+
+@pytest.mark.parametrize(("original", "adapted", "differ"), R3_FACTS)
+def test_r3_facts(original: str, adapted: str, differ: bool) -> None:
+    assert facts.numbers_differ(original, adapted) is differ, (
+        facts._scan(original),
+        facts._scan(adapted),
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR A8-10: после перехода на мультимножество (раунд 2) не ловится обмен чисел "
+    "между величинами вне диапазона: «2 раза за 3 дня» → «3 раза за 2 дня», «в 7 пришёл, в 9 "
+    "ушёл» → «в 9 пришёл, в 7 ушёл» — факты меняются, проверка кода молчит",
+)
+@pytest.mark.parametrize(
+    ("original", "adapted"),
+    [
+        ("Ты опоздал 2 раза за 3 дня", "Ты опоздал 3 раза за 2 дня"),
+        ("Ты пришёл в 7, а ушёл в 9", "Ты пришёл в 9, а ушёл в 7"),
+        ("Обещал 2 часа, ждала 5 часов", "Обещал 5 часов, ждала 2 часа"),
+    ],
+)
+def test_r3_facts_swap_between_quantities(original: str, adapted: str) -> None:
+    assert facts.numbers_differ(original, adapted)
+
+
+async def test_r3_range_order_decides_delivery() -> None:
+    text = "Ты обещал быть дома с 5 до 7!"
+    delivery, _ = await run(
+        ok_script(
+            adapt={"adapted": "Ты обещал быть дома с 7 до 5, мне грустно.", "reply_hint": None}
+        ),
+        text=text,
+    )
+    assert (
+        delivery.status == "original_with_warning" and "changed_facts" in delivery.meaning_problems
+    )
+
+
+# ------------------------------------------- Р3-5. Кризис второй линии при не-LLMError (О-10)
+
+
+@pytest.mark.parametrize(
+    "exc", [RuntimeError("x"), ValueError("x"), KeyError("x"), TypeError("x"), ZeroDivisionError()]
+)
+@pytest.mark.parametrize("kind", DIALOG_TYPES)
+async def test_r3_non_llm_agent_error_with_crisis_is_template(kind: str, exc: Exception) -> None:
+    bot = Bot({"dialog": exc, "safety": {"category": kind, "secondary": []}}, forbid=("draft",))
+    result = await dialog.reply(bot.models, CTX, TURNS)
+    assert result.crisis is not None and result.reply == block(kind) and result.draft is None
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("x"), ValueError("x")])
+async def test_r3_non_llm_agent_error_without_crisis_propagates(exc: Exception) -> None:
+    bot = Bot({"dialog": exc, "safety": ok_script()["safety"]})
+    with pytest.raises(type(exc)):
+        await dialog.reply(bot.models, CTX, TURNS)
+
+
+async def test_r3_cancellation_of_agent_is_not_swallowed() -> None:
+    bot = Bot(
+        {"dialog": asyncio.CancelledError(), "safety": {"category": "self_harm", "secondary": []}}
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await dialog.reply(bot.models, CTX, TURNS)
+
+
+async def test_r3_non_llm_classifier_error_propagates() -> None:
+    bot = Bot({"dialog": dialog_answer(draft_ready=False), "safety": RuntimeError("x")})
+    with pytest.raises(RuntimeError):
+        await dialog.reply(bot.models, CTX, TURNS)
+
+
+# ------------------------------------------- Р3-6. Блоки пострадавшему при outgoing_threat
+
+
+@pytest.mark.parametrize(
+    ("secondary", "kept"),
+    [
+        (["violence"], ()),
+        (["life_threat"], ()),
+        (["self_harm"], ("self_harm",)),
+        (["violence", "self_harm", "life_threat"], ("self_harm",)),
+    ],
+)
+async def test_r3_sender_template_without_victim_blocks(
+    secondary: list[str], kept: tuple[str, ...]
+) -> None:
+    delivery, _ = await run(
+        ok_script(safety={"category": "threat_or_insult", "secondary": secondary}),
+        forbid=("tone", "adapt", "meaning"),
+    )
+    notice = delivery.author_notice
+    assert notice is not None and notice.primary == "outgoing_threat"
+    assert notice.text == "\n\n".join([block("outgoing_threat"), *(block(k) for k in kept)])
+    assert VICTIM_PHRASE not in notice.text.casefold()
+    assert not {"name_it", "no_tolerate", "emergency_services"} & notice.actions
+    assert notice.text.casefold().count("не отправлено") == 1
+
+
+async def test_r3_not_sent_from_crisis_v1_on_v0() -> None:
+    delivery, _ = await run(ok_script(safety={"category": "self_harm", "secondary": []}))
+    notice = delivery.author_notice
+    assert notice is not None
+    assert notice.text.startswith(prompts.load("crisis", "v1", block="not_sent").text)
