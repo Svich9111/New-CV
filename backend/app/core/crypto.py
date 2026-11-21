@@ -45,8 +45,13 @@ class KeyConfigError(ConfigError):
     """Неверный набор ключей. В тексте — только имя переменной и id ключа, не значение."""
 
 
+# Код причины: контекст (id строки для связанных данных) потерян — например, удалён черновик
+# отправленного сообщения (BACKLOG Б-38). Отличается от `auth` — подделки или чужого ключа.
+CONTEXT_MISSING = "context"
+
+
 class DecryptionError(Exception):
-    """Шифротекст отвергнут. `reason`: format, unknown_key, auth, encoding."""
+    """Шифротекст отвергнут. `reason`: format, unknown_key, auth, encoding, context."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(f"ciphertext rejected: {reason}")

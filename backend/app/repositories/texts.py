@@ -14,6 +14,7 @@
 которые пишут тексты, до 4.2 не было. Тексты в журналы не пишутся; параметры запросов скрыты
 (`make_engine(hide_parameters=True)`)."""
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,13 +29,17 @@ from app.db import user_scope
 
 Author = Literal["owner", "agent"]
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class ConversationText:
     id: uuid.UUID
     author: str
-    text: str
+    text: str | None
     created_at: datetime
+    # Код причины (DecryptionError.reason), если текст не расшифровался; тогда text = None.
+    unavailable: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,7 +47,8 @@ class MemoryText:
     id: uuid.UUID
     type: str
     source: str
-    text: str
+    text: str | None
+    unavailable: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,10 +67,32 @@ class FeedText:
     is_adapted: bool
     status: str
     sent_at: datetime
+    unavailable: str | None = None
 
 
 def _uuid(value: object) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+def _open_row(
+    keys: Keyring, field: crypto.Field, row_id: uuid.UUID | None, blob: bytes
+) -> tuple[str | None, str | None]:
+    """Чтение одной строки из многих: отказ расшифровки не роняет весь список.
+    `row_id=None` — контекст потерян (код `context`). → (текст, None) или (None, код причины).
+    В журнал — только код причины и колонка: ни текста, ни id пользователя или строки
+    (ТЗ §9.1 п.5)."""
+    try:
+        if row_id is None:
+            raise crypto.DecryptionError(crypto.CONTEXT_MISSING)
+        return keys.open(field, row_id, blob), None
+    except crypto.DecryptionError as exc:
+        logger.warning(
+            "encrypted text unavailable: field=%s.%s reason=%s",
+            field.table,
+            field.column,
+            exc.reason,
+        )
+        return None, exc.reason
 
 
 # --- Личный чат с агентом (ФТ-05) ---------------------------------------------------------
@@ -110,15 +138,12 @@ async def list_conversation_messages(
             ),
             {"c": conversation_id},
         )
-        return [
-            ConversationText(
-                id=_uuid(r.id),
-                author=r.author,
-                text=keys.open(crypto.CONVERSATION_MESSAGE_TEXT, _uuid(r.id), r.text_enc),
-                created_at=r.created_at,
-            )
-            for r in rows
-        ]
+        result = []
+        for r in rows:
+            row_id = _uuid(r.id)
+            body, reason = _open_row(keys, crypto.CONVERSATION_MESSAGE_TEXT, row_id, r.text_enc)
+            result.append(ConversationText(row_id, r.author, body, r.created_at, reason))
+        return result
 
 
 async def set_conversation_summary(
@@ -234,15 +259,12 @@ async def list_memory_items(
             ),
             {"a": agent_id},
         )
-        return [
-            MemoryText(
-                id=_uuid(r.id),
-                type=r.type,
-                source=r.source,
-                text=keys.open(crypto.MEMORY_TEXT, _uuid(r.id), r.text_enc),
-            )
-            for r in rows
-        ]
+        result = []
+        for r in rows:
+            row_id = _uuid(r.id)
+            body, reason = _open_row(keys, crypto.MEMORY_TEXT, row_id, r.text_enc)
+            result.append(MemoryText(row_id, r.type, r.source, body, reason))
+        return result
 
 
 # --- Черновик и сообщение пары (ФТ-07…ФТ-11) -------------------------------------------------
@@ -357,20 +379,27 @@ async def read_feed(
         result = []
         for r in rows:
             msg_id = _uuid(r.id)
+            body: str | None = None
+            reason: str | None = None
             if r.text_enc is None:
-                body = None
-            elif r.outgoing:
-                body = _open_original(keys, r.draft_id, r.text_enc)
+                pass
+            elif not r.outgoing:
+                body, reason = _open_row(keys, crypto.MESSAGE_ADAPTED, msg_id, r.text_enc)
             else:
-                body = keys.open(crypto.MESSAGE_ADAPTED, msg_id, r.text_enc)
-            result.append(FeedText(msg_id, r.outgoing, body, r.is_adapted, r.status, r.sent_at))
+                # Оригинал — с контекстом черновика; черновик удалён → `context` (Б-38).
+                draft = None if r.draft_id is None else _uuid(r.draft_id)
+                body, reason = _open_row(keys, crypto.MESSAGE_ORIGINAL, draft, r.text_enc)
+            result.append(
+                FeedText(msg_id, r.outgoing, body, r.is_adapted, r.status, r.sent_at, reason)
+            )
         return result
 
 
 def _open_original(keys: Keyring, draft_id: object, blob: bytes) -> str:
-    """Оригинал расшифровывается с контекстом своего черновика; без черновика — отказ."""
+    """Оригинал расшифровывается с контекстом своего черновика; без черновика — отказ с
+    кодом `context` (потерян контекст), отличимым от подделки (`auth`)."""
     if draft_id is None:
-        raise crypto.DecryptionError("auth")
+        raise crypto.DecryptionError(crypto.CONTEXT_MISSING)
     return keys.open(crypto.MESSAGE_ORIGINAL, _uuid(draft_id), blob)
 
 
@@ -380,7 +409,9 @@ async def read_original(
     user_id: uuid.UUID,
     message_id: uuid.UUID,
 ) -> str | None:
-    """«Показать оригинал» (ФТ-10): получателю — с фиксацией просмотра (функция БД)."""
+    """«Показать оригинал» (ФТ-10): получателю — с фиксацией просмотра (функция БД).
+    Расшифровка — внутри той же транзакции: если она не удалась, `DecryptionError` откатывает
+    и отметку `original_viewed_at` — просмотр засчитывается, только когда текст показан (ТЗ §7)."""
     async with user_scope(sm, user_id) as s:
         row = (
             await s.execute(
@@ -391,9 +422,9 @@ async def read_original(
                 {"m": message_id},
             )
         ).one()
-    if row.blob is None:
-        return None
-    return _open_original(keys, row.draft_id, row.blob)
+        if row.blob is None:
+            return None
+        return _open_original(keys, row.draft_id, row.blob)
 
 
 # --- Конвейер (задача 3.2): сессия уже под ролью feelings_worker --------------------------

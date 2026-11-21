@@ -327,8 +327,33 @@ async def encrypted_world(world: World, engine: AsyncEngine) -> World:
     return world
 
 
+# Типы, в которых текст храниться не может: их колонки не перебираются. Любой другой тип
+# (новый в схеме) — провал теста, а не молчаливый пропуск (ревью 4.2 MINOR-4).
+NON_TEXT_TYPES = frozenset(
+    {
+        "uuid",
+        "smallint",
+        "integer",
+        "bigint",
+        "double precision",
+        "real",
+        "numeric",
+        "boolean",
+        "date",
+        "timestamp with time zone",
+        "timestamp without time zone",
+    }
+)
+# bytea — побайтно; текстовые, json, массивы (ARRAY) и USER-DEFINED (перечисления, vector) —
+# через приведение к text.
+SEARCHED_TYPES = frozenset(
+    {"bytea", "text", "character varying", "character", "jsonb", "json", "ARRAY", "USER-DEFINED"}
+)
+
+
 async def _plaintext_hits(engine: AsyncEngine, needle: str) -> list[str]:
-    """Все bytea/text/varchar/jsonb колонки всех таблиц public, где встречается подстрока."""
+    """Все колонки всех таблиц public, где встречается подстрока (по всем текстоподобным
+    типам; неизвестный тип колонки — ошибка теста)."""
     hits = []
     async with engine.connect() as conn:
         cols = (
@@ -337,14 +362,15 @@ async def _plaintext_hits(engine: AsyncEngine, needle: str) -> list[str]:
                     "SELECT c.table_name, c.column_name, c.data_type "
                     "FROM information_schema.columns c JOIN information_schema.tables t "
                     "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
-                    "WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' "
-                    "AND c.data_type IN ('bytea', 'text', 'character varying', 'character', "
-                    "'jsonb', 'json')"
+                    "WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'"
                 )
             )
         ).all()
-        assert any(c.data_type == "bytea" for c in cols)
-        for table, column, data_type in cols:
+        unknown = {c.data_type for c in cols} - NON_TEXT_TYPES - SEARCHED_TYPES
+        assert not unknown, f"неучтённые типы колонок: {unknown}"
+        searched = [c for c in cols if c.data_type in SEARCHED_TYPES]
+        assert {"bytea", "ARRAY", "USER-DEFINED"} <= {c.data_type for c in searched}
+        for table, column, data_type in searched:
             if data_type == "bytea":
                 cond = f'position(CAST(:n AS bytea) IN "{column}") > 0'
                 param: object = needle.encode()
@@ -525,8 +551,88 @@ async def test_swapped_ciphertext_between_rows_is_rejected(
             ),
             {"f": first, "s": second},
         )
-    with pytest.raises(DecryptionError):
-        await texts.list_memory_items(sessionmaker, keys, a.user_id, a.agent_id)
+    # Список не падает целиком: подменённая строка помечена недоступной, остальные читаются.
+    items = {
+        m.id: m for m in await texts.list_memory_items(sessionmaker, keys, a.user_id, a.agent_id)
+    }
+    assert items[first].text == "первое" and items[first].unavailable is None
+    assert items[second].text is None and items[second].unavailable == "auth"
+
+
+async def _send_and_deliver(
+    w: World,
+    sm: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    kr: Keyring,
+    body: str,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    draft = await texts.create_draft(sm, kr, w.a.user_id, w.a.agent_id, body)
+    msg = await texts.send_draft(sm, w.a.user_id, draft, 1)
+    async with engine.begin() as conn, AsyncSession(bind=conn) as s:
+        await s.execute(text("SET LOCAL ROLE feelings_worker"))
+        assert await texts.pipeline_deliver(s, kr, msg, body, is_adapted=False, tone=0, harsh=False)
+    return draft, msg
+
+
+async def test_feed_survives_deleted_draft(
+    encrypted_world: World,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    keys: Keyring,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Ревью 4.2 MAJOR-1: удалённый черновик (контекст оригинала потерян, Б-38) не роняет
+    ленту автора: запись помечена недоступной с кодом `context`, остальные на месте."""
+    w = encrypted_world
+    tag = uuid.uuid4().hex
+    lost_draft, lost = await _send_and_deliver(w, sessionmaker, engine, keys, f"потерян {tag}")
+    _, kept = await _send_and_deliver(w, sessionmaker, engine, keys, f"на месте {tag}")
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM message_drafts WHERE id = :d"), {"d": lost_draft})
+    caplog.set_level(logging.DEBUG)
+    feed = {f.id: f for f in await texts.read_feed(sessionmaker, keys, w.a.user_id)}
+    assert feed[lost].text is None and feed[lost].unavailable == crypto.CONTEXT_MISSING
+    assert feed[kept].text == f"на месте {tag}" and feed[kept].unavailable is None
+    # Получатель читает свою версию (adapted_enc) — она от черновика не зависит.
+    partner = {f.id: f for f in await texts.read_feed(sessionmaker, keys, w.b.user_id)}
+    assert partner[lost].text == f"потерян {tag}"
+    assert "reason=context" in caplog.text
+    for secret in (tag, str(w.a.user_id), str(lost), str(lost_draft)):
+        assert secret not in caplog.text
+
+
+async def test_failed_original_is_not_counted_as_viewed(
+    encrypted_world: World,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    keys: Keyring,
+) -> None:
+    """Ревью 4.2 MINOR-3: оригинал не расшифровался → просмотр не засчитан (откат), код причины
+    `context` отличим от подделки `auth` (MINOR-1)."""
+    w = encrypted_world
+    draft, msg = await _send_and_deliver(w, sessionmaker, engine, keys, "оригинал")
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM message_drafts WHERE id = :d"), {"d": draft})
+    with pytest.raises(DecryptionError) as exc:
+        await texts.read_original(sessionmaker, keys, w.b.user_id, msg)
+    assert exc.value.reason == crypto.CONTEXT_MISSING
+    async with engine.connect() as conn:
+        viewed = (
+            await conn.execute(
+                text("SELECT original_viewed_at FROM partner_messages WHERE id = :m"), {"m": msg}
+            )
+        ).scalar_one()
+    assert viewed is None
+    # Подделка — другой код; удачный показ засчитывается.
+    _, other = await _send_and_deliver(w, sessionmaker, engine, keys, "другой")
+    assert await texts.read_original(sessionmaker, keys, w.b.user_id, other) == "другой"
+    async with engine.connect() as conn:
+        viewed = (
+            await conn.execute(
+                text("SELECT original_viewed_at FROM partner_messages WHERE id = :m"), {"m": other}
+            )
+        ).scalar_one()
+    assert viewed is not None
 
 
 async def test_db_functions_pass_ciphertext_as_opaque_bytes(
