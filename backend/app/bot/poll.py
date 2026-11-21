@@ -51,7 +51,10 @@ CONFIRM_HTTP_TIMEOUT = httpx.Timeout(5.0)
 RETRY_DELAYS_S: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
 # Неверный токен: повторять бесполезно.
 FATAL_ERROR_CODES = frozenset({401, 404})
-PRODUCTION_ENVS = frozenset({"prod", "production"})
+# Опрос удаляет вебхук бота, поэтому разрешён только в явно непродуктивных окружениях (A8 1.4 D-5):
+# список разрешённых, а не запрещённых — «prd», «live» и т. п. не пройдут. По умолчанию
+# Settings.env = "dev": на продуктивном сервере FEELINGS_ENV обязателен и не dev/test/local.
+DEV_ENVS = frozenset({"dev", "test", "local"})
 
 log = logging.getLogger("app.bot")
 
@@ -136,8 +139,11 @@ async def poll_updates(
             break
         sent_offset = offset
         if not isinstance(batch, list):
-            log.warning("getUpdates: unexpected result, ignored")
-            batch = []
+            # Настоящий Telegram так не отвечает; без паузы повтор шёл бы вплотную (A8 1.4 D-4).
+            delay = next_delay()
+            log.warning("getUpdates: unexpected result; retry in %.0f s", delay)
+            await _pause(stop, delay)
+            continue
         retry = False
         for update in batch:
             if stop.is_set():
@@ -177,8 +183,11 @@ async def poll_updates(
 def check_poll_config(settings: Settings) -> None:
     """Только разработка: токен и https-адрес Mini App; секрет вебхука и БД не нужны."""
     check_dev_bot_config(settings)
-    if settings.env.strip().lower() in PRODUCTION_ENVS:
-        raise ConfigError("app.bot.poll is for development only; production uses the webhook")
+    if settings.env.strip().lower() not in DEV_ENVS:
+        raise ConfigError(
+            "app.bot.poll is for development only (FEELINGS_ENV must be dev, test or local); "
+            "production uses the webhook"
+        )
 
 
 async def run(

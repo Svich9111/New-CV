@@ -1296,8 +1296,11 @@ def test_dev_bot_config_requires_token_and_https_webapp(field: str, value: Any) 
     assert TOKEN not in str(exc.value)
 
 
-@pytest.mark.parametrize("env", ["prod", "production", " PROD "])
+@pytest.mark.parametrize(
+    "env", ["prod", "production", " PROD ", "prd", "live", "staging", "", "development"]
+)
 async def test_poll_refuses_production_env(env: str) -> None:
+    """A8 D-5: разрешённый список окружений — всё, кроме dev/test/local, отклоняется."""
     stop = asyncio.Event()
     tg = PollTelegram(stop)
     with pytest.raises(ConfigError, match="development only"):
@@ -1446,3 +1449,41 @@ def test_check_main_requires_token(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(SystemExit) as info:
         check_module.main()
     assert "FEELINGS_TELEGRAM_BOT_TOKEN" in str(info.value.code)
+
+
+@pytest.mark.parametrize("env", ["dev", "test", "local", "DEV", " Local "])
+def test_poll_allows_only_dev_envs(env: str) -> None:
+    poll_module.check_poll_config(_dev_settings(env=env))
+
+
+def test_poll_default_env_is_dev() -> None:
+    """По умолчанию Settings.env = "dev" — опрос разрешён (осознанно, для разработчика);
+    на продуктиве FEELINGS_ENV обязателен (bot/README.md)."""
+    assert Settings.model_fields["env"].default == "dev"
+    poll_module.check_poll_config(_dev_settings())
+
+
+@pytest.mark.parametrize("result", [{"not": "a list"}, None, "junk", 7])
+async def test_poll_non_list_result_is_transient_with_pause(
+    result: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A8 D-4: ok:true с результатом не списком — временный сбой: пауза перед повтором."""
+    caplog.set_level(logging.DEBUG)
+    stop = asyncio.Event()
+    tg = PollTelegram(stop)
+    u = _message("/start")
+    bad = httpx.Response(200, json={"ok": True, "result": result})
+    tg.batches = [bad, bad, [u]]
+    pauses: list[float] = []
+    real_pause = poll_module._pause
+
+    async def spy(stop_event: asyncio.Event, delay: float) -> None:
+        pauses.append(delay)
+        await real_pause(stop_event, 0.0)
+
+    monkeypatch.setattr(poll_module, "_pause", spy)
+    offset = await _run_poll(tg, stop)
+    assert pauses == [0.0, 0.01]  # нарастающая пауза (retry_delays теста)
+    assert offset == u["update_id"] + 1
+    assert len(tg.sent()) == 1
+    assert "unexpected result; retry in" in caplog.text
