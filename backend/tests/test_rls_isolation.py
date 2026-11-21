@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, IntegrityError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.db import user_scope
@@ -115,12 +115,17 @@ async def _ids(s: AsyncSession, sql: str) -> set[uuid.UUID]:
     return {r[0] for r in await s.execute(text(sql))}
 
 
+# Без JOIN с agents: иначе отключённый RLS дочерней таблицы маскируется RLS агентов (D-9).
 PRIVATE_QUERIES = {
-    "agents": "SELECT user_id FROM agents",
-    "conversations": "SELECT a.user_id FROM conversations c JOIN agents a ON a.id = c.agent_id",
-    "memory_items": "SELECT a.user_id FROM memory_items m JOIN agents a ON a.id = m.agent_id",
-    "message_drafts": "SELECT a.user_id FROM message_drafts d JOIN agents a ON a.id = d.agent_id",
-    "users": "SELECT id FROM users",
+    "agents": ("SELECT id FROM agents", "agent_id"),
+    "conversations": ("SELECT id FROM conversations", "conversation_id"),
+    "memory_items": ("SELECT DISTINCT agent_id FROM memory_items", "agent_id"),
+    "message_drafts": ("SELECT DISTINCT agent_id FROM message_drafts", "agent_id"),
+    "conversation_messages": (
+        "SELECT DISTINCT conversation_id FROM conversation_messages",
+        "conversation_id",
+    ),
+    "users": ("SELECT id FROM users", "user_id"),
 }
 
 
@@ -129,9 +134,10 @@ async def test_private_data_visible_only_to_owner(
     world: World, sessionmaker: async_sessionmaker[AsyncSession], table: str
 ) -> None:
     """Личный чат, черновики и память читает только владелец (ТЗ §7); партнёр — тоже нет."""
+    sql, attr = PRIVATE_QUERIES[table]
     for person in (world.a, world.b, world.c):
         async with user_scope(sessionmaker, person.user_id) as s:
-            assert await _ids(s, PRIVATE_QUERIES[table]) == {person.user_id}
+            assert await _ids(s, sql) == {getattr(person, attr)}
 
 
 async def test_partner_cannot_read_owner_conversation_messages(
@@ -183,7 +189,7 @@ async def test_no_user_context_sees_nothing(
     world: World, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
     async with user_scope(sessionmaker, None) as s:
-        for sql in PRIVATE_QUERIES.values():
+        for sql, _ in PRIVATE_QUERIES.values():
             assert await _ids(s, sql) == set()
         assert await _ids(s, "SELECT id FROM partner_messages") == set()
 
@@ -221,8 +227,8 @@ async def test_cannot_update_or_delete_partner_memory(
 async def test_cannot_send_message_as_partner(
     world: World, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    """Слова остаются вашими (ТЗ §2 п.2): нельзя создать сообщение от имени партнёра."""
-    with pytest.raises(ProgrammingError, match="row-level security"):
+    """Слова остаются вашими (ТЗ §2 п.2): прямой INSERT в partner_messages закрыт."""
+    with pytest.raises(ProgrammingError, match=r"permission denied|row-level security"):
         async with user_scope(sessionmaker, world.a.user_id) as s:
             await s.execute(
                 text(
@@ -236,7 +242,7 @@ async def test_cannot_send_message_as_partner(
 async def test_outsider_cannot_send_into_couple(
     world: World, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    with pytest.raises(ProgrammingError, match="row-level security"):
+    with pytest.raises(ProgrammingError, match=r"permission denied|row-level security"):
         async with user_scope(sessionmaker, world.c.user_id) as s:
             await s.execute(
                 text(
@@ -247,17 +253,30 @@ async def test_outsider_cannot_send_into_couple(
             )
 
 
+async def _draft_id(s: AsyncSession) -> uuid.UUID:
+    return (await s.execute(text("SELECT id FROM message_drafts LIMIT 1"))).scalar_one()
+
+
 async def test_member_can_send_within_active_couple(
     world: World, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
+    """«Отправить» создаёт сообщение из своего черновика; черновик становится sent (ФТ-08)."""
     async with user_scope(sessionmaker, world.b.user_id) as s:
-        await s.execute(
-            text(
-                "INSERT INTO partner_messages (id, couple_id, author_id, recipient_id, "
-                "original_enc) VALUES (:m, :c, :b, :a, 'otvet')"
-            ),
-            {"m": uuid.uuid4(), "c": world.couple_id, "a": world.a.user_id, "b": world.b.user_id},
+        draft = await _draft_id(s)
+        msg = (await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": draft})).scalar_one()
+        status = await s.execute(
+            text("SELECT status FROM message_drafts WHERE id = :d"), {"d": draft}
         )
+        assert status.scalar_one() == "sent"
+        row = (
+            await s.execute(
+                text(
+                    "SELECT author_id, recipient_id, status, draft_id FROM partner_messages WHERE id = :m"
+                ),
+                {"m": msg},
+            )
+        ).one()
+    assert tuple(row) == (world.b.user_id, world.a.user_id, "processing", draft)
 
 
 async def test_no_sending_after_leaving_couple_but_history_readable(
@@ -272,15 +291,9 @@ async def test_no_sending_after_leaving_couple_but_history_readable(
             ),
             {"c": world.couple_id, "a": world.a.user_id},
         )
-    with pytest.raises(ProgrammingError, match="row-level security"):
+    with pytest.raises(DBAPIError, match="no active couple"):
         async with user_scope(sessionmaker, world.b.user_id) as s:
-            await s.execute(
-                text(
-                    "INSERT INTO partner_messages (couple_id, author_id, recipient_id, "
-                    "original_enc) VALUES (:c, :b, :a, 'x')"
-                ),
-                {"c": world.couple_id, "a": world.a.user_id, "b": world.b.user_id},
-            )
+            await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": await _draft_id(s)})
     async with user_scope(sessionmaker, world.a.user_id) as s:
         assert await _ids(s, "SELECT id FROM partner_messages") == {world.message_id}
 
@@ -464,7 +477,7 @@ async def test_cannot_join_couple_by_known_id(
             {"c": pending, "u": world.c.user_id},
         )
     for role in ("partner", "initiator"):
-        with pytest.raises(ProgrammingError, match="row-level security"):
+        with pytest.raises(ProgrammingError, match=r"permission denied|row-level security"):
             async with user_scope(sessionmaker, outsider) as s:
                 await s.execute(
                     text(
@@ -494,9 +507,9 @@ async def test_left_member_cannot_rejoin_by_update(
             text("UPDATE couple_members SET active = false WHERE user_id = :a"),
             {"a": world.a.user_id},
         )
-    with pytest.raises(ProgrammingError, match="row-level security"):
-        async with user_scope(sessionmaker, world.a.user_id) as s:
-            await s.execute(
-                text("UPDATE couple_members SET active = true WHERE user_id = :a"),
-                {"a": world.a.user_id},
-            )
+    async with user_scope(sessionmaker, world.a.user_id) as s:
+        res = await s.execute(
+            text("UPDATE couple_members SET active = true WHERE user_id = :a"),
+            {"a": world.a.user_id},
+        )
+        assert res.rowcount == 0  # type: ignore[attr-defined]

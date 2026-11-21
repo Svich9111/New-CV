@@ -11,6 +11,8 @@ class Settings(BaseSettings):
 
     env: str = "dev"
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/feelings"
+    # Владелец схемы для Alembic; приложение под ним не работает.
+    migration_database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/feelings"
     redis_url: str = "redis://localhost:6379/0"
     telegram_bot_token: SecretStr = SecretStr("")
     # Максимальный возраст initData, секунд (ФТ-01)

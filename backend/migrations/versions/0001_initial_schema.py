@@ -2,7 +2,7 @@
 
 Revision ID: 0001
 Revises:
-Create Date: 2026-11-21 10:31:33.771227
+Create Date: 2026-11-21 10:49:31.547340
 
 """
 
@@ -34,6 +34,12 @@ def _create_tables() -> None:
             sa.DateTime(timezone=True),
             server_default=sa.text("now()"),
             nullable=False,
+        ),
+        sa.CheckConstraint(
+            "action ~ '^[a-z][a-z0-9_.]{0,63}$'", name=op.f("ck_audit_log_action_code")
+        ),
+        sa.CheckConstraint(
+            "object_type ~ '^[a-z][a-z0-9_]{0,63}$'", name=op.f("ck_audit_log_object_type_code")
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_audit_log")),
     )
@@ -91,6 +97,7 @@ def _create_tables() -> None:
         ),
         sa.Column("is_active", sa.Boolean(), server_default=sa.text("false"), nullable=False),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_prompt_versions")),
+        sa.UniqueConstraint("purpose", "version", name="uq_prompt_versions_purpose_version"),
     )
     op.create_index(
         "uq_prompt_versions_one_active",
@@ -223,6 +230,13 @@ def _create_tables() -> None:
         sa.PrimaryKeyConstraint("id", name=op.f("pk_invites")),
         sa.UniqueConstraint("token_hash", name=op.f("uq_invites_token_hash")),
     )
+    op.create_index(
+        "uq_invites_one_active_per_couple",
+        "invites",
+        ["couple_id"],
+        unique=True,
+        postgresql_where=sa.text("status = 'active'"),
+    )
     op.create_table(
         "kb_chunks",
         sa.Column("id", sa.UUID(), server_default=sa.text("gen_random_uuid()"), nullable=False),
@@ -254,7 +268,8 @@ def _create_tables() -> None:
         sa.Column("id", sa.UUID(), server_default=sa.text("gen_random_uuid()"), nullable=False),
         sa.Column("couple_id", sa.UUID(), nullable=False),
         sa.Column("author_id", sa.UUID(), nullable=False),
-        sa.Column("recipient_id", sa.UUID(), nullable=False),
+        sa.Column("recipient_id", sa.UUID(), nullable=True),
+        sa.Column("draft_id", sa.UUID(), nullable=True),
         sa.Column("reply_to_id", sa.UUID(), nullable=True),
         sa.Column("original_enc", sa.LargeBinary(), nullable=False),
         sa.Column("adapted_enc", sa.LargeBinary(), nullable=True),
@@ -265,7 +280,14 @@ def _create_tables() -> None:
         ),
         sa.Column(
             "status",
-            sa.Enum("processing", "delivered", "read", "answered", name="partner_message_status"),
+            sa.Enum(
+                "processing",
+                "withheld",
+                "delivered",
+                "read",
+                "answered",
+                name="partner_message_status",
+            ),
             server_default="processing",
             nullable=False,
         ),
@@ -303,7 +325,7 @@ def _create_tables() -> None:
             ["recipient_id"],
             ["users.id"],
             name=op.f("fk_partner_messages_recipient_id_users"),
-            ondelete="CASCADE",
+            ondelete="SET NULL",
         ),
         sa.ForeignKeyConstraint(
             ["reply_to_id"],
@@ -312,6 +334,7 @@ def _create_tables() -> None:
             ondelete="SET NULL",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_partner_messages")),
+        sa.UniqueConstraint("draft_id", name=op.f("uq_partner_messages_draft_id")),
     )
     op.create_index(
         op.f("ix_partner_messages_couple_id"), "partner_messages", ["couple_id"], unique=False
@@ -320,7 +343,18 @@ def _create_tables() -> None:
         "safety_events",
         sa.Column("id", sa.UUID(), server_default=sa.text("gen_random_uuid()"), nullable=False),
         sa.Column("user_id", sa.UUID(), nullable=False),
-        sa.Column("type", sa.String(length=64), nullable=False),
+        sa.Column(
+            "type",
+            sa.Enum(
+                "violence",
+                "threat_outgoing",
+                "self_harm",
+                "life_threat",
+                "underage",
+                name="safety_event_type",
+            ),
+            nullable=False,
+        ),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -434,6 +468,10 @@ def _create_tables() -> None:
             name=op.f("ck_memory_items_partner_source_consistent"),
         ),
         sa.CheckConstraint(
+            "source <> 'partner_message' OR source_message_id IS NOT NULL",
+            name=op.f("ck_memory_items_partner_source_has_message"),
+        ),
+        sa.CheckConstraint(
             "confidence >= 0 AND confidence <= 1", name=op.f("ck_memory_items_confidence_range")
         ),
         sa.CheckConstraint(
@@ -450,7 +488,7 @@ def _create_tables() -> None:
             ["source_message_id"],
             ["partner_messages.id"],
             name=op.f("fk_memory_items_source_message_id_partner_messages"),
-            ondelete="SET NULL",
+            ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_memory_items")),
     )
@@ -460,6 +498,7 @@ def _create_tables() -> None:
         sa.Column("id", sa.UUID(), server_default=sa.text("gen_random_uuid()"), nullable=False),
         sa.Column("agent_id", sa.UUID(), nullable=False),
         sa.Column("text_enc", sa.LargeBinary(), nullable=False),
+        sa.Column("reply_to_id", sa.UUID(), nullable=True),
         sa.Column("version", sa.Integer(), server_default=sa.text("1"), nullable=False),
         sa.Column(
             "status",
@@ -480,7 +519,21 @@ def _create_tables() -> None:
             name=op.f("fk_message_drafts_agent_id_agents"),
             ondelete="CASCADE",
         ),
+        sa.ForeignKeyConstraint(
+            ["reply_to_id"],
+            ["partner_messages.id"],
+            name=op.f("fk_message_drafts_reply_to_id_partner_messages"),
+            ondelete="SET NULL",
+        ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_message_drafts")),
+    )
+    op.create_foreign_key(
+        op.f("fk_partner_messages_draft_id_message_drafts"),
+        "partner_messages",
+        "message_drafts",
+        ["draft_id"],
+        ["id"],
+        ondelete="SET NULL",
     )
     op.create_index(
         op.f("ix_message_drafts_agent_id"), "message_drafts", ["agent_id"], unique=False
@@ -547,6 +600,9 @@ def _create_tables() -> None:
 
 
 def _drop_tables() -> None:
+    op.drop_constraint(
+        "fk_partner_messages_draft_id_message_drafts", "partner_messages", type_="foreignkey"
+    )
     # ### commands auto generated by Alembic - please adjust! ###
     op.drop_index(
         op.f("ix_conversation_messages_conversation_id"), table_name="conversation_messages"
@@ -568,6 +624,11 @@ def _drop_tables() -> None:
     op.drop_table("partner_messages")
     op.drop_index(op.f("ix_kb_chunks_document_id"), table_name="kb_chunks")
     op.drop_table("kb_chunks")
+    op.drop_index(
+        "uq_invites_one_active_per_couple",
+        table_name="invites",
+        postgresql_where=sa.text("status = 'active'"),
+    )
     op.drop_table("invites")
     op.drop_index(
         "uq_couple_members_one_active_per_user",
@@ -601,6 +662,7 @@ ENUMS = (
     "subscription_status",
     "payment_status",
     "kb_index_status",
+    "safety_event_type",
 )
 
 # Таблицы с личными данными: RLS включён, доступ только через app.user_id (ТЗ §7, §9.2).
@@ -625,88 +687,249 @@ REFERENCE_TABLES = ("kb_documents", "kb_chunks", "prompt_versions")
 
 
 SECURITY_SQL = r"""
--- Роли. feelings_app — роль приложения: не владелец таблиц, поэтому подчиняется RLS.
--- feelings_admin — админ-панель: только справочные таблицы, без доступа к перепискам (ТЗ §9.1 п.5).
+-- Модель угроз и ролей — DECISIONS.md, АР-7 и АР-10.
+-- feelings_app    — права приложения; не владелец таблиц, поэтому подчиняется RLS.
+-- feelings_api    — роль входа сервера API: NOINHERIT, без собственных прав, может только
+--                   SET ROLE feelings_app (user_scope). LOGIN и пароль задаёт инфраструктура (0.8).
+-- feelings_worker — фоновые задачи конвейера: только функции конвейера.
+-- feelings_admin  — админ-панель: только справочные таблицы (ТЗ §9.1 п.5).
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'feelings_app') THEN
         CREATE ROLE feelings_app NOLOGIN;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'feelings_worker') THEN
+        CREATE ROLE feelings_worker NOLOGIN;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'feelings_admin') THEN
         CREATE ROLE feelings_admin NOLOGIN;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'feelings_api') THEN
+        CREATE ROLE feelings_api NOLOGIN NOINHERIT;
+    END IF;
 END $$;
+GRANT feelings_app TO feelings_api;
 
--- Текущий пользователь транзакции: SET LOCAL app.user_id (backend/app/db.py: user_scope).
+-- Подмена таблиц временными объектами (ревью 0.7, D-2): временные таблицы запрещены всем.
+DO $$ BEGIN
+    EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
+END $$;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
 CREATE FUNCTION app_uid() RETURNS uuid
-    LANGUAGE sql STABLE
+    LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp
     AS $f$ SELECT NULLIF(current_setting('app.user_id', true), '')::uuid $f$;
 
--- Участник пары (в т.ч. бывший: история после расторжения остаётся для чтения, допущение Д7).
+-- Текущий пользователь — участник пары (в т.ч. бывший: история читается, допущение Д7).
 CREATE FUNCTION app_is_member(p_couple uuid) RETURNS boolean
-    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
-    AS $f$ SELECT EXISTS (
-        SELECT 1 FROM couple_members WHERE couple_id = p_couple AND user_id = app_uid()) $f$;
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$ SELECT EXISTS (SELECT 1 FROM public.couple_members
+                          WHERE couple_id = p_couple AND user_id = public.app_uid()) $f$;
 
--- Есть ли у пары участники (для политики вступления).
-CREATE FUNCTION app_couple_has_members(p_couple uuid) RETURNS boolean
-    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
-    AS $f$ SELECT EXISTS (SELECT 1 FROM couple_members WHERE couple_id = p_couple) $f$;
+-- Текущий пользователь — активный участник пары (писать в пару может только он, ТЗ §4.5 п.2).
+CREATE FUNCTION app_is_active_member(p_couple uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$ SELECT EXISTS (SELECT 1 FROM public.couple_members
+                          WHERE couple_id = p_couple AND user_id = public.app_uid() AND active) $f$;
 
--- Активный участник пары: писать в пару может только активный участник.
-CREATE FUNCTION app_is_active_member(p_couple uuid, p_user uuid) RETURNS boolean
-    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
-    AS $f$ SELECT EXISTS (
-        SELECT 1 FROM couple_members cm JOIN couples c ON c.id = cm.couple_id
-        WHERE cm.couple_id = p_couple AND cm.user_id = p_user AND cm.active
-          AND c.status = 'active') $f$;
-
--- Вход через Telegram (ФТ-01): до входа app.user_id неизвестен, поэтому поиск/создание
--- пользователя по telegram_id идёт через функцию, а не через прямой доступ к users.
+-- Вход (ФТ-01): до входа app.user_id неизвестен.
 CREATE FUNCTION app_upsert_user(p_telegram_id bigint) RETURNS uuid
-    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
     AS $f$
     DECLARE v_id uuid;
     BEGIN
-        SELECT id INTO v_id FROM users WHERE telegram_id = p_telegram_id AND deleted_at IS NULL;
-        IF v_id IS NULL THEN
-            INSERT INTO users (id, telegram_id) VALUES (gen_random_uuid(), p_telegram_id)
-            ON CONFLICT (telegram_id) DO NOTHING
-            RETURNING id INTO v_id;
-            IF v_id IS NULL THEN
-                SELECT id INTO v_id FROM users WHERE telegram_id = p_telegram_id
-                  AND deleted_at IS NULL;
-            END IF;
-        END IF;
+        INSERT INTO public.users (telegram_id) VALUES (p_telegram_id)
+        ON CONFLICT (telegram_id) DO NOTHING;
+        SELECT id INTO v_id FROM public.users
+        WHERE telegram_id = p_telegram_id AND deleted_at IS NULL;
         RETURN v_id;
     END $f$;
 
--- Поиск приглашения по хешу токена для принимающей стороны (она ещё не участник пары).
+-- Приглашённый ещё не участник пары: проверка приглашения по хешу токена (ФТ-03).
 CREATE FUNCTION app_find_invite(p_token_hash bytea)
-    RETURNS TABLE (id uuid, couple_id uuid, created_by uuid, expires_at timestamptz,
+    RETURNS TABLE (couple_id uuid, inviter_name varchar, expires_at timestamptz,
                    status invite_status)
-    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
-    AS $f$ SELECT i.id, i.couple_id, i.created_by, i.expires_at, i.status
-           FROM invites i WHERE i.token_hash = p_token_hash $f$;
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$ SELECT i.couple_id, u.name, i.expires_at, i.status
+           FROM public.invites i JOIN public.users u ON u.id = i.created_by
+           WHERE i.token_hash = p_token_hash AND public.app_uid() IS NOT NULL $f$;
 
-REVOKE ALL ON FUNCTION app_upsert_user(bigint), app_find_invite(bytea),
-    app_is_member(uuid), app_is_active_member(uuid, uuid), app_couple_has_members(uuid)
-    FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION app_uid(), app_is_member(uuid), app_is_active_member(uuid, uuid),
-    app_couple_has_members(uuid), app_upsert_user(bigint), app_find_invite(bytea)
-    TO feelings_app;
+-- Участники своей пары с именами (Couple.members, ТЗ §8 «статус пары»).
+CREATE FUNCTION app_couple_members(p_couple uuid)
+    RETURNS TABLE (user_id uuid, role member_role, name varchar, active boolean)
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$ SELECT cm.user_id, cm.role, u.name, cm.active
+           FROM public.couple_members cm JOIN public.users u ON u.id = cm.user_id
+           WHERE cm.couple_id = p_couple AND public.app_is_member(p_couple) $f$;
 
-GRANT USAGE ON SCHEMA public TO feelings_app, feelings_admin;
-GRANT SELECT, INSERT, UPDATE, DELETE ON
-    users, couples, couple_members, invites, agents, conversations, conversation_messages,
-    memory_items, partner_messages, message_drafts, subscriptions, payments TO feelings_app;
+-- Создать пару в статусе pending с текущим пользователем-инициатором (ФТ-03, ФТ-04).
+CREATE FUNCTION app_create_couple() RETURNS uuid
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    DECLARE v_uid uuid := public.app_uid(); v_id uuid;
+    BEGIN
+        IF v_uid IS NULL THEN RAISE EXCEPTION 'no user' USING ERRCODE = '42501'; END IF;
+        INSERT INTO public.couples (status) VALUES ('pending') RETURNING id INTO v_id;
+        INSERT INTO public.couple_members (couple_id, user_id, role)
+        VALUES (v_id, v_uid, 'initiator');
+        RETURN v_id;
+    END $f$;
+
+-- «Отправить» (ФТ-08, ТЗ §6.2 п.2): единственный путь создать сообщение партнёру.
+-- Оригинал = текст одобренного черновика той версии, которую видел автор.
+-- Коды ошибок: FA001 нет черновика, FA002 версия устарела, FA003 нет активной пары,
+-- FA004 ответ не на своё входящее.
+CREATE FUNCTION app_send_draft(p_draft uuid, p_expected_version integer) RETURNS uuid
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    DECLARE
+        v_uid uuid := public.app_uid();
+        d record; v_couple uuid; v_recipient uuid; v_id uuid;
+    BEGIN
+        IF v_uid IS NULL THEN RAISE EXCEPTION 'no user' USING ERRCODE = '42501'; END IF;
+        SELECT md.* INTO d FROM public.message_drafts md
+            JOIN public.agents a ON a.id = md.agent_id
+            WHERE md.id = p_draft AND a.user_id = v_uid FOR UPDATE OF md;
+        IF NOT FOUND OR d.status NOT IN ('draft', 'approved') THEN
+            RAISE EXCEPTION 'draft not sendable' USING ERRCODE = 'FA001';
+        END IF;
+        IF d.version <> p_expected_version THEN
+            RAISE EXCEPTION 'version conflict' USING ERRCODE = 'FA002';
+        END IF;
+        SELECT cm.couple_id INTO v_couple FROM public.couple_members cm
+            JOIN public.couples c ON c.id = cm.couple_id
+            WHERE cm.user_id = v_uid AND cm.active AND c.status = 'active';
+        SELECT cm.user_id INTO v_recipient FROM public.couple_members cm
+            WHERE cm.couple_id = v_couple AND cm.active AND cm.user_id <> v_uid;
+        IF v_couple IS NULL OR v_recipient IS NULL THEN
+            RAISE EXCEPTION 'no active couple' USING ERRCODE = 'FA003';
+        END IF;
+        IF d.reply_to_id IS NOT NULL THEN
+            UPDATE public.partner_messages
+               SET status = 'answered', answered_at = now()
+             WHERE id = d.reply_to_id AND recipient_id = v_uid AND couple_id = v_couple
+               AND status IN ('delivered', 'read', 'answered');
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'bad reply target' USING ERRCODE = 'FA004';
+            END IF;
+        END IF;
+        INSERT INTO public.partner_messages
+            (couple_id, author_id, recipient_id, reply_to_id, draft_id, original_enc, status)
+        VALUES (v_couple, v_uid, v_recipient, d.reply_to_id, d.id, d.text_enc, 'processing')
+        RETURNING id INTO v_id;
+        UPDATE public.message_drafts SET status = 'sent', updated_at = now() WHERE id = d.id;
+        RETURN v_id;
+    END $f$;
+
+-- Лента пары (ФТ-11): автору — его оригинал, получателю — версия для получателя.
+CREATE FUNCTION app_couple_feed(p_limit integer, p_before timestamptz)
+    RETURNS TABLE (id uuid, outgoing boolean, text_enc bytea, is_adapted boolean,
+                   harsh_tone_warning boolean, status partner_message_status,
+                   reply_to_id uuid, sent_at timestamptz, read_at timestamptz)
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    SELECT m.id, m.author_id = public.app_uid(),
+           CASE WHEN m.author_id = public.app_uid() THEN m.original_enc ELSE m.adapted_enc END,
+           m.is_adapted, m.harsh_tone_warning, m.status, m.reply_to_id, m.sent_at, m.read_at
+    FROM public.partner_messages m
+    WHERE public.app_uid() IS NOT NULL
+      AND (m.author_id = public.app_uid()
+           OR (m.recipient_id = public.app_uid()
+               AND m.status NOT IN ('processing', 'withheld')))
+      AND (p_before IS NULL OR m.sent_at < p_before)
+    ORDER BY m.sent_at DESC
+    LIMIT LEAST(GREATEST(p_limit, 1), 100) $f$;
+
+-- «Показать оригинал» (ФТ-10): получателю — с фиксацией просмотра (ТЗ §7).
+CREATE FUNCTION app_read_original(p_message uuid) RETURNS bytea
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    DECLARE v_uid uuid := public.app_uid(); m record;
+    BEGIN
+        SELECT * INTO m FROM public.partner_messages WHERE id = p_message;
+        IF FOUND AND v_uid IS NOT NULL AND m.author_id = v_uid THEN
+            RETURN m.original_enc;
+        END IF;
+        IF FOUND AND v_uid IS NOT NULL AND m.recipient_id = v_uid
+           AND m.status NOT IN ('processing', 'withheld') THEN
+            UPDATE public.partner_messages SET original_viewed_at = COALESCE(original_viewed_at, now())
+             WHERE id = p_message;
+            RETURN m.original_enc;
+        END IF;
+        RETURN NULL;
+    END $f$;
+
+-- Отметка «прочитано» (ФТ-11): только получатель доставленного сообщения.
+CREATE FUNCTION app_mark_read(p_message uuid) RETURNS boolean
+    LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    WITH u AS (
+        UPDATE public.partner_messages SET status = 'read', read_at = now()
+         WHERE id = p_message AND recipient_id = public.app_uid() AND status = 'delivered'
+        RETURNING 1)
+    SELECT EXISTS (SELECT 1 FROM u) $f$;
+
+-- Конвейер (ТЗ §6.2 п.3–7, задача 3.2): выполняет только feelings_worker.
+CREATE FUNCTION pipeline_original(p_message uuid) RETURNS bytea
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$ SELECT original_enc FROM public.partner_messages
+           WHERE id = p_message AND status = 'processing' $f$;
+
+CREATE FUNCTION pipeline_deliver(p_message uuid, p_for_recipient bytea, p_is_adapted boolean,
+                                 p_tone smallint, p_harsh boolean) RETURNS boolean
+    LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    WITH u AS (
+        UPDATE public.partner_messages
+           SET adapted_enc = p_for_recipient, is_adapted = p_is_adapted, tone_score = p_tone,
+               harsh_tone_warning = p_harsh, status = 'delivered', delivered_at = now()
+         WHERE id = p_message AND status = 'processing'
+        RETURNING 1)
+    SELECT EXISTS (SELECT 1 FROM u) $f$;
+
+CREATE FUNCTION pipeline_withhold(p_message uuid) RETURNS boolean
+    LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    WITH u AS (
+        UPDATE public.partner_messages SET status = 'withheld'
+         WHERE id = p_message AND status = 'processing'
+        RETURNING 1)
+    SELECT EXISTS (SELECT 1 FROM u) $f$;
+
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_uid(), app_is_member(uuid), app_is_active_member(uuid),
+    app_upsert_user(bigint), app_find_invite(bytea), app_couple_members(uuid),
+    app_create_couple(), app_send_draft(uuid, integer), app_couple_feed(integer, timestamptz),
+    app_read_original(uuid), app_mark_read(uuid) TO feelings_app;
+GRANT EXECUTE ON FUNCTION pipeline_original(uuid),
+    pipeline_deliver(uuid, bytea, boolean, smallint, boolean), pipeline_withhold(uuid)
+    TO feelings_worker;
+
+GRANT USAGE ON SCHEMA public TO feelings_app, feelings_admin, feelings_worker;
+
+-- Права на таблицы: только то, что нужно приложению напрямую. Изменения, которые нельзя
+-- доверить клиентской стороне (сообщения пары, пары, подписки), — только через функции.
+GRANT SELECT, DELETE ON users TO feelings_app;
+GRANT UPDATE (name, address_form, partner_name, timezone, consent_terms_at, consent_data_at,
+              consent_sensitive_at, age_confirmed_at) ON users TO feelings_app;
+GRANT SELECT ON couples, couple_members TO feelings_app;
+GRANT UPDATE (status, dissolved_at) ON couples TO feelings_app;
+GRANT UPDATE (active, left_at) ON couple_members TO feelings_app;
+GRANT SELECT, INSERT ON invites TO feelings_app;
+GRANT UPDATE (status) ON invites TO feelings_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON agents, conversations, conversation_messages,
+    memory_items, message_drafts TO feelings_app;
+-- partner_messages: без оригинала; оригинал — через app_read_original / app_couple_feed.
+GRANT SELECT (id, couple_id, author_id, recipient_id, reply_to_id, draft_id, adapted_enc,
+              is_adapted, tone_score, harsh_tone_warning, status, sent_at, delivered_at,
+              read_at, answered_at, original_viewed_at) ON partner_messages TO feelings_app;
+GRANT SELECT ON subscriptions, payments TO feelings_app;
 GRANT INSERT ON safety_events, audit_log TO feelings_app;
 GRANT USAGE ON SEQUENCE audit_log_id_seq TO feelings_app;
 GRANT SELECT ON kb_documents, kb_chunks, prompt_versions TO feelings_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kb_documents, kb_chunks, prompt_versions
     TO feelings_admin;
 
--- RLS на всех таблицах с личными данными.
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE couples ENABLE ROW LEVEL SECURITY;
 ALTER TABLE couple_members ENABLE ROW LEVEL SECURITY;
@@ -722,36 +945,29 @@ ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
 
--- users: только своя строка.
 CREATE POLICY users_self ON users FOR ALL TO feelings_app
     USING (id = app_uid()) WITH CHECK (id = app_uid());
 
--- couples: видят участники (включая бывших); создаёт любой вошедший пользователь.
+-- Пары: видят участники; напрямую можно только расторгнуть, будучи активным участником.
 CREATE POLICY couples_select ON couples FOR SELECT TO feelings_app
     USING (app_is_member(id));
-CREATE POLICY couples_insert ON couples FOR INSERT TO feelings_app
-    WITH CHECK (app_uid() IS NOT NULL);
--- Участник может только расторгнуть пару; активация — при принятии приглашения (задача 1.3,
--- функция SECURITY DEFINER), чтобы пару нельзя было активировать без второго участника.
-CREATE POLICY couples_update ON couples FOR UPDATE TO feelings_app
-    USING (app_is_member(id)) WITH CHECK (status = 'dissolved');
+CREATE POLICY couples_dissolve ON couples FOR UPDATE TO feelings_app
+    USING (app_is_active_member(id)) WITH CHECK (status = 'dissolved');
 
--- couple_members: видны участники своей пары; добавить и изменить можно только себя.
 CREATE POLICY members_select ON couple_members FOR SELECT TO feelings_app
     USING (app_is_member(couple_id));
--- Напрямую можно только стать инициатором новой пустой пары. Партнёр вступает только через
--- приглашение (задача 1.3, функция SECURITY DEFINER), не по известному id пары.
-CREATE POLICY members_insert ON couple_members FOR INSERT TO feelings_app
-    WITH CHECK (user_id = app_uid() AND role = 'initiator'
-                AND NOT app_couple_has_members(couple_id));
--- Изменить можно только свою запись и только выйти из пары (ТЗ §4.5 п.2).
-CREATE POLICY members_update ON couple_members FOR UPDATE TO feelings_app
-    USING (user_id = app_uid()) WITH CHECK (user_id = app_uid() AND NOT active);
+CREATE POLICY members_leave ON couple_members FOR UPDATE TO feelings_app
+    USING (user_id = app_uid() AND active) WITH CHECK (user_id = app_uid() AND NOT active);
 
--- invites: создатель видит и отзывает свои; принимающая сторона — через app_find_invite.
-CREATE POLICY invites_owner ON invites FOR ALL TO feelings_app
-    USING (created_by = app_uid())
-    WITH CHECK (created_by = app_uid() AND app_is_member(couple_id));
+-- Приглашения: создаёт активный участник ожидающей пары; можно только отозвать своё.
+CREATE POLICY invites_select ON invites FOR SELECT TO feelings_app
+    USING (created_by = app_uid());
+CREATE POLICY invites_insert ON invites FOR INSERT TO feelings_app
+    WITH CHECK (created_by = app_uid() AND status = 'active' AND app_is_active_member(couple_id)
+                AND EXISTS (SELECT 1 FROM couples c WHERE c.id = couple_id
+                            AND c.status = 'pending'));
+CREATE POLICY invites_revoke ON invites FOR UPDATE TO feelings_app
+    USING (created_by = app_uid() AND status = 'active') WITH CHECK (status = 'revoked');
 
 -- Личный агент и всё, что к нему привязано, — только владелец (ТЗ §6, §9.2 п.1).
 CREATE POLICY agents_owner ON agents FOR ALL TO feelings_app
@@ -765,46 +981,52 @@ CREATE POLICY conv_messages_owner ON conversation_messages FOR ALL TO feelings_a
 CREATE POLICY memory_owner ON memory_items FOR ALL TO feelings_app
     USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id))
     WITH CHECK (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id));
-CREATE POLICY drafts_owner ON message_drafts FOR ALL TO feelings_app
-    USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id))
-    WITH CHECK (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id));
+-- Черновик: отправленный не меняется; статус sent ставит только app_send_draft.
+CREATE POLICY drafts_select ON message_drafts FOR SELECT TO feelings_app
+    USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id));
+CREATE POLICY drafts_insert ON message_drafts FOR INSERT TO feelings_app
+    WITH CHECK (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id) AND status = 'draft');
+CREATE POLICY drafts_update ON message_drafts FOR UPDATE TO feelings_app
+    USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id) AND status <> 'sent')
+    WITH CHECK (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id) AND status <> 'sent');
+CREATE POLICY drafts_delete ON message_drafts FOR DELETE TO feelings_app
+    USING (EXISTS (SELECT 1 FROM agents a WHERE a.id = agent_id));
 
--- partner_messages: читают автор и получатель; создаёт только автор — активный участник
--- активной пары, получатель — второй активный участник (ФТ-08, §9.2 п.1).
+-- Сообщения пары: только чтение; получатель — после конвейера (ТЗ §6.2, ревью 0.7 M5).
 CREATE POLICY pm_select ON partner_messages FOR SELECT TO feelings_app
-    USING (author_id = app_uid() OR recipient_id = app_uid());
-CREATE POLICY pm_insert ON partner_messages FOR INSERT TO feelings_app
-    WITH CHECK (author_id = app_uid()
-                AND app_is_active_member(couple_id, author_id)
-                AND app_is_active_member(couple_id, recipient_id));
-CREATE POLICY pm_update ON partner_messages FOR UPDATE TO feelings_app
-    USING (author_id = app_uid() OR recipient_id = app_uid())
-    WITH CHECK (author_id = app_uid() OR recipient_id = app_uid());
+    USING (author_id = app_uid()
+           OR (recipient_id = app_uid() AND status NOT IN ('processing', 'withheld')));
 
--- safety_events и audit_log: приложение только пишет; чтения у роли приложения нет.
 CREATE POLICY safety_insert ON safety_events FOR INSERT TO feelings_app
     WITH CHECK (user_id = app_uid());
 CREATE POLICY audit_insert ON audit_log FOR INSERT TO feelings_app
     WITH CHECK (actor_id IS NULL OR actor_id = app_uid());
 
--- Подписка на пару видна обоим участникам (ФТ-19).
-CREATE POLICY subs_member ON subscriptions FOR ALL TO feelings_app
-    USING (app_is_member(couple_id)) WITH CHECK (app_is_member(couple_id));
-CREATE POLICY payments_member ON payments FOR ALL TO feelings_app
-    USING (EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = subscription_id))
-    WITH CHECK (EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = subscription_id));
+-- Подписка видна обоим участникам (ФТ-19); изменения — платёжная часть (4.4).
+CREATE POLICY subs_member ON subscriptions FOR SELECT TO feelings_app
+    USING (app_is_member(couple_id));
+CREATE POLICY payments_member ON payments FOR SELECT TO feelings_app
+    USING (EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = subscription_id));
 """
 
 DROP_SECURITY_SQL = r"""
+DROP FUNCTION IF EXISTS pipeline_withhold(uuid);
+DROP FUNCTION IF EXISTS pipeline_deliver(uuid, bytea, boolean, smallint, boolean);
+DROP FUNCTION IF EXISTS pipeline_original(uuid);
+DROP FUNCTION IF EXISTS app_mark_read(uuid);
+DROP FUNCTION IF EXISTS app_read_original(uuid);
+DROP FUNCTION IF EXISTS app_couple_feed(integer, timestamptz);
+DROP FUNCTION IF EXISTS app_send_draft(uuid, integer);
+DROP FUNCTION IF EXISTS app_create_couple();
+DROP FUNCTION IF EXISTS app_couple_members(uuid);
 DROP FUNCTION IF EXISTS app_find_invite(bytea);
 DROP FUNCTION IF EXISTS app_upsert_user(bigint);
-DROP FUNCTION IF EXISTS app_is_active_member(uuid, uuid) CASCADE;
-DROP FUNCTION IF EXISTS app_couple_has_members(uuid) CASCADE;
+DROP FUNCTION IF EXISTS app_is_active_member(uuid) CASCADE;
 DROP FUNCTION IF EXISTS app_is_member(uuid) CASCADE;
 DROP FUNCTION IF EXISTS app_uid() CASCADE;
-REVOKE ALL ON ALL TABLES IN SCHEMA public FROM feelings_app, feelings_admin;
-REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM feelings_app, feelings_admin;
-REVOKE ALL ON SCHEMA public FROM feelings_app, feelings_admin;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM feelings_app, feelings_admin, feelings_worker;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM feelings_app, feelings_admin, feelings_worker;
+REVOKE ALL ON SCHEMA public FROM feelings_app, feelings_admin, feelings_worker;
 """
 
 

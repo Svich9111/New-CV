@@ -15,7 +15,10 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-db_url = context.get_x_argument(as_dictionary=True).get("db_url") or get_settings().database_url
+db_url = (
+    context.get_x_argument(as_dictionary=True).get("db_url")
+    or get_settings().migration_database_url
+)
 config.set_main_option("sqlalchemy.url", db_url)
 target_metadata = Base.metadata
 

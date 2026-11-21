@@ -230,6 +230,9 @@ paths:
         Ответ — Server-Sent Events. События: `delta` {text}, `done` {message_id, suggest_draft: bool},
         `crisis` {contacts} — кризисный протокол (ФТ-17), `error` {code, message} — отказ модели,
         текст реплики не теряется (ТЗ §10). Первый символ — до 5 с в 95% случаев.
+        Порядок проверок: сначала классификатор безопасности, потом подписка и лимиты. При признаках
+        кризиса ответ с контактами помощи идёт всегда — 402 и 429 в этом случае не возвращаются
+        (ТЗ §9.3, §11 п.5).
       requestBody:
         required: true
         content:
@@ -278,7 +281,18 @@ paths:
     post:
       tags: [drafts]
       summary: Сгенерировать черновик сообщения партнёру по текущему разговору (ФТ-07)
-      description: Схема «чувство — ситуация — потребность — просьба» (ТЗ §4.3). Ничего не отправляется партнёру.
+      description: |
+        Схема «чувство — ситуация — потребность — просьба» (ТЗ §4.3). Ничего не отправляется партнёру.
+        `reply_to_id` — ответ на конкретное входящее («Ответить с агентом», ТЗ §4.4 п.5, §8): после
+        отправки входящее получает статус `answered` (ФТ-11).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reply_to_id: { type: [string, "null"], format: uuid }
       responses:
         "201":
           description: Черновик
@@ -715,6 +729,7 @@ components:
       properties:
         id: { type: string, format: uuid }
         text: { type: string }
+        reply_to_id: { type: [string, "null"], format: uuid }
         version: { type: integer, minimum: 1 }
         status: { type: string, enum: [draft, approved, rejected, blocked, sent] }
 
@@ -730,7 +745,7 @@ components:
         text: { type: string }
         is_adapted: { type: boolean, description: "Пометка «адаптировано» (ФТ-09)" }
         harsh_tone_warning: { type: boolean, description: "ТЗ §6.2 п.6" }
-        status: { type: string, enum: [processing, delivered, read, answered] }
+        status: { type: string, enum: [processing, delivered, read, answered], description: "Получателю приходят только delivered/read/answered; withheld (остановлено безопасностью) клиенту не отдаётся" }
         reply_to_id: { type: [string, "null"], format: uuid }
         sent_at: { type: string, format: date-time }
         read_at: { type: [string, "null"], format: date-time }

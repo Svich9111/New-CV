@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.db import make_engine, make_sessionmaker
@@ -29,20 +30,48 @@ def alembic(*args: str) -> None:
     )
 
 
+# Роль входа приложения (АР-10). В продуктиве пароль задаёт инфраструктура; здесь — тестовый.
+API_ROLE_PASSWORD = "feelings_api_test_only"
+
+
+def app_database_url(url: str) -> str:
+    """Тот же сервер и БД, но под ролью входа feelings_api (без суперпользователя)."""
+    scheme, rest = url.split("://", 1)
+    host = rest.split("@", 1)[1]
+    return f"{scheme}://feelings_api:{API_ROLE_PASSWORD}@{host}"
+
+
 @pytest.fixture(scope="session")
-def migrated_db() -> str:
+async def migrated_db() -> str:
     alembic("downgrade", "base")
     alembic("upgrade", "head")
+    eng = make_engine(TEST_DATABASE_URL)
+    async with eng.begin() as conn:
+        await conn.execute(text(f"ALTER ROLE feelings_api LOGIN PASSWORD '{API_ROLE_PASSWORD}'"))
+    await eng.dispose()
     return TEST_DATABASE_URL
 
 
 @pytest.fixture(scope="session")
 async def engine(migrated_db: str) -> AsyncIterator[AsyncEngine]:
+    """Суперпользователь: только для подготовки данных и проверок схемы в обход RLS."""
     eng = make_engine(migrated_db)
     yield eng
     await eng.dispose()
 
 
 @pytest.fixture(scope="session")
-def sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return make_sessionmaker(engine)
+async def app_engine(migrated_db: str) -> AsyncIterator[AsyncEngine]:
+    """Подключение как у приложения: роль входа feelings_api."""
+    eng = make_engine(app_database_url(migrated_db))
+    yield eng
+    await eng.dispose()
+
+
+@pytest.fixture(scope="session")
+def sessionmaker(app_engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    return make_sessionmaker(app_engine)
+
+
+# Фикстура world (пара Анна и Игорь, посторонняя Ольга) доступна всем модулям тестов.
+from tests.test_rls_isolation import world  # noqa: E402, F401

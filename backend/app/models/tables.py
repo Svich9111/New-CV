@@ -51,12 +51,21 @@ MemoryType = _enum(
     name="memory_type",
 )
 MemorySource = _enum("owner_dialog", "agent_inference", "partner_message", name="memory_source")
+# withheld — остановлено проверкой безопасности (ТЗ §6.2 п.3, §9.3): получатель не видит.
 PartnerMessageStatus = _enum(
-    "processing", "delivered", "read", "answered", name="partner_message_status"
+    "processing", "withheld", "delivered", "read", "answered", name="partner_message_status"
 )
 DraftStatus = _enum("draft", "approved", "rejected", "blocked", "sent", name="draft_status")
 SubscriptionStatus = _enum("trial", "active", "expired", "canceled", name="subscription_status")
 PaymentStatus = _enum("pending", "succeeded", "failed", "refunded", name="payment_status")
+SafetyEventType = _enum(
+    "violence",
+    "threat_outgoing",
+    "self_harm",
+    "life_threat",
+    "underage",
+    name="safety_event_type",
+)
 IndexStatus = _enum("uploaded", "indexing", "indexed", "failed", name="kb_index_status")
 
 
@@ -104,7 +113,6 @@ class CoupleMember(Base):
     __tablename__ = "couple_members"
     __table_args__ = (
         UniqueConstraint("couple_id", "role", name="uq_couple_members_couple_role"),
-        UniqueConstraint("couple_id", "user_id", name="uq_couple_members_couple_user"),
         Index(
             "uq_couple_members_one_active_per_user",
             "user_id",
@@ -132,6 +140,14 @@ class Invite(Base):
     """
 
     __tablename__ = "invites"
+    __table_args__ = (
+        Index(
+            "uq_invites_one_active_per_couple",
+            "couple_id",
+            unique=True,
+            postgresql_where=sa_text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
     token_hash: Mapped[bytes] = mapped_column(LargeBinary(32), unique=True, nullable=False)
@@ -153,6 +169,7 @@ class PromptVersion(Base):
 
     __tablename__ = "prompt_versions"
     __table_args__ = (
+        UniqueConstraint("purpose", "version", name="uq_prompt_versions_purpose_version"),
         Index(
             "uq_prompt_versions_one_active",
             "purpose",
@@ -233,6 +250,10 @@ class MemoryItem(Base):
             "(type = 'from_partner') = (source = 'partner_message')",
             name="partner_source_consistent",
         ),
+        CheckConstraint(
+            "source <> 'partner_message' OR source_message_id IS NOT NULL",
+            name="partner_source_has_message",
+        ),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -245,7 +266,7 @@ class MemoryItem(Base):
     source: Mapped[str] = mapped_column(MemorySource, nullable=False)
     # Ссылка на одобренное сообщение пары, если source = partner_message (ФТ-14).
     source_message_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("partner_messages.id", ondelete="SET NULL")
+        ForeignKey("partner_messages.id", ondelete="CASCADE")
     )
     confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default=sa_text("1.0"))
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
@@ -275,13 +296,20 @@ class PartnerMessage(Base):
     author_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    recipient_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    # Удаление аккаунта получателя не стирает сообщения, которые написал партнёр (ФТ-21 vs Д7,
+    # окончательно — задача 4.5): получатель обнуляется.
+    recipient_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    # Одобренный автором черновик, из которого создано сообщение (ФТ-08): без него строки нет.
+    draft_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("message_drafts.id", ondelete="SET NULL", use_alter=True), unique=True
     )
     reply_to_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("partner_messages.id", ondelete="SET NULL")
     )
     original_enc: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # Версия для получателя (ТЗ §4.3 п.3): адаптированная или копия оригинала; заполняет конвейер.
     adapted_enc: Mapped[bytes | None] = mapped_column(LargeBinary)
     is_adapted: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=sa_text("false")
@@ -311,6 +339,10 @@ class MessageDraft(Base):
         ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
     )
     text_enc: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # Ответ на конкретное входящее (ФТ-11 «отвечено», ключевой сценарий §1).
+    reply_to_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("partner_messages.id", ondelete="SET NULL")
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sa_text("1"))
     status: Mapped[str] = mapped_column(DraftStatus, nullable=False, server_default="draft")
     created_at: Mapped[datetime] = created_at()
@@ -364,7 +396,7 @@ class SafetyEvent(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    type: Mapped[str] = mapped_column(String(64), nullable=False)
+    type: Mapped[str] = mapped_column(SafetyEventType, nullable=False)
     created_at: Mapped[datetime] = created_at()
 
 
@@ -408,6 +440,11 @@ class AuditLog(Base):
     """§7 audit_log: id, кто, действие, объект, время. Без содержимого сообщений."""
 
     __tablename__ = "audit_log"
+    # Только машинные коды — свободный текст (и содержимое сообщений) записать нельзя (§7).
+    __table_args__ = (
+        CheckConstraint("action ~ '^[a-z][a-z0-9_.]{0,63}$'", name="action_code"),
+        CheckConstraint("object_type ~ '^[a-z][a-z0-9_]{0,63}$'", name="object_type_code"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     actor_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
