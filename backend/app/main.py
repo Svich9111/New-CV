@@ -10,6 +10,7 @@ from app.bot import webhook as bot_webhook
 from app.bot.client import BotApi
 from app.bot.dedup import UpdateDeduplicator
 from app.config import check_auth_config, check_bot_config, check_invite_config, get_settings
+from app.core.crypto import load_keyring
 from app.core.logging import install_log_redaction
 from app.db import make_engine, make_sessionmaker
 from app.errors import install_error_handlers
@@ -22,6 +23,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         check_auth_config(settings)  # сервис не стартует с пустыми ключами
         check_invite_config(settings)  # и без имени бота для ссылок-приглашений
         check_bot_config(settings)  # и без секрета вебхука и адреса Mini App (задача 1.4)
+        # и без ключей шифрования текстов или с ключом неверной длины (задача 4.2)
+        app.state.keyring = load_keyring(settings)
         engine = make_engine(settings.database_url)
         app.state.sessionmaker = make_sessionmaker(engine)
         try:
@@ -43,6 +46,7 @@ install_log_redaction()
 app = FastAPI(title="Чувства AI", version="0.1.0", lifespan=lifespan)
 app.state.sessionmaker = None
 app.state.bot_api = None  # клиент Bot API создаётся при старте (lifespan)
+app.state.keyring = None  # набор ключей шифрования создаётся при старте (lifespan)
 app.state.bot_updates = UpdateDeduplicator()  # идемпотентность по update_id (в памяти)
 install_error_handlers(app)
 app.include_router(auth.router, prefix="/api/v1")

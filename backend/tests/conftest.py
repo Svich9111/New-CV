@@ -73,5 +73,16 @@ def sessionmaker(app_engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return make_sessionmaker(app_engine)
 
 
+# Выдуманный тестовый набор ключей шифрования (задача 4.2): без него сервис не стартует, поэтому
+# тесты запуска (lifespan) получают его из окружения. Тесты отказа старта убирают его сами.
+TEST_ENCRYPTION_KEYS = "t1:" + "A" * 43
+
+
+@pytest.fixture(autouse=True)
+def _encryption_keys_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FEELINGS_ENCRYPTION_KEYS", TEST_ENCRYPTION_KEYS)
+    monkeypatch.setenv("FEELINGS_ENCRYPTION_KEY_ID", "t1")
+
+
 # Фикстура world (пара Анна и Игорь, посторонняя Ольга) доступна всем модулям тестов.
 from tests.test_rls_isolation import world  # noqa: E402, F401

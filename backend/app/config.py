@@ -21,8 +21,10 @@ class Settings(BaseSettings):
     # Максимальный возраст initData, секунд (ФТ-01)
     init_data_max_age_s: int = 86400
     session_secret: SecretStr = SecretStr("")
-    # Ключ шифрования текстов при хранении (ТЗ §9.1 п.3, задача 4.2)
-    encryption_key: SecretStr = SecretStr("")
+    # Ключи шифрования текстов при хранении (ТЗ §9.1 п.3, задача 4.2): набор
+    # «id:base64url(32 байта)» через запятую и id текущего; проверка — app.core.crypto.
+    encryption_keys: SecretStr = SecretStr("")
+    encryption_key_id: str = ""
     session_ttl_s: int = 3600
     # Имя бота без «@» для ссылки-приглашения https://t.me/<бот>?startapp=<токен> (ФТ-03).
     # Не секрет; правила имени Telegram — 5–32 символа, латиница, цифры, «_».
