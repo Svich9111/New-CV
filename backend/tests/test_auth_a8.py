@@ -23,7 +23,7 @@ from urllib.parse import quote, quote_plus
 import httpx
 import jwt
 import pytest
-import yaml  # type: ignore[import-untyped]
+import yaml
 from jsonschema import Draft202012Validator, FormatChecker  # type: ignore[import-untyped]
 from pydantic import SecretStr
 from referencing import Registry, Resource
@@ -372,11 +372,16 @@ async def test_empty_bot_token_http_refuses(
     c = make_client(telegram_bot_token=SecretStr(""))
     tg = _tg_id()
     fields = real_like_fields(tg, int(time.time()) - 2)
+    # initData подписан «пустым токеном» — подпись сошлась бы, если бы проверка токена не стояла.
     resp = await c.post(
         "/api/v1/auth/telegram", json={"init_data": tg_encode(fields, tg_hash(fields, ""))}
     )
-    assert resp.status_code == 401
+    # Контракт: 503 service_unavailable (сервис не настроен), а не вход и не 500.
+    assert resp.status_code == 503
+    assert resp.headers.get("content-type", "").startswith("application/json")
+    assert resp.json()["code"] == "service_unavailable"
     assert_schema(resp.json(), "Error")
+    assert "access_token" not in resp.text
     assert await _count_users(engine, tg) == 0
 
 
@@ -489,19 +494,34 @@ async def test_empty_session_secret_issues_no_token(
     assert "access_token" not in resp.text
 
 
-@pytest.mark.xfail(reason="дефект D-1, см. docs/reviews/1.1-test.md", strict=True)
+@pytest.mark.parametrize("weak", ["", "short", "x" * 31])
 async def test_empty_session_secret_controlled_refusal(
-    make_client: Callable[..., httpx.AsyncClient], engine: AsyncEngine
+    make_client: Callable[..., httpx.AsyncClient], engine: AsyncEngine, weak: str
 ) -> None:
-    """Отказ — в формате контракта (Error), без необработанного исключения, и пользователь
-    не создаётся (критерий «При отказе пользователь в БД не создаётся»)."""
-    c = make_client(session_secret=SecretStr(""))
+    """Пустой или слабый секрет (D-1): отказ в формате контракта (503 service_unavailable),
+    без необработанного исключения, и пользователь не создаётся (критерий «При отказе
+    пользователь в БД не создаётся»)."""
+    c = make_client(session_secret=SecretStr(weak))
     tg = _tg_id()
     resp = await c.post("/api/v1/auth/telegram", json={"init_data": _now_init_data(tg)})
-    assert resp.status_code != 200
+    assert resp.status_code == 503
     assert resp.headers.get("content-type", "").startswith("application/json")
+    assert resp.json()["code"] == "service_unavailable"
     assert_schema(resp.json(), "Error")
+    assert "access_token" not in resp.text
     assert await _count_users(engine, tg) == 0
+
+
+async def test_secret_of_exactly_32_chars_is_enough(
+    make_client: Callable[..., httpx.AsyncClient],
+) -> None:
+    """Граница MIN_SECRET_LEN: 32 символа — вход работает, токен принимается."""
+    c = make_client(session_secret=SecretStr("y" * 32))
+    resp = await c.post("/api/v1/auth/telegram", json={"init_data": _now_init_data(_tg_id())})
+    assert resp.status_code == 200, resp.text
+    token = resp.json()["access_token"]
+    me = await c.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+    assert me.status_code == 200
 
 
 async def test_empty_session_secret_rejects_token_forged_with_empty_key(
@@ -526,7 +546,6 @@ async def test_empty_session_secret_rejects_token_forged_with_empty_key(
     assert resp.status_code == 401
 
 
-@pytest.mark.xfail(reason="дефект D-2, см. docs/reviews/1.1-test.md", strict=True)
 async def test_weak_session_secret_rejects_tokens(
     make_client: Callable[..., httpx.AsyncClient],
     sessionmaker: async_sessionmaker[AsyncSession],
@@ -575,3 +594,171 @@ def test_duplicate_key_rejected_even_when_signature_would_match(where: str) -> N
         data = "hash=" + "0" * 64 + "&" + good
     with pytest.raises(InitDataError):
         validate_init_data(data, BOT_TOKEN, DAY, now=NOW)
+
+
+# --- раунд 2: удалённый аккаунт, проверка конфигурации при старте, контракт кодов -------------
+
+
+async def _delete_account(engine: AsyncEngine, tg_id: int) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE users SET deleted_at = now() WHERE telegram_id = :t"), {"t": tg_id}
+        )
+
+
+async def test_current_user_dependency_itself_rejects_deleted_user(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    client: httpx.AsyncClient,
+) -> None:
+    """Проверка удалённого пользователя — в самой зависимости CurrentUser, а не только в /me:
+    будущий эндпоинт, который сам не читает users, тоже не пускает удалённого (MINOR-6)."""
+    from fastapi import FastAPI
+
+    from app.api.deps import CurrentUser
+    from app.errors import install_error_handlers
+
+    probe = FastAPI()
+    probe.state.sessionmaker = sessionmaker
+    install_error_handlers(probe)
+
+    @probe.get("/probe")
+    async def _probe(uid: CurrentUser) -> dict[str, str]:
+        return {"uid": str(uid)}
+
+    probe.dependency_overrides[get_settings] = _settings()
+    tg = _tg_id()
+    login = await client.post("/api/v1/auth/telegram", json={"init_data": _now_init_data(tg)})
+    token = login.json()["access_token"]
+    auth = {"Authorization": f"Bearer {token}"}
+    transport = httpx.ASGITransport(app=probe, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as pc:
+        ok = await pc.get("/probe", headers=auth)
+        assert ok.status_code == 200
+        assert ok.json() == {"uid": login.json()["me"]["id"]}
+        await _delete_account(engine, tg)
+        gone = await pc.get("/probe", headers=auth)
+    assert gone.status_code == 401
+    assert gone.json()["code"] == "unauthorized"
+    assert_schema(gone.json(), "Error")
+
+
+async def test_deleted_account_login_is_403_and_creates_nothing(
+    client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    tg = _tg_id()
+    first = await client.post("/api/v1/auth/telegram", json={"init_data": _now_init_data(tg)})
+    assert first.status_code == 200
+    await _delete_account(engine, tg)
+    resp = await client.post("/api/v1/auth/telegram", json={"init_data": _now_init_data(tg)})
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "account_deleted"
+    assert_schema(resp.json(), "Error")
+    assert "access_token" not in resp.text
+    assert await _count_users(engine, tg) == 1
+    me = await client.get(
+        "/api/v1/me", headers={"Authorization": f"Bearer {first.json()['access_token']}"}
+    )
+    assert me.status_code == 401
+
+
+async def test_misconfig_refusal_precedes_any_parsing(
+    make_client: Callable[..., httpx.AsyncClient],
+) -> None:
+    """Без токена бота ответ 503 одинаков для любого initData (не раскрывает, верна ли подпись)."""
+    c = make_client(telegram_bot_token=SecretStr(""))
+    for data in ("%%%&&==", _now_init_data(_tg_id())):
+        resp = await c.post("/api/v1/auth/telegram", json={"init_data": data})
+        assert resp.status_code == 503
+        assert resp.json() == {"code": "service_unavailable", "message": "Вход временно недоступен"}
+
+
+@pytest.mark.parametrize(
+    ("bot_token", "secret"),
+    [("", SECRET), (BOT_TOKEN, ""), (BOT_TOKEN, "z" * 31)],
+)
+async def test_service_does_not_start_with_bad_keys(
+    monkeypatch: pytest.MonkeyPatch, bot_token: str, secret: str
+) -> None:
+    """check_auth_config в lifespan: сервис не стартует с пустым токеном или слабым секретом."""
+    from app.config import ConfigError
+    from app.main import lifespan
+
+    monkeypatch.setenv("FEELINGS_TELEGRAM_BOT_TOKEN", bot_token)
+    monkeypatch.setenv("FEELINGS_SESSION_SECRET", secret)
+    saved = app.state.sessionmaker
+    app.state.sessionmaker = None
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(ConfigError):
+            async with lifespan(app):
+                pytest.fail("сервис запустился с неверной конфигурацией ключей")
+        assert app.state.sessionmaker is None
+    finally:
+        get_settings.cache_clear()
+        app.state.sessionmaker = saved
+
+
+async def test_service_starts_with_good_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.main import lifespan
+
+    monkeypatch.setenv("FEELINGS_TELEGRAM_BOT_TOKEN", BOT_TOKEN)
+    monkeypatch.setenv("FEELINGS_SESSION_SECRET", SECRET)
+    saved = app.state.sessionmaker
+    app.state.sessionmaker = None
+    get_settings.cache_clear()
+    try:
+        async with lifespan(app):
+            assert app.state.sessionmaker is not None
+    finally:
+        get_settings.cache_clear()
+        app.state.sessionmaker = saved
+
+
+async def test_every_auth_status_is_declared_in_contract(
+    make_client: Callable[..., httpx.AsyncClient], engine: AsyncEngine
+) -> None:
+    """Каждый код, который реально отдаёт вход, объявлен в api/openapi.yaml (MAJOR-3 / D-3)."""
+    declared = set(_spec()["paths"]["/auth/telegram"]["post"]["responses"])
+    c = make_client()
+    tg = _tg_id()
+    seen = {
+        (await c.post("/api/v1/auth/telegram", json={"init_data": _now_init_data(tg)})).status_code
+    }
+    seen.add((await c.post("/api/v1/auth/telegram", json={"init_data": "x=1"})).status_code)
+    seen.add((await c.post("/api/v1/auth/telegram", json={"init_data": ""})).status_code)
+    await _delete_account(engine, tg)
+    seen.add(
+        (await c.post("/api/v1/auth/telegram", json={"init_data": _now_init_data(tg)})).status_code
+    )
+    broken = make_client(session_secret=SecretStr(""))
+    seen.add(
+        (
+            await broken.post("/api/v1/auth/telegram", json={"init_data": _now_init_data(_tg_id())})
+        ).status_code
+    )
+    assert seen == {200, 401, 403, 422, 503}
+    assert {str(s) for s in seen} <= declared
+
+
+@pytest.mark.parametrize(
+    "bad_hash",
+    [
+        "%D0%B0",  # кириллица
+        "%D0%B0" * 64,  # 64 символа, но не ASCII
+        "%EF%BC%90" * 64,  # полноширинные цифры: isdigit() == True, но не hex
+        "%00" * 64,
+        "a" * 63 + "%E2%80%8B",  # zero-width space в конце
+    ],
+)
+async def test_non_ascii_hash_is_401_contract_not_500(
+    client: httpx.AsyncClient, engine: AsyncEngine, bad_hash: str
+) -> None:
+    """MAJOR-2: hash не из ASCII — штатный отказ 401 invalid_init_data, а не 500."""
+    tg = _tg_id()
+    base = _now_init_data(tg).rsplit("&hash=", 1)[0]
+    resp = await client.post("/api/v1/auth/telegram", json={"init_data": f"{base}&hash={bad_hash}"})
+    assert resp.status_code == 401
+    assert resp.json()["code"] == "invalid_init_data"
+    assert_schema(resp.json(), "Error")
+    assert await _count_users(engine, tg) == 0
