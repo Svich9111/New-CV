@@ -36,6 +36,12 @@ make db-up        # PostgreSQL и Redis в Docker для локальной ра
 Тесты backend берут адрес БД из `TEST_DATABASE_URL`
 (по умолчанию `postgresql+asyncpg://postgres:postgres@localhost:5432/feelings_test`).
 
+В облачной сессии тестовый PostgreSQL — отдельный кластер `/var/tmp/feelings-pgdata` (порт 5432, вход `trust`,
+расширение pgvector). Системный кластер (`/var/lib/postgresql/16/main`, проверка пароля) не запускать — тест роли
+входа `feelings_api` на нём падает. Если кластер не запущен:
+`su postgres -c "/usr/lib/postgresql/16/bin/pg_ctl -D /var/tmp/feelings-pgdata -o '-p 5432 -k /tmp' -l /var/tmp/feelings-pgdata/log start"`.
+Роли `feelings_*` общие для всего кластера — менять их только в откатываемых транзакциях.
+
 ## Семь принципов продукта (ТЗ, раздел 2) — обязательны для кода, промптов и интерфейса
 
 1. Агент — переводчик, а не адвокат.
