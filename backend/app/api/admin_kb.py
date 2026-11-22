@@ -37,6 +37,7 @@ from app.api.deps import AppSettings, get_sessionmaker, unauthorized
 from app.config import Settings, admin_token_hashes
 from app.core.session import SessionError, read_token
 from app.errors import AppError, not_found
+from app.kb.parse import ParseError, ParseLimits, parse_txt
 from app.repositories import kb_admin, users
 from app.repositories.kb_admin import Duplicate, InvalidUpload, KbDocumentRow, TooLarge
 
@@ -166,6 +167,7 @@ class UploadFields(BaseModel):
 # --------------------------------------------------------------------------- формат
 
 
+_TXT_LIMITS = ParseLimits()
 _ZIP = b"PK\x03\x04"
 _EPUB_MIMETYPE = b"mimetypeapplication/epub+zip"
 
@@ -195,11 +197,14 @@ def _zip_has(data: bytes, name: str) -> bool:
 
 
 def _is_text(data: bytes) -> bool:
+    """TXT в UTF-8 или CP1251 — та же проверка, что у разборщика (``kb.parse.parse_txt``:
+    кодировки и отсечение двоичного мусора по доле управляющих символов), плюс без NUL.
+    Достаточно ли в нём букв (``empty_text``), решает индексация."""
     if b"\x00" in data:
         return False
     try:
-        data.decode("utf-8-sig")
-    except UnicodeDecodeError:
+        parse_txt(data, _TXT_LIMITS)
+    except ParseError:
         return False
     return True
 

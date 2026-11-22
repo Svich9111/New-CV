@@ -67,6 +67,8 @@ async def env(sessionmaker: SM, engine: AsyncEngine) -> AsyncIterator[Env]:
             admin_database_url="postgresql+asyncpg://admin@db.invalid/none",  # не используется
         )
 
+    async with engine.connect() as conn:
+        started = (await conn.execute(text("SELECT clock_timestamp()"))).scalar_one()
     prev = (app.state.sessionmaker, app.state.admin_sessionmaker)
     app.state.sessionmaker = sessionmaker
     app.state.admin_sessionmaker = make_sessionmaker(engine)
@@ -77,6 +79,14 @@ async def env(sessionmaker: SM, engine: AsyncEngine) -> AsyncIterator[Env]:
         yield Env(c, engine, token, other)
     app.dependency_overrides.clear()
     app.state.sessionmaker, app.state.admin_sessionmaker = prev
+    # Загруженные тестом материалы удаляются: иначе их возьмёт воркер индексации других тестов
+    # (общая тестовая БД; `kb_claim_index` берёт все `uploaded`).
+    async with engine.begin() as conn:
+        await conn.execute(text("SET LOCAL ROLE feelings_admin"))
+        await conn.execute(
+            text("SELECT admin_kb_delete(id) FROM kb_documents WHERE created_at >= :t"),
+            {"t": started},
+        )
 
 
 def book(label: str = "") -> bytes:
@@ -266,13 +276,22 @@ async def test_upload_detects_format_by_content_and_extension(
         (docx(), "book.epub"),  # zip без mimetype epub
         (b"PK\x03\x04not a zip", "book.docx"),
         ("\x00бинарный".encode(), "book.txt"),
-        (b"\xff\xfe\xfa", "book.txt"),  # не UTF-8
+        (bytes(range(1, 32)) * 40, "book.txt"),  # двоичный мусор (управляющие символы)
     ],
 )
 async def test_unsupported_format_415_before_db(env: Env, data: bytes, filename: str) -> None:
     resp = await upload(env, data, filename)
     _error(resp, 415, "unsupported_format")
     assert await _count_docs(env, hashlib.sha256(data).hexdigest()) == 0
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "cp1251"])
+async def test_txt_accepted_in_utf8_and_cp1251(env: Env, encoding: str) -> None:
+    """Б-76 (A8-K2): TXT — в UTF-8 (с BOM и без) или CP1251, как у разборщика."""
+    data = book(encoding).decode().encode(encoding)
+    resp = await upload(env, data, "book.txt")
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["source_format"] == "txt"
 
 
 async def test_duplicate_is_409(env: Env) -> None:
