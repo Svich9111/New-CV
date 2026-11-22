@@ -33,6 +33,9 @@ class CallRecord:
     latency_s: float = 0.0
     fallback_used: bool = False
     error: str | None = None
+    # Потоковый ответ (``stream_text``) не возвращает токены и стоимость: False — расход есть,
+    # но не измерен (не $0; ТЗ §10, задача 2.1).
+    usage_known: bool = True
 
 
 @dataclass

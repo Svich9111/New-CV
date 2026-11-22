@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ def role_of(schema: Mapping[str, Any]) -> str:
         ("tone", "signals"),
         ("adapt", "adapted"),
         ("meaning", "problems"),
+        ("summary", "summary"),
     ):
         if key in props:
             return role
@@ -136,3 +138,53 @@ def demo_handler(role: str, payload: dict[str, Any], system: str) -> dict[str, A
     if role == "meaning":
         return {"problems": []}
     raise ValueError(role)
+
+
+# --------------------------------------------------------------------------- поток (задача 2.1)
+
+StreamScript = Callable[[dict[str, Any]], Sequence["str | BaseException"]]
+
+
+def json_chunks(data: Mapping[str, Any], size: int = 7) -> list[str]:
+    """JSON-ответ, порезанный на куски по ``size`` символов (как его отдаёт поток модели)."""
+    raw = json.dumps(data, ensure_ascii=False)
+    return [raw[i : i + size] for i in range(0, len(raw), size)]
+
+
+@dataclass
+class ScriptedStreamProvider(ScriptedProvider):
+    """Заглушка с потоком: ``complete_json`` — как у ``ScriptedProvider`` (классификатор),
+    ``stream_text`` — куски из ``stream(payload)``; исключение в списке бросается на своём
+    месте. ``first_delay_s`` / ``chunk_delay_s`` — задержки (проверка «первый кусок не ждёт
+    конца ответа»); ``stream_requests`` — что ушло бы в модель потоком."""
+
+    stream: StreamScript | None = None
+    first_delay_s: float = 0.0
+    chunk_delay_s: float = 0.0
+    stream_requests: list[dict[str, Any]] = field(default_factory=list)
+
+    async def stream_text(
+        self,
+        *,
+        system: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int = 16000,
+    ) -> AsyncIterator[str]:
+        payload = json.loads(messages[-1].content)
+        self.stream_requests.append(
+            {
+                "system": system,
+                "messages": [(m.role, m.content) for m in messages],
+                "max_tokens": max_tokens,
+            }
+        )
+        if self.stream is None:
+            raise NotImplementedError
+        if self.first_delay_s:
+            await asyncio.sleep(self.first_delay_s)
+        for i, item in enumerate(self.stream(payload)):
+            if isinstance(item, BaseException):
+                raise item
+            if i and self.chunk_delay_s:
+                await asyncio.sleep(self.chunk_delay_s)
+            yield item

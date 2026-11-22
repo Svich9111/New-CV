@@ -183,6 +183,9 @@ def test_owner_context_has_only_owner_fields() -> None:
         "memory",
         "knowledge",
         "pair_messages",
+        # 2.1 (§6.1 п.2, п.5): сводка профиля и сводка диалога — данные владельца.
+        "profile_summary",
+        "dialog_summary",
     }
     payload = dialog.context_payload(CONTEXT, TURNS)
     assert set(payload) == {

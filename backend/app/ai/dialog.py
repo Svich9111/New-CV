@@ -96,6 +96,11 @@ class OwnerContext:
     memory: tuple[str, ...] = ()
     knowledge: tuple[str, ...] = ()
     pair_messages: tuple[PairMessage, ...] = ()
+    # §6.1 п.2 и п.5 (задача 2.1): сводка профиля владельца (``agents.profile_summary_enc``) и
+    # краткое содержание предыдущих реплик (``conversations.summary_enc``). Пустые — не
+    # передаются модели (вход эталонного набора не меняется).
+    profile_summary: str = ""
+    dialog_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -203,7 +208,30 @@ def context_payload(context: OwnerContext, dialog: Sequence[Turn]) -> dict[str, 
             {"direction": m.direction, "text": m.text} for m in context.pair_messages
         ],
         "dialog": [{"from": t.author, "text": t.text} for t in dialog],
+        **({"owner_profile": context.profile_summary} if context.profile_summary else {}),
+        **({"dialog_summary": context.dialog_summary} if context.dialog_summary else {}),
     }
+
+
+# Порядок блоков §6.1 во входе модели (п.1 — системный промпт, отдельным сообщением):
+# п.2 профиль и сводка памяти, п.3 память, п.4 база знаний, п.5 сводка и реплики, п.6 пара.
+PAYLOAD_ORDER_6_1 = (
+    "owner_name",
+    "partner_name",
+    "relationship",
+    "owner_profile",
+    "owner_memory",
+    "knowledge",
+    "dialog_summary",
+    "dialog",
+    "pair_messages",
+)
+
+
+def ordered_payload(context: OwnerContext, dialog: Sequence[Turn]) -> dict[str, Any]:
+    """Те же поля, что ``context_payload``, в порядке блоков §6.1 (потоковый чат, 2.1)."""
+    payload = context_payload(context, dialog)
+    return {k: payload[k] for k in PAYLOAD_ORDER_6_1 if k in payload}
 
 
 def safety_payload(kind: Literal["message", "dialog"], text: str) -> dict[str, Any]:

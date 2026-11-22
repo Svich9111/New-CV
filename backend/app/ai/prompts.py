@@ -20,6 +20,9 @@ PROMPTS_DIR_ENV = "FEELINGS_PROMPTS_DIR"
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[3] / "prompts"
 
 ROLES = ("dialog", "draft", "safety", "tone", "adapt", "meaning", "crisis")
+# Служебные роли вне ``PromptSet`` (не входят в эталонный набор диалога и конвейера): версия
+# задаётся в своём модуле. ``summary`` — сжатие истории чата (задача 2.1, ``app/ai/summary.py``).
+AUX_ROLES = ("summary",)
 _VERSION = re.compile(r"^v[0-9]+$")
 
 
@@ -92,7 +95,7 @@ def _read(path: Path) -> str:
 
 def load(role: str, version: str, block: str = "system", directory: Path | None = None) -> Prompt:
     """Текст блока ``block`` из ``<роль>.<версия>.md``."""
-    if role not in ROLES:
+    if role not in ROLES and role not in AUX_ROLES:
         raise PromptError(f"неизвестная роль промпта {role!r}")
     if not _VERSION.match(version):
         raise PromptError(f"версия промпта {version!r} — не vN")

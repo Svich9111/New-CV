@@ -25,6 +25,8 @@ class AgentModels:
     safety: LLMProvider
     tone: LLMProvider
     meaning: LLMProvider
+    # Сжатие истории чата (2.1, ``summary.v0``); ``None`` — модель классификатора (``safety``).
+    summary: LLMProvider | None = None
 
     @classmethod
     def single(cls, provider: LLMProvider) -> AgentModels:

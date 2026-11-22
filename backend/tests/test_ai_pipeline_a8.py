@@ -662,6 +662,9 @@ def test_owner_context_has_no_partner_fields() -> None:
         "memory",
         "knowledge",
         "pair_messages",
+        # 2.1 (§6.1 п.2, п.5): сводка профиля и сводка диалога — данные владельца.
+        "profile_summary",
+        "dialog_summary",
     }
 
 

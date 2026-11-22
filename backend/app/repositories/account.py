@@ -27,6 +27,7 @@ from app.core import crypto
 from app.core.crypto import Keyring
 from app.db import sqlstate, user_scope
 from app.repositories import users
+from app.repositories.chat import summary_text
 from app.repositories.texts import open_row
 from app.repositories.users import ONBOARDED_SQL
 from app.schemas import (
@@ -88,6 +89,12 @@ def _optional_text(
     keys: Keyring, field: crypto.Field, row_id: object, blob: bytes | None
 ) -> ExportText | None:
     return None if blob is None else _text(keys, field, row_id, blob)
+
+
+def _summary(keys: Keyring, conversation_id: object, blob: bytes | None) -> ExportText | None:
+    """Сводка диалога для людей: без служебной отметки конверта (задача 2.1, `chat`)."""
+    value = _optional_text(keys, crypto.CONVERSATION_SUMMARY, conversation_id, blob)
+    return summary_text(value) if isinstance(value, str) else value
 
 
 # --- Удаление ---------------------------------------------------------------------------------
@@ -251,7 +258,7 @@ async def _conversations(
         ExportConversation(
             id=c.id,
             started_at=c.started_at,
-            summary=_optional_text(keys, crypto.CONVERSATION_SUMMARY, c.id, c.summary_enc),
+            summary=_summary(keys, c.id, c.summary_enc),
             messages=by_conv.get(_uuid(c.id), []),
         )
         for c in convs
