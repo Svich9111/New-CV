@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 from openapi_spec_validator import validate
 
@@ -119,7 +120,24 @@ SERVED_STATUSES = {
     # 409 conflict_retry — 40P01/40001 (АР-24, общий обработчик app/errors.py).
     ("delete", "/me"): {"204", "401", "409"},
     ("get", "/me/export"): {"200", "401", "409"},
+    # 2.1 этап 2 (app/api/chat.py, tests/test_chat_api.py; АР-32). 402 не отдаётся до этапа 4;
+    # 409 conflict_retry — только из транзакции сохранения реплики владельца (АР-24).
+    ("post", "/chat/messages"): {"200", "401", "403", "409", "422", "429"},
+    ("get", "/chat/messages"): {"200", "401", "403", "422"},
+    # АР-33 (app/api/help.py): без онбординга и подписки. 401 (вход по общей схеме bearer)
+    # отдаётся, но в контракте не объявлен — страж ниже, карточка A1.
+    ("get", "/help/contacts"): {"200"},
 }
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="контракт: у GET /help/contacts не объявлен 401, хотя путь требует входа "
+    "(общая схема bearer) — карточка A1 из отчёта 2.1 этап 2",
+)
+def test_help_contacts_declares_401() -> None:
+    declared = set(_spec()["paths"]["/help/contacts"]["get"]["responses"])
+    assert "401" in declared
 
 
 def test_account_endpoints_do_not_declare_onboarding_required() -> None:

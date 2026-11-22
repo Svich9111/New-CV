@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     telegram_webhook_secret: SecretStr = SecretStr("")
     # Адрес Mini App (https) для кнопки web_app в ответе на /start и кнопки меню (задача 1.4).
     webapp_url: str = ""
+    # Личный чат (задача 2.1, этап 2). Дневной лимит реплик агенту на пользователя (ТЗ §10):
+    # окно — календарные сутки UTC, счётчик — в Redis (`redis_url`); кризисные реплики
+    # засчитываются, но не отклоняются (ТЗ §9.3).
+    chat_daily_limit: int = Field(default=100, ge=1)
+    # Строка-комментарий SSE для поддержания соединения, если событий нет дольше (секунды).
+    chat_keepalive_s: float = Field(default=15.0, gt=0)
+    # Модели OpenRouter по ролям (гипотеза АР-19); ключ — OPENROUTER_API_KEY (не FEELINGS_).
+    llm_writer_model: str = "anthropic/claude-sonnet-5.5"
+    llm_classifier_model: str = "anthropic/claude-haiku-5.5"
 
 
 MIN_SESSION_SECRET_LEN = 32

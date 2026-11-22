@@ -517,33 +517,38 @@ async def current_conversation(
     Миграция не нужна; уникальность «один диалог на агента» в схеме не вводится — несколько
     сессий на агента допускает §7 (деление на сессии — 2.4)."""
     async with user_scope(sm, user_id) as s:
-        agent = (
-            await s.execute(
-                text(
-                    "SELECT a.id FROM agents a JOIN users u ON u.id = a.user_id "
-                    "WHERE a.user_id = :u AND u.deleted_at IS NULL FOR NO KEY UPDATE OF a"
-                ),
-                {"u": user_id},
-            )
-        ).scalar_one_or_none()
-        if agent is None:
-            raise OwnerGone
+        return await _conversation(s, user_id)
+
+
+async def _conversation(s: AsyncSession, user_id: uuid.UUID) -> uuid.UUID:
+    """Тело ``current_conversation`` внутри уже открытой транзакции владельца."""
+    agent = (
+        await s.execute(
+            text(
+                "SELECT a.id FROM agents a JOIN users u ON u.id = a.user_id "
+                "WHERE a.user_id = :u AND u.deleted_at IS NULL FOR NO KEY UPDATE OF a"
+            ),
+            {"u": user_id},
+        )
+    ).scalar_one_or_none()
+    if agent is None:
+        raise OwnerGone
+    conv = (
+        await s.execute(
+            text(
+                "SELECT id FROM conversations WHERE agent_id = :a "
+                "ORDER BY started_at DESC, id DESC LIMIT 1"
+            ),
+            {"a": agent},
+        )
+    ).scalar_one_or_none()
+    if conv is None:
         conv = (
             await s.execute(
-                text(
-                    "SELECT id FROM conversations WHERE agent_id = :a "
-                    "ORDER BY started_at DESC, id DESC LIMIT 1"
-                ),
+                text("INSERT INTO conversations (agent_id) VALUES (:a) RETURNING id"),
                 {"a": agent},
             )
-        ).scalar_one_or_none()
-        if conv is None:
-            conv = (
-                await s.execute(
-                    text("INSERT INTO conversations (agent_id) VALUES (:a) RETURNING id"),
-                    {"a": agent},
-                )
-            ).scalar_one()
+        ).scalar_one()
     return _uuid(conv)
 
 
@@ -557,28 +562,106 @@ async def add_message(
 ) -> uuid.UUID | None:
     """Реплика в свой диалог (шифротекст). ``None`` — диалог не свой или владелец удалён
     (Б-44: не ошибка). Реплику владельца API пишет **до** вызова модели (ТЗ §10)."""
+    async with user_scope(sm, user_id) as s:
+        return await _insert_message(s, keys, user_id, conversation_id, author, body)
+
+
+async def _insert_message(
+    s: AsyncSession,
+    keys: Keyring,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    author: Author,
+    body: str,
+) -> uuid.UUID | None:
     if author not in ("owner", "agent"):
         raise ValueError("author")
     row_id = uuid.uuid4()
-    async with user_scope(sm, user_id) as s:
-        res = await s.execute(
-            text(
-                "INSERT INTO conversation_messages (id, conversation_id, author, text_enc) "
-                "SELECT :i, c.id, CAST(:au AS message_author), :t FROM conversations c "
-                "JOIN agents a ON a.id = c.agent_id JOIN users u ON u.id = a.user_id "
-                "WHERE c.id = :c AND a.user_id = :u AND u.deleted_at IS NULL RETURNING id"
-            ),
-            {
-                "i": row_id,
-                "c": conversation_id,
-                "u": user_id,
-                "au": author,
-                "t": keys.seal(crypto.CONVERSATION_MESSAGE_TEXT, row_id, body),
-            },
-        )
-        if res.one_or_none() is None:
-            return None
+    res = await s.execute(
+        text(
+            "INSERT INTO conversation_messages (id, conversation_id, author, text_enc) "
+            "SELECT :i, c.id, CAST(:au AS message_author), :t FROM conversations c "
+            "JOIN agents a ON a.id = c.agent_id JOIN users u ON u.id = a.user_id "
+            "WHERE c.id = :c AND a.user_id = :u AND u.deleted_at IS NULL RETURNING id"
+        ),
+        {
+            "i": row_id,
+            "c": conversation_id,
+            "u": user_id,
+            "au": author,
+            "t": keys.seal(crypto.CONVERSATION_MESSAGE_TEXT, row_id, body),
+        },
+    )
+    if res.one_or_none() is None:
+        return None
     return row_id
+
+
+async def add_owner_turn(
+    sm: async_sessionmaker[AsyncSession], keys: Keyring, user_id: uuid.UUID, body: str
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """Реплика владельца в текущий диалог (создаётся, если его нет) — **одной** транзакцией
+    (АР-24: 40P01/40001 → 409, ничего не сохранено, повтор безопасен). → (id диалога, id
+    реплики). ``OwnerGone`` — владельца или агента нет (удалён во время запроса)."""
+    async with user_scope(sm, user_id) as s:
+        conv = await _conversation(s, user_id)
+        row_id = await _insert_message(s, keys, user_id, conv, "owner", body)
+        if row_id is None:
+            raise OwnerGone
+    return conv, row_id
+
+
+_PAGE_FIRST = (
+    "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at "
+    "FROM conversation_messages m JOIN conversations c ON c.id = m.conversation_id "
+    "JOIN agents a ON a.id = c.agent_id JOIN users u ON u.id = a.user_id "
+    "WHERE a.user_id = :u AND u.deleted_at IS NULL "
+    "ORDER BY m.created_at DESC, m.id DESC LIMIT :n"
+)
+_PAGE_BEFORE = (
+    "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at "
+    "FROM conversation_messages m JOIN conversations c ON c.id = m.conversation_id "
+    "JOIN agents a ON a.id = c.agent_id JOIN users u ON u.id = a.user_id "
+    "WHERE a.user_id = :u AND u.deleted_at IS NULL AND (m.created_at, m.id) < (:bt, :bi) "
+    "ORDER BY m.created_at DESC, m.id DESC LIMIT :n"
+)
+
+
+@dataclass(frozen=True)
+class FeedPosition:
+    """Позиция реплики в ленте личного чата (ключ курсора ``GET /chat/messages``)."""
+
+    created_at: datetime
+    id: uuid.UUID
+
+
+async def read_chat_page(
+    sm: async_sessionmaker[AsyncSession],
+    keys: Keyring,
+    user_id: uuid.UUID,
+    *,
+    limit: int,
+    before: FeedPosition | None = None,
+) -> tuple[list[ConversationText], bool]:
+    """Страница ленты личного чата владельца — реплики **всех** его диалогов от новых к старым
+    (``created_at DESC, id DESC``), строго старше ``before``. → (реплики, есть ли старше).
+    Нерасшифрованная строка не пропускается: ``text = None``, код — в ``unavailable``. Явный
+    отбор по владельцу (``agents.user_id``) поверх RLS; удалённый владелец — пустая страница."""
+    if limit < 1:
+        raise ValueError("limit")
+    params: dict[str, object] = {"u": user_id, "n": limit + 1}
+    sql = _PAGE_FIRST
+    if before is not None:
+        sql = _PAGE_BEFORE
+        params |= {"bt": before.created_at, "bi": before.id}
+    async with user_scope(sm, user_id) as s:
+        rows = (await s.execute(text(sql), params)).all()
+    items: list[ConversationText] = []
+    for r in rows[:limit]:
+        row_id = _uuid(r.id)
+        body, reason = open_row(keys, crypto.CONVERSATION_MESSAGE_TEXT, row_id, r.text_enc)
+        items.append(ConversationText(row_id, r.author, body, r.created_at, reason))
+    return items, len(rows) > limit
 
 
 async def read_history(

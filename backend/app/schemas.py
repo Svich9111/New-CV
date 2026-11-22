@@ -294,3 +294,41 @@ class AccountExport(_Export):
     couples: list[ExportCouple]
     subscriptions: list[ExportSubscription]
     safety_events: list[ExportSafetyEvent]
+
+
+# --- Личный чат (задача 2.1, этап 2; контракт `/chat/messages`, АР-32) ---------------------
+
+
+def _not_blank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("пустая реплика")
+    return value
+
+
+class ChatMessageRequest(BaseModel):
+    """Тело `POST /chat/messages`: только `text`, 1–4000 символов, не из одних пробелов."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    text: Annotated[
+        str, StringConstraints(min_length=1, max_length=4000), AfterValidator(_not_blank)
+    ]
+
+
+class ChatMessage(_Export):
+    id: uuid.UUID
+    author: Literal["owner", "agent"]
+    text: ExportText
+    created_at: datetime
+
+
+class ChatPage(_Export):
+    items: list[ChatMessage]
+    next_cursor: str | None
+
+
+class HelpContact(BaseModel):
+    name: str
+    phone: str
+    description: str
+    round_the_clock: bool | None = None
