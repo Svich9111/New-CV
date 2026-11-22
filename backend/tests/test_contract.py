@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 import yaml
 from openapi_spec_validator import validate
 
@@ -142,7 +143,40 @@ SERVED_STATUSES = {
     ("get", "/admin/kb/documents"): {"200", "401", "403"},
     ("post", "/admin/kb/documents"): {"202", "401", "403", "409", "413", "415", "422"},
     ("delete", "/admin/kb/documents/{document_id}"): {"204", "401", "403", "404"},
+    # 3.3 (app/api/couple_messages.py, tests/test_couple_messages_api.py; АР-11, АР-25). Сервер
+    # отдаёт ещё 401/403 onboarding_required (все три), 422 у ленты (курсор, limit) и 404 у
+    # «прочитано» — в контракте не объявлены; стражи ниже, карточка A1 (отчёт 3.3).
+    ("get", "/couple/messages"): {"200"},
+    ("get", "/couple/messages/{message_id}/original"): {"200", "404", "409"},
+    ("post", "/couple/messages/{message_id}/read"): {"204"},
 }
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="контракт 3.3: у /couple/messages* не объявлены 401, 403 onboarding_required, 422 "
+    "ленты, 404 «прочитано» — карточка A1 из отчёта 3.3",
+)
+def test_couple_messages_declare_served_errors() -> None:
+    paths = _spec()["paths"]
+    assert {"401", "403", "422"} <= set(paths["/couple/messages"]["get"]["responses"])
+    original = paths["/couple/messages/{message_id}/original"]["get"]["responses"]
+    assert {"401", "403"} <= set(original)
+    read = paths["/couple/messages/{message_id}/read"]["post"]["responses"]
+    assert {"401", "403", "404"} <= set(read)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="контракт 3.3: PartnerMessage.text и текст оригинала — только строка; нужен "
+    "ExportText (UnavailableText для нерасшифрованного) и Cache-Control: no-store — карточка A1",
+)
+def test_couple_messages_allow_unavailable_text_and_no_store() -> None:
+    spec = _spec()
+    text_schema = spec["components"]["schemas"]["PartnerMessage"]["properties"]["text"]
+    assert text_schema.get("$ref") == "#/components/schemas/ExportText"
+    feed_200 = spec["paths"]["/couple/messages"]["get"]["responses"]["200"]
+    assert feed_200["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
 
 
 def test_memory_declares_401_and_422() -> None:
