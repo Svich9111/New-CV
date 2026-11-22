@@ -612,6 +612,15 @@ paths:
         Только свои неудалённые записи (ТЗ §2 п.6, §6.3). Наблюдения агента отделены от слов
         владельца: `type: observation`, `source: agent_inference`; записи из одобренных
         сообщений партнёра — `type: from_partner`, `source: partner_message` (ФТ-14).
+
+        Доступно после входа без завершённого онбординга (принцип 6 «человек видит и удаляет
+        любую запись»; как выход из пары и выгрузка, АР-17, АР-25): код `onboarding_required`
+        (403) этот путь не отдаёт.
+
+        Запись, текст которой не удалось расшифровать, не скрывается и не роняет ответ: в
+        `text` — объект `UnavailableText` с кодом причины (в журнал — только код причины и
+        колонка, без текста и id); такую запись можно удалить. Неверный `type` — 422. Ответ не
+        кэшируется (`Cache-Control: no-store`).
       parameters:
         - name: type
           in: query
@@ -619,6 +628,11 @@ paths:
       responses:
         "200":
           description: OK
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema:
@@ -628,6 +642,8 @@ paths:
                   items:
                     type: array
                     items: { $ref: "#/components/schemas/MemoryItem" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
   /memory/{memory_id}:
     parameters:
       - name: memory_id
@@ -640,11 +656,24 @@ paths:
       description: |
         Удаляет функция БД `app_delete_memory` (АР-36): текст, вектор и дата события стираются,
         отпечаток записи остаётся — запись не возвращается ни повторным извлечением, ни
-        слиянием, ни сжатием. Чужая, уже удалённая и несуществующая запись — одинаково 404;
-        повтор удаления — 404, ничего не меняет.
+        слиянием, ни сжатием. Удаляется и запись, текст которой не расшифровывается. Чужая,
+        уже удалённая и несуществующая запись — одинаково 404; повтор удаления — 404, ничего
+        не меняет.
+
+        Без требования онбординга (принцип 6, АР-17, АР-25): 403 не отдаётся. Ответ не
+        кэшируется (`Cache-Control: no-store`). 409 `conflict_retry` — одновременное изменение
+        (40P01/40001, АР-24), ничего не изменено, повтор безопасен.
       responses:
-        "204": { description: Удалено }
+        "204":
+          description: Удалено
+          headers:
+            Cache-Control:
+              description: Ответ не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
 
   /subscription:
     get:
@@ -1129,7 +1158,9 @@ components:
       properties:
         id: { type: string, format: uuid }
         type: { $ref: "#/components/schemas/MemoryType" }
-        text: { type: string }
+        text:
+          $ref: "#/components/schemas/ExportText"
+          description: Расшифрованный текст или `UnavailableText` (запись видна и удаляется)
         event_date: { type: [string, "null"], format: date }
         source: { type: string, enum: [owner_dialog, agent_inference, partner_message] }
         confidence: { type: number, minimum: 0, maximum: 1 }
@@ -1198,8 +1229,8 @@ components:
 
     ExportText:
       description: >-
-        Расшифрованный текст или отметка о его недоступности (выгрузка ФТ-21 и история
-        личного чата `GET /chat/messages`)
+        Расшифрованный текст или отметка о его недоступности (выгрузка ФТ-21, история
+        личного чата `GET /chat/messages`, память `GET /memory`)
       oneOf:
         - { type: string }
         - { $ref: "#/components/schemas/UnavailableText" }
