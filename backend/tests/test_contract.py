@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 import yaml
 from openapi_spec_validator import validate
 
@@ -145,11 +144,6 @@ def test_help_contacts_is_public_in_contract() -> None:
     assert set(op["responses"]) == {"200"}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A2: сервер отдаёт 401 на GET /help/contacts без сессии (app/api/help.py требует "
-    "CurrentUser); по контракту 2.0v путь публичный — снять зависимость входа и этот xfail",
-)
 async def test_help_contacts_served_without_session() -> None:
     """Сервер следует контракту: без заголовка и с негодным токеном — 200 и тот же список."""
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)

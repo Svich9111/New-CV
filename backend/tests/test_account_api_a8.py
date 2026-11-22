@@ -863,7 +863,9 @@ def _user_routes() -> list[tuple[str, str]]:
     """Все реализованные эндпоинты пользователя (схема FastAPI), кроме входа и проверки."""
     out = []
     for path, ops in app.openapi()["paths"].items():
-        if path in (f"{API}/auth/telegram", f"{API}/health"):
+        # 2.0v (A2): /help/contacts — публичный путь (контракт security: []), проверяется
+        # отдельно — 200 и с токеном удалённого (test_delete_me_then_401_everywhere_…).
+        if path in (f"{API}/auth/telegram", f"{API}/health", f"{API}/help/contacts"):
             continue
         for method in ops:
             out.append((method.upper(), path.replace("{token}", "A" * 43)))
@@ -892,6 +894,9 @@ async def test_delete_me_then_401_everywhere_and_clean_relogin(
         payload = _onboarding(a) if method == "PUT" else None
         _unauthorized(await api.request(method, path, headers=a.h, json=payload))
     _unauthorized(await api.delete(f"{API}/me", headers=a.h))  # повтор
+    # 2.0v (A2): контакты помощи открываются и с токеном удалённого аккаунта.
+    r = await api.get(f"{API}/help/contacts", headers=a.h)
+    assert r.status_code == 200 and any(c["phone"] == "112" for c in r.json())
     assert await _su(engine, "SELECT count(*) FROM users WHERE id = :u", u=a.uid) == 0
     # Партнёр: пара распущена, его история — у него, без текстов удалённой.
     assert (await api.get(f"{API}/couple", headers=w.igor.h)).status_code == 404

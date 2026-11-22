@@ -571,6 +571,11 @@ async def test_protected_endpoint_listed_in_app_requires_session(
 ) -> None:
     """Все маршруты приложения, кроме входа, health и документации, требуют сессию."""
     public = {"/api/v1/auth/telegram", "/api/v1/health"}
+    # 2.0v (A2): контакты помощи публичны (контракт security: []) — без сессии 200, не 401.
+    help_path = "/api/v1/help/contacts"
+    r = await client.get(help_path)
+    assert r.status_code == 200 and r.json(), r.text
+    public.add(help_path)
     checked = 0
     for path, ops in app.openapi()["paths"].items():
         if path in public or "{" in path:

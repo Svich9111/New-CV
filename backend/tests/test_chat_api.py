@@ -1243,7 +1243,10 @@ async def test_auth_onboarding_and_body_checks(env: Env) -> None:
     for headers in ({}, {"Authorization": "Bearer nope"}, {"Authorization": f"Bearer {ghost}"}):
         _error(await env.client.post(API, headers=headers, json={"text": "x"}), 401, "unauthorized")
         _error(await env.client.get(API, headers=headers), 401, "unauthorized")
-        _error(await env.client.get("/api/v1/help/contacts", headers=headers), 401, "unauthorized")
+        # 2.0v (A2): контакты помощи — публичный путь: без сессии и с негодным токеном — 200.
+        resp = await env.client.get("/api/v1/help/contacts", headers=headers)
+        assert resp.status_code == 200 and resp.json() == help_contacts()
+        assert resp.headers["cache-control"] == "no-store"
     fresh = await _login(env.client)  # вход без онбординга
     _error(
         await env.client.post(API, headers=fresh.headers, json={"text": "x"}),
