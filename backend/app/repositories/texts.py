@@ -58,6 +58,7 @@ class DraftText:
     text: str
     version: int
     status: str
+    reply_to_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -331,6 +332,73 @@ async def update_draft_text(
     return None if version is None else int(version)
 
 
+async def own_agent_id(
+    sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID
+) -> uuid.UUID | None:
+    """Агент владельца (живого); None — нет агента или владелец удалён."""
+    async with user_scope(sm, user_id) as s:
+        value = (
+            await s.execute(
+                text(
+                    "SELECT a.id FROM agents a JOIN users u ON u.id = a.user_id "
+                    "WHERE a.user_id = :u AND u.deleted_at IS NULL"
+                ),
+                {"u": user_id},
+            )
+        ).scalar_one_or_none()
+    return None if value is None else _uuid(value)
+
+
+async def reply_target_ok(
+    sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID, message_id: uuid.UUID
+) -> bool:
+    """«Ответить с агентом» (ТЗ §4.4 п.5): сообщение — **полученное** владельцем, доставленное
+    (``delivered``/``read``/``answered``) в его **текущей активной** паре — как проверит
+    ``app_send_draft`` (FA004) при отправке."""
+    async with user_scope(sm, user_id) as s:
+        value = (
+            await s.execute(
+                text(
+                    "SELECT EXISTS (SELECT 1 FROM partner_messages pm "
+                    "JOIN couple_members cm ON cm.couple_id = pm.couple_id AND cm.user_id = :u "
+                    "AND cm.active JOIN couples c ON c.id = pm.couple_id AND c.status = 'active' "
+                    "WHERE pm.id = :m AND pm.recipient_id = :u "
+                    "AND pm.status IN ('delivered', 'read', 'answered'))"
+                ),
+                {"u": user_id, "m": message_id},
+            )
+        ).scalar_one()
+    return bool(value)
+
+
+async def replace_draft_text(
+    sm: async_sessionmaker[AsyncSession],
+    keys: Keyring,
+    user_id: uuid.UUID,
+    draft_id: uuid.UUID,
+    body: str,
+    *,
+    expected_version: int,
+) -> int | None:
+    """«Другой вариант» (ФТ-07): новая версия черновика только в статусе ``draft`` и только если
+    версия всё ещё ``expected_version`` (автор не правил его, пока шла модель). None — иначе."""
+    async with user_scope(sm, user_id) as s:
+        res = await s.execute(
+            text(
+                "UPDATE message_drafts SET text_enc = :t, version = version + 1, "
+                "updated_at = now() WHERE id = :d AND status = 'draft' AND version = :v "
+                "RETURNING version"
+            ),
+            {
+                "d": draft_id,
+                "v": expected_version,
+                "t": keys.seal(crypto.DRAFT_TEXT, draft_id, body),
+            },
+        )
+        version = res.scalar_one_or_none()
+    return None if version is None else int(version)
+
+
 async def get_draft(
     sm: async_sessionmaker[AsyncSession],
     keys: Keyring,
@@ -341,8 +409,8 @@ async def get_draft(
         row = (
             await s.execute(
                 text(
-                    "SELECT id, text_enc, version, status::text AS status FROM message_drafts "
-                    "WHERE id = :d"
+                    "SELECT id, text_enc, version, status::text AS status, reply_to_id "
+                    "FROM message_drafts WHERE id = :d"
                 ),
                 {"d": draft_id},
             )
@@ -354,6 +422,7 @@ async def get_draft(
         text=keys.open(crypto.DRAFT_TEXT, draft_id, row.text_enc),
         version=row.version,
         status=row.status,
+        reply_to_id=None if row.reply_to_id is None else _uuid(row.reply_to_id),
     )
 
 

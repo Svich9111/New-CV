@@ -233,12 +233,19 @@ async def _rank_pair(
     return sorted(chosen, key=lambda r: (r.sent_at, r.id))
 
 
-def _turns(rows: ContextRows, turn_chars: int) -> list[tuple[uuid.UUID, Turn]]:
+def _turns(
+    rows: ContextRows, turn_chars: int, *, trim_agent_tail: bool = False
+) -> list[tuple[uuid.UUID, Turn]]:
     turns = [
         (r.id, Turn("owner" if r.author == "owner" else "agent", clip(r.text, turn_chars)))
         for r in rows.turns
         if r.text is not None and r.text.strip()
     ]
+    if trim_agent_tail:
+        # Черновик (3.1) пишется по разговору, который обычно кончается ответом агента: вход
+        # модели черновика — до последней реплики владельца (``dialog.draft``).
+        while turns and turns[-1][1].author != "owner":
+            turns.pop()
     if not turns or turns[-1][1].author != "owner":
         # API пишет реплику владельца до сборки контекста (ТЗ §10); без неё отвечать не на что.
         raise ValueError("последняя реплика диалога — не владельца")
@@ -256,6 +263,7 @@ async def build_context(
     knowledge: KnowledgeBase | None = None,
     budget: ContextBudget | None = None,
     prompt_set: PromptSet = V0,
+    for_draft: bool = False,
 ) -> BuiltContext:
     """Контекст агента владельца для ответа на реплику ``query`` (её текст уже сохранён в
     диалоге). Ошибки: ``chat.OwnerGone`` (нет владельца/агента), ``LookupError`` (диалог не
@@ -299,7 +307,7 @@ async def build_context(
             )
             for p in pair
         ],
-        turns=_turns(rows, budget.turn_chars),
+        turns=_turns(rows, budget.turn_chars, trim_agent_tail=for_draft),
         profile=clip(rows.profile_summary or "", budget.profile_chars),
         summary=clip(rows.summary.visible_text if rows.summary else "", budget.summary_chars),
     )
