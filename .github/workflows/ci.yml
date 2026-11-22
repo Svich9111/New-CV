@@ -25,6 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+      # test_login_roles.py запускает infra/db/roles.sql настоящим psql (нужен ≥ 15, \getenv).
+      - run: psql --version
       - run: make backend-lint
       - run: make backend-test
 

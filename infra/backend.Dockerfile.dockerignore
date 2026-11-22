@@ -1,0 +1,12 @@
+# Контекст сборки infra/backend.Dockerfile (корень репозитория): только backend/ и prompts/.
+*
+!backend/pyproject.toml
+!backend/uv.lock
+!backend/alembic.ini
+!backend/migrations/
+!backend/app/
+!prompts/
+**/__pycache__
+**/*.pyc
+**/.env
+**/.env.*
