@@ -902,12 +902,18 @@ APP_FUNCS = [
     "app_memory_nearest(text, text, integer)",  # 0008, задача 2.0v
     "app_set_memory_embedding(uuid, text, text)",  # 0008
     "app_kb_nearest(text, text, integer, text, text[], integer)",  # 0008
+    "app_delete_memory(uuid)",  # 0009, задача 2.4
+    "app_memory_forgotten(bytea[])",  # 0009
+    "app_memory_extraction_done(uuid, uuid, uuid)",  # 0009
+    "app_memory_compaction_done(uuid)",  # 0009
 ]
 PIPELINE_FUNCS = [
     "pipeline_original(uuid)",
     "pipeline_deliver(uuid, bytea, boolean, smallint, boolean)",
     "pipeline_withhold(uuid)",
     "kb_set_chunk_embedding(uuid, text, text)",  # 0008, задача 2.0v: воркер индексации
+    "memory_claim_extraction(interval, interval, integer)",  # 0009, задача 2.4: воркер памяти
+    "memory_claim_compaction(interval, interval, integer)",  # 0009
 ]
 
 

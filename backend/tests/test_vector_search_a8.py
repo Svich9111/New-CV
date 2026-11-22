@@ -582,19 +582,26 @@ async def test_set_memory_embedding_own_live_only(
 
 async def test_delete_check_constraints(mw: MemWorld, engine: AsyncEngine) -> None:
     """Кр.2, CHECK 0001/0008: удаление без обнуления вектора или модели — 23514; полное обнуление
-    (текст, вектор, модель) — проходит; модель без вектора не хранится; пустая модель — нельзя."""
-    item = mw.good[1]
+    (текст, вектор, модель) — проходит; модель без вектора не хранится; пустая модель — нельзя.
+
+    С 0009 (Б-63) изменение текста само обнуляет вектор и модель (триггер
+    ``clear_stale_embedding``), поэтому CHECK проверяется на строке, где текст не меняется
+    (``no_text``: текста уже нет, вектор и модель есть)."""
+    item, no_text = mw.good[1], mw.bad["no_text"]
     bad_updates = [
-        "UPDATE memory_items SET deleted_at = now(), text_enc = NULL WHERE id = :i",
-        "UPDATE memory_items SET deleted_at = now(), text_enc = NULL, embedding = NULL "
-        "WHERE id = :i",
-        "UPDATE memory_items SET embedding = NULL WHERE id = :i",
-        "UPDATE memory_items SET embedding_model = '' WHERE id = :i",
+        ("UPDATE memory_items SET deleted_at = now() WHERE id = :i", no_text),
+        (
+            "UPDATE memory_items SET deleted_at = now(), text_enc = NULL, embedding = NULL "
+            "WHERE id = :i",
+            no_text,
+        ),
+        ("UPDATE memory_items SET embedding = NULL WHERE id = :i", item),
+        ("UPDATE memory_items SET embedding_model = '' WHERE id = :i", item),
     ]
-    for sql in bad_updates:
+    for sql, target in bad_updates:
         with pytest.raises(DBAPIError) as e:
             async with engine.begin() as c:
-                await c.execute(text(sql), {"i": item})
+                await c.execute(text(sql), {"i": target})
         assert e.value.orig.sqlstate == "23514", sql  # type: ignore[union-attr]
     async with engine.begin() as c:
         await c.execute(
@@ -602,8 +609,23 @@ async def test_delete_check_constraints(mw: MemWorld, engine: AsyncEngine) -> No
                 "UPDATE memory_items SET deleted_at = now(), text_enc = NULL, embedding = NULL, "
                 "embedding_model = NULL WHERE id = :i"
             ),
+            {"i": no_text},
+        )
+        # Стирание текста без явного обнуления вектора: триггер 0009 обнуляет вектор и модель.
+        await c.execute(
+            text("UPDATE memory_items SET deleted_at = now(), text_enc = NULL WHERE id = :i"),
             {"i": item},
         )
+        left = (
+            await c.execute(
+                text(
+                    "SELECT embedding IS NULL, embedding_model IS NULL FROM memory_items "
+                    "WHERE id = :i"
+                ),
+                {"i": item},
+            )
+        ).one()
+        assert tuple(left) == (True, True)
 
 
 # =============================================================== 5. База знаний

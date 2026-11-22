@@ -352,29 +352,39 @@ async def test_set_memory_embedding_only_own_live_item(
 
 
 async def test_delete_clears_vector_and_model(sessionmaker: SM, engine: AsyncEngine) -> None:
-    """Удалённая запись без вектора (CHECK 0001) и без модели (CHECK 0008): иначе 23514."""
+    """Удалённая запись без вектора (CHECK 0001) и без модели (CHECK 0008): иначе 23514. С 0009
+    приложение удаляет только функцией ``app_delete_memory`` (Б-63: прямой UPDATE пометки
+    удаления, вектора и модели — 42501), а смена текста сама обнуляет вектор и модель."""
     mdl = model()
     uid, aid = await _user(engine)
     item = await _memory(engine, aid, Q, mdl)
+    no_text = await _memory(engine, aid, Q, mdl, body=None)
+    for assignments, target in (
+        ("deleted_at = now()", no_text),  # вектор и модель остались
+        ("deleted_at = now(), embedding_model = NULL", no_text),  # вектор остался
+        ("deleted_at = now(), embedding = NULL", no_text),  # модель осталась
+        ("embedding = NULL", item),  # модель без вектора и у живой записи
+        ("embedding_model = ''", item),
+    ):
+        with pytest.raises(DBAPIError) as ei:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f"UPDATE memory_items SET {assignments} WHERE id = :i"), {"i": target}
+                )
+        assert _sqlstate(ei.value) == "23514", assignments
     for assignments in (
-        "deleted_at = now(), text_enc = NULL, embedding_model = NULL",  # вектор остался
-        "deleted_at = now(), text_enc = NULL, embedding = NULL",  # модель осталась
-        "embedding = NULL",  # модель без вектора и у живой записи
-        "embedding_model = ''",
+        "deleted_at = now(), text_enc = NULL, embedding = NULL, embedding_model = NULL",
+        "embedding = NULL, embedding_model = NULL",
+        "deleted_at = now()",
     ):
         err = await _fails(
             sessionmaker, uid, f"UPDATE memory_items SET {assignments} WHERE id = :i", {"i": item}
         )
-        assert _sqlstate(err) == "23514", assignments
+        assert _sqlstate(err) == "42501", assignments
     async with user_scope(sessionmaker, uid) as s:
-        done = await s.execute(
-            text(
-                "UPDATE memory_items SET deleted_at = now(), text_enc = NULL, embedding = NULL, "
-                "embedding_model = NULL WHERE id = :i"
-            ),
-            {"i": item},
-        )
-        assert done.rowcount == 1  # type: ignore[attr-defined]
+        done = await s.execute(text("SELECT app_delete_memory(:i)"), {"i": item})
+        assert done.scalar_one() is True
+    assert await _stored(engine, item) == (None, None)
     assert await _nearest(sessionmaker, uid, mdl) == []
     assert await _set_memory(sessionmaker, uid, item, Q, mdl) is False
 

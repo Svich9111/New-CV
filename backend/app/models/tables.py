@@ -189,9 +189,29 @@ class PromptVersion(Base):
 
 
 class Agent(Base):
-    """§7 agents: id, user_id, версия промпта, сводка профиля владельца, настройки тона."""
+    """§7 agents: id, user_id, версия промпта, сводка профиля владельца, настройки тона.
+
+    Служебные колонки ``memory_*`` (0009, АР-36) — состояние фоновых задач памяти: отметка
+    обработанных сообщений пары, аренда воркера, время последнего сжатия. Меняют их только
+    функции БД (у приложения нет прав на эти колонки)."""
 
     __tablename__ = "agents"
+    __table_args__ = (
+        CheckConstraint(
+            "(memory_partner_through_at IS NULL) = (memory_partner_through_id IS NULL)",
+            name="memory_partner_through_pair",
+        ),
+        CheckConstraint(
+            "memory_lease_token IS NULL OR (memory_lease_kind IS NOT NULL "
+            "AND memory_lease_at IS NOT NULL AND memory_lease_until IS NOT NULL)",
+            name="memory_lease_whole",
+        ),
+        CheckConstraint(
+            "memory_lease_kind IS NULL OR memory_lease_kind IN ('extract', 'compact')",
+            name="memory_lease_kind",
+        ),
+        CheckConstraint("memory_attempts >= 0", name="memory_attempts_nonnegative"),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -205,12 +225,32 @@ class Agent(Base):
         JSONB, nullable=False, server_default=sa_text("'{}'::jsonb")
     )
     created_at: Mapped[datetime] = created_at()
+    # ФТ-14: доставленные владельцу сообщения пары обработаны извлечением по (delivered_at, id).
+    memory_partner_through_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    memory_partner_through_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    memory_compacted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    memory_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    memory_lease_kind: Mapped[str | None] = mapped_column(String(8))
+    memory_lease_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    memory_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    memory_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sa_text("0")
+    )
 
 
 class Conversation(Base):
-    """§7 conversations: id, agent_id, начало, краткое содержание."""
+    """§7 conversations: id, agent_id, начало, краткое содержание.
+
+    ``memory_through_at/_id`` (0009, АР-36) — реплика, по которую включительно диалог обработан
+    извлечением памяти; меняет только ``app_memory_extraction_done``."""
 
     __tablename__ = "conversations"
+    __table_args__ = (
+        CheckConstraint(
+            "(memory_through_at IS NULL) = (memory_through_id IS NULL)",
+            name="memory_through_pair",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
     agent_id: Mapped[uuid.UUID] = mapped_column(
@@ -218,12 +258,18 @@ class Conversation(Base):
     )
     started_at: Mapped[datetime] = created_at()
     summary_enc: Mapped[bytes | None] = mapped_column(LargeBinary)
+    memory_through_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    memory_through_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
 
 
 class ConversationMessage(Base):
     """§7 conversation_messages: id, conversation_id, автор, текст (зашифрован), время."""
 
     __tablename__ = "conversation_messages"
+    __table_args__ = (
+        # Порядок реплик (created_at, id): сессии и отметки извлечения (0009), сводка (2.1).
+        Index("ix_conversation_messages_conversation_order", "conversation_id", "created_at", "id"),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
     conversation_id: Mapped[uuid.UUID] = mapped_column(
@@ -265,6 +311,13 @@ class MemoryItem(Base):
             postgresql_using="hnsw",
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
+        # 0009 (АР-36): проверка отпечатков удалённых записей своего агента.
+        Index(
+            "ix_memory_items_agent_fingerprint",
+            "agent_id",
+            "fingerprint",
+            postgresql_where=sa_text("fingerprint IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -283,6 +336,7 @@ class MemoryItem(Base):
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
     # АР-5, АР-35: модель, которой сделан вектор; поиск — только по векторам текущей модели.
     embedding_model: Mapped[str | None] = mapped_column(String(128))
+    # АР-36: HMAC-SHA-256 нормализованного текста (считает приложение); после удаления остаётся.
     fingerprint: Mapped[bytes | None] = mapped_column(LargeBinary(32))
     created_at: Mapped[datetime] = created_at()
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -300,6 +354,14 @@ class PartnerMessage(Base):
         CheckConstraint("author_id <> recipient_id", name="author_not_recipient"),
         CheckConstraint("tone_score IS NULL OR tone_score BETWEEN 0 AND 3", name="tone_range"),
         CheckConstraint("NOT is_adapted OR adapted_enc IS NOT NULL", name="adapted_has_text"),
+        # 0009: доставленные получателю по порядку (delivered_at, id) — извлечение памяти (ФТ-14).
+        Index(
+            "ix_partner_messages_recipient_delivered",
+            "recipient_id",
+            "delivered_at",
+            "id",
+            postgresql_where=sa_text("delivered_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()

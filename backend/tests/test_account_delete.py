@@ -1165,9 +1165,10 @@ async def test_sent_draft_and_agent_not_deletable(sessionmaker: SM, engine: Asyn
     async with engine.connect() as conn:
         row = await conn.execute(
             text(
+                # 0009 (Б-63, АР-36): INSERT/UPDATE агента — по колонкам, без служебных memory_*.
                 "SELECT has_table_privilege('feelings_app', 'agents', 'DELETE'), "
-                "has_table_privilege('feelings_app', 'agents', 'INSERT'), "
-                "has_table_privilege('feelings_app', 'agents', 'UPDATE'), "
+                "has_any_column_privilege('feelings_app', 'agents', 'INSERT'), "
+                "has_any_column_privilege('feelings_app', 'agents', 'UPDATE'), "
                 "has_table_privilege('feelings_app', 'message_drafts', 'DELETE')"
             )
         )
