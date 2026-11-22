@@ -344,11 +344,6 @@ async def test_owner_turn_save_failure(
     assert r.status == 409 and r.json()["code"] == "conflict_retry"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-E2 MINOR: реплика не сохранилась и классификатор без вердикта — 500 без подсказки "
-    "помощи (АР-34 п.2)",
-)
 async def test_owner_turn_save_failure_without_verdict_has_help(
     w: World,
     monkeypatch: pytest.MonkeyPatch,
@@ -423,11 +418,6 @@ async def test_crisis_not_delayed_by_slow_safety_events(
     assert [x[0] for x in rows] == ["self_harm"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-E3 MINOR: остановка сервиса (ChatRuntime.aclose) отменяет незаписанные "
-    "safety_events вместе со сжатием",
-)
 async def test_shutdown_waits_for_safety_events(
     w: World,
     engine: AsyncEngine,

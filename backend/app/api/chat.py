@@ -116,6 +116,7 @@ class ChatRuntime:
     limit_timeout_s: float = LIMIT_STORE_TIMEOUT_S
     limit_cooldown_s: float = LIMIT_STORE_COOLDOWN_S
     background: set[asyncio.Task[Any]] = field(default_factory=set)
+    safety_writes: set[asyncio.Task[None]] = field(default_factory=set)
     _models_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _limit_down_until: float | None = None
     _compressing: dict[uuid.UUID, asyncio.Task[None]] = field(default_factory=dict)
@@ -193,9 +194,34 @@ class ChatRuntime:
         while self.background:
             await asyncio.gather(*list(self.background), return_exceptions=True)
 
+    def record_safety_events(
+        self, sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID, types: Sequence[str]
+    ) -> asyncio.Task[None]:
+        """Запись ``safety_events`` (только типы) фоновой задачей: уход клиента её не отменяет,
+        остановка сервиса её дожидается (§9.3 «событие фиксируется»)."""
+
+        async def write() -> None:
+            try:
+                await asyncio.wait_for(
+                    chat_repo.record_safety_events(sm, user_id, types), SAFETY_EVENTS_TIMEOUT_S
+                )
+            except Exception as exc:
+                logger.error("chat: safety events not recorded: %s", type(exc).__name__)
+
+        task = self.spawn(write())
+        self.safety_writes.add(task)
+        task.add_done_callback(self.safety_writes.discard)
+        return task
+
     async def aclose(self) -> None:
-        """Остановка сервиса: фоновые задачи снимаются и дожидаются."""
-        await _cancel_and_wait(*self.background)
+        """Остановка сервиса: записи ``safety_events`` дожидаются (не дольше
+        ``SAFETY_EVENTS_TIMEOUT_S``; A8-E3), остальные фоновые задачи (сжатие) снимаются."""
+        others = [t for t in self.background if t not in self.safety_writes]
+        writes = set(self.safety_writes)
+        await _cancel_and_wait(*others)
+        if writes:
+            _, late = await asyncio.wait(writes, timeout=SAFETY_EVENTS_TIMEOUT_S)
+            await _cancel_and_wait(*late)
 
 
 def runtime(request: Request) -> ChatRuntime:
@@ -324,6 +350,9 @@ class _Prepared:
     models: AgentModels | None = None
     models_error: LLMError | None = None
     screen_ms: int = 0
+    # Запись ``safety_events`` по кризису классификатора — запущена сразу после вердикта, до
+    # потока (ревью р.2 MINOR-3); ``None`` — кризиса до потока не было.
+    safety_write: asyncio.Task[None] | None = None
 
     @property
     def crisis(self) -> bool:
@@ -558,7 +587,9 @@ class _Reply:
         Запись ``safety_events`` — фоновая задача (ревью MINOR-3): уход клиента её не отменяет;
         событие ждёт её не дольше ``SAFETY_EVENTS_WAIT_S``, чтобы медленная БД не задерживала
         контакты."""
-        events = self.rt.spawn(self._record_safety_events(ev.safety_events))
+        events = self.prep.safety_write or self.rt.record_safety_events(
+            self.sm, self.user_id, ev.safety_events
+        )
         message_id: uuid.UUID | None = None
         if self.conversation_id is not None:
             try:
@@ -580,15 +611,6 @@ class _Reply:
                 "contacts": help_contacts(),
             },
         )
-
-    async def _record_safety_events(self, types: Sequence[str]) -> None:
-        try:
-            await asyncio.wait_for(
-                chat_repo.record_safety_events(self.sm, self.user_id, types),
-                SAFETY_EVENTS_TIMEOUT_S,
-            )
-        except Exception as exc:
-            logger.error("chat: safety events not recorded: %s", type(exc).__name__)
 
     def _compress_later(self) -> None:
         models, conversation_id = self.prep.models, self.conversation_id
@@ -648,6 +670,7 @@ async def post_message(
     except ClientGone:
         logger.info("chat reply: event=client_gone stage=prepare")
         return Response(status_code=CLIENT_CLOSED)
+    _record_crisis_now(rt, sm, user_id, prep)
     # АР-34 п.1: кризис или нет вердикта второй линии — 429 не отдаётся, реплика засчитывается.
     force = prep.crisis or prep.no_verdict
     decision = await rt.acquire(user_id, settings.chat_daily_limit, force=force)
@@ -660,6 +683,15 @@ async def post_message(
         )
     reply = _Reply(rt, sm, keys, user_id, conversation_id, payload.text, prep, _Outcome(started))
     return EventStreamResponse(reply.produce, settings.chat_keepalive_s)
+
+
+def _record_crisis_now(
+    rt: ChatRuntime, sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID, prep: _Prepared
+) -> None:
+    """Кризис второй линии — событие безопасности записывается сразу после вердикта, до потока:
+    клиент, ушедший до первого байта, его не отменит (ревью р.2 MINOR-3)."""
+    if prep.crisis and prep.screen is not None:
+        prep.safety_write = rt.record_safety_events(sm, user_id, prep.screen.crisis_types)
 
 
 async def _unsaved_turn(
@@ -681,8 +713,11 @@ async def _unsaved_turn(
         prep = await until_disconnect(request.receive, _prepare_unsaved(rt, settings, body))
     except ClientGone:
         return Response(status_code=CLIENT_CLOSED)
-    if not prep.crisis:
-        raise error
+    if not prep.crisis and not prep.no_verdict:
+        raise error  # вердикт «не кризис» есть: 500 по схеме Error (app.errors)
+    # Кризис — поток из одного ``crisis``; без вердикта — из одного ``error internal`` с
+    # указанием на помощь (АР-34 п.2, A8-E2): ответ модели без сохранённой реплики не нужен.
+    _record_crisis_now(rt, sm, user_id, prep)
     await rt.acquire(user_id, settings.chat_daily_limit, force=True)
     reply = _Reply(rt, sm, keys, user_id, None, body, prep, _Outcome(started))
     return EventStreamResponse(reply.produce, settings.chat_keepalive_s)

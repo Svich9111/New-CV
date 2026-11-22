@@ -804,6 +804,77 @@ async def test_safety_events_survive_client_leaving_during_crisis(
         assert list(types) == ["violence"]
 
 
+async def test_safety_events_recorded_when_client_leaves_before_first_byte(
+    env: Env, engine: AsyncEngine
+) -> None:
+    """Ревью р.2 MINOR-3: кризис классификатора — запись `safety_events` стартует сразу после
+    вердикта, до потока; клиент ушёл до первого байта ответа — событие всё равно записано."""
+    gone = asyncio.Event()
+
+    class LeaveOnLimit(MemoryDailyLimit):
+        async def acquire(self, *a: Any, **kw: Any) -> Any:
+            gone.set()  # вердикт уже есть, поток ещё не создан
+            return await super().acquire(*a, **kw)
+
+    env.use(stub(category="self_harm"))
+    env.rt.limiter = LeaveOnLimit()
+    anna = await _person(env.client)
+    calls: list[bool] = []  # был ли уже шаг лимита (за ним — создание потока)
+    real = env.rt.record_safety_events
+
+    def spy(*a: Any, **kw: Any) -> Any:
+        calls.append(gone.is_set())
+        return real(*a, **kw)
+
+    env.rt.record_safety_events = spy  # type: ignore[method-assign]
+    await raw_post(anna, "не хочу жить", disconnect=lambda r: gone.is_set())
+    assert calls == [False]  # одна запись, запущена до лимита и до потока
+    await env.rt.drain()
+    async with engine.connect() as conn:
+        types = (
+            await conn.execute(
+                text("SELECT type::text FROM safety_events WHERE user_id = :u"), {"u": anna.id}
+            )
+        ).scalars()
+        assert list(types) == ["self_harm"]
+
+
+async def test_unsaved_turn_without_verdict_streams_error_with_help(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ревью р.2 MINOR-2 (A8-E2): реплика не сохранилась и вердикта нет — поток из одного
+    `error internal` с указанием на помощь; агент не вызывается."""
+
+    async def broken(*a: Any, **kw: Any) -> Any:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(chat_repo, "add_owner_turn", broken)
+    p = stub()
+    env.use(p, RefusingSafety(LLMUnavailable("down")))
+    anna = await _person(env.client)
+    _, events = await post(env, anna, "Привет")
+    assert [n for n, _ in events] == ["error"]
+    assert events[0][1]["code"] == "internal" and "112" in events[0][1]["message"]
+    assert p.started == 0
+
+
+async def test_unhandled_error_is_500_by_error_schema(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Необработанная ошибка — 500 по схеме `Error`, без текста исключения."""
+
+    async def broken(*a: Any, **kw: Any) -> Any:
+        raise RuntimeError("секрет-исключения")
+
+    monkeypatch.setattr(chat_repo, "add_owner_turn", broken)
+    anna = await _person(env.client)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(API, headers=anna.headers, json={"text": "Привет"})
+    _error(resp, 500, "internal")
+    assert "секрет" not in resp.text
+
+
 async def test_one_compression_task_per_conversation() -> None:
     """Ревью MINOR-5: одна задача сжатия на диалог; запрос во время работы — один повтор после
     неё, без параллельного вызова модели."""

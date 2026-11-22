@@ -10,6 +10,7 @@ from app.db import RETRYABLE_SQLSTATES, sqlstate
 
 NOT_FOUND_CODE = "not_found"
 NOT_FOUND_MESSAGE = "Не найдено"
+INTERNAL_MESSAGE = "Что-то пошло не так — попробуйте ещё раз"
 
 
 class AppError(Exception):
@@ -57,6 +58,17 @@ def install_error_handlers(app: FastAPI) -> None:
                 "message": "Не получилось с первого раза — повторите, пожалуйста",
             },
             # Повтор — новым запросом: ответ не кэшируется (в т.ч. у /me/export, тест 4.5 О-9).
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.exception_handler(Exception)
+    async def _unhandled(_: Request, __: Exception) -> JSONResponse:
+        # Необработанная ошибка — 500 по схеме Error (ревью 2.1 э.2 р.2 MINOR-2): без текста
+        # исключения, SQL и данных запроса. Starlette после ответа пробрасывает исключение
+        # дальше (журнал сервера, тесты с raise_app_exceptions).
+        return JSONResponse(
+            status_code=500,
+            content={"code": "internal", "message": INTERNAL_MESSAGE},
             headers={"Cache-Control": "no-store"},
         )
 
