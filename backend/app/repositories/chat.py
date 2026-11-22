@@ -679,10 +679,15 @@ async def save_history_summary(
     summary: HistorySummary,
     *,
     expected_through_id: uuid.UUID | None,
+    expected: HistorySummary | None = None,
 ) -> bool:
-    """Записать сводку, если отметка в БД всё ещё ``expected_through_id`` (иначе сводку уже
-    обновил другой запрос — False, ничего не меняется). False и при чужом диалоге или удалённом
-    владельце (Б-44). Шифрование — ``conversations|summary_enc|<id диалога>``."""
+    """Записать сводку, если в БД всё ещё та, что прочитана: отметка ``expected_through_id``, а
+    при переданном ``expected`` — весь конверт (текст, отметка, пометка «на очистку»; ревью 2.4
+    р2 MAJOR-2). Сводка, помеченная удалением записи памяти после чтения (АР-37), не
+    затирается: иначе пометка пропала бы, а удалённое из прежнего текста вернулось. Без
+    ``expected`` помеченная сводка тоже не перезаписывается. False — ничего не меняется (и при
+    чужом диалоге или удалённом владельце, Б-44). Шифрование — ``conversations|summary_enc|<id>``.
+    """
     if summary.through_at is None or summary.through_id is None:
         raise ValueError("у сводки нет отметки")
     async with user_scope(sm, user_id) as s:
@@ -698,11 +703,19 @@ async def save_history_summary(
         ).one_or_none()
         if row is None:
             return False
-        current: uuid.UUID | None = None
+        current: HistorySummary | None = None
         if row.summary_enc is not None:
             raw, _ = open_row(keys, crypto.CONVERSATION_SUMMARY, conversation_id, row.summary_enc)
-            current = unpack_summary(raw).through_id if raw is not None else None
-        if current != expected_through_id:
+            current = unpack_summary(raw) if raw is not None else None
+        if (current.through_id if current else None) != expected_through_id:
+            return False
+        if expected is not None:
+            if current is None or (current.text, current.forget) != (
+                expected.text,
+                expected.forget,
+            ):
+                return False
+        elif current is not None and current.forget:
             return False
         await s.execute(
             text("UPDATE conversations SET summary_enc = :t WHERE id = :c"),

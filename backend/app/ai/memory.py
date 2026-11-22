@@ -39,7 +39,8 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Literal
@@ -53,7 +54,7 @@ from app.ai.llm import LLMError, LLMRefusal
 from app.ai.models import AgentModels
 from app.ai.prompts import load
 from app.core.crypto import Keyring
-from app.core.fingerprint import FingerprintKeys
+from app.core.fingerprint import FingerprintKeys, normalize
 from app.db import user_scope
 from app.repositories import memory_work as mw
 from app.repositories.chat import HistorySummary, pack_summary, unpack_summary
@@ -104,6 +105,22 @@ class Outcome:
     dropped: int = 0  # дубликаты, убранные сжатием
     error: str | None = None
     calls: tuple[CallRecord, ...] = field(default_factory=tuple)
+
+
+class _Gone(Exception):
+    """Агента нет (владелец удалён во время работы) — штатный исход (Б-44)."""
+
+
+@asynccontextmanager
+async def _owner_write(
+    sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID
+) -> AsyncIterator[AsyncSession]:
+    """Транзакция записи от имени владельца; первой берётся строка агента (порядок блокировок
+    «агент → записи памяти → диалоги», ревью 2.4 р2 MAJOR-1)."""
+    async with user_scope(sm, user_id) as s:
+        if not await mw.lock_agent_in(s, user_id):
+            raise _Gone
+        yield s
 
 
 class _Rollback(Exception):
@@ -352,7 +369,7 @@ def _mergeable(item: LiveMemory, kind: str, source: str, message: uuid.UUID | No
 
 
 async def _finish_extraction(sm: async_sessionmaker[AsyncSession], claim: ExtractionClaim) -> bool:
-    async with user_scope(sm, claim.user_id) as s:
+    async with _owner_write(sm, claim.user_id) as s:
         if not await mw.extraction_done_in(
             s,
             claim.token,
@@ -463,7 +480,7 @@ async def run_extraction(
         )
 
         counts = {"inserted": 0, "merged": 0, "repeated": 0, "forgotten": 0}
-        async with user_scope(sm, claim.user_id) as s:
+        async with _owner_write(sm, claim.user_id) as s:
             texts = [c.text for c in cands] + [m.text for m in merges.values()]
             forgotten = await mw.forgotten_in(
                 s, [f for t in texts for f in fp.all_of(claim.agent_id, t)]
@@ -543,6 +560,8 @@ async def run_extraction(
         return outcome("done", **counts)
     except _Rollback:
         return outcome("lost")
+    except _Gone:
+        return outcome("gone")
     except DBAPIError as exc:
         if mw.owner_gone(exc):
             return outcome("gone")
@@ -577,7 +596,7 @@ async def run_compaction(
         return Outcome("compact", status, calls=tuple(log.records), **kw)
 
     async def finish_only() -> None:
-        async with user_scope(sm, claim.user_id) as s:
+        async with _owner_write(sm, claim.user_id) as s:
             if not await mw.compaction_done_in(s, claim.token):
                 raise _Rollback
 
@@ -664,7 +683,7 @@ async def run_compaction(
         )
 
         merged = 0
-        async with user_scope(sm, claim.user_id) as s:
+        async with _owner_write(sm, claim.user_id) as s:
             # Всё, на чём построены слияние и сводка, должно быть живо и не изменено: иначе
             # (владелец удалил запись во время сжатия) — откат, следующий раунд.
             now_live = {m.id: m.version for m in await mw.live_memory(s, keys, claim.user_id)}
@@ -715,6 +734,8 @@ async def run_compaction(
         return outcome("done", merged=merged, dropped=len(drop))
     except _Rollback:
         return outcome("lost")
+    except _Gone:
+        return outcome("gone")
     except DBAPIError as exc:
         if mw.owner_gone(exc):
             return outcome("gone")
@@ -747,7 +768,7 @@ async def forget_memory(
     запускает ``run_forget(job)`` в фоне (не дожидаясь); если она не выполнится, помеченные сводки
     обнулит сжатие памяти (``run_compaction``)."""
     try:
-        async with user_scope(sm, user_id) as s:
+        async with _owner_write(sm, user_id) as s:
             taken = await mw.take_for_forget_in(s, keys, user_id, item_id)
             if taken is None:
                 return None
@@ -765,6 +786,8 @@ async def forget_memory(
                 await mw.replace_summary_in(
                     s, keys, user_id, conv_id, expected_raw=raw, new_raw=pack_summary(marked)
                 )
+    except _Gone:
+        return None
     except DBAPIError as exc:
         if mw.owner_gone(exc):
             return None
@@ -785,6 +808,13 @@ async def rewrite_without(
         log=log,
         max_tokens=MAX_TOKENS,
     )
+
+
+def leaks(summary: str, forgotten: str) -> bool:
+    """Удалённый текст дословно остался в сводке — после нормализации АР-36 (регистр, «ё»,
+    пунктуация, пробелы): целиком или как предложение. Перефразировку не ловит."""
+    target = normalize(forgotten)
+    return bool(target) and f" {target} " in f" {normalize(summary)} "
 
 
 async def run_forget(
@@ -816,12 +846,14 @@ async def run_forget(
                 rest = tuple(x for x in old.forget if x != mark)
                 try:
                     text = await rewrite_without(models, old.text, job.text, log=log)
+                    if leaks(text, job.text):
+                        text = ""  # модель оставила удалённое дословно — сводка пустая (MINOR-1)
                     new_raw: str | None = pack_summary(
                         HistorySummary(text, old.through_at, old.through_id, rest)
                     )
                 except LLMError:
                     new_raw = forgotten_summary(old)
-                async with user_scope(sm, job.user_id) as s:
+                async with _owner_write(sm, job.user_id) as s:
                     if await mw.replace_summary_in(
                         s, keys, job.user_id, conv_id, expected_raw=raw, new_raw=new_raw
                     ):
@@ -836,11 +868,13 @@ async def run_forget(
             return Outcome(
                 "forget", "error", merged=cleaned, error=exc.kind, calls=tuple(log.records)
             )
-        async with user_scope(sm, job.user_id) as s:
+        async with _owner_write(sm, job.user_id) as s:
             now = {m.id: m.version for m in await mw.live_memory(s, keys, job.user_id)}
             if now == {m.id: m.version for m in items}:
                 await mw.set_profile_summary_in(s, keys, job.user_id, job.agent_id, profile)
         return Outcome("forget", "done", merged=cleaned, calls=tuple(log.records))
+    except _Gone:
+        return Outcome("forget", "gone", calls=tuple(log.records))
     except DBAPIError as exc:
         if mw.owner_gone(exc):
             return Outcome("forget", "gone", calls=tuple(log.records))

@@ -985,7 +985,8 @@ async def test_forget_foreign_or_missing_is_none(sessionmaker: SM, engine: Async
 async def test_chat_compression_ignores_marked_previous_summary(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
-    """Сжатие чата при пометке «на очистку» не передаёт прежнюю сводку модели (в ней удалённое)."""
+    """Сжатие чата при пометке «на очистку» не передаёт прежнюю сводку модели (в ней удалённое) и
+    сохраняет пометку в новой сводке."""
     from app.ai import summary as chat_summary
 
     who, secret, _ = await _paraphrased_world(sessionmaker, engine)
@@ -1010,7 +1011,9 @@ async def test_chat_compression_ignores_marked_previous_summary(
     )
     assert out.status == "saved" and seen[0]["previous_summary"] == ""
     s, _ = await chat.read_history(sessionmaker, KEYS, who.user_id, who.conv)
-    assert s is not None and s.text == "новая сводка" and not s.forget
+    # 2.4 р2: пометка переносится в новую сводку — она скрыта до очистки (реплики пачки тоже
+    # могут содержать удалённое).
+    assert s is not None and s.text == "новая сводка" and s.forget == (str(secret),)
 
 
 async def test_compaction_summary_write_checks_concurrent_change(
@@ -1151,3 +1154,131 @@ async def test_delete_queues_compaction_outside_period(
     assert out.status == "done"
     assert await memory.forget_memory(sessionmaker, KEYS, who.user_id, mid) is not None
     assert await claim_mine(engine, who, compaction=True) is not None
+
+
+# =============================================================== 2.4 р2: блокировки, проверка итога
+
+
+async def test_forget_result_with_deleted_text_left_verbatim_is_emptied(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """MINOR-1: модель очистки оставила удалённое дословно (другой регистр, пунктуация) — сводка
+    пустая, отметка цела."""
+    who, secret, turns = await _paraphrased_world(sessionmaker, engine)
+    job = await memory.forget_memory(sessionmaker, KEYS, who.user_id, secret)
+    assert job is not None
+    model = ForgetModel("Говорили об отпуске. БОЛЕЗНЕННО реагирует на тему денег!")
+    await memory.run_forget(sessionmaker, KEYS, AgentModels.single(model), job)
+    s, _ = await chat.read_history(sessionmaker, KEYS, who.user_id, who.conv)
+    assert s is not None and s.text == "" and not s.forget and s.through_id == turns[-1].id
+    assert memory.leaks(
+        "x. Болезненно реагирует на тему денег.", "болезненно реагирует на тему денег"
+    )
+    assert not memory.leaks("Тема денег болезненна", "болезненно реагирует на тему денег")
+    assert not memory.leaks("детишки", "дети")
+
+
+async def _no_deadlock(*jobs: Any) -> list[Any]:
+    got = await asyncio.gather(*jobs, return_exceptions=True)
+    for g in got:
+        if isinstance(g, BaseException):
+            assert "40P01" not in str(getattr(g, "orig", g)) and "deadlock" not in str(g).lower(), g
+    return got
+
+
+@pytest.mark.parametrize("first", ["forget", "account"])
+async def test_forget_and_account_deletion_without_deadlock(
+    sessionmaker: SM, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    """MAJOR-1: удаление записи (держит транзакцию) ∥ удаление аккаунта — в обоих порядках без
+    40P01 (единый порядок «агент → записи → диалоги»)."""
+    who, secret, _ = await _paraphrased_world(sessionmaker, engine)
+    real_delete = mw.delete_memory_in
+    real_take = mw.take_for_forget_in
+
+    async def slow_delete(s: Any, item: uuid.UUID) -> bool:
+        await asyncio.sleep(0.3)  # запись и агент уже заблокированы
+        return await real_delete(s, item)
+
+    async def account_in_tx() -> None:
+        async with user_scope(sessionmaker, who.user_id) as s:
+            await s.execute(text("SELECT app_delete_account()"))
+            await asyncio.sleep(0.3)  # держим блокировки удаления аккаунта
+
+    async def forget_later() -> Any:
+        await asyncio.sleep(0.1)
+        return await memory.forget_memory(sessionmaker, KEYS, who.user_id, secret)
+
+    async def account_later() -> None:
+        await asyncio.sleep(0.1)
+        await account.delete_account(sessionmaker, who.user_id)
+
+    if first == "forget":
+        monkeypatch.setattr(mw, "delete_memory_in", slow_delete)
+        got = await _no_deadlock(
+            memory.forget_memory(sessionmaker, KEYS, who.user_id, secret), account_later()
+        )
+        assert got[0] is not None and got[1] is None
+    else:
+        got = await _no_deadlock(account_in_tx(), forget_later())
+        assert got[0] is None and got[1] is None  # аккаунта уже нет — 404 по смыслу
+    monkeypatch.setattr(mw, "delete_memory_in", real_delete)
+    monkeypatch.setattr(mw, "take_for_forget_in", real_take)
+    async with engine.connect() as conn:
+        assert (
+            await conn.execute(text("SELECT count(*) FROM users WHERE id = :u"), {"u": who.user_id})
+        ).scalar_one() == 0
+
+
+@pytest.mark.parametrize("first", ["worker", "account"])
+async def test_worker_and_account_deletion_without_deadlock(
+    sessionmaker: SM, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    who = await person(engine, sessionmaker, "Вера")
+    base = await texts.add_memory_item(
+        sessionmaker,
+        KEYS,
+        who.user_id,
+        who.agent_id,
+        "fact",
+        "owner_dialog",
+        "Владелец работает посменно",
+        fingerprints=FP,
+    )
+    [vec] = await EMB.embed(["Владелец работает посменно"])
+    await chat.set_memory_embedding(sessionmaker, who.user_id, base, vec, EMB.model)
+    await say(engine, who, "работаю посменно в больнице")
+    model = Model()
+    model.extract_items = lambda p: [item("fact", "Владелец работает посменно в больнице")]
+    model.merge = lambda existing, new: "Владелец работает посменно в больнице"
+    claim = await claim_mine(engine, who)
+    real_update = mw.update_text_in
+
+    async def slow_update(*a: Any, **kw: Any) -> bool:
+        ok = await real_update(*a, **kw)  # строка записи изменена — держим транзакцию
+        await asyncio.sleep(0.3)
+        return ok
+
+    async def run() -> Any:
+        if first == "account":
+            await asyncio.sleep(0.1)
+        return await memory.run_extraction(
+            sessionmaker,
+            KEYS,
+            FP,
+            AgentModels.single(model),
+            claim,
+            embedder=EMB,
+            merge_distance=0.3,
+        )
+
+    async def account_in_tx() -> None:
+        if first == "worker":
+            await asyncio.sleep(0.15)
+        async with user_scope(sessionmaker, who.user_id) as s:
+            await s.execute(text("SELECT app_delete_account()"))
+            await asyncio.sleep(0.3)
+
+    monkeypatch.setattr(mw, "update_text_in", slow_update)
+    got = await _no_deadlock(run(), account_in_tx())
+    assert got[0].status in ("done", "gone") and got[1] is None

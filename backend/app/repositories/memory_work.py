@@ -519,11 +519,40 @@ async def replace_summary_in(
     return True
 
 
+async def lock_agent_in(s: AsyncSession, user_id: uuid.UUID) -> bool:
+    """Первые блокировки любой транзакции записи памяти (ревью 2.4 р2 MAJOR-1): строка
+    пользователя ``FOR KEY SHARE``, затем строка агента ``FOR NO KEY UPDATE``, затем — записи
+    памяти и диалоги. Тот же порядок, что у удаления аккаунта (пользователь ``FOR UPDATE`` → … →
+    каскад ``agents`` → ``memory_items``, АР-13/0005): удаление аккаунта ждёт нашу транзакцию с
+    самого начала, а не посередине. Строка пользователя нужна и потому, что повторный UPDATE
+    строки агента в той же транзакции (``app_delete_memory`` + сводка профиля, ``…_done``)
+    перепроверяет внешний ключ и берёт ``FOR KEY SHARE`` пользователя — без предварительной
+    блокировки это встречная блокировка с удалением аккаунта (40P01, проверено тестом).
+    False — владельца или агента нет (удалён)."""
+    user = (
+        await s.execute(
+            text("SELECT id FROM users WHERE id = :u AND deleted_at IS NULL FOR KEY SHARE"),
+            {"u": user_id},
+        )
+    ).one_or_none()
+    if user is None:
+        return False
+    row = (
+        await s.execute(
+            text("SELECT id FROM agents WHERE user_id = :u FOR NO KEY UPDATE"), {"u": user_id}
+        )
+    ).one_or_none()
+    return row is not None
+
+
 async def take_for_forget_in(
     s: AsyncSession, keys: Keyring, user_id: uuid.UUID, item_id: uuid.UUID
 ) -> tuple[uuid.UUID, str] | None:
     """Живая своя запись под блокировкой: (агент, расшифрованный текст) — до удаления (АР-37:
-    текст нужен задаче очистки сводок и живёт только в памяти процесса). ``None`` — нет такой."""
+    текст нужен задаче очистки сводок и живёт только в памяти процесса). ``None`` — нет такой.
+    Порядок блокировок: сначала строка агента (``lock_agent_in``), затем запись."""
+    if not await lock_agent_in(s, user_id):
+        return None
     row = (
         await s.execute(
             text(

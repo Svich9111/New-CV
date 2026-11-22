@@ -32,6 +32,7 @@ from app.repositories.texts import ConversationText
 SUMMARY_VERSION = "v0"  # черновик без прогона (АР-26)
 SUMMARY_SCHEMA: dict[str, Any] = strict_object({"summary": {"type": "string"}})
 MAX_TOKENS_SUMMARY = 1500
+CONFLICT_RETRIES = 2
 
 
 @dataclass(frozen=True)
@@ -169,7 +170,8 @@ async def compress_history(
     log = CallLog()
     done_rounds = 0
     summarized = 0
-    for _ in range(policy.rounds):
+    retries = 0
+    while done_rounds < policy.rounds:
         try:
             summary, total, head = await chat.read_history_head(
                 sm, keys, user_id, conversation_id, limit=read_limit(policy)
@@ -213,10 +215,25 @@ async def compress_history(
             keys,
             user_id,
             conversation_id,
-            HistorySummary(text, last.created_at, last.id),
+            # Пометка «на очистку» (АР-37) переносится в новую сводку: реплики пачки тоже могут
+            # содержать удалённое — сводку очистит run_forget (или обнулит сжатие памяти).
+            HistorySummary(text, last.created_at, last.id, summary.forget if summary else ()),
             expected_through_id=summary.through_id if summary else None,
+            expected=summary,
         )
         if not saved:
+            # Сводку пометили «на очистку» (удаление записи памяти, АР-37), пока шла модель:
+            # повтор уже со скрытой прежней сводкой (ревью 2.4 р2 MAJOR-2). Иной конфликт
+            # (другое сжатие успело раньше) — как прежде.
+            try:
+                now, _, _ = await chat.read_history_head(
+                    sm, keys, user_id, conversation_id, limit=1
+                )
+            except (OwnerGone, LookupError):
+                now = None
+            if now is not None and now.forget and retries < CONFLICT_RETRIES:
+                retries += 1
+                continue
             return CompressionResult(
                 "conflict" if not done_rounds else "saved",
                 summarized,

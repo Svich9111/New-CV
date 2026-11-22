@@ -317,14 +317,7 @@ async def test_shutdown_leaves_summaries_hidden(
 @pytest.mark.parametrize(
     "order",
     [
-        pytest.param(
-            "chat_reads_before_forget",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="A8-M2 MAJOR: сжатие чата, прочитавшее сводку до удаления, записывает её "
-                "после — без пометки «на очистку», удалённое возвращается в контекст",
-            ),
-        ),
+        "chat_reads_before_forget",
         "chat_reads_after_forget",
     ],
 )
