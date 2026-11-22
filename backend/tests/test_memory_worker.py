@@ -729,12 +729,9 @@ async def test_dissolved_couple_messages_not_extracted(
             ),
             {"m": mid},
         )
-    model = Model()
-    model.extract_items = lambda p: [item("from_partner", "Партнёр просил предупреждать", ref="m1")]
-    out = await extract_once(sessionmaker, engine, anna, model)
-    assert out.status == "empty" and await rows(engine, anna) == []
-    assert "memory_extract" not in model.payloads
+    # 0010 (A1, АР-37): захват сообщения бывшей пары не выдаёт вовсе — до модели дело не доходит.
     assert await claim_mine(engine, anna) is None
+    assert await rows(engine, anna) == []
 
 
 # =============================================================== Б-64
@@ -1132,10 +1129,6 @@ async def test_skipped_after_attempts_logged_as_error(
     assert any(r.levelname == "ERROR" and "skipped" in r.getMessage() for r in caplog.records)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="АР-37 п.1: постановка агента на сжатие вне периода при удалении — функция БД (A1)",
-)
 async def test_delete_queues_compaction_outside_period(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:

@@ -12,6 +12,7 @@
 import asyncio
 import itertools
 import os
+import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -141,7 +142,7 @@ async def _memory(
                 "a": agent,
                 "t": b"\x01memory",
                 "ev": date(2026, 6, 14) if event else None,
-                "f": finger,
+                "f": finger if finger is not None else fp(),
                 "e": emb,
                 "m": model,
             },
@@ -559,8 +560,9 @@ async def test_done_rejects_bad_marks_and_rolls_back(sessionmaker: SM, engine: A
         async with user_scope(sessionmaker, p.uid) as s:
             await s.execute(
                 text(
-                    "INSERT INTO memory_items (agent_id, type, source, text_enc) "
-                    "VALUES (:a, 'fact', 'owner_dialog', 'rolled-back')"
+                    "INSERT INTO memory_items (fingerprint, agent_id, type, source, text_enc) "
+                    "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                    ":a, 'fact', 'owner_dialog', 'rolled-back')"
                 ),
                 {"a": p.agent},
             )
@@ -658,6 +660,14 @@ async def test_partner_messages_watermark(sessionmaker: SM, engine: AsyncEngine)
         await c.execute(
             text("INSERT INTO couples (id, status) VALUES (:c, 'active')"), {"c": couple}
         )
+        for who, role in ((anna, "initiator"), (igor, "partner")):
+            await c.execute(
+                text(
+                    "INSERT INTO couple_members (couple_id, user_id, role) "
+                    "VALUES (:c, :u, CAST(:r AS member_role))"
+                ),
+                {"c": couple, "u": who.uid, "r": role},
+            )
         for name, author, recipient, status, ago in (
             ("d1", igor, anna, "delivered", 10 * DAY),
             ("d2", igor, anna, "read", 9 * DAY),
@@ -720,8 +730,9 @@ async def test_deleted_owner_not_claimed_and_done_fails(
     async with user_scope(sessionmaker, p.uid) as s:
         await s.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, source, text_enc) "
-                "VALUES (:a, 'fact', 'owner_dialog', 'x')"
+                "INSERT INTO memory_items (fingerprint, agent_id, type, source, text_enc) "
+                "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":a, 'fact', 'owner_dialog', 'x')"
             ),
             {"a": p.agent},
         )
@@ -790,9 +801,33 @@ async def test_compaction_claim_and_exclusive_lease(sessionmaker: SM, engine: As
     st = await _state(engine, p)
     assert (st.token, st.attempts, st.compacted_at) == (None, 0, st.lease_at)
     assert await _app(sessionmaker, p.uid, done, t=comp.token) == [(False,)]
-    # Период: сжатие недавно — не выдаётся, даже с изменениями.
-    await _app(sessionmaker, p.uid, "SELECT app_delete_memory(:i)", i=item)
+    # Период: сжатие недавно — изменения (не удаление) его не вызывают.
+    other = await _memory(engine, p.agent)
     assert await _claim(engine, p.agent, compaction=True) is None
+    # АР-37 п.1: удаление владельцем ставит отметку — сжатие выдаётся вне периода.
+    await _app(sessionmaker, p.uid, "SELECT app_delete_memory(:i)", i=item)
+    flagged = await _row(
+        engine, "SELECT memory_compaction_requested_at FROM agents WHERE id = :a", a=p.agent
+    )
+    assert flagged[0] is not None
+    urgent = await _claim(engine, p.agent, compaction=True)
+    assert urgent is not None
+    # Удаление во время сжатия (отметка новее захвата) — отметка остаётся до следующего.
+    await _app(sessionmaker, p.uid, "SELECT app_delete_memory(:i)", i=other)
+    assert await _app(sessionmaker, p.uid, done, t=urgent.token) == [(True,)]
+    left = await _row(
+        engine, "SELECT memory_compaction_requested_at FROM agents WHERE id = :a", a=p.agent
+    )
+    assert left[0] is not None
+    last = await _claim(engine, p.agent, compaction=True)
+    assert last is not None
+    assert await _app(sessionmaker, p.uid, done, t=last.token) == [(True,)]
+    cleared = await _row(
+        engine, "SELECT memory_compaction_requested_at FROM agents WHERE id = :a", a=p.agent
+    )
+    assert cleared[0] is None
+    assert await _claim(engine, p.agent, compaction=True) is None
+    # Период прошёл: без изменений с прошлого сжатия — не выдаётся; с изменением — выдаётся.
     async with engine.begin() as c:
         await c.execute(
             text("UPDATE agents SET memory_compacted_at = now() - interval '8 days' WHERE id = :a"),
@@ -813,6 +848,142 @@ async def test_compaction_claim_and_exclusive_lease(sessionmaker: SM, engine: As
         )
     again = await _claim(engine, p.agent, compaction=True)
     assert again is not None and again.compacted_at is not None
+
+
+# --- 0010: раунд 1 ревью 2.4 --------------------------------------------------------------
+
+
+async def test_partner_messages_only_current_couple(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """ФТ-14 (АР-37): сообщения бывшей пары не выдаются захватом и не принимаются `done`;
+    сообщения текущей активной пары — выдаются."""
+    anna, igor, oleg = await _person(engine), await _person(engine), await _person(engine)
+    old, cur = uuid.uuid4(), uuid.uuid4()
+    msgs: dict[str, uuid.UUID] = {}
+    async with engine.begin() as c:
+        await c.execute(
+            text("INSERT INTO couples (id, status) VALUES (:o, 'dissolved'), (:n, 'active')"),
+            {"o": old, "n": cur},
+        )
+        for couple, members, active in ((old, (anna, oleg), False), (cur, (anna, igor), True)):
+            for who, role in zip(members, ("initiator", "partner"), strict=True):
+                await c.execute(
+                    text(
+                        "INSERT INTO couple_members (couple_id, user_id, role, active) "
+                        "VALUES (:c, :u, CAST(:r AS member_role), :ac)"
+                    ),
+                    {"c": couple, "u": who.uid, "r": role, "ac": active},
+                )
+        for name, couple, author, ago in (
+            ("old", old, oleg, 10 * DAY),
+            ("cur", cur, igor, 5 * DAY),
+        ):
+            msgs[name] = uuid.uuid4()
+            await c.execute(
+                text(
+                    "INSERT INTO partner_messages (id, couple_id, author_id, recipient_id, "
+                    "original_enc, status, sent_at, delivered_at) VALUES (:i, :c, :a, :r, 'x', "
+                    "'delivered', now() - interval '11 days', now() - CAST(:ago AS interval))"
+                ),
+                {"i": msgs[name], "c": couple, "a": author.uid, "r": anna.uid, "ago": ago},
+            )
+    got = await _claim(engine, anna.agent)
+    assert got is not None
+    assert (got.partner_after_id, got.partner_through_id) == (None, msgs["cur"])
+    assert await _done(sessionmaker, anna.uid, got.token, None, msgs["old"]) is False
+    assert await _done(sessionmaker, anna.uid, got.token, None, msgs["cur"]) is True
+    # Пара распалась: доставленное ей сообщение больше не выдаётся.
+    async with engine.begin() as c:
+        await c.execute(
+            text(
+                "UPDATE partner_messages SET delivered_at = now() - interval '3 days' WHERE id = :i"
+            ),
+            {"i": msgs["old"]},
+        )
+        await c.execute(text("UPDATE couples SET status = 'dissolved' WHERE id = :c"), {"c": cur})
+    assert await _claim(engine, anna.agent) is None
+
+
+async def test_claim_does_not_lock_ongoing_sessions_on_volume(engine: AsyncEngine) -> None:
+    """MINOR-4: 1500 агентов с идущей сессией (первая реплика старше порога, последняя — моложе:
+    в 0009 такие агенты блокировались перебором) — захват их строки не
+    блокирует (чат не ждёт: `FOR NO KEY UPDATE NOWAIT` из другой транзакции проходит, пока
+    захват не зафиксирован) и укладывается в секунды; агент с готовой работой выдаётся."""
+    base = 7_000_000_000 + int.from_bytes(os.urandom(3), "big") * 10_000
+    async with engine.begin() as c:
+        await c.execute(
+            text(
+                "WITH u AS (INSERT INTO users (id, telegram_id) "
+                "SELECT gen_random_uuid(), CAST(:b AS bigint) + g FROM generate_series(1, 1500) g RETURNING id), "
+                "a AS (INSERT INTO agents (user_id) SELECT id FROM u RETURNING id), "
+                "c AS (INSERT INTO conversations (agent_id) SELECT id FROM a RETURNING id) "
+                "INSERT INTO conversation_messages (conversation_id, author, text_enc, created_at) "
+                "SELECT c.id, 'owner', 'x', now() - d FROM c CROSS JOIN (VALUES (interval '3 days'), "
+                "(interval '47 hours')) v(d)"
+            ),
+            {"b": base},
+        )
+        ongoing = [
+            r[0]
+            for r in await c.execute(
+                text(
+                    "SELECT a.id FROM agents a JOIN users u ON u.id = a.user_id "
+                    "WHERE u.telegram_id > CAST(:b AS bigint) AND u.telegram_id <= CAST(:b AS bigint) + 1500"
+                ),
+                {"b": base},
+            )
+        ]
+    assert len(ongoing) == 1500
+    ready = await _person(engine)
+    await _turns(engine, ready, [30 * DAY])
+    async with engine.connect() as w, engine.connect() as chat:
+        await w.begin()
+        started = time.monotonic()
+        rows = await _worker(w, CLAIM_EXTRACTION, g=GAP, l=LEASE, n=100)
+        elapsed = time.monotonic() - started
+        assert ready.agent in {r.agent_id for r in rows}
+        assert not set(ongoing) & {r.agent_id for r in rows}
+        await chat.begin()
+        locked = await chat.execute(
+            text(
+                "SELECT count(*) FROM (SELECT id FROM agents WHERE id = ANY(:ids) "
+                "FOR NO KEY UPDATE NOWAIT) x"
+            ),
+            {"ids": ongoing},
+        )
+        assert locked.scalar_one() == 1500
+        await chat.rollback()
+        await w.rollback()
+    assert elapsed < 5, elapsed
+
+
+async def test_text_requires_fingerprint(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Б-68 (MINOR-7): запись с текстом без отпечатка не сохраняется (23514) — ни приложением,
+    ни в обход RLS; без текста отпечаток не обязателен."""
+    p = await _person(engine)
+    sql = (
+        "INSERT INTO memory_items (agent_id, type, source, text_enc) "
+        "VALUES (:a, 'fact', 'owner_dialog', 'x')"
+    )
+    assert await _app_fails(sessionmaker, p.uid, sql, a=p.agent) == "23514"
+    with pytest.raises(DBAPIError) as ei:
+        async with engine.begin() as c:
+            await c.execute(text(sql), {"a": p.agent})
+    assert _sqlstate(ei.value) == "23514"
+    item = await _memory(engine, p.agent)
+    with pytest.raises(DBAPIError) as ei:
+        async with engine.begin() as c:
+            await c.execute(
+                text("UPDATE memory_items SET fingerprint = NULL WHERE id = :i"), {"i": item}
+            )
+    assert _sqlstate(ei.value) == "23514"
+    async with engine.begin() as c:
+        await c.execute(
+            text(
+                "INSERT INTO memory_items (agent_id, type, source, text_enc) "
+                "VALUES (:a, 'fact', 'owner_dialog', NULL)"
+            ),
+            {"a": p.agent},
+        )
 
 
 # --- Б-65 и обратимость ------------------------------------------------------------------------

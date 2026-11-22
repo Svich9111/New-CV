@@ -77,8 +77,9 @@ async def _memory(
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "INSERT INTO memory_items (id, agent_id, type, source, text_enc, embedding, "
-                "embedding_model) VALUES (:i, :a, 'fact', 'owner_dialog', :t, "
+                "INSERT INTO memory_items (fingerprint, id, agent_id, type, source, text_enc, embedding, "
+                "embedding_model) VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":i, :a, 'fact', 'owner_dialog', :t, "
                 "CAST(:e AS vector), :m)"
             ),
             {"i": mid, "a": agent, "t": body, "e": emb, "m": mdl},
@@ -231,8 +232,9 @@ async def test_memory_limit_capped_at_50(sessionmaker: SM, engine: AsyncEngine) 
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, source, text_enc, embedding, "
-                "embedding_model) SELECT :a, 'fact', 'owner_dialog', '\\x01', "
+                "INSERT INTO memory_items (fingerprint, agent_id, type, source, text_enc, embedding, "
+                "embedding_model) SELECT sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":a, 'fact', 'owner_dialog', '\\x01', "
                 "CAST(:e AS vector), :m FROM generate_series(1, 60)"
             ),
             {"a": aid, "e": Q, "m": mdl},
@@ -569,8 +571,9 @@ async def _numscans(conn: AsyncConnection, index: str) -> int:
 async def _bulk(conn: AsyncConnection, agent: uuid.UUID, n: int, head: float, mdl: str) -> None:
     await conn.execute(
         text(
-            "INSERT INTO memory_items (agent_id, type, source, text_enc, embedding, "
-            f"embedding_model) SELECT :a, 'fact', 'owner_dialog', '\\x01', {RANDOM_VECTOR}, :m "
+            "INSERT INTO memory_items (fingerprint, agent_id, type, source, text_enc, embedding, "
+            f"embedding_model) SELECT sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+            f":a, 'fact', 'owner_dialog', '\\x01', {RANDOM_VECTOR}, :m "
             "FROM generate_series(1, :n) g"
         ),
         {"a": agent, "n": n, "head": head, "m": mdl},

@@ -93,8 +93,9 @@ async def _person(s: AsyncSession, name: str) -> P:
     )
     await s.execute(
         text(
-            "INSERT INTO memory_items (id, agent_id, type, text_enc, source) "
-            "VALUES (:i, :a, 'fact', :t, 'owner_dialog')"
+            "INSERT INTO memory_items (fingerprint, id, agent_id, type, text_enc, source) "
+            "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+            ":i, :a, 'fact', :t, 'owner_dialog')"
         ),
         {"i": p.memory_id, "a": p.agent_id, "t": f"память {name}".encode()},
     )
@@ -1363,8 +1364,9 @@ async def test_relogin_after_account_delete_creates_new_user(
         ).scalar_one()
         await s.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, text_enc, source) "
-                "VALUES (:a, 'fact', 'old-memory', 'owner_dialog')"
+                "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source) "
+                "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":a, 'fact', 'old-memory', 'owner_dialog')"
             ),
             {"a": agent},
         )

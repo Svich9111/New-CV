@@ -59,8 +59,9 @@ async def _person(conn: AsyncSession, name: str) -> Person:
     )
     await conn.execute(
         text(
-            "INSERT INTO memory_items (agent_id, type, text_enc, source) "
-            "VALUES (:a, 'fact', :t, 'owner_dialog')"
+            "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source) "
+            "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+            ":a, 'fact', :t, 'owner_dialog')"
         ),
         {"a": aid, "t": f"память {name}".encode()},
     )
@@ -202,8 +203,9 @@ async def test_cannot_write_into_partner_memory(
         async with user_scope(sessionmaker, world.a.user_id) as s:
             await s.execute(
                 text(
-                    "INSERT INTO memory_items (agent_id, type, text_enc, source) "
-                    "VALUES (:a, 'fact', 'x', 'owner_dialog')"
+                    "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source) "
+                    "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                    ":a, 'fact', 'x', 'owner_dialog')"
                 ),
                 {"a": world.b.agent_id},
             )

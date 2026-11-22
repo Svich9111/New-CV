@@ -182,8 +182,9 @@ async def _from_partner_memory(
     async with user_scope(sm, owner.uid) as s:
         await s.execute(
             text(
-                "INSERT INTO memory_items (id, agent_id, type, source, source_message_id, "
-                "text_enc) VALUES (:i, :a, 'from_partner', 'partner_message', :m, :t)"
+                "INSERT INTO memory_items (fingerprint, id, agent_id, type, source, source_message_id, "
+                "text_enc) VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":i, :a, 'from_partner', 'partner_message', :m, :t)"
             ),
             {
                 "i": mid,

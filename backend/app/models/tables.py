@@ -229,6 +229,8 @@ class Agent(Base):
     memory_partner_through_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     memory_partner_through_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     memory_compacted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 0010 (АР-37 п.1): удаление записи владельцем — сжатие вне периода; снимает сжатие.
+    memory_compaction_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     memory_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     memory_lease_kind: Mapped[str | None] = mapped_column(String(8))
     memory_lease_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -300,6 +302,8 @@ class MemoryItem(Base):
             "source <> 'partner_message' OR source_message_id IS NOT NULL",
             name="partner_source_has_message",
         ),
+        # 0010 (Б-68): у записи с текстом всегда есть отпечаток — удаление оставляет след.
+        CheckConstraint("text_enc IS NULL OR fingerprint IS NOT NULL", name="text_has_fingerprint"),
         # 0008 (АР-35): имя модели без вектора не хранится; удаление обнуляет оба поля.
         CheckConstraint(
             "embedding_model IS NULL OR (embedding IS NOT NULL AND embedding_model <> '')",

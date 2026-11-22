@@ -89,8 +89,9 @@ async def mem(
     mid = uuid.uuid4()
     await c.execute(
         text(
-            "INSERT INTO memory_items (id, agent_id, type, text_enc, source, embedding, "
-            "embedding_model, created_at, deleted_at) VALUES (:i, :a, 'fact', :t, 'owner_dialog', "
+            "INSERT INTO memory_items (fingerprint, id, agent_id, type, text_enc, source, embedding, "
+            "embedding_model, created_at, deleted_at) VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+            ":i, :a, 'fact', :t, 'owner_dialog', "
             "CAST(:v AS vector), :m, :w, :d)"
         ),
         {
@@ -112,8 +113,9 @@ async def bulk_mem(
     ids = [uuid.uuid4() for _ in vecs]
     await c.execute(
         text(
-            "INSERT INTO memory_items (id, agent_id, type, text_enc, source, embedding, "
-            "embedding_model) VALUES (:i, :a, 'fact', :t, 'owner_dialog', CAST(:v AS vector), :m)"
+            "INSERT INTO memory_items (fingerprint, id, agent_id, type, text_enc, source, embedding, "
+            "embedding_model) VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+            ":i, :a, 'fact', :t, 'owner_dialog', CAST(:v AS vector), :m)"
         ),
         [
             {"i": i, "a": agent, "t": b"enc", "v": lit(v), "m": model}
@@ -1065,8 +1067,9 @@ async def test_migration_reversible_and_check(engine: AsyncEngine) -> None:
             )
             await c.execute(
                 text(
-                    "INSERT INTO memory_items (agent_id, type, text_enc, source, embedding, "
-                    "embedding_model) VALUES (:a, 'fact', 'x', 'owner_dialog', CAST(:v AS vector), 'm')"
+                    "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source, embedding, "
+                    "embedding_model) VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                    ":a, 'fact', 'x', 'owner_dialog', CAST(:v AS vector), 'm')"
                 ),
                 {"a": aid, "v": lit(rvec())},
             )

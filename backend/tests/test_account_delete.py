@@ -92,8 +92,9 @@ async def _person(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> 
         )
         await conn.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, text_enc, source, embedding) "
-                "VALUES (:a, 'fact', :t, 'owner_dialog', CAST(:e AS vector))"
+                "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source, embedding) "
+                "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":a, 'fact', :t, 'owner_dialog', CAST(:e AS vector))"
             ),
             {"a": aid, "t": b"pamyat " + marker, "e": embedding},
         )
@@ -227,8 +228,9 @@ async def _scene(sm: SM, engine: AsyncEngine) -> Scene:
         )
         await conn.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, text_enc, source, source_message_id, "
-                "embedding) VALUES (:a, 'from_partner', :t, 'partner_message', :m, "
+                "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source, source_message_id, "
+                "embedding) VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":a, 'from_partner', :t, 'partner_message', :m, "
                 "CAST(:e AS vector))"
             ),
             {"a": igor.agent_id, "t": b"citata " + anna.marker, "m": anna_msg, "e": anna.embedding},

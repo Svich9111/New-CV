@@ -53,8 +53,9 @@ async def _user(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> uu
         )
         await conn.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, text_enc, source) "
-                "VALUES (:a, 'fact', :t, 'owner_dialog')"
+                "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source) "
+                "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":a, 'fact', :t, 'owner_dialog')"
             ),
             {"a": aid, "t": f"память {name}".encode()},
         )

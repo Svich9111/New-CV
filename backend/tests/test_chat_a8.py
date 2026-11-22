@@ -314,8 +314,9 @@ async def _mem(
         text(
             # 2.0v (A3): вектор помечается моделью (АР-35, embedding_model) — поиск находит
             # только векторы модели эмбеддера запроса; без модели запись по смыслу не ищется.
-            "INSERT INTO memory_items (id, agent_id, type, text_enc, source, embedding, "
-            "embedding_model, created_at, deleted_at) VALUES (:i, :a, 'fact', :t, "
+            "INSERT INTO memory_items (fingerprint, id, agent_id, type, text_enc, source, embedding, "
+            "embedding_model, created_at, deleted_at) VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+            ":i, :a, 'fact', :t, "
             "'owner_dialog', CAST(:v AS vector), :em, :w, :d)"
         ),
         {

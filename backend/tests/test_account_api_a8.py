@@ -373,8 +373,9 @@ async def _world(c: httpx.AsyncClient, sm: SM, engine: AsyncEngine, keys: Keyrin
         async with user_scope(sm, owner.uid) as s:
             await s.execute(
                 text(
-                    "INSERT INTO memory_items (id, agent_id, type, source, source_message_id, "
-                    "text_enc, confidence) VALUES (:i, :a, 'from_partner', 'partner_message', "
+                    "INSERT INTO memory_items (fingerprint, id, agent_id, type, source, source_message_id, "
+                    "text_enc, confidence) VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                    ":i, :a, 'from_partner', 'partner_message', "
                     ":m, :t, 0.5)"
                 ),
                 {
