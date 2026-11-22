@@ -989,14 +989,16 @@ async def test_text_requires_fingerprint(sessionmaker: SM, engine: AsyncEngine) 
 async def test_delete_memory_vs_delete_account_no_deadlock(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
-    """Ревью 2.4 р.2 MAJOR-1, АР-38: единый порядок «агент → записи памяти → диалоги».
+    """Ревью 2.4 р.2 MAJOR-1, АР-38: единый порядок «пользователь → агент → записи памяти →
+    диалоги».
     Удаление записи (путь слоя доступа: агент, запись `FOR UPDATE`, `app_delete_memory`) и
     удаление аккаунта того же владельца в обоих порядках идут по очереди — без 40P01."""
-    # Порядок 1: удаление записи взяло агента; удаление аккаунта ждёт; запись берётся уже
-    # после того, как удаление аккаунта встало в очередь.
+    # Порядок 1: удаление записи (путь слоя доступа: пользователь FOR KEY SHARE → агент) взяло
+    # агента; удаление аккаунта ждёт; запись берётся уже после того, как оно встало в очередь.
     p = await _person(engine)
     item = await _memory(engine, p.agent, finger=fp())
     async with user_scope(sessionmaker, p.uid) as s:
+        await s.execute(text("SELECT 1 FROM users WHERE id = app_uid() FOR KEY SHARE"))
         await s.execute(text("SELECT id FROM agents WHERE user_id = app_uid() FOR NO KEY UPDATE"))
         deleting = asyncio.create_task(_app(sessionmaker, p.uid, "SELECT app_delete_account()"))
         await asyncio.sleep(0.5)
@@ -1007,8 +1009,8 @@ async def test_delete_memory_vs_delete_account_no_deadlock(
     await asyncio.wait_for(deleting, 10)  # без 40P01
     assert await _row(engine, "SELECT count(*) FROM agents WHERE id = :a", a=p.agent) == (0,)
 
-    # Порядок 2: удаление аккаунта первым (не зафиксировано); удаление записи ждёт агента и
-    # после фиксации получает false — записи уже нет.
+    # Порядок 2: удаление аккаунта первым (не зафиксировано); удаление записи ждёт строку
+    # пользователя и после фиксации получает 42501 (владельца нет) — не 40P01.
     q = await _person(engine)
     item = await _memory(engine, q.agent, finger=fp())
     async with user_scope(sessionmaker, q.uid) as s:
@@ -1018,10 +1020,12 @@ async def test_delete_memory_vs_delete_account_no_deadlock(
         )
         await asyncio.sleep(0.5)
         assert not forgetting.done()
-    assert await asyncio.wait_for(forgetting, 10) == [(False,)]
+    with pytest.raises(DBAPIError) as ei:
+        await asyncio.wait_for(forgetting, 10)
+    assert _sqlstate(ei.value) == "42501"
     assert await _row(engine, "SELECT count(*) FROM memory_items WHERE id = :i", i=item) == (0,)
 
-    # Вектор записи — тот же порядок (агент FOR KEY SHARE → запись).
+    # Вектор записи — тот же порядок (пользователь → агент FOR KEY SHARE → запись).
     r = await _person(engine)
     item = await _memory(engine, r.agent, finger=fp())
     async with user_scope(sessionmaker, r.uid) as s:
@@ -1037,7 +1041,70 @@ async def test_delete_memory_vs_delete_account_no_deadlock(
         )
         await asyncio.sleep(0.5)
         assert not setting.done()
-    assert await asyncio.wait_for(setting, 10) == [(False,)]
+    with pytest.raises(DBAPIError) as ei:
+        await asyncio.wait_for(setting, 10)
+    assert _sqlstate(ei.value) == "42501"
+
+
+ACCOUNT_RACE_CALLS = {
+    # Функция и второе изменение строки агента в той же транзакции (как обнуление сводки
+    # профиля после удаления записи): без пользователя первым — 40P01 против удаления аккаунта.
+    "delete_memory": (
+        "SELECT app_delete_memory(:i)",
+        "UPDATE agents SET profile_summary_enc = NULL WHERE user_id = app_uid()",
+    ),
+    "set_embedding": (
+        "SELECT app_set_memory_embedding(:i, :v, 'm-race')",
+        "UPDATE agents SET profile_summary_enc = NULL WHERE user_id = app_uid()",
+    ),
+    "extraction_done": (
+        "SELECT app_memory_extraction_done(:t, :s, NULL)",
+        "UPDATE agents SET profile_summary_enc = NULL WHERE user_id = app_uid()",
+    ),
+    "compaction_done": (
+        "SELECT app_memory_compaction_done(:t)",
+        "UPDATE agents SET profile_summary_enc = NULL WHERE user_id = app_uid()",
+    ),
+}
+
+
+@pytest.mark.parametrize("first", ["function", "account"])
+@pytest.mark.parametrize("call", sorted(ACCOUNT_RACE_CALLS))
+async def test_agent_functions_vs_delete_account_no_deadlock(
+    call: str, first: str, sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """АР-13, АР-38 (2.4 р.2): функции 0010, меняющие или блокирующие строку агента, первым
+    шагом берут пользователя `FOR KEY SHARE`. Вызов вне транзакций A3 с повторным изменением
+    агента в той же транзакции и удаление аккаунта того же владельца — в обоих порядках по
+    очереди: без 40P01; после удаления аккаунта функция — 42501."""
+    p = await _person(engine)
+    item = await _memory(engine, p.agent, finger=fp())
+    s1 = await _turns(engine, p, [30 * DAY])
+    params: dict[str, Any] = {"i": item, "v": vec(6), "s": s1[0]}
+    if call == "extraction_done":
+        params["t"] = (await _claim(engine, p.agent)).token
+    elif call == "compaction_done":
+        params["t"] = (await _claim(engine, p.agent, compaction=True)).token
+    fn_sql, second = ACCOUNT_RACE_CALLS[call]
+    delete = "SELECT app_delete_account()"
+    if first == "function":
+        async with user_scope(sessionmaker, p.uid) as s:
+            assert (await s.execute(text(fn_sql), params)).scalar_one() is True
+            deleting = asyncio.create_task(_app(sessionmaker, p.uid, delete))
+            await asyncio.sleep(0.5)
+            assert not deleting.done()
+            await s.execute(text(second))
+        await asyncio.wait_for(deleting, 10)  # без 40P01
+    else:
+        async with user_scope(sessionmaker, p.uid) as s:
+            await s.execute(text(delete))
+            racing = asyncio.create_task(_app(sessionmaker, p.uid, fn_sql, **params))
+            await asyncio.sleep(0.5)
+            assert not racing.done()
+        with pytest.raises(DBAPIError) as ei:
+            await asyncio.wait_for(racing, 10)
+        assert _sqlstate(ei.value) == "42501"
+    assert await _row(engine, "SELECT count(*) FROM agents WHERE id = :a", a=p.agent) == (0,)
 
 
 # --- Б-65 и обратимость ------------------------------------------------------------------------

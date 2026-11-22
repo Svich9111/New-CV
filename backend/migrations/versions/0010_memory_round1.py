@@ -15,8 +15,9 @@ MINOR-4, MINOR-7; BACKLOG Б-68.
    времени захвата (удаление во время сжатия оставит отметку — следующее сжатие). Удаление,
    поставившее отметку, держит строку агента до фиксации, а захват строки пропускает
    (``SKIP LOCKED``): выданное сжатие всегда видит удаление, отметка которого не новее захвата.
-   Порядок блокировок (ревью 2.4 р.2 MAJOR-1) — единый: **агент → записи памяти → диалоги**, как
-   каскад ``app_delete_account`` (пользователь → агент → память, диалоги). ``app_delete_memory``
+   Порядок блокировок (ревью 2.4 р.2 MAJOR-1) — единый: **пользователь → агент → записи памяти →
+   диалоги**, как ``app_delete_account`` (пользователь → … → каскад агент → память, диалоги):
+   функции владельца 0010 первым шагом берут строку пользователя ``FOR KEY SHARE``. ``app_delete_memory``
    первым шагом берёт строку агента ``FOR NO KEY UPDATE``, ``app_set_memory_embedding`` (тело
    0008) — ``FOR KEY SHARE``; удаление записи и удаление аккаунта идут по очереди, без 40P01.
 2. **MINOR-4 — захват извлечения.** Кандидаты отбираются без блокировки (завершённая
@@ -59,7 +60,14 @@ def _module(name: str) -> ModuleType:
 
 
 M0009 = _module("0009_memory.py")
-USER_CHECK: str = M0009.USER_CHECK
+# АР-13, АР-38: пользователь — первым (FOR KEY SHARE: ждёт удаление аккаунта, совместима с
+# остальными). Без этого повторное изменение строки агента в той же транзакции (например,
+# удаление записи, затем обнуление сводки профиля) перепроверяет FK и берёт KEY SHARE
+# пользователя уже после агента — против порядка удаления аккаунта (40P01).
+USER_LOCK = """
+        IF v_uid IS NULL THEN RAISE EXCEPTION 'no user' USING ERRCODE = '42501'; END IF;
+        PERFORM 1 FROM public.users u WHERE u.id = v_uid AND u.deleted_at IS NULL FOR KEY SHARE;
+        IF NOT FOUND THEN RAISE EXCEPTION 'no user' USING ERRCODE = '42501'; END IF;"""
 LEASE_CHECK: str = M0009.LEASE_CHECK
 DELIVERED: str = M0009.DELIVERED
 PARTNER_BATCH: int = M0009.PARTNER_BATCH
@@ -92,7 +100,7 @@ CURRENT_COUPLE = """pm.couple_id IN (
 def _fill(template: str) -> str:
     """Подставить общие фрагменты (без f-строк: тексты функций — константы миграции)."""
     for name, value in (
-        ("USER_CHECK", USER_CHECK),
+        ("USER_LOCK", USER_LOCK),
         ("LEASE_CHECK", LEASE_CHECK),
         ("DELIVERED", DELIVERED),
         ("PARTNER_BATCH", str(PARTNER_BATCH)),
@@ -116,10 +124,10 @@ CREATE OR REPLACE FUNCTION app_delete_memory(p_item uuid) RETURNS boolean
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
     AS $f$
     DECLARE v_uid uuid := public.app_uid(); v_agent uuid;
-    BEGIN@USER_CHECK@
-        -- Порядок блокировок (АР-38, ревью 2.4 р.2 MAJOR-1): агент → записи памяти → диалоги,
-        -- как каскад app_delete_account (пользователь → агент → память). Удаление аккаунта,
-        -- уже взявшее агента, — ждём его; после ожидания агента нет — false.
+    BEGIN@USER_LOCK@
+        -- Порядок блокировок (АР-38, ревью 2.4 р.2 MAJOR-1): пользователь (выше) → агент →
+        -- записи памяти → диалоги, как app_delete_account. Удаление аккаунта, уже взявшее
+        -- пользователя, — ждём его; после него пользователя нет — 42501.
         SELECT a.id INTO v_agent FROM public.agents a WHERE a.user_id = v_uid
            FOR NO KEY UPDATE;
         IF NOT FOUND THEN RETURN false; END IF;
@@ -148,7 +156,7 @@ CREATE OR REPLACE FUNCTION app_set_memory_embedding(p_item uuid, p_vec text, p_m
         v_uid uuid := public.app_uid();
         v public.vector;
         v_agent uuid;
-    BEGIN@USER_CHECK@
+    BEGIN@USER_LOCK@
         v := public.embedding_arg(p_vec, p_model);
         -- АР-38: агент (FOR KEY SHARE — не мешает чату и другим записям памяти, но ждёт
         -- удаление аккаунта) → запись памяти.
@@ -357,9 +365,9 @@ CREATE OR REPLACE FUNCTION app_memory_extraction_done(p_token uuid, p_session_th
         v_pat timestamptz; v_pid uuid;
         v_conv uuid; v_at timestamptz; v_cat timestamptz; v_cid uuid;
         v_dat timestamptz;
-    BEGIN@USER_CHECK@
+    BEGIN@USER_LOCK@
         IF p_token IS NULL THEN RETURN false; END IF;
-        -- Порядок блокировок (АР-13): агент → диалог; пользователя не блокирует.
+        -- Порядок блокировок (АР-13, АР-38): пользователь → агент → диалог.
         SELECT a.id, a.memory_partner_through_at, a.memory_partner_through_id
           INTO v_agent, v_pat, v_pid
           FROM public.agents a
@@ -413,7 +421,7 @@ CREATE OR REPLACE FUNCTION app_memory_compaction_done(p_token uuid) RETURNS bool
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
     AS $f$
     DECLARE v_uid uuid := public.app_uid();
-    BEGIN@USER_CHECK@
+    BEGIN@USER_LOCK@
         -- Отметка — время захвата: изменения памяти во время сжатия войдут в следующее.
         -- Отметка «нужно сжатие» снимается, только если удаление было до захвата (АР-37 п.1).
         UPDATE public.agents a
