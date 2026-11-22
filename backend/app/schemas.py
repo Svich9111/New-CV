@@ -344,7 +344,7 @@ MemoryTypeName = Literal[
 class MemoryItem(BaseModel):
     id: uuid.UUID
     type: MemoryTypeName
-    text: str
+    text: ExportText  # строка или `UnavailableText` — запись видна и удаляется
     event_date: date | None
     source: Literal["owner_dialog", "agent_inference", "partner_message"]
     confidence: float = Field(ge=0, le=1)

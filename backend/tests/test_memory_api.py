@@ -209,18 +209,26 @@ async def test_without_onboarding_and_without_session(env: Env) -> None:
         assert resp.status_code == 401
 
 
-async def test_undecryptable_record_is_not_shown_and_list_does_not_fail(
+async def test_undecryptable_record_shown_as_unavailable_and_deletable(
     env: Env, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Контракт: `MemoryItem.text` — только строка. Нерасшифрованная запись не показывается,
-    список не падает; в журнале — код причины без id."""
+    """Контракт: `MemoryItem.text` — `ExportText`. Нерасшифрованная запись видна как
+    `UnavailableText` (только код причины), список не падает, запись удаляется; в журнале — код
+    причины без id."""
     caplog.set_level(logging.DEBUG)
     anna = await _person(env.client)
     ok = await add_item(env, anna, "читается")
     bad = await add_item(env, anna, "", blob=b"\x00broken")
-    got = await items(env, anna)
-    assert [i["id"] for i in got] == [str(ok)]
+    got = {i["id"]: i for i in await items(env, anna)}
+    assert set(got) == {str(ok), str(bad)}
+    assert got[str(ok)]["text"] == "читается"
+    broken = got[str(bad)]["text"]
+    assert broken["unavailable"] is True and isinstance(broken["reason"], str)
+    assert_matches(broken, "UnavailableText")
     assert "memory_items.text_enc" in caplog.text and str(bad) not in caplog.text
+    resp = await env.client.delete(f"{MEM}/{bad}", headers=anna.headers)
+    assert resp.status_code == 204
+    assert [i["id"] for i in await items(env, anna)] == [str(ok)]
 
 
 # --------------------------------------------------------------------------- удаление
@@ -270,7 +278,7 @@ async def test_partner_and_outsider_neither_see_nor_delete(env: Env) -> None:
     item = await add_item(env, anna, secret)
     own_igor = await add_item(env, igor, mark("igor"))
     for other in (igor, olga):
-        assert all(secret not in i["text"] for i in await items(env, other))
+        assert all(secret not in str(i["text"]) for i in await items(env, other))
         _not_found(await env.client.delete(f"{MEM}/{item}", headers=other.headers))
     assert [i["id"] for i in await items(env, igor)] == [str(own_igor)]
     assert [i["text"] for i in await items(env, anna)] == [secret]

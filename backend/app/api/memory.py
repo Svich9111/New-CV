@@ -8,9 +8,9 @@
 
 Только свои записи — `repositories.memory` (RLS + явный отбор по владельцу). Удаление — функцией
 БД `app_delete_memory`: чужая, удалённая и несуществующая запись — одинаково 404, повтор — 404.
-Запись, текст которой не расшифровался, в списке не показывается: `MemoryItem.text` в контракте —
-только строка (`UnavailableText` не допускается; карточка A1 в отчёте 2.4 э.2); в журнал — только
-код причины и колонка (`texts.open_row`). Ответы не кэшируются (`Cache-Control: no-store`)."""
+Запись, текст которой не расшифровался, показывается с `UnavailableText` (только код причины) —
+её видно и можно удалить (контракт `MemoryItem.text` — `ExportText`); в журнал — только код
+причины и колонка (`texts.open_row`). Ответы не кэшируются (`Cache-Control: no-store`)."""
 
 import uuid
 from typing import Annotated
@@ -21,7 +21,7 @@ from app.api.deps import CurrentUser, Keys, SessionMaker, unauthorized
 from app.errors import not_found
 from app.repositories import memory
 from app.repositories.memory import MemoryOwnerGone
-from app.schemas import MemoryItem, MemoryPage, MemoryTypeName
+from app.schemas import MemoryItem, MemoryPage, MemoryTypeName, UnavailableText
 
 router = APIRouter(tags=["memory"])
 
@@ -41,14 +41,13 @@ async def list_memory(
             MemoryItem(
                 id=r.id,
                 type=r.type,
-                text=r.text,
+                text=r.text if r.text is not None else UnavailableText(reason=r.unavailable),
                 event_date=r.event_date,
                 source=r.source,
                 confidence=r.confidence,
                 created_at=r.created_at,
             )
             for r in rows
-            if r.text is not None
         ]
     )
 
