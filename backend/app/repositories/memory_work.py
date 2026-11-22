@@ -182,9 +182,10 @@ async def session_owner_turns(
 async def session_partner_messages(
     s: AsyncSession, keys: Keyring, user_id: uuid.UUID, claim: ExtractionClaim
 ) -> list[SourceText]:
-    """Одобренные автором и **доставленные владельцу** сообщения пары ``(after, through]`` по
-    ``(delivered_at, id)`` — версия, которую владелец видел (``adapted_enc``, ФТ-14). Личный чат и
-    память партнёра недоступны: их нет в этой выборке, RLS их не отдаёт."""
+    """Одобренные автором и **доставленные владельцу** сообщения **текущей активной пары**
+    ``(after, through]`` по ``(delivered_at, id)`` — версия, которую владелец видел
+    (``adapted_enc``, ФТ-14, АР-37). Сообщения распавшейся пары пропускаются (отметка всё равно
+    двигается). Личный чат и память партнёра недоступны: их нет в выборке, RLS их не отдаёт."""
     if claim.partner_through is None:
         return []
     params: dict[str, object] = {
@@ -201,6 +202,10 @@ async def session_partner_messages(
         text(
             "SELECT pm.id, pm.adapted_enc FROM partner_messages pm "  # noqa: S608 — константы
             "WHERE pm.recipient_id = :u AND pm.author_id <> :u "
+            # АР-37 (ФТ-14): только текущая активная пара, как контекст 2.1.
+            "AND pm.couple_id IN (SELECT cm.couple_id FROM couple_members cm "
+            "JOIN couples c ON c.id = cm.couple_id "
+            "WHERE cm.user_id = :u AND cm.active AND c.status = 'active') "
             "AND pm.status::text = ANY(CAST(:st AS text[])) AND pm.delivered_at IS NOT NULL "
             f"{after}AND (pm.delivered_at, pm.id) <= (:ta, :ti) "
             "ORDER BY pm.delivered_at, pm.id"
@@ -476,21 +481,76 @@ async def conversation_summaries_in(
     return out
 
 
-async def set_conversation_summary_in(
-    s: AsyncSession, keys: Keyring, user_id: uuid.UUID, conversation_id: uuid.UUID, raw: str
+async def replace_summary_in(
+    s: AsyncSession,
+    keys: Keyring,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    *,
+    expected_raw: str,
+    new_raw: str | None,
 ) -> bool:
-    res = await s.execute(
-        text(
-            "UPDATE conversations c SET summary_enc = :t FROM agents a WHERE c.id = :c "
-            "AND a.id = c.agent_id AND a.user_id = :u RETURNING c.id"
-        ),
+    """Заменить сводку диалога, если она всё ещё ``expected_raw`` (``FOR UPDATE`` + сверка, как
+    ``chat.save_history_summary``; ревью 2.4 MINOR-5): иначе её уже переписали — пропуск.
+    ``new_raw = None`` — сводки нет."""
+    row = (
+        await s.execute(
+            text(
+                "SELECT c.summary_enc FROM conversations c JOIN agents a ON a.id = c.agent_id "
+                "WHERE c.id = :c AND a.user_id = :u FOR UPDATE OF c"
+            ),
+            {"c": conversation_id, "u": user_id},
+        )
+    ).one_or_none()
+    if row is None or row.summary_enc is None:
+        return False
+    current, _ = open_row(keys, crypto.CONVERSATION_SUMMARY, conversation_id, row.summary_enc)
+    if current != expected_raw:
+        return False
+    await s.execute(
+        text("UPDATE conversations SET summary_enc = :t WHERE id = :c"),
         {
             "c": conversation_id,
-            "u": user_id,
-            "t": keys.seal(crypto.CONVERSATION_SUMMARY, conversation_id, raw),
+            "t": None
+            if new_raw is None
+            else keys.seal(crypto.CONVERSATION_SUMMARY, conversation_id, new_raw),
         },
     )
-    return res.one_or_none() is not None
+    return True
+
+
+async def take_for_forget_in(
+    s: AsyncSession, keys: Keyring, user_id: uuid.UUID, item_id: uuid.UUID
+) -> tuple[uuid.UUID, str] | None:
+    """Живая своя запись под блокировкой: (агент, расшифрованный текст) — до удаления (АР-37:
+    текст нужен задаче очистки сводок и живёт только в памяти процесса). ``None`` — нет такой."""
+    row = (
+        await s.execute(
+            text(
+                "SELECT m.agent_id, m.text_enc FROM memory_items m JOIN agents a "
+                "ON a.id = m.agent_id WHERE m.id = :i AND a.user_id = :u "
+                "AND m.deleted_at IS NULL AND m.text_enc IS NOT NULL FOR UPDATE OF m"
+            ),
+            {"i": item_id, "u": user_id},
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    body, _ = open_row(keys, crypto.MEMORY_TEXT, item_id, row.text_enc)
+    return _uuid(row.agent_id), body or ""
+
+
+async def delete_memory_in(s: AsyncSession, item_id: uuid.UUID) -> bool:
+    return bool(
+        (await s.execute(text("SELECT app_delete_memory(:i)"), {"i": item_id})).scalar_one()
+    )
+
+
+async def clear_profile_summary_in(s: AsyncSession, user_id: uuid.UUID) -> None:
+    """АР-37 (1): сводка профиля обнуляется сразу при удалении записи памяти."""
+    await s.execute(
+        text("UPDATE agents SET profile_summary_enc = NULL WHERE user_id = :u"), {"u": user_id}
+    )
 
 
 async def extraction_done_in(

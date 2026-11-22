@@ -301,7 +301,7 @@ async def build_context(
         ],
         turns=_turns(rows, budget.turn_chars),
         profile=clip(rows.profile_summary or "", budget.profile_chars),
-        summary=clip(rows.summary.text if rows.summary else "", budget.summary_chars),
+        summary=clip(rows.summary.visible_text if rows.summary else "", budget.summary_chars),
     )
     safety_dialog = tuple(t for _, t in parts.turns if t.author == "owner")[-SAFETY_TURNS:]
     base = OwnerContext(owner_name=rows.owner_name, partner_name=rows.partner_name)

@@ -191,7 +191,7 @@ async def compress_history(
         try:
             text = await summarize(
                 models,
-                summary.text if summary else "",
+                summary.visible_text if summary else "",
                 old,
                 log=log,
                 version=version,

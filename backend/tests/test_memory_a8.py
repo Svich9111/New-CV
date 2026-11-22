@@ -608,9 +608,9 @@ async def test_old_key_still_catches_deleted(engine: AsyncEngine, sessionmaker: 
 async def test_deleted_not_in_context_profile_or_dialog_summary(
     engine: AsyncEngine, sessionmaker: SM
 ) -> None:
-    """Кр.1 и кр.4, АР-31: удалённое — не в контексте 2.1; сжатие пересобирает сводку профиля
-    только из живых (вход модели сводки — без удалённого), из сводки диалога выбрасывает
-    предложение, совпадающее с удалённой записью; отметка сводки сохраняется."""
+    """Кр.1 и кр.4, АР-37 (2.4 р1, A3): удалённое — не в контексте 2.1 сразу после удаления;
+    сжатие пересобирает сводку профиля только из живых (вход модели сводки — без удалённого),
+    помеченную сводку диалога обнуляет; отметка сводки сохраняется."""
     async with engine.begin() as c:
         p = await person(c, "Сводки")
         live = await add_mem(c, p, "двое детей")
@@ -627,9 +627,12 @@ async def test_deleted_not_in_context_profile_or_dialog_summary(
                 "a": p.agent,
             },
         )
-    assert await delete_mem(sessionmaker, p, gone)
+    # 2.4 р1 (A3), АР-37: удаление — путём API (`forget_memory`): профиль обнуляется, сводка
+    # диалога помечена «на очистку» и в контекст не идёт уже сразу, до сжатия.
+    assert await mem_ai.forget_memory(sessionmaker, KEYS, p.uid, gone) is not None
     ctx = await build_context(sessionmaker, KEYS, p.uid, p.conv, query="новое")
     assert gone not in ctx.stats.memory_ids and live in ctx.stats.memory_ids
+    assert "посменно" not in json.dumps(ctx.payload(), ensure_ascii=False).lower()
     comp = [x for x in await mw.claim_compaction(async_sessionmaker(engine),
             every=timedelta(minutes=1), lease=timedelta(minutes=5), limit=100)
             if x.agent_id == p.agent]  # fmt: skip
@@ -646,7 +649,10 @@ async def test_deleted_not_in_context_profile_or_dialog_summary(
                              {"c": p.conv})).one()  # fmt: skip
     assert KEYS.open(crypto.AGENT_PROFILE_SUMMARY, p.agent, r[0]) == "Двое детей."
     raw = json.loads(KEYS.open(crypto.CONVERSATION_SUMMARY, p.conv, s[0]))
-    assert "посменно" not in raw["text"].lower() and "Любит чай" in raw["text"]
+    # 2.4 р1 (A3), АР-37: задача очистки не выполнялась («перезапуск») — сжатие обнуляет
+    # помеченную сводку с сохранением отметки (приватность важнее непрерывности; прежнее
+    # ожидание «Любит чай» осталось бы только при буквальном совпадении предложения).
+    assert raw["text"] == "" and "forget" not in raw
     assert raw["through_id"] == str(t1)
     ctx2 = await build_context(sessionmaker, KEYS, p.uid, p.conv, query="новое")
     assert "посменно" not in json.dumps(ctx2.payload(), ensure_ascii=False).lower()
@@ -655,9 +661,8 @@ async def test_deleted_not_in_context_profile_or_dialog_summary(
 async def test_profile_keeps_deleted_until_next_compaction_period(
     engine: AsyncEngine, sessionmaker: SM
 ) -> None:
-    """Фиксирует поведение по АР-31 (до решения оператора): удаление сразу после сжатия не
-    вызывает нового сжатия раньше периода (`compact_every`, по умолчанию 7 дней) — сводка
-    профиля с удалённым содержанием остаётся в контексте 2.1 до следующего сжатия (О-1)."""
+    """АР-37 (2.4 р1, A3; было — фиксация О-1 по АР-31): удаление сразу после сжатия обнуляет
+    сводку профиля — удалённое не остаётся в контексте 2.1 до следующего сжатия."""
     async with engine.begin() as c:
         p = await person(c, "Период")
         item = await add_mem(c, p, "ТАЙНАa8 работает ночами")
@@ -669,12 +674,12 @@ async def test_profile_keeps_deleted_until_next_compaction_period(
     assert (
         await mem_ai.run_compaction(sessionmaker, KEYS, FP, models_of(m), comp[0])
     ).status == "done"
-    assert await delete_mem(sessionmaker, p, item)
-    again = [x for x in await mw.claim_compaction(async_sessionmaker(engine), every=every,
-             lease=timedelta(minutes=5), limit=100) if x.agent_id == p.agent]  # fmt: skip
-    assert again == []
+    # 2.4 р1 (A3), АР-37: удаление обнуляет сводку профиля сразу — удалённого в контексте нет и
+    # до следующего сжатия (О-1 закрыт). Постановка на сжатие вне периода — функция БД (A1),
+    # страж — `test_memory_worker.py::test_delete_queues_compaction_outside_period` (xfail).
+    assert await mem_ai.forget_memory(sessionmaker, KEYS, p.uid, item) is not None
     ctx = await build_context(sessionmaker, KEYS, p.uid, p.conv, query="привет")
-    assert "ТАЙНАa8" in ctx.context.profile_summary  # удалённое — в сводке профиля до сжатия
+    assert "ТАЙНАa8" not in ctx.context.profile_summary
 
 
 async def test_compaction_rolls_back_when_record_deleted_midway(
@@ -732,8 +737,8 @@ async def test_extraction_isolation(engine: AsyncEngine, sessionmaker: SM) -> No
     доставленные ему сообщения пары (версия, которую он видел). Не попадают: чат, память, черновики
     партнёра, оригинал адаптированного сообщения, `processing`/`withheld`, свои отправленные,
     ответы агента, посторонняя, id. Сообщение без версии для получателя (`adapted_enc` NULL) — не
-    берётся (оригинал не читается). Распавшаяся пара: доставленное раньше — данные владельца
-    (карточка 2.4), недоставленное — нет."""
+    берётся (оригинал не читается). Распавшаяся пара: не берётся (АР-37, 2.4 р1 — A3;
+    было «доставленное раньше — данные владельца»), недоставленное — нет."""
     async with engine.begin() as c:
         anna = await person(c, "Анна")
         igor = await person(c, "Игорь")
@@ -793,7 +798,9 @@ async def test_extraction_isolation(engine: AsyncEngine, sessionmaker: SM) -> No
              "confidence": 0.8} for m in payload["partner_messages"]
         ] + [{"text": "наблюдение", "kind": "observation", "confidence": 0.99},
              {"text": "чужая ссылка", "kind": "from_partner", "partner_ref": "m999"},
-             {"text": "владелец со ссылкой", "kind": "fact", "partner_ref": refs[0]}]  # fmt: skip
+             # 2.4 р1 (A3): реплики владельца и сообщения партнёра — разные вызовы (MINOR-2).
+             *([{"text": "владелец со ссылкой", "kind": "fact", "partner_ref": refs[0]}]
+               if refs else [])]  # fmt: skip
 
     m = MemModel(items=answer)
     out = await extract_for(engine, sessionmaker, anna, m, emb=emb)
@@ -803,16 +810,25 @@ async def test_extraction_isolation(engine: AsyncEngine, sessionmaker: SM) -> No
     assert not [i for i in (anna.uid, anna.agent, igor.uid, delivered) if str(i) in sent]
     assert "ВЛАДЕЛЕЦa8" in sent and "ВИДЕЛААННАa8" in sent and "КАКЕСТЬa8" in sent
     assert "БЕЗВЕРСИИa8" not in sent and "tmp" not in json.dumps(m.of("extract")[0]["payload"])
-    assert "ОТБЫВШЕГОa8" in sent and "БЫВШИЙЖДЁТa8" not in sent
+    # 2.4 р1 (A3), АР-37 (ФТ-14): только текущая активная пара — бывшая не берётся.
+    assert "ОТБЫВШЕГОa8" not in sent and "БЫВШИЙЖДЁТa8" not in sent
     rows = await memory_of(engine, anna)
     by_text = {r.text: r for r in rows}
     assert by_text["владелец тяжело"].source == "owner_dialog"
     fp_rows = [r for r in rows if r.type == "from_partner"]
-    assert {r.source_message_id for r in fp_rows} == {delivered, plain, ex_msg}
+    # 2.4 р1 (A3), АР-37: сообщение бывшей пары (ex_msg) в память не идёт.
+    assert {r.source_message_id for r in fp_rows} == {delivered, plain}
+    assert ex_msg not in {r.source_message_id for r in rows}
     assert all(r.source == "partner_message" for r in fp_rows)
     obs = by_text["наблюдение"]
     assert (obs.type, obs.source, obs.confidence) == ("observation", "agent_inference", 0.6)
-    assert "чужая ссылка" not in by_text and "владелец со ссылкой" not in by_text
+    assert "чужая ссылка" not in by_text
+    # 2.4 р1 (A3), MINOR-2: в вызове по сообщениям партнёра источник задаёт код — «факт» из текста
+    # партнёра записан как from_partner, а не как слова владельца.
+    assert (by_text["владелец со ссылкой"].type, by_text["владелец со ссылкой"].source) == (
+        "from_partner",
+        "partner_message",
+    )
     assert all(r.model == emb.model for r in rows)
     assert all(r.fingerprint == my_fp(FPK, anna.agent, r.text or "") for r in rows)
     # Партнёр: его память не тронута, записей Анны у него нет.

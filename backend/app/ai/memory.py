@@ -13,8 +13,15 @@
 2. отпечатки удалённых записей (``app_memory_forgotten``) — перед каждой вставкой и слиянием и при
    сжатии; отпечаток ловит совпадение нормализованного текста (регистр, «ё», пунктуация), но не
    перефразировку (АР-36);
-3. сжатие пересобирает сводку профиля только из живых записей, а из сводок диалога выбрасывает
-   предложения, совпадающие с удалёнными записями (АР-31, до решения оператора).
+3. сводки (АР-37, допущение до решения оператора): удаление записи (``forget_memory``) сразу
+   обнуляет сводку профиля и помечает сводки диалогов «на очистку» — помеченная сводка в контекст
+   не идёт; фоновая ``run_forget`` с удалённым текстом в памяти процесса переписывает сводку
+   (``summary_forget.v0``) и пересобирает профиль из живых записей; не выполнилась — сжатие памяти
+   обнуляет помеченную сводку с сохранением отметки. Сравнение предложений сводки с отпечатками
+   (прежняя логика 2.4) убрано: сводки пишет модель своими словами, совпадений почти не бывает.
+4. из сообщений партнёра — только текущей активной пары (АР-37, ФТ-14); реплики владельца и
+   сообщения партнёра извлекаются **разными вызовами**, источник задаёт код (ревью MINOR-2);
+   длинная сессия — пачками (MINOR-3).
 
 **Слияние** (§6.3 п.1): совпадение отпечатка с живой записью — повтор (уверенность не ниже новой);
 близкая по смыслу запись того же вида и источника (соседи ``app_memory_nearest``, расстояние не
@@ -31,9 +38,8 @@
 
 from __future__ import annotations
 
-import re
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Literal
@@ -50,12 +56,14 @@ from app.core.crypto import Keyring
 from app.core.fingerprint import FingerprintKeys
 from app.db import user_scope
 from app.repositories import memory_work as mw
-from app.repositories.chat import pack_summary, unpack_summary
+from app.repositories.chat import HistorySummary, pack_summary, unpack_summary
 from app.repositories.memory_work import CompactionClaim, ExtractionClaim, LiveMemory, SourceText
 
 EXTRACT_VERSION = "v0"  # черновики без прогона (АР-26)
 MERGE_VERSION = "v0"
 PROFILE_VERSION = "v0"
+FORGET_VERSION = "v0"
+FORGET_RETRIES = 3
 
 OWNER_KINDS = ("fact", "date", "preference", "sensitive_topic")
 KINDS = (*OWNER_KINDS, "observation", "from_partner")
@@ -67,6 +75,8 @@ MAX_PROFILE_CHARS = 1000
 MERGE_DISTANCE = 0.15  # косинусное расстояние: «близко по смыслу»
 NEIGHBOURS = 3
 MAX_TOKENS = 2000
+BATCH_ITEMS = 40  # реплик или сообщений в одном вызове извлечения
+BATCH_CHARS = 8_000
 
 Status = Literal["done", "empty", "skipped", "refused", "error", "lost", "gone"]
 
@@ -85,7 +95,7 @@ class Candidate:
 class Outcome:
     """Итог одной задачи — без текстов (для журнала и тестов)."""
 
-    kind: Literal["extract", "compact"]
+    kind: Literal["extract", "compact", "forget"]
     status: Status
     inserted: int = 0
     merged: int = 0
@@ -156,10 +166,18 @@ def _date(value: object) -> date | None:
         return None
 
 
-def candidates_from(data: dict[str, Any], refs: dict[str, uuid.UUID]) -> list[Candidate]:
-    """Проверка ответа в коде: структура неверна — ``ValueError``/``TypeError`` (→ ``bad_output``);
-    отдельная запись не по правилам (ссылка на несуществующее сообщение, ссылка у записи владельца,
-    пустой текст) отбрасывается — остальные сохраняются."""
+def candidates_from(
+    data: dict[str, Any], refs: dict[str, uuid.UUID], mode: Literal["owner", "partner"]
+) -> list[Candidate]:
+    """Проверка ответа в коде; **источник задаёт код по виду вызова** (ревью 2.4 MINOR-2):
+
+    - ``owner`` (вход — только реплики владельца): виды владельца и наблюдения; ``from_partner`` и
+      ссылки на сообщения отбрасываются;
+    - ``partner`` (вход — только доставленные сообщения партнёра): любая запись становится
+      ``from_partner`` со ссылкой на своё сообщение — запись без верной ссылки отбрасывается; факт
+      из текста партнёра не получит источник «слова владельца».
+
+    Структура неверна — ``ValueError``/``TypeError`` (→ ``bad_output``)."""
     items = data["items"]
     if not isinstance(items, list):
         raise TypeError("items")
@@ -176,12 +194,12 @@ def candidates_from(data: dict[str, Any], refs: dict[str, uuid.UUID]) -> list[Ca
             raise ValueError("confidence")
         ref = item.get("partner_ref")
         message: uuid.UUID | None = None
-        if kind == "from_partner":
+        if mode == "partner":
             if not isinstance(ref, str) or ref not in refs:
-                continue  # из сообщения партнёра — только со ссылкой на переданное сообщение
-            message = refs[ref]
-        elif ref is not None:
-            continue  # запись владельца не может опираться на сообщение партнёра
+                continue
+            kind, message = "from_partner", refs[ref]
+        elif kind == "from_partner" or ref is not None:
+            continue
         confidence = float(conf)
         if kind == "observation":
             confidence = min(confidence, OBSERVATION_MAX_CONFIDENCE)
@@ -198,6 +216,26 @@ def candidates_from(data: dict[str, Any], refs: dict[str, uuid.UUID]) -> list[Ca
     return out
 
 
+def batches(
+    items: Sequence[SourceText], *, max_items: int, max_chars: int
+) -> list[list[SourceText]]:
+    """Пачки по числу и длине (хотя бы один текст в пачке; длинный текст — обрезан): длинная
+    сессия не превышает окно модели и не теряется после предела попыток (MINOR-3)."""
+    out: list[list[SourceText]] = []
+    cur: list[SourceText] = []
+    size = 0
+    for it in items:
+        t = SourceText(it.id, it.text[:max_chars])
+        if cur and (len(cur) >= max_items or size + len(t.text) > max_chars):
+            out.append(cur)
+            cur, size = [], 0
+        cur.append(t)
+        size += len(t.text)
+    if cur:
+        out.append(cur)
+    return out
+
+
 async def extract(
     models: AgentModels,
     owner_turns: Sequence[SourceText],
@@ -205,20 +243,36 @@ async def extract(
     *,
     log: CallLog,
     version: str = EXTRACT_VERSION,
+    max_items: int = BATCH_ITEMS,
+    max_chars: int = BATCH_CHARS,
 ) -> list[Candidate]:
-    if not owner_turns and not partner:
-        return []
-    payload, refs = extract_payload(owner_turns, partner)
-    validate: Callable[[dict[str, Any]], list[Candidate]] = lambda d: candidates_from(d, refs)  # noqa: E731
-    return await complete(
-        _provider(models),
-        prompt=load("memory_extract", version),
-        payload=payload,
-        schema=EXTRACT_SCHEMA,
-        validate=validate,
-        log=log,
-        max_tokens=MAX_TOKENS,
-    )
+    """Отдельные вызовы: по пачкам реплик владельца и по пачкам сообщений партнёра."""
+    out: list[Candidate] = []
+    jobs: list[tuple[Literal["owner", "partner"], list[SourceText]]] = [
+        ("owner", b) for b in batches(owner_turns, max_items=max_items, max_chars=max_chars)
+    ] + [("partner", b) for b in batches(partner, max_items=max_items, max_chars=max_chars)]
+    for mode, chunk in jobs:
+        payload, refs = (
+            extract_payload(chunk, []) if mode == "owner" else extract_payload([], chunk)
+        )
+
+        def validate(
+            d: dict[str, Any],
+            refs: dict[str, uuid.UUID] = refs,
+            mode: Literal["owner", "partner"] = mode,
+        ) -> list[Candidate]:
+            return candidates_from(d, refs, mode)
+
+        out += await complete(
+            _provider(models),
+            prompt=load("memory_extract", version),
+            payload=payload,
+            schema=EXTRACT_SCHEMA,
+            validate=validate,
+            log=log,
+            max_tokens=MAX_TOKENS,
+        )
+    return out
 
 
 async def merge_texts(
@@ -497,19 +551,13 @@ async def run_extraction(
 
 # --------------------------------------------------------------------------- сжатие
 
-_SENTENCE = re.compile(r"(?<=[.!?…])\s+")
 
-
-def _sentence_key(sentence: str) -> str:
-    return sentence.strip().rstrip(".!?…").strip()
-
-
-def without_forgotten(text: str, is_forgotten: Callable[[str], bool]) -> tuple[str, int]:
-    """Предложения сводки, совпадающие с удалённой записью (отпечаток), выбрасываются (АР-31).
-    → (текст, сколько выброшено). Перефразированное содержание так не ловится (АР-36)."""
-    parts = [p for p in _SENTENCE.split(text) if p.strip()]
-    kept = [p for p in parts if not is_forgotten(_sentence_key(p))]
-    return " ".join(kept), len(parts) - len(kept)
+def forgotten_summary(old: HistorySummary) -> str | None:
+    """Сводка диалога без текста, с сохранённой отметкой (АР-37: приватность важнее
+    непрерывности). Реплики после отметки по-прежнему идут в контекст."""
+    if old.through_at is None:
+        return None
+    return pack_summary(HistorySummary("", old.through_at, old.through_id))
 
 
 async def run_compaction(
@@ -545,14 +593,13 @@ async def run_compaction(
                 for m in items:
                     if m.embedding is not None:
                         near[m.id] = await mw.nearest_in(s, m.embedding, model, NEIGHBOURS + 1)
-            summaries = await mw.conversation_summaries_in(s, keys, claim.user_id)
-            sentence_fps = [
-                f
-                for _, raw in summaries
-                for p in _SENTENCE.split(unpack_summary(raw).text)
-                for f in fp.all_of(claim.agent_id, _sentence_key(p))
+            # Сводки «на очистку» (АР-37), которые задача очистки не успела переписать
+            # (перезапуск, сбой), — обнуляются здесь с сохранением отметки.
+            summaries = [
+                (cid, raw)
+                for cid, raw in await mw.conversation_summaries_in(s, keys, claim.user_id)
+                if unpack_summary(raw).forget
             ]
-            forgotten = await mw.forgotten_in(s, sentence_fps)
         by_id = {m.id: m for m in items}
 
         # 1) Дубликаты по отпечатку (один вид, источник, сообщение): остаётся самая ранняя.
@@ -616,9 +663,6 @@ async def run_compaction(
             )
         )
 
-        def is_forgotten_sentence(body: str) -> bool:
-            return any(f in forgotten for f in fp.all_of(claim.agent_id, body))
-
         merged = 0
         async with user_scope(sm, claim.user_id) as s:
             # Всё, на чём построены слияние и сводка, должно быть живо и не изменено: иначе
@@ -657,15 +701,15 @@ async def run_compaction(
                     raise _Rollback
             await mw.set_profile_summary_in(s, keys, claim.user_id, claim.agent_id, profile)
             for conv_id, raw in summaries:
-                old = unpack_summary(raw)
-                cleaned, removed = without_forgotten(old.text, is_forgotten_sentence)
-                if removed:
-                    new_raw = (
-                        pack_summary(type(old)(cleaned, old.through_at, old.through_id))
-                        if old.through_at
-                        else cleaned
-                    )
-                    await mw.set_conversation_summary_in(s, keys, claim.user_id, conv_id, new_raw)
+                # Сверка с прочитанным (MINOR-5): сводку переписали — пропуск.
+                await mw.replace_summary_in(
+                    s,
+                    keys,
+                    claim.user_id,
+                    conv_id,
+                    expected_raw=raw,
+                    new_raw=forgotten_summary(unpack_summary(raw)),
+                )
             if not await mw.compaction_done_in(s, claim.token):
                 raise _Rollback
         return outcome("done", merged=merged, dropped=len(drop))
@@ -674,4 +718,130 @@ async def run_compaction(
     except DBAPIError as exc:
         if mw.owner_gone(exc):
             return outcome("gone")
+        raise
+
+
+# --------------------------------------------------------------------------- удаление (АР-37)
+
+FORGET_SCHEMA: dict[str, Any] = strict_object({"rewritten": {"type": "string"}})
+
+
+@dataclass(frozen=True)
+class ForgetJob:
+    """Задача очистки сводок после удаления записи памяти. Текст удалённой записи живёт **только
+    в памяти процесса** (в БД его уже нет); в журналы и ``repr`` не попадает."""
+
+    user_id: uuid.UUID
+    agent_id: uuid.UUID
+    item_id: uuid.UUID
+    text: str = field(repr=False)
+
+
+async def forget_memory(
+    sm: async_sessionmaker[AsyncSession], keys: Keyring, user_id: uuid.UUID, item_id: uuid.UUID
+) -> ForgetJob | None:
+    """Удаление записи памяти владельцем (``DELETE /memory/{id}``, ФТ-13; АР-37) — одна
+    транзакция: прочитать и расшифровать текст (до удаления), ``app_delete_memory`` (отпечаток
+    остаётся), обнулить сводку профиля, пометить сводки диалогов «на очистку» (в контекст и
+    выгрузку не идут). ``None`` — записи нет среди своих живых (404, неразличимо). Затем API
+    запускает ``run_forget(job)`` в фоне (не дожидаясь); если она не выполнится, помеченные сводки
+    обнулит сжатие памяти (``run_compaction``)."""
+    try:
+        async with user_scope(sm, user_id) as s:
+            taken = await mw.take_for_forget_in(s, keys, user_id, item_id)
+            if taken is None:
+                return None
+            agent_id, body = taken
+            if not await mw.delete_memory_in(s, item_id):
+                return None
+            await mw.clear_profile_summary_in(s, user_id)
+            for conv_id, raw in await mw.conversation_summaries_in(s, keys, user_id):
+                old = unpack_summary(raw)
+                if not old.text:
+                    continue
+                marked = HistorySummary(
+                    old.text, old.through_at, old.through_id, (*old.forget, str(item_id))
+                )
+                await mw.replace_summary_in(
+                    s, keys, user_id, conv_id, expected_raw=raw, new_raw=pack_summary(marked)
+                )
+    except DBAPIError as exc:
+        if mw.owner_gone(exc):
+            return None
+        raise
+    return ForgetJob(user_id, agent_id, item_id, body)
+
+
+async def rewrite_without(
+    models: AgentModels, summary: str, forget: str, *, log: CallLog, version: str = FORGET_VERSION
+) -> str:
+    """Сводка без удалённого сведения (``summary_forget.v0``, черновик без прогона, АР-26)."""
+    return await complete(
+        _provider(models),
+        prompt=load("summary_forget", version),
+        payload={"summary": summary, "forget": forget},
+        schema=FORGET_SCHEMA,
+        validate=lambda d: text_field(d, "rewritten", allow_empty=True),
+        log=log,
+        max_tokens=MAX_TOKENS,
+    )
+
+
+async def run_forget(
+    sm: async_sessionmaker[AsyncSession],
+    keys: Keyring,
+    models: AgentModels,
+    job: ForgetJob,
+) -> Outcome:
+    """Фоновая очистка после ``forget_memory``: каждая сводка диалога с пометкой этой записи
+    переписывается моделью без удалённого (пометка этой записи снимается; другие — остаются); при
+    ошибке модели сводка обнуляется с сохранением отметки. Запись — со сверкой (сводку могли
+    переписать — перечитать, до ``FORGET_RETRIES`` раз). Затем сводка профиля пересобирается из
+    живых записей (если с чтения ничего не удалили и не изменили)."""
+    log = CallLog()
+    mark = str(job.item_id)
+    cleaned = 0
+    try:
+        for _ in range(FORGET_RETRIES):
+            async with user_scope(sm, job.user_id) as s:
+                pending = [
+                    (cid, raw)
+                    for cid, raw in await mw.conversation_summaries_in(s, keys, job.user_id)
+                    if mark in unpack_summary(raw).forget
+                ]
+            if not pending:
+                break
+            for conv_id, raw in pending:
+                old = unpack_summary(raw)
+                rest = tuple(x for x in old.forget if x != mark)
+                try:
+                    text = await rewrite_without(models, old.text, job.text, log=log)
+                    new_raw: str | None = pack_summary(
+                        HistorySummary(text, old.through_at, old.through_id, rest)
+                    )
+                except LLMError:
+                    new_raw = forgotten_summary(old)
+                async with user_scope(sm, job.user_id) as s:
+                    if await mw.replace_summary_in(
+                        s, keys, job.user_id, conv_id, expected_raw=raw, new_raw=new_raw
+                    ):
+                        cleaned += 1
+        async with user_scope(sm, job.user_id) as s:
+            items = await mw.live_memory(s, keys, job.user_id)
+        try:
+            profile = await build_profile(
+                models, [(m.type, m.text, m.event_date) for m in items], log=log
+            )
+        except LLMError as exc:
+            return Outcome(
+                "forget", "error", merged=cleaned, error=exc.kind, calls=tuple(log.records)
+            )
+        async with user_scope(sm, job.user_id) as s:
+            now = {m.id: m.version for m in await mw.live_memory(s, keys, job.user_id)}
+            if now == {m.id: m.version for m in items}:
+                await mw.set_profile_summary_in(s, keys, job.user_id, job.agent_id, profile)
+        return Outcome("forget", "done", merged=cleaned, calls=tuple(log.records))
+    except DBAPIError as exc:
+        if mw.owner_gone(exc):
+            return Outcome("forget", "gone", calls=tuple(log.records))
         raise

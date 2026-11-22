@@ -361,8 +361,12 @@ async def test_isolation_partner_chat_memory_and_undelivered(
         igor.label,
     ):
         assert hidden not in sent_text, hidden
-    [payload] = model.payloads["memory_extract"]
-    assert payload["partner_messages"] == [{"ref": "m1", "text": "Предупреждай заранее об отменах"}]
+    owner_payload, partner_payload = model.payloads["memory_extract"]  # раздельные вызовы
+    assert owner_payload["partner_messages"] == [] and owner_payload["owner_turns"]
+    assert partner_payload == {
+        "owner_turns": [],
+        "partner_messages": [{"ref": "m1", "text": "Предупреждай заранее об отменах"}],
+    }
     partner_row = next(r for r in await rows(engine, anna) if r.type == "from_partner")
     assert (partner_row.source, partner_row.source_message_id) == (
         "partner_message",
@@ -499,8 +503,10 @@ async def test_merge_without_duplicates_and_sources_kept(
 async def test_compaction_duplicates_profile_and_summary_without_deleted(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
-    """§6.3 п.3, АР-31: дубликаты объединены, сводка профиля — только из живых записей, из
-    сводки диалога выброшено предложение, совпадающее с удалённой записью."""
+    """§6.3 п.3, АР-37: дубликаты объединены, сводка профиля — только из живых записей; сводка
+    диалога, помеченная «на очистку» удалением, которую задача очистки так и не переписала
+    (перезапуск), обнуляется сжатием с сохранением отметки. (Прежняя проверка «выброшено
+    совпадающее предложение» снята вместе с логикой — 2.4 р1, A3.)"""
     who = await person(engine, sessionmaker, "Вера")
 
     async def add(kind: str, src: str, txt: str) -> uuid.UUID:
@@ -516,7 +522,6 @@ async def test_compaction_duplicates_profile_and_summary_without_deleted(
     near1 = await add("date", "owner_dialog", "Годовщина летом")
     await add("date", "owner_dialog", "Годовщина летом, 14 июня")
     secret = await add("sensitive_topic", "owner_dialog", "Болезненна тема денег")
-    await delete_memory(sessionmaker, who, secret)
     await chat.add_message(sessionmaker, KEYS, who.user_id, who.conv, "owner", "x")
     _, turns = await chat.read_history(sessionmaker, KEYS, who.user_id, who.conv)
     assert await chat.save_history_summary(
@@ -531,6 +536,8 @@ async def test_compaction_duplicates_profile_and_summary_without_deleted(
         ),
         expected_through_id=None,
     )
+    job = await memory.forget_memory(sessionmaker, KEYS, who.user_id, secret)
+    assert job is not None  # задача очистки не запускается — «процесс перезапустился»
     model = Model()
     model.merge = lambda existing, new: (
         "Годовщина летом, 14 июня" if "Годовщина" in existing else None
@@ -559,7 +566,7 @@ async def test_compaction_duplicates_profile_and_summary_without_deleted(
     )
     assert agent.memory_compacted_at is not None
     s, _ = await chat.read_history(sessionmaker, KEYS, who.user_id, who.conv)
-    assert s is not None and s.text == "Говорили о детях. Решили обсудить отпуск."
+    assert s is not None and s.text == "" and not s.forget
     assert s.through_id == turns[-1].id  # отметка сводки сохранена
     # Удалённая запись осталась удалённой (отпечаток жив), сжатие её не тронуло.
     gone = [r for r in await rows(engine, who) if r.deleted_at is not None]
@@ -703,10 +710,12 @@ async def test_worker_run_once_catches_up_and_logs_no_texts(
     assert await worker.run_once() == []  # всё догнано, повторной работы нет
 
 
-async def test_couple_leave_does_not_break_partner_extraction(
+async def test_dissolved_couple_messages_not_extracted(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
-    """Доставленное до распада пары остаётся данными владельца (Д7) — извлекается как обычно."""
+    """АР-37 (ФТ-14): из сообщений партнёра — только текущей активной пары. Доставленное до
+    распада пары в память не идёт (отметка всё равно двигается — повторной работы нет).
+    (2.4 р1, A3: прежнее ожидание «извлекается после распада» заменено решением АР-37.)"""
     anna = await person(engine, sessionmaker, "Анна")
     igor = await person(engine, sessionmaker, "Игорь")
     await _couple(sessionmaker, anna, igor)
@@ -723,7 +732,9 @@ async def test_couple_leave_does_not_break_partner_extraction(
     model = Model()
     model.extract_items = lambda p: [item("from_partner", "Партнёр просил предупреждать", ref="m1")]
     out = await extract_once(sessionmaker, engine, anna, model)
-    assert out.status == "done" and out.inserted == 1
+    assert out.status == "empty" and await rows(engine, anna) == []
+    assert "memory_extract" not in model.payloads
+    assert await claim_mine(engine, anna) is None
 
 
 # =============================================================== Б-64
@@ -817,3 +828,333 @@ def test_extract_prompt_limits_partner_text() -> None:
     body = prompts.load("memory_extract", "v0").text
     assert "Из сообщений партнёра — только содержание самого сообщения" in body
     assert "observation" in body and "не выше 0.6" in body
+
+
+# =============================================================== 2.4 р1: АР-37, MINOR-2/3/5
+
+
+class ForgetModel(Model):
+    def __init__(self, rewritten: str | Exception = "Говорили об отпуске.") -> None:
+        super().__init__()
+        self.rewritten = rewritten
+
+    def _handle(self, role: str, payload: dict[str, Any], system: str) -> dict[str, Any]:
+        if role == "summary_forget":
+            self.payloads.setdefault(role, []).append(payload)
+            if isinstance(self.rewritten, Exception):
+                raise self.rewritten
+            return {"rewritten": self.rewritten}
+        return super()._handle(role, payload, system)
+
+
+async def _paraphrased_world(sm: SM, engine: AsyncEngine) -> tuple[Who, uuid.UUID, list[Any]]:
+    """Запись «Болезненно реагирует на тему денег», сводка диалога её **перефразирует** (так
+    пишет модель сжатия чата), сводка профиля тоже содержит её."""
+    who = await person(engine, sm, "Вера")
+    secret = await texts.add_memory_item(
+        sm,
+        KEYS,
+        who.user_id,
+        who.agent_id,
+        "sensitive_topic",
+        "owner_dialog",
+        "Болезненно реагирует на тему денег",
+        fingerprints=FP,
+    )
+    await texts.add_memory_item(
+        sm, KEYS, who.user_id, who.agent_id, "fact", "owner_dialog", "Двое детей", fingerprints=FP
+    )
+    assert await texts.set_agent_profile_summary(
+        sm, KEYS, who.user_id, who.agent_id, "Двое детей; переживает из-за финансов"
+    )
+    await chat.add_message(sm, KEYS, who.user_id, who.conv, "owner", "старое")
+    _, turns = await chat.read_history(sm, KEYS, who.user_id, who.conv)
+    assert await chat.save_history_summary(
+        sm,
+        KEYS,
+        who.user_id,
+        who.conv,
+        chat.HistorySummary(
+            "Владелец переживает из-за финансов. Говорили об отпуске.",
+            turns[-1].created_at,
+            turns[-1].id,
+        ),
+        expected_through_id=None,
+    )
+    await chat.add_message(sm, KEYS, who.user_id, who.conv, "owner", "новое")
+    return who, secret, turns
+
+
+async def _context_text(sm: SM, who: Who) -> str:
+    from app.ai.context import build_context
+
+    built = await build_context(sm, KEYS, who.user_id, who.conv, query="новое")
+    return json.dumps(built.payload(), ensure_ascii=False)
+
+
+async def test_forget_hides_paraphrased_summary_and_rewrites_it(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """АР-37 / ревью MAJOR-1: сводка пересказывает удалённое своими словами (отпечаток не ловит).
+    Сразу после удаления: сводка профиля обнулена, сводка диалога «на очистку» — в контексте нет;
+    фоновая задача переписывает сводку без удалённого и пересобирает профиль из живых записей."""
+    who, secret, turns = await _paraphrased_world(sessionmaker, engine)
+    assert "финансов" in await _context_text(sessionmaker, who)
+    job = await memory.forget_memory(sessionmaker, KEYS, who.user_id, secret)
+    assert job is not None and "Болезненно" not in repr(job)
+    now = await _context_text(sessionmaker, who)
+    assert "финансов" not in now and "денег" not in now and "Говорили об отпуске" not in now
+    assert "новое" in now  # реплики после отметки — на месте
+    model = ForgetModel("Говорили об отпуске.")
+    model.profile = lambda records: "Двое детей"
+    out = await memory.run_forget(sessionmaker, KEYS, AgentModels.single(model), job)
+    assert out.status == "done" and out.merged == 1
+    [call] = model.payloads["summary_forget"]
+    assert call == {
+        "summary": "Владелец переживает из-за финансов. Говорили об отпуске.",
+        "forget": "Болезненно реагирует на тему денег",
+    }
+    [prof] = model.payloads["profile_summary"]
+    assert "денег" not in json.dumps(prof, ensure_ascii=False)
+    after = await _context_text(sessionmaker, who)
+    assert "Говорили об отпуске." in after and "финансов" not in after
+    assert '"owner_profile": "Двое детей"' in after
+    s, _ = await chat.read_history(sessionmaker, KEYS, who.user_id, who.conv)
+    assert s is not None and not s.forget and s.through_id == turns[-1].id
+    # Выгрузка (ФТ-21) до очистки сводку не показывает, после — показывает переписанную.
+    export = await account.export_account(sessionmaker, KEYS, who.user_id)
+    assert export.conversations[0].summary == "Говорили об отпуске."
+
+
+async def test_forget_job_failure_nulls_summary_keeping_mark(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Сбой задачи (модель недоступна) — сводка обнулена с сохранением отметки."""
+    who, secret, turns = await _paraphrased_world(sessionmaker, engine)
+    job = await memory.forget_memory(sessionmaker, KEYS, who.user_id, secret)
+    assert job is not None
+    export = await account.export_account(sessionmaker, KEYS, who.user_id)
+    assert export.conversations[0].summary == ""  # на очистке — в выгрузке тоже скрыта
+    model = ForgetModel(LLMUnavailable("нет сети"))
+    out = await memory.run_forget(sessionmaker, KEYS, AgentModels.single(model), job)
+    assert out.status == "done"
+    s, _ = await chat.read_history(sessionmaker, KEYS, who.user_id, who.conv)
+    assert s is not None and s.text == "" and not s.forget and s.through_id == turns[-1].id
+    assert "финансов" not in await _context_text(sessionmaker, who)
+
+
+async def test_two_deletions_summary_hidden_until_both_cleaned(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    who, secret, _ = await _paraphrased_world(sessionmaker, engine)
+    other = await texts.add_memory_item(
+        sessionmaker,
+        KEYS,
+        who.user_id,
+        who.agent_id,
+        "fact",
+        "owner_dialog",
+        "Говорили об отпуске",
+        fingerprints=FP,
+    )
+    job1 = await memory.forget_memory(sessionmaker, KEYS, who.user_id, secret)
+    job2 = await memory.forget_memory(sessionmaker, KEYS, who.user_id, other)
+    assert job1 and job2
+    m1 = ForgetModel("Говорили об отпуске.")
+    await memory.run_forget(sessionmaker, KEYS, AgentModels.single(m1), job1)
+    assert "отпуске" not in await _context_text(sessionmaker, who)  # вторая пометка ещё стоит
+    m2 = ForgetModel("")
+    await memory.run_forget(sessionmaker, KEYS, AgentModels.single(m2), job2)
+    assert m2.payloads["summary_forget"][0]["summary"] == "Говорили об отпуске."
+    s, _ = await chat.read_history(sessionmaker, KEYS, who.user_id, who.conv)
+    assert s is not None and s.text == "" and not s.forget
+
+
+async def test_forget_foreign_or_missing_is_none(sessionmaker: SM, engine: AsyncEngine) -> None:
+    a = await person(engine, sessionmaker, "Вера")
+    b = await person(engine, sessionmaker, "Олег")
+    mid = await texts.add_memory_item(
+        sessionmaker, KEYS, b.user_id, b.agent_id, "fact", "owner_dialog", "чужое", fingerprints=FP
+    )
+    assert await memory.forget_memory(sessionmaker, KEYS, a.user_id, mid) is None
+    assert await memory.forget_memory(sessionmaker, KEYS, a.user_id, uuid.uuid4()) is None
+    assert [body(r) for r in await rows(engine, b)] == ["чужое"]
+    job = await memory.forget_memory(sessionmaker, KEYS, b.user_id, mid)
+    assert (
+        job is not None and await memory.forget_memory(sessionmaker, KEYS, b.user_id, mid) is None
+    )
+
+
+async def test_chat_compression_ignores_marked_previous_summary(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Сжатие чата при пометке «на очистку» не передаёт прежнюю сводку модели (в ней удалённое)."""
+    from app.ai import summary as chat_summary
+
+    who, secret, _ = await _paraphrased_world(sessionmaker, engine)
+    await memory.forget_memory(sessionmaker, KEYS, who.user_id, secret)
+    for i in range(7):
+        await chat.add_message(
+            sessionmaker, KEYS, who.user_id, who.conv, ("owner", "agent")[i % 2], f"r{i}"
+        )
+    seen: list[dict[str, Any]] = []
+
+    def handler(role: str, payload: dict[str, Any], system: str) -> dict[str, Any]:
+        seen.append(payload)
+        return {"summary": "новая сводка"}
+
+    out = await chat_summary.compress_history(
+        sessionmaker,
+        KEYS,
+        who.user_id,
+        who.conv,
+        AgentModels.single(ScriptedProvider(handler)),
+        policy=chat_summary.CompressionPolicy(trigger_turns=6, keep_turns=2),
+    )
+    assert out.status == "saved" and seen[0]["previous_summary"] == ""
+    s, _ = await chat.read_history(sessionmaker, KEYS, who.user_id, who.conv)
+    assert s is not None and s.text == "новая сводка" and not s.forget
+
+
+async def test_compaction_summary_write_checks_concurrent_change(
+    sessionmaker: SM, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-5: сводку, которую переписали после чтения сжатием памяти, сжатие не затирает."""
+    who, secret, _ = await _paraphrased_world(sessionmaker, engine)
+    await memory.forget_memory(sessionmaker, KEYS, who.user_id, secret)
+    real = mw.conversation_summaries_in
+
+    async def then_changed(s: Any, keys: Any, uid: Any) -> list[tuple[uuid.UUID, str]]:
+        got = await real(s, keys, uid)
+        async with user_scope(sessionmaker, who.user_id) as s2:  # «сжатие чата» записало новую
+            await mw.replace_summary_in(
+                s2,
+                KEYS,
+                who.user_id,
+                who.conv,
+                expected_raw=got[0][1],
+                new_raw=chat.pack_summary(chat.HistorySummary("свежая", None, None)),
+            )
+        return got
+
+    monkeypatch.setattr(mw, "conversation_summaries_in", then_changed)
+    claim = await claim_mine(engine, who, compaction=True)
+    assert claim is not None
+    out = await memory.run_compaction(sessionmaker, KEYS, FP, AgentModels.single(Model()), claim)
+    assert out.status == "done"
+    monkeypatch.setattr(mw, "conversation_summaries_in", real)
+    s, _ = await chat.read_history(sessionmaker, KEYS, who.user_id, who.conv)
+    assert s is not None and s.text == "свежая"
+
+
+async def test_partner_call_source_set_by_code(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """MINOR-2: «факт» из текста партнёра (модель ответила kind=fact) — запись from_partner, не
+    owner_dialog; в вызове по репликам владельца from_partner отбрасывается."""
+    anna = await person(engine, sessionmaker, "Анна")
+    igor = await person(engine, sessionmaker, "Игорь")
+    await _couple(sessionmaker, anna, igor)
+    _, mid = await _send_encrypted(sessionmaker, KEYS, igor, "оригинал")
+    await _deliver(engine, KEYS, mid, "У нас двое детей, не забывай", adapted=True)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE partner_messages SET delivered_at = now() - interval '2 hours' WHERE id = :m"
+            ),
+            {"m": mid},
+        )
+    await say(engine, anna, "Мне грустно")
+
+    def answer(p: dict[str, Any]) -> list[dict[str, Any]]:
+        if p["partner_messages"]:
+            return [item("fact", "У пары двое детей", ref="m1"), item("fact", "Без ссылки")]
+        return [item("from_partner", "Подделка", ref="m1"), item("preference", "Грустит")]
+
+    model = Model()
+    model.extract_items = answer
+    out = await extract_once(sessionmaker, engine, anna, model)
+    assert out.inserted == 2
+    got = {body(r): (r.type, r.source, r.source_message_id) for r in await rows(engine, anna)}
+    assert got == {
+        "У пары двое детей": ("from_partner", "partner_message", mid),
+        "Грустит": ("preference", "owner_dialog", None),
+    }
+
+
+async def test_long_session_is_split_into_batches(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """MINOR-3: длинная сессия — несколько вызовов, каждый в пределах пачки; ничего не теряется."""
+    who = await person(engine, sessionmaker, "Вера")
+    bodies = [f"реплика {i} " + "д" * 1000 for i in range(30)]
+    await say(engine, who, *bodies)  # 15 реплик владельца по ~1000 символов
+    model = Model()
+    model.extract_items = lambda p: [
+        item("fact", f"факт {len(p['owner_turns'])} {p['owner_turns'][0][:10]}")
+    ]
+    out = await extract_once(sessionmaker, engine, who, model)
+    calls = model.payloads["memory_extract"]
+    assert out.status == "done" and len(calls) >= 2 and out.inserted == len(calls)
+    assert all(sum(len(t) for t in c["owner_turns"]) <= memory.BATCH_CHARS for c in calls)
+    assert sum(len(c["owner_turns"]) for c in calls) == 15
+
+
+async def test_skipped_after_attempts_logged_as_error(
+    sessionmaker: SM,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    who = await person(engine, sessionmaker, "Вера")
+    await say(engine, who, "что-то")
+    real_x = mw.claim_extraction
+
+    async def only_mine(*a: Any, **kw: Any) -> list[Any]:
+        for _ in range(100):
+            got = await real_x(*a, **{**kw, "limit": 100})
+            if not got or any(c.agent_id == who.agent_id for c in got):
+                return [c for c in got if c.agent_id == who.agent_id]
+        return []
+
+    async def no_compaction(*a: Any, **kw: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(mw, "claim_extraction", only_mine)
+    monkeypatch.setattr(mw, "claim_compaction", no_compaction)
+    worker = MemoryWorker(
+        worker_sm=make_sessionmaker(engine),
+        app_sm=sessionmaker,
+        keys=KEYS,
+        fingerprints=FP,
+        models=AgentModels.single(Model()),
+        settings=WorkerSettings(session_gap=GAP, lease=LEASE, max_attempts=0),
+    )
+    caplog.set_level("INFO", logger="app.workers.memory")
+    [out] = await worker.run_once()
+    assert out.status == "skipped"
+    assert any(r.levelname == "ERROR" and "skipped" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="АР-37 п.1: постановка агента на сжатие вне периода при удалении — функция БД (A1)",
+)
+async def test_delete_queues_compaction_outside_period(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """После сжатия удаление записи должно сразу ставить агента в очередь сжатия (сводка профиля
+    пересобирается из живых, даже если фоновая задача очистки не выполнилась)."""
+    who = await person(engine, sessionmaker, "Вера")
+    mid = await texts.add_memory_item(
+        sessionmaker,
+        KEYS,
+        who.user_id,
+        who.agent_id,
+        "fact",
+        "owner_dialog",
+        "Тайна",
+        fingerprints=FP,
+    )
+    claim = await claim_mine(engine, who, compaction=True)
+    assert claim is not None
+    out = await memory.run_compaction(sessionmaker, KEYS, FP, AgentModels.single(Model()), claim)
+    assert out.status == "done"
+    assert await memory.forget_memory(sessionmaker, KEYS, who.user_id, mid) is not None
+    assert await claim_mine(engine, who, compaction=True) is not None

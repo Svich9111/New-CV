@@ -120,6 +120,9 @@ class MemoryWorker:
         except Exception as exc:
             logger.warning("memory %s failed: %s", kind, type(exc).__name__)
             return memory.Outcome(kind, "error", error="internal")
+        if result.status == "skipped":
+            # Задача исчерпала попытки и завершена без извлечения/сжатия — потеря памяти (MINOR-3).
+            logger.error("memory %s skipped after max attempts", result.kind)
         logger.info(
             "memory %s: status=%s inserted=%d merged=%d repeated=%d forgotten=%d dropped=%d "
             "error=%s",

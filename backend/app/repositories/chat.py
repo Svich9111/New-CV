@@ -63,18 +63,26 @@ class HistorySummary:
     text: str
     through_at: datetime | None = None
     through_id: uuid.UUID | None = None
+    # АР-37: id удалённых владельцем записей памяти, которые ещё не убраны из сводки. Пока
+    # список не пуст, сводка «на очистку»: в контекст, выгрузку и сжатие чата не идёт.
+    forget: tuple[str, ...] = ()
+
+    @property
+    def visible_text(self) -> str:
+        """Текст, который можно показывать агенту и человеку (на очистке — пусто)."""
+        return "" if self.forget else self.text
 
 
 def pack_summary(summary: HistorySummary) -> str:
-    return json.dumps(
-        {
-            "v": SUMMARY_FORMAT,
-            "text": summary.text,
-            "through_at": summary.through_at.isoformat() if summary.through_at else None,
-            "through_id": str(summary.through_id) if summary.through_id else None,
-        },
-        ensure_ascii=False,
-    )
+    data: dict[str, object] = {
+        "v": SUMMARY_FORMAT,
+        "text": summary.text,
+        "through_at": summary.through_at.isoformat() if summary.through_at else None,
+        "through_id": str(summary.through_id) if summary.through_id else None,
+    }
+    if summary.forget:
+        data["forget"] = list(summary.forget)
+    return json.dumps(data, ensure_ascii=False)
 
 
 def unpack_summary(raw: str) -> HistorySummary:
@@ -94,12 +102,15 @@ def unpack_summary(raw: str) -> HistorySummary:
         through_at, through_id = None, None
     if through_at is None or through_id is None:
         through_at, through_id = None, None
-    return HistorySummary(body if isinstance(body, str) else "", through_at, through_id)
+    forget = data.get("forget")
+    pending = tuple(str(x) for x in forget) if isinstance(forget, list) else ()
+    return HistorySummary(body if isinstance(body, str) else "", through_at, through_id, pending)
 
 
 def summary_text(raw: str) -> str:
-    """Текст сводки для людей (выгрузка ФТ-21): без служебной отметки."""
-    return unpack_summary(raw).text
+    """Текст сводки для людей (выгрузка ФТ-21): без служебной отметки; сводка на очистке после
+    удаления записи памяти (АР-37) — пусто."""
+    return unpack_summary(raw).visible_text
 
 
 # --------------------------------------------------------------------------- строки контекста
