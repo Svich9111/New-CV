@@ -30,7 +30,8 @@
 --   FEELINGS_WORKER_DB_PASSWORD=... FEELINGS_ADMIN_DB_PASSWORD=... FEELINGS_API_DB_PASSWORD=... \
 --     psql "postgresql://postgres@HOST:5432/feelings" -v ON_ERROR_STOP=1 -f infra/db/roles.sql
 -- Необязательные переменные psql: -v worker_login=ИМЯ -v admin_login=ИМЯ (имена ролей входа),
--- -v dry_run=1 (всё выполнить и проверить, затем ROLLBACK). Повторный запуск безопасен: роли
+-- -v dry_run=1 (всё выполнить и проверить, затем ROLLBACK), -v allow_logged=1 (см. ниже про
+-- журнал). Не запускать с psql -a / -e / -E: они печатают запросы вместе с паролем. Повторный запуск безопасен: роли
 -- обновляются (новый пароль = ротация), лишние членства не снимаются, а останавливают скрипт.
 -- Нужен psql ≥ 15 (\getenv). Подробно — docs/ADMIN.md, раздел «Роли БД».
 
@@ -56,16 +57,50 @@
 
 BEGIN;
 
--- Пароли не должны попасть в журнал сервера: ни сам запрос (log_statement), ни текст запроса
--- при ошибке (log_min_error_statement). Эти настройки меняет только суперпользователь; иначе —
--- предупреждение: убедитесь, что на сервере log_statement не 'ddl'/'all' (docs/ADMIN.md).
-SELECT rolsuper AS is_super FROM pg_roles WHERE rolname = current_user \gset
+-- Пароли не должны попасть в журнал сервера и статистику запросов: ни сам запрос
+-- (log_statement, log_min_duration_statement), ни текст запроса при ошибке
+-- (log_min_error_statement), ни текст служебной команды в pg_stat_statements (track_utility).
+-- Под суперпользователем скрипт отключает это сам. Без суперпользователя менять эти настройки
+-- нельзя: если запросы журналируются (log_statement = ddl/all, log_min_duration_statement ≠ -1)
+-- или pg_stat_statements записывает служебные команды, скрипт останавливается — разве что
+-- передано явное согласие -v allow_logged=1 (тогда пароли сменить сразу после, docs/ADMIN.md).
+\if :{?allow_logged}
+\else
+\set allow_logged 0
+\endif
+SELECT rolsuper AS is_super,
+       current_setting('pg_stat_statements.track_utility', true) IS NOT NULL AS has_pgss
+FROM pg_roles WHERE rolname = current_user \gset
+-- SUPERUSER / CREATEDB / REPLICATION / BYPASSRLS меняет только суперпользователь. Без него эти пункты
+-- опускаются: новая роль их не получит, а существующую с ними скрипт не трогает (проверка ниже).
+\if :is_super
+\set super_attrs ' NOSUPERUSER NOCREATEDB NOREPLICATION NOBYPASSRLS'
+\else
+\set super_attrs ''
+\endif
 \if :is_super
 SET LOCAL log_statement = 'none';
 SET LOCAL log_min_duration_statement = -1;
 SET LOCAL log_min_error_statement = 'panic';
+\if :has_pgss
+SET LOCAL pg_stat_statements.track_utility = off;
+\endif
 \else
-\echo 'ВНИМАНИЕ: не суперпользователь — журналирование запросов отключить нельзя; проверьте log_statement на сервере.'
+SELECT current_setting('log_statement') IN ('ddl', 'all')
+       OR current_setting('log_min_duration_statement') <> '-1'
+       OR coalesce(current_setting('pg_stat_statements.track_utility', true), 'off') = 'on'
+       AS logged \gset
+\if :logged
+\if :allow_logged
+\echo 'ВНИМАНИЕ: запросы журналируются (allow_logged=1) — пароли могут остаться в журнале; смените их повторно после отключения журнала.'
+\else
+DO $log$ BEGIN
+    RAISE EXCEPTION 'запросы журналируются (log_statement / log_min_duration_statement / pg_stat_statements.track_utility) — пароль попадёт в журнал; запустите под суперпользователем, отключите журналирование или передайте -v allow_logged=1';
+END $log$;
+\endif
+\else
+\echo 'ВНИМАНИЕ: не суперпользователь — при ошибке запроса текст с паролем может попасть в журнал (log_min_error_statement).'
+\endif
 \endif
 SET LOCAL password_encryption = 'scram-sha-256';
 
@@ -150,8 +185,8 @@ END $chk$;
 \if :do_worker
 SELECT format('CREATE ROLE %I', :'worker_login')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'worker_login') \gexec
-SELECT format('ALTER ROLE %I LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
-              :'worker_login', :'worker_password') \gexec
+SELECT format('ALTER ROLE %I LOGIN NOINHERIT NOCREATEROLE%s PASSWORD %L',
+              :'worker_login', :'super_attrs', :'worker_password') \gexec
 SELECT format('GRANT feelings_worker TO %I WITH INHERIT FALSE, SET TRUE', :'worker_login') \gexec
 SELECT format('GRANT feelings_app TO %I WITH INHERIT FALSE, SET TRUE', :'worker_login') \gexec
 \endif
@@ -159,14 +194,14 @@ SELECT format('GRANT feelings_app TO %I WITH INHERIT FALSE, SET TRUE', :'worker_
 \if :do_admin
 SELECT format('CREATE ROLE %I', :'admin_login')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'admin_login') \gexec
-SELECT format('ALTER ROLE %I LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
-              :'admin_login', :'admin_password') \gexec
+SELECT format('ALTER ROLE %I LOGIN NOINHERIT NOCREATEROLE%s PASSWORD %L',
+              :'admin_login', :'super_attrs', :'admin_password') \gexec
 SELECT format('GRANT feelings_admin TO %I WITH INHERIT FALSE, SET TRUE', :'admin_login') \gexec
 \endif
 
 \if :do_api
-SELECT format('ALTER ROLE feelings_api LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
-              :'api_password') \gexec
+SELECT format('ALTER ROLE feelings_api LOGIN NOINHERIT NOCREATEROLE%s PASSWORD %L',
+              :'super_attrs', :'api_password') \gexec
 \endif
 
 -- Проверка итога: роль входа может стать (SET ROLE, в т.ч. через вложенные членства) только

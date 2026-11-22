@@ -36,12 +36,21 @@ def _psql_url() -> str:
 
 
 def run_roles_sql(
-    *, env: dict[str, str], worker: str, admin: str, dry_run: bool = False
+    *,
+    env: dict[str, str],
+    worker: str,
+    admin: str,
+    dry_run: bool = False,
+    allow_logged: bool = False,
+    url: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    base = {k: v for k, v in os.environ.items() if not k.startswith("FEELINGS_")}
-    args = ["psql", _psql_url(), "-X", "-v", f"worker_login={worker}", "-v", f"admin_login={admin}"]
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("FEELINGS_", "PG"))}
+    args = ["psql", url or _psql_url(), "-X"]
+    args += ["-v", f"worker_login={worker}", "-v", f"admin_login={admin}"]
     if dry_run:
         args += ["-v", "dry_run=1"]
+    if allow_logged:
+        args += ["-v", "allow_logged=1"]
     return subprocess.run(  # noqa: S603 — фиксированная команда, аргументы из теста
         [*args, "-f", str(ROLES_SQL)],
         env={**base, **env},
@@ -336,5 +345,95 @@ async def test_dry_run_checks_and_rolls_back(engine: AsyncEngine) -> None:
                 {"n": [worker, admin]},
             )
             assert left.scalar_one() == 0
+    finally:
+        await _drop_roles(engine, worker, admin)
+
+
+async def test_api_password_path_dry_run_leaves_roles_unchanged(engine: AsyncEngine) -> None:
+    """Ветка FEELINGS_API_DB_PASSWORD (ALTER ROLE feelings_api …) выполняется и проверяется, но
+    в dry_run откатывается: снимок групповых ролей и хеш пароля feelings_api не меняются."""
+    tag = uuid.uuid4().hex[:10]
+    worker, admin = f"t_wlogin_{tag}", f"t_alogin_{tag}"
+    before = await _role_snapshot(engine)
+    password = new_password()
+    try:
+        done = run_roles_sql(
+            env={"FEELINGS_API_DB_PASSWORD": password}, worker=worker, admin=admin, dry_run=True
+        )
+        assert done.returncode == 0, done.stderr
+        assert "dry_run" in done.stdout
+        assert password not in done.stdout and password not in done.stderr
+    finally:
+        await _drop_roles(engine, worker, admin)
+    assert await _role_snapshot(engine) == before
+
+
+@pytest.fixture
+async def manager_url(engine: AsyncEngine) -> AsyncIterator[tuple[str, str]]:
+    """Временная роль-управляющий без суперпользователя: CREATEROLE и ADMIN OPTION на группы
+    (как у оператора управляемого PostgreSQL). Удаляется вместе со своими членствами."""
+    name, password = f"t_mgr_{uuid.uuid4().hex[:10]}", new_password()
+    async with engine.connect() as conn:
+        await conn.execute(text(f"CREATE ROLE {name} LOGIN CREATEROLE PASSWORD '{password}'"))
+        await conn.execute(
+            text(f"GRANT feelings_worker, feelings_app, feelings_admin TO {name} WITH ADMIN OPTION")
+        )
+        await conn.commit()
+    parts = urlsplit(_psql_url())
+    host = parts.netloc.split("@")[-1]
+    try:
+        yield name, urlunsplit(parts._replace(netloc=f"{name}:{password}@{host}"))
+    finally:
+        await _drop_roles(engine, name)
+
+
+async def test_non_superuser_runs_without_privileged_attributes(
+    engine: AsyncEngine, manager_url: tuple[str, str]
+) -> None:
+    _, url = manager_url
+    tag = uuid.uuid4().hex[:10]
+    worker, admin = f"t_wlogin_{tag}", f"t_alogin_{tag}"
+    try:
+        done = run_roles_sql(
+            env={k: new_password() for k in PASSWORD_ENVS},
+            worker=worker,
+            admin=admin,
+            dry_run=True,
+            url=url,
+        )
+        assert done.returncode == 0, done.stderr
+        assert "dry_run" in done.stdout
+    finally:
+        await _drop_roles(engine, worker, admin)
+
+
+async def test_non_superuser_stops_when_statements_are_logged(
+    engine: AsyncEngine, manager_url: tuple[str, str]
+) -> None:
+    """Без суперпользователя журналирование не отключить: при log_statement = ddl скрипт
+    останавливается до первого запроса с паролем; явное -v allow_logged=1 — продолжает."""
+    name, url = manager_url
+    async with engine.connect() as conn:
+        await conn.execute(text(f"ALTER ROLE {name} SET log_statement = 'ddl'"))
+        await conn.commit()
+    tag = uuid.uuid4().hex[:10]
+    worker, admin = f"t_wlogin_{tag}", f"t_alogin_{tag}"
+    password = new_password()
+    try:
+        refused = run_roles_sql(
+            env={"FEELINGS_WORKER_DB_PASSWORD": password}, worker=worker, admin=admin, url=url
+        )
+        assert refused.returncode != 0
+        assert "журналируются" in refused.stderr
+        allowed = run_roles_sql(
+            env={"FEELINGS_WORKER_DB_PASSWORD": password},
+            worker=worker,
+            admin=admin,
+            url=url,
+            dry_run=True,
+            allow_logged=True,
+        )
+        assert allowed.returncode == 0, allowed.stderr
+        assert "allow_logged" in allowed.stdout
     finally:
         await _drop_roles(engine, worker, admin)

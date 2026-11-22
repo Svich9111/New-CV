@@ -18,7 +18,9 @@ x-backend: &backend
   env_file:
     - path: ../.env
       required: false
-  restart: unless-stopped
+  # Ошибка конфигурации (нет ключей, OPENROUTER_API_KEY) повторяется при каждом старте — не
+  # больше 5 перезапусков, затем контейнер остаётся остановленным (docker compose logs worker-memory).
+  restart: "on-failure:5"
 
 services:
   postgres:
