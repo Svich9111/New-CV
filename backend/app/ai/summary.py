@@ -40,10 +40,18 @@ class CompressionPolicy:
     trigger_chars: int = 16_000
     keep_turns: int = 12
     summary_max_chars: int = 2_000  # жёсткий предел в коде (промпт просит до 1200)
+    # Пачка одного раунда (ревью MAJOR-2): самые старые реплики, не больше ``batch_turns`` и
+    # ``batch_chars`` (но хотя бы одна). После долгой серии сбоев хвост догоняется несколькими
+    # раундами (``rounds`` за вызов и следующие вызовы), вход модели не растёт без предела.
+    batch_turns: int = 40
+    batch_chars: int = 20_000
+    rounds: int = 3
 
     def __post_init__(self) -> None:
         if self.keep_turns < 1 or self.trigger_turns <= self.keep_turns:
             raise ValueError("keep_turns ≥ 1 и trigger_turns > keep_turns")
+        if self.batch_turns < 1 or self.batch_chars < 1 or self.rounds < 1:
+            raise ValueError("batch_turns, batch_chars, rounds ≥ 1")
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,8 @@ class CompressionResult:
     status: Literal["skipped", "saved", "conflict", "error", "gone"]
     summarized_turns: int = 0
     error: str | None = None  # вид ошибки модели (LLMError.kind), без текста
+    rounds: int = 0  # сколько раундов записано
+    more: bool = False  # хвост ещё длиннее порога — следующий вызов продолжит
     calls: tuple[CallRecord, ...] = ()
     prompt: str | None = None
 
@@ -64,6 +74,20 @@ def needs_compression(turns: list[ConversationText], policy: CompressionPolicy) 
     return len(turns) > policy.trigger_turns or (
         chars > policy.trigger_chars and len(turns) > policy.keep_turns
     )
+
+
+def batch(turns: list[ConversationText], policy: CompressionPolicy) -> list[ConversationText]:
+    """Пачка раунда: самые старые реплики вне последних ``keep_turns``, в пределах пачки."""
+    old = turns[: -policy.keep_turns]
+    out: list[ConversationText] = []
+    chars = 0
+    for t in old[: policy.batch_turns]:
+        size = len(t.text or "")
+        if out and chars + size > policy.batch_chars:
+            break
+        out.append(t)
+        chars += size
+    return out
 
 
 def summary_payload(previous: str, turns: list[ConversationText]) -> dict[str, Any]:
@@ -120,39 +144,74 @@ async def compress_history(
     сравнивает отметку, ничего не теряется); ошибка модели — ``error`` (сводка прежняя)."""
     policy = policy or CompressionPolicy()
     prompt_name = summary_prompt(version).name
-    try:
-        summary, turns = await chat.read_history(sm, keys, user_id, conversation_id)
-    except (OwnerGone, LookupError):
-        return CompressionResult("gone")
-    if not needs_compression(turns, policy):
-        return CompressionResult("skipped")
-    old = turns[: -policy.keep_turns]
     log = CallLog()
+    done_rounds = 0
+    summarized = 0
+    for _ in range(policy.rounds):
+        try:
+            summary, turns = await chat.read_history(sm, keys, user_id, conversation_id)
+        except (OwnerGone, LookupError):
+            return CompressionResult(
+                "gone", summarized, calls=tuple(log.records), rounds=done_rounds
+            )
+        if not needs_compression(turns, policy):
+            status: Literal["skipped", "saved"] = "saved" if done_rounds else "skipped"
+            return CompressionResult(
+                status,
+                summarized,
+                calls=tuple(log.records),
+                prompt=prompt_name if done_rounds else None,
+                rounds=done_rounds,
+            )
+        old = batch(turns, policy)
+        try:
+            text = await summarize(
+                models,
+                summary.text if summary else "",
+                old,
+                log=log,
+                version=version,
+                max_chars=policy.summary_max_chars,
+            )
+        except LLMError as exc:
+            return CompressionResult(
+                "error",
+                summarized,
+                error=exc.kind,
+                calls=tuple(log.records),
+                prompt=prompt_name,
+                rounds=done_rounds,
+                more=True,
+            )
+        last = old[-1]
+        saved = await chat.save_history_summary(
+            sm,
+            keys,
+            user_id,
+            conversation_id,
+            HistorySummary(text, last.created_at, last.id),
+            expected_through_id=summary.through_id if summary else None,
+        )
+        if not saved:
+            return CompressionResult(
+                "conflict" if not done_rounds else "saved",
+                summarized,
+                calls=tuple(log.records),
+                prompt=prompt_name,
+                rounds=done_rounds,
+            )
+        done_rounds += 1
+        summarized += len(old)
     try:
-        text = await summarize(
-            models,
-            summary.text if summary else "",
-            old,
-            log=log,
-            version=version,
-            max_chars=policy.summary_max_chars,
-        )
-    except LLMError as exc:
-        return CompressionResult(
-            "error", error=exc.kind, calls=tuple(log.records), prompt=prompt_name
-        )
-    last = old[-1]
-    saved = await chat.save_history_summary(
-        sm,
-        keys,
-        user_id,
-        conversation_id,
-        HistorySummary(text, last.created_at, last.id),
-        expected_through_id=summary.through_id if summary else None,
-    )
+        _, rest = await chat.read_history(sm, keys, user_id, conversation_id)
+        more = needs_compression(rest, policy)
+    except (OwnerGone, LookupError):
+        more = False
     return CompressionResult(
-        "saved" if saved else "conflict",
-        summarized_turns=len(old) if saved else 0,
+        "saved",
+        summarized,
         calls=tuple(log.records),
         prompt=prompt_name,
+        rounds=done_rounds,
+        more=more,
     )

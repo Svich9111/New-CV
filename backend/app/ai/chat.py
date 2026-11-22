@@ -15,7 +15,8 @@
 - **до вызова агента** — ``screen()``; так требует контракт (сначала классификатор, потом
   подписка и лимиты: при кризисе 402/429 не отдаются). Найден кризис — ответ только из блоков
   протокола, модель агента не вызывается (кризисный ответ не зависит от её доступности);
-- **параллельно** (``stream_reply`` без ``screen``) — агент уже пишет, но куски придерживаются
+- **параллельно** (``stream_reply`` без ``screen``; в API не по умолчанию — АР-30) — агент уже
+  пишет, но куски придерживаются
   до вердикта классификатора не дольше ``gate_timeout_s``; если вердикт пришёл позже и нашёл
   кризис, поток прерывается событием ``Crisis`` с ``replaces_streamed = True`` (клиент заменяет
   показанный текст). ``Done`` не отдаётся, пока классификатор не ответил (не дольше
@@ -32,7 +33,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import re
 import time
@@ -302,10 +302,20 @@ def _crisis_event(
 
 
 async def _cancel(task: asyncio.Task[Any] | None) -> None:
-    if task is not None and not task.done():
-        task.cancel()
-        with contextlib.suppress(BaseException):
-            await task
+    """Отменить внутреннюю задачу и дождаться её. Глушится только её собственная отмена (и её
+    ошибка — она уже не нужна); отмена **текущей** задачи (клиент ушёл, запрос снят) не
+    теряется и пробрасывается (ревью MINOR-1)."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+    except Exception:  # noqa: S110 — ошибка отменённой задачи результата не меняет
+        pass
 
 
 async def stream_reply(
@@ -315,11 +325,15 @@ async def stream_reply(
     *,
     prompt_set: PromptSet = V0,
     safety: SafetyScreen | None = None,
+    safety_dialog: Sequence[Turn] | None = None,
     gate_timeout_s: float = SAFETY_GATE_TIMEOUT_S,
     final_timeout_s: float = SAFETY_FINAL_TIMEOUT_S,
 ) -> AsyncIterator[ChatEvent]:
     """Ответ агента потоком (см. описание модуля). ``safety`` — результат ``screen()``, если API
-    уже проверил реплику (порядок контракта); без него классификатор идёт параллельно.
+    уже проверил реплику (порядок контракта, АР-30 — так и делает API); без него классификатор
+    идёт параллельно (режим не по умолчанию для API). ``safety_dialog`` — вход параллельного
+    классификатора (``BuiltContext.safety_dialog``: последние реплики владельца до усечения);
+    по умолчанию — ``dialog``.
 
     Последнее событие — ``Done``, ``Crisis`` или ``ChatError``. Исключения, кроме ошибок модели,
     — ошибки кода: бросаются (API отвечает событием ``error`` с кодом ``internal``). Закрытие
@@ -349,15 +363,28 @@ async def stream_reply(
     provider = models.dialog
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
+    async def chunks() -> AsyncIterator[tuple[str, str]]:
+        """(модель, кусок): у ``FallbackProvider`` видно, какая модель ответила (MINOR-3)."""
+        kwargs: dict[str, Any] = {
+            "system": dialog_prompt.text,
+            "messages": [ChatMessage("user", as_json(ordered_payload(context, dialog)))],
+            "max_tokens": MAX_TOKENS_DIALOG,
+        }
+        with_model = getattr(provider, "stream_chunks", None)
+        if callable(with_model):
+            async for pair in with_model(**kwargs):
+                yield pair
+        else:
+            async for chunk in provider.stream_text(**kwargs):
+                yield provider.model, chunk
+
     async def pump() -> None:
         started = time.monotonic()
         error: str | None = None
+        answered_by: str | None = None
         try:
-            async for chunk in provider.stream_text(
-                system=dialog_prompt.text,
-                messages=[ChatMessage("user", as_json(ordered_payload(context, dialog)))],
-                max_tokens=MAX_TOKENS_DIALOG,
-            ):
+            async for model_name, chunk in chunks():
+                answered_by = answered_by or model_name
                 await queue.put(("chunk", chunk))
             await queue.put(("end", None))
         except Exception as exc:  # передаётся в основной цикл; CancelledError — нет
@@ -368,8 +395,9 @@ async def stream_reply(
                 CallRecord(
                     role="dialog",
                     prompt=dialog_prompt.name,
-                    model=provider.model,
+                    model=answered_by or provider.model,
                     latency_s=round(time.monotonic() - started, 3),
+                    fallback_used=answered_by is not None and answered_by != provider.model,
                     error=error,
                     usage_known=False,
                 )
@@ -377,7 +405,9 @@ async def stream_reply(
 
     safety_task: asyncio.Task[SafetyScreen] | None = None
     if safety is None:
-        safety_task = asyncio.create_task(screen(models, dialog, prompt_set=prompt_set))
+        safety_task = asyncio.create_task(
+            screen(models, safety_dialog or dialog, prompt_set=prompt_set)
+        )
     agent_task = asyncio.create_task(pump())
     get_task: asyncio.Task[tuple[str, Any]] | None = None
     parser = ReplyStream()
@@ -451,9 +481,25 @@ async def stream_reply(
                 agent_exc = value
                 break
 
-        # Агент закончил или упал: запись его вызова — в журнал; до итога нужен вердикт второй
-        # линии.
+        # Агент закончил или упал: запись его вызова — в журнал; ответ проверяется сразу.
         await asyncio.wait({agent_task})
+        answer: Any = None
+        if agent_exc is None:
+            try:
+                answer = parser.answer()
+            except LLMBadOutput as exc:
+                agent_exc = exc
+        # Придержка — не дольше ``gate_timeout_s`` и тогда, когда агент дописал раньше вердикта
+        # (A8-1): по её истечении проверенный ответ уходит, а вердикт ждётся до ``Done``.
+        if safety_task is not None and agent_exc is None and pending and not gate_open:
+            await asyncio.wait({safety_task}, timeout=max(gate_deadline - loop.time(), 0.0))
+            if not safety_task.done():
+                gate_open = True
+                piece = "".join(pending)
+                pending.clear()
+                streamed.append(piece)
+                yield Delta(piece)
+        # До итога нужен вердикт второй линии.
         if safety_task is not None:
             try:
                 await asyncio.wait_for(asyncio.shield(safety_task), final_timeout_s)
@@ -476,11 +522,6 @@ async def stream_reply(
             )
             return
 
-        if agent_exc is None:
-            try:
-                answer = parser.answer()
-            except LLMBadOutput as exc:
-                agent_exc = exc
         if agent_exc is not None:
             if not isinstance(agent_exc, LLMError):
                 raise agent_exc

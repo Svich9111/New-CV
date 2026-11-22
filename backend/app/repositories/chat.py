@@ -5,7 +5,7 @@
 а не промптом и не одной проверкой в коде (ТЗ §6, §9.2 п.1). Данных партнёра (его агента,
 памяти, чата, профиля) здесь нет и прочитать их RLS не даст; из пары — только доставленные
 сообщения текущей активной пары, как их видел владелец: свои — оригинал, полученные — версия
-для получателя (``app_couple_feed``, АР-11).
+для получателя (как в ``app_couple_feed``, АР-11; см. ``_pair``).
 
 Тексты расшифровываются построчно (``texts.open_row``): строка, которая не расшифровалась, в
 контекст не идёт (считается в ``unavailable``), сборка не падает. В журналы — ни текстов, ни id.
@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import Iterable, Sequence
@@ -27,6 +28,7 @@ from typing import Literal
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.ai.embeddings import cosine
 from app.core import crypto
 from app.core.crypto import Keyring
 from app.db import user_scope
@@ -34,7 +36,6 @@ from app.repositories.texts import Author, ConversationText, open_row
 
 # Статусы сообщения пары, которые владелец видел как доставленные (ТЗ §6.2 п.7, АР-25 п.1).
 DELIVERED = ("delivered", "read", "answered")
-FEED_MAX = 100  # app_couple_feed отдаёт не больше 100 строк
 SUMMARY_FORMAT = 1
 
 # crisis.CrisisType → значение перечисления safety_event_type (миграция 0001).
@@ -220,9 +221,19 @@ async def _turns_after(
 
 
 def parse_vector(raw: object) -> list[float] | None:
-    """Вектор из текстового вида pgvector ``[x1,x2,...]`` (так его отдаёт драйвер без кодека)."""
+    """Вектор из того, что отдал драйвер: текст pgvector ``[x1,x2,...]`` (asyncpg без кодека —
+    так сейчас), список/кортеж, объект кодека pgvector/numpy (``to_list()`` / ``tolist()``).
+    Нераспознанное — ``None`` (запись идёт в добор по свежести)."""
+    for method in ("to_list", "tolist"):
+        convert = getattr(raw, method, None)
+        if callable(convert):
+            raw = convert()
+            break
     if isinstance(raw, list | tuple):
-        return [float(v) for v in raw]
+        try:
+            return [float(v) for v in raw]
+        except (TypeError, ValueError):
+            return None
     if not isinstance(raw, str) or not raw.startswith("[") or not raw.endswith("]"):
         return None
     try:
@@ -231,13 +242,18 @@ def parse_vector(raw: object) -> list[float] | None:
         return None
 
 
-def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    if len(a) != len(b):
-        return -1.0
-    dot = sum(x * y for x, y in zip(a, b, strict=True))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(y * y for y in b) ** 0.5
-    return dot / (na * nb) if na and nb else 0.0
+def rank_by_similarity(
+    query: Sequence[float], rows: Sequence[tuple[uuid.UUID, object]], limit: int
+) -> list[uuid.UUID]:
+    """id ближайших по косинусу (при равенстве — по id). Чистый расчёт без ввода-вывода:
+    вызывается в отдельном потоке (``asyncio.to_thread``), чтобы не держать цикл событий."""
+    scored: list[tuple[float, str, uuid.UUID]] = []
+    for rid, raw in rows:
+        vec = parse_vector(raw)
+        if vec is not None and len(vec) == len(query):
+            scored.append((-cosine(query, vec), str(rid), rid))
+    scored.sort()
+    return [rid for _, _, rid in scored[:limit]]
 
 
 async def _memory(
@@ -253,10 +269,11 @@ async def _memory(
     ``scan_limit`` самых свежих); недобор — по свежести. Удалённые записи (ФТ-13:
     ``deleted_at``, текст и вектор стёрты) не берутся никогда.
 
-    Близость считается в приложении: у ``feelings_app`` нет EXECUTE на функции pgvector
+    Близость считается в приложении, в отдельном потоке (``asyncio.to_thread``), по не более
+    чем ``scan_limit`` векторам: у ``feelings_app`` нет EXECUTE на функции pgvector
     (``REVOKE ALL ON ALL FUNCTIONS … FROM PUBLIC``, миграция 0001), поэтому ни ``<=>``, ни
-    ``CAST(… AS vector)`` в запросах приложения не работают. Перенос в БД (индекс, ``<=>``) —
-    после миграции A1 (отчёт 2.1). Читаются только векторы, тексты — только выбранных."""
+    ``CAST(… AS vector)`` в запросах приложения не работают. Перенос в БД (функция поиска,
+    индекс) — миграция A1 (Б-55). Читаются только векторы, тексты — только выбранных."""
     base = (
         "FROM memory_items m JOIN agents a ON a.id = m.agent_id "
         "WHERE m.agent_id = :a AND a.user_id = :u AND m.deleted_at IS NULL "
@@ -271,13 +288,9 @@ async def _memory(
             ),
             {"a": agent_id, "u": user_id, "n": scan_limit},
         )
-        scored = []
-        for r in rows:
-            vec = parse_vector(r.embedding)
-            if vec is not None:
-                scored.append((-_cosine(query_vector, vec), str(r.id), _uuid(r.id)))
-        scored.sort()
-        chosen += [(rid, "vector") for _, _, rid in scored[:limit]]
+        candidates = [(_uuid(r.id), r.embedding) for r in rows]
+        best = await asyncio.to_thread(rank_by_similarity, list(query_vector), candidates, limit)
+        chosen += [(rid, "vector") for rid in best]
     rest = limit - len(chosen)
     if rest > 0:
         rows = await s.execute(
@@ -330,15 +343,23 @@ async def _pair(
     ).scalar_one_or_none()
     if couple is None or limit <= 0:
         return [], 0
+    # Фильтр по паре, статусу и стороне — в самом запросе, до LIMIT (ревью MINOR-11, тест О-3):
+    # остановленные и ждущие конвейера сообщения не вытесняют доставленные. Своё — оригинал: это
+    # шифротекст своего отправленного черновика (``app_send_draft`` копирует его байты в
+    # ``original_enc``; отправленный черновик не меняется и не удаляется, 0005), полученное —
+    # версия для получателя (``adapted_enc``). ``original_enc`` приложению по-прежнему не нужен
+    # (АР-11); черновик партнёра RLS не отдаёт (и соединение — только для своих).
     rows = await s.execute(
         text(
-            "SELECT f.id, f.outgoing, f.text_enc, f.sent_at, pm.draft_id "
-            "FROM app_couple_feed(:l, NULL) f JOIN partner_messages pm ON pm.id = f.id "
-            "WHERE f.couple_id = :cc AND f.status::text = ANY(CAST(:st AS text[])) "
+            "SELECT pm.id, pm.author_id = :u AS outgoing, pm.sent_at, pm.draft_id, "
+            "CASE WHEN pm.author_id = :u THEN md.text_enc ELSE pm.adapted_enc END AS text_enc "
+            "FROM partner_messages pm "
+            "LEFT JOIN message_drafts md ON md.id = pm.draft_id AND pm.author_id = :u "
+            "WHERE pm.couple_id = :cc AND pm.status::text = ANY(CAST(:st AS text[])) "
             "AND (pm.author_id = :u OR pm.recipient_id = :u) "
-            "ORDER BY f.sent_at DESC, f.id LIMIT :n"
+            "ORDER BY pm.sent_at DESC, pm.id LIMIT :n"
         ),
-        {"l": FEED_MAX, "cc": couple, "st": list(DELIVERED), "u": user_id, "n": limit},
+        {"cc": couple, "st": list(DELIVERED), "u": user_id, "n": limit},
     )
     out: list[PairRow] = []
     lost = 0
@@ -366,8 +387,8 @@ async def read_context(
     *,
     query_vector: Sequence[float] | None = None,
     memory_limit: int = 8,
-    memory_scan_limit: int = 500,
-    turns_limit: int = 40,
+    memory_scan_limit: int = 200,
+    turns_limit: int | None = None,
     pair_limit: int = 20,
 ) -> ContextRows:
     """Всё для контекста агента владельца — одной транзакцией (один снимок). ``OwnerGone`` —
@@ -419,13 +440,18 @@ async def current_conversation(
     sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID
 ) -> uuid.UUID:
     """Текущий диалог владельца (последний по началу); нет — создаётся. ``OwnerGone`` — нет
-    владельца или агента. Сессии пока не делятся по времени (одна лента; см. отчёт 2.1)."""
+    владельца или агента. Сессии пока не делятся по времени (одна лента; см. отчёт 2.1).
+
+    Строка агента блокируется (``FOR NO KEY UPDATE``) до проверки и вставки: два одновременных
+    первых запроса не создают два диалога (ревью MINOR-7) — второй ждёт и видит диалог первого.
+    Миграция не нужна; уникальность «один диалог на агента» в схеме не вводится — несколько
+    сессий на агента допускает §7 (деление на сессии — 2.4)."""
     async with user_scope(sm, user_id) as s:
         agent = (
             await s.execute(
                 text(
                     "SELECT a.id FROM agents a JOIN users u ON u.id = a.user_id "
-                    "WHERE a.user_id = :u AND u.deleted_at IS NULL"
+                    "WHERE a.user_id = :u AND u.deleted_at IS NULL FOR NO KEY UPDATE OF a"
                 ),
                 {"u": user_id},
             )

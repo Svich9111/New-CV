@@ -61,6 +61,20 @@ class FallbackProvider:
     ) -> AsyncIterator[str]:
         """Переключение — только до первого фрагмента: начатый ответ не склеивается из двух
         моделей, ошибка после начала передаётся вызывающему."""
+        async for _, chunk in self.stream_chunks(
+            system=system, messages=messages, max_tokens=max_tokens
+        ):
+            yield chunk
+
+    async def stream_chunks(
+        self,
+        *,
+        system: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int = 16000,
+    ) -> AsyncIterator[tuple[str, str]]:
+        """То же, что ``stream_text``, но с моделью, которая отдала фрагмент (учёт резерва в
+        записи вызова, задача 2.1). Правила переключения — те же."""
         last: LLMError | None = None
         for provider in self._chain:
             started = False
@@ -69,7 +83,7 @@ class FallbackProvider:
                     system=system, messages=messages, max_tokens=max_tokens
                 ):
                     started = True
-                    yield chunk
+                    yield provider.model, chunk
                 return
             except LLMError as exc:
                 if started or not exc.fallback_ok:

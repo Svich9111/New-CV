@@ -231,6 +231,10 @@ PAYLOAD_ORDER_6_1 = (
 def ordered_payload(context: OwnerContext, dialog: Sequence[Turn]) -> dict[str, Any]:
     """Те же поля, что ``context_payload``, в порядке блоков §6.1 (потоковый чат, 2.1)."""
     payload = context_payload(context, dialog)
+    unknown = set(payload) - set(PAYLOAD_ORDER_6_1)
+    if unknown:
+        # Новое поле входа должно получить место в порядке §6.1, а не пропасть молча (MINOR-5).
+        raise ValueError(f"поля входа вне порядка §6.1: {sorted(unknown)}")
     return {k: payload[k] for k in PAYLOAD_ORDER_6_1 if k in payload}
 
 

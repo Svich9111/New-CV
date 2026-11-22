@@ -9,8 +9,8 @@
    считается в приложении, см. ``repositories.chat._memory``; без эмбеддинга или при его
    ошибке — по свежести), не больше ``ContextBudget.memory_items``; удалённые — никогда;
 4. фрагменты базы знаний по теме (``KnowledgeBase``; до 2.6 пусто);
-5. краткое содержание предыдущих реплик (``conversations.summary_enc``) и последние реплики после
-   отметки сводки;
+5. краткое содержание предыдущих реплик (``conversations.summary_enc``) и **все** реплики после
+   отметки сводки в пределах бюджета (без разрыва между сводкой и репликами, ``turns_read_limit``);
 6. одобренные и доставленные сообщения текущей пары, относящиеся к теме (по смыслу при наличии
    эмбеддера, иначе последние), — как их видел владелец.
 
@@ -35,7 +35,7 @@ from typing import Any, Literal
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ai.calls import as_json
-from app.ai.dialog import OwnerContext, PairMessage, Turn, ordered_payload
+from app.ai.dialog import SAFETY_TURNS, OwnerContext, PairMessage, Turn, ordered_payload
 from app.ai.embeddings import Embedder, EmbeddingError, check_dim, cosine
 from app.ai.knowledge import KnowledgeBase, KnowledgeFragment
 from app.ai.prompts import V0, Prompt, PromptSet, system_prompt
@@ -44,6 +44,27 @@ from app.repositories import chat
 from app.repositories.chat import ContextRows, PairRow
 
 ELLIPSIS = "…"
+
+
+def _min_turn_chars() -> int:
+    """Наименьший вклад одной реплики в JSON входа (непустой текст в 1 символ)."""
+    turn = {"from": "agent", "text": "x"}
+    one = as_json({"dialog": [turn]})
+    two = as_json({"dialog": [turn, turn]})
+    return len(two) - len(one)
+
+
+# Инвариант «сводка + реплики без разрыва» (ТЗ §6.1 п.5; ревью 2.1 MAJOR-1): в контекст читаются
+# **все** реплики после отметки сводки, сколько их ни есть, — но не больше, чем физически
+# помещается в бюджет даже при самых коротких репликах. Реплика старше этого предела в контекст
+# не вошла бы ни при каком усечении, поэтому предел чтения разрыва не создаёт: всё, чего нет в
+# контексте, — либо в сводке, либо выброшено бюджетом (``stats.dropped["dialog"]``). От настроек
+# сжатия (``summary.CompressionPolicy``) и от его сбоев сборка не зависит.
+MIN_TURN_CHARS = _min_turn_chars()
+
+
+def turns_read_limit(max_chars: int) -> int:
+    return max(max_chars, 0) // MIN_TURN_CHARS + 1
 
 
 @dataclass(frozen=True)
@@ -55,7 +76,6 @@ class ContextBudget:
     knowledge_items: int = 5  # §6.4: 3–5 фрагментов
     pair_messages: int = 5
     pair_candidates: int = 20
-    recent_turns: int = 30
     item_chars: int = 800  # одна запись памяти, фрагмент, сообщение пары
     turn_chars: int = 4_000  # реплика (контракт POST /chat/messages: до 4000)
     summary_chars: int = 2_000
@@ -90,6 +110,9 @@ class BuiltContext:
     dialog: tuple[Turn, ...]
     conversation_id: uuid.UUID
     stats: ContextStats
+    # Последние реплики владельца до усечения (не больше ``SAFETY_TURNS``) — вход второй линии
+    # безопасности: классификатор видит их, даже если бюджет выбросил их из диалога (тест О-2).
+    safety_dialog: tuple[Turn, ...] = ()
 
     def payload(self) -> dict[str, Any]:
         """JSON входа модели в порядке §6.1 (п.2–6)."""
@@ -245,7 +268,7 @@ async def build_context(
         conversation_id,
         query_vector=vector,
         memory_limit=budget.memory_items,
-        turns_limit=budget.recent_turns,
+        turns_limit=turns_read_limit(budget.max_chars),
         pair_limit=budget.pair_candidates,
     )
     fragments: list[KnowledgeFragment] = []
@@ -270,6 +293,7 @@ async def build_context(
         profile=clip(rows.profile_summary or "", budget.profile_chars),
         summary=clip(rows.summary.text if rows.summary else "", budget.summary_chars),
     )
+    safety_dialog = tuple(t for _, t in parts.turns if t.author == "owner")[-SAFETY_TURNS:]
     base = OwnerContext(owner_name=rows.owner_name, partner_name=rows.partner_name)
     context, dialog, dropped, over = fit(system.text, base, parts, budget.max_chars)
     memory_search: Literal["vector", "recency", "none"] = "none"
@@ -296,4 +320,5 @@ async def build_context(
         dialog=dialog,
         conversation_id=conversation_id,
         stats=stats,
+        safety_dialog=safety_dialog,
     )

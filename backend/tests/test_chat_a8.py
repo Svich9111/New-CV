@@ -1122,10 +1122,6 @@ async def test_gate_holds_at_most_3_seconds_then_done_waits_for_verdict() -> Non
     assert isinstance(done, Done) and t_done >= 3.95
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-1 MAJOR: агент закончил раньше придержки — куски ждут вердикта до final_timeout_s",
-)
 async def test_gate_limit_holds_when_agent_finishes_inside_gate() -> None:
     """ТЗ §10 (первый символ ≤ 5 с), карточка 2.1 «придержка до вердикта» (не дольше
     ``gate_timeout_s``): если агент дописал ответ раньше конца придержки, а классификатор медлит,
