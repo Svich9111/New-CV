@@ -181,6 +181,15 @@ async def _summary(
     return True, unpack_summary(raw), False
 
 
+TURN_SCAN_FACTOR = (
+    10  # сколько строк на одну нужную реплику можно просмотреть, пропуская нечитаемые
+)
+
+
+def _readable(t: ConversationText) -> bool:
+    return t.text is not None and bool(t.text.strip())
+
+
 async def _turns_after(
     s: AsyncSession,
     keys: Keyring,
@@ -189,35 +198,96 @@ async def _turns_after(
     summary: HistorySummary | None,
     limit: int | None,
 ) -> tuple[list[ConversationText], int]:
+    """Реплики после отметки сводки, по порядку. ``limit`` — сколько **читаемых** (расшифрованных
+    и непустых) реплик нужно с конца: нечитаемые строки места в бюджете не занимают и предел не
+    съедают (тест A8-3) — чтение идёт страницами дальше назад, но не больше
+    ``TURN_SCAN_FACTOR × limit`` строк (потерянный ключ, 4.7). → (реплики, сколько нечитаемых;
+    если просмотр упёрся в потолок, а строки ещё есть, — +1 к потерям, сборка пишет её в
+    ``unavailable``)."""
     params: dict[str, object] = {"c": conversation_id, "u": user_id}
     after = ""
     if summary is not None and summary.through_at is not None:
         after = "AND (m.created_at, m.id) > (:ta, :ti) "
         params |= {"ta": summary.through_at, "ti": summary.through_id}
-    tail = ""
-    if limit is not None:
-        tail = "LIMIT :n"
-        params["n"] = limit
-    rows = await s.execute(
-        text(
-            "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at "  # noqa: S608 — фрагменты-константы, ввод — параметры
-            "FROM conversation_messages m JOIN conversations c ON c.id = m.conversation_id "
-            "JOIN agents a ON a.id = c.agent_id "
-            f"WHERE m.conversation_id = :c AND a.user_id = :u {after}"
-            f"ORDER BY m.created_at DESC, m.id DESC {tail}"
-        ),
-        params,
+    sql = (
+        "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at "  # noqa: S608 — фрагменты-константы, ввод — параметры
+        "FROM conversation_messages m JOIN conversations c ON c.id = m.conversation_id "
+        "JOIN agents a ON a.id = c.agent_id "
+        f"WHERE m.conversation_id = :c AND a.user_id = :u {after}"
+        "{before}ORDER BY m.created_at DESC, m.id DESC {tail}"
     )
     turns: list[ConversationText] = []
     lost = 0
+    readable = 0
+    scanned = 0
+    cursor: tuple[datetime, uuid.UUID] | None = None
+    while True:
+        page_params = dict(params)
+        before = ""
+        if cursor is not None:
+            before = "AND (m.created_at, m.id) < (:ba, :bi) "
+            page_params |= {"ba": cursor[0], "bi": cursor[1]}
+        tail = ""
+        page = None
+        if limit is not None:
+            page = max(limit - readable, 1)
+            tail = "LIMIT :n"
+            page_params["n"] = page
+        rows = (await s.execute(text(sql.format(before=before, tail=tail)), page_params)).all()
+        for r in rows:
+            row_id = _uuid(r.id)
+            body, reason = open_row(keys, crypto.CONVERSATION_MESSAGE_TEXT, row_id, r.text_enc)
+            if body is None:
+                lost += 1
+            item = ConversationText(row_id, r.author, body, r.created_at, reason)
+            readable += int(_readable(item))
+            turns.append(item)
+            cursor = (r.created_at, row_id)
+        scanned += len(rows)
+        if limit is None or page is None or len(rows) < page or readable >= limit:
+            break
+        if scanned >= TURN_SCAN_FACTOR * max(limit, 1):
+            lost += 1  # дальше не смотрим: старее — только в потерях, не молча
+            break
+    turns.reverse()
+    return turns, lost
+
+
+async def _turns_head(
+    s: AsyncSession,
+    keys: Keyring,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    summary: HistorySummary | None,
+    limit: int,
+) -> tuple[int, list[ConversationText]]:
+    """(сколько всего реплик после отметки, первые ``limit`` из них по порядку) — расшифровываются
+    только первые (раунд сжатия, R2-MINOR-3)."""
+    params: dict[str, object] = {"c": conversation_id, "u": user_id, "n": limit}
+    after = ""
+    if summary is not None and summary.through_at is not None:
+        after = "AND (m.created_at, m.id) > (:ta, :ti) "
+        params |= {"ta": summary.through_at, "ti": summary.through_id}
+    base = (
+        "FROM conversation_messages m JOIN conversations c ON c.id = m.conversation_id "
+        "JOIN agents a ON a.id = c.agent_id "
+        f"WHERE m.conversation_id = :c AND a.user_id = :u {after}"
+    )
+    total = (await s.execute(text("SELECT count(*) " + base), params)).scalar_one()
+    rows = await s.execute(
+        text(
+            "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at "
+            + base
+            + "ORDER BY m.created_at, m.id LIMIT :n"
+        ),
+        params,
+    )
+    head = []
     for r in rows:
         row_id = _uuid(r.id)
         body, reason = open_row(keys, crypto.CONVERSATION_MESSAGE_TEXT, row_id, r.text_enc)
-        if body is None:
-            lost += 1
-        turns.append(ConversationText(row_id, r.author, body, r.created_at, reason))
-    turns.reverse()
-    return turns, lost
+        head.append(ConversationText(row_id, r.author, body, r.created_at, reason))
+    return int(total), head
 
 
 def parse_vector(raw: object) -> list[float] | None:
@@ -524,6 +594,24 @@ async def read_history(
             raise LookupError("диалог не найден среди своих")
         turns, _ = await _turns_after(s, keys, user_id, conversation_id, summary, None)
     return summary, turns
+
+
+async def read_history_head(
+    sm: async_sessionmaker[AsyncSession],
+    keys: Keyring,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    *,
+    limit: int,
+) -> tuple[HistorySummary | None, int, list[ConversationText]]:
+    """Сводка, число реплик после её отметки и первые ``limit`` из них (для раунда сжатия: весь
+    хвост не читается и не расшифровывается). ``LookupError`` — диалог не свой."""
+    async with user_scope(sm, user_id) as s:
+        own, summary, _ = await _summary(s, keys, user_id, conversation_id)
+        if not own:
+            raise LookupError("диалог не найден среди своих")
+        total, head = await _turns_head(s, keys, user_id, conversation_id, summary, limit)
+    return summary, total, head
 
 
 async def save_history_summary(

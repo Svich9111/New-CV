@@ -241,10 +241,6 @@ async def test_batches_catch_up_after_long_failures(
     assert covered == everything[: len(covered)] and len(everything) - len(covered) <= 4
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-3 MINOR: нерасшифрованные строки съедают предел чтения turns_read_limit",
-)
 async def test_read_limit_not_eaten_by_unreadable_rows(
     engine: AsyncEngine, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
@@ -359,11 +355,6 @@ async def test_outer_cancel_propagates(phase: str) -> None:
     assert task.cancelled()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-2 MAJOR: при отмене внешней задачи первый _cancel пробрасывает отмену, "
-    "агент и классификатор не отменяются",
-)
 @pytest.mark.parametrize("phase", ["gate", "streaming"])
 async def test_outer_cancel_also_cancels_model_calls(phase: str) -> None:
     """Карточка 2.1 «закрытие потока отменяет вызовы», ТЗ §10 (учёт расходов): при отмене задачи-

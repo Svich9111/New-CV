@@ -38,7 +38,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from app.ai import crisis
 from app.ai.calls import CallLog, CallRecord, as_json
@@ -47,6 +47,7 @@ from app.ai.dialog import (
     MAX_TOKENS_DIALOG,
     SAFETY_TURNS,
     STRATEGIES,
+    ContextDialog,
     OwnerContext,
     SafetyVerdict,
     Turn,
@@ -60,6 +61,9 @@ from app.ai.llm import ChatMessage, LLMBadOutput, LLMError
 from app.ai.llm.errors import USER_MESSAGE_UNAVAILABLE
 from app.ai.models import AgentModels
 from app.ai.prompts import V0, PromptSet, system_prompt
+
+if TYPE_CHECKING:
+    from app.ai.context import BuiltContext
 
 # Классификатор (Haiku) отвечает за 1–2 с; придержка не должна съесть бюджет «первый символ
 # ≤ 5 с» (§10). После неё куски идут, а вердикт ждётся параллельно.
@@ -144,12 +148,28 @@ def _recent_owner_text(dialog: Sequence[Turn]) -> str:
     return "\n".join(owner[-SAFETY_TURNS:])
 
 
+def safety_turns(source: BuiltContext | Sequence[Turn]) -> Sequence[Turn]:
+    """Вход второй линии: у сборки контекста — реплики владельца **до** усечения
+    (``BuiltContext.safety_dialog`` / ``ContextDialog.safety``), иначе — переданный диалог."""
+    if isinstance(source, ContextDialog):
+        return source.safety
+    if isinstance(source, Sequence):
+        return source
+    return source.safety_dialog
+
+
 async def screen(
-    models: AgentModels, dialog: Sequence[Turn], *, prompt_set: PromptSet = V0
+    models: AgentModels,
+    dialog: BuiltContext | Sequence[Turn],
+    *,
+    prompt_set: PromptSet = V0,
 ) -> SafetyScreen:
-    """Классификатор безопасности по последним ``SAFETY_TURNS`` репликам владельца. Ошибка
+    """Классификатор безопасности по последним ``SAFETY_TURNS`` репликам владельца. В API —
+    ``screen(models, built)`` (или ``built.dialog``): из сборки контекста всегда берутся реплики
+    владельца до усечения бюджетом, усечённые на вход не попадают (R2-MINOR-1). Ошибка
     модели не бросается (``error`` — её вид): вторая линия не блокирует ответ. Прочие
     исключения — ошибки кода, бросаются."""
+    dialog = safety_turns(dialog)
     _check_dialog(dialog)
     log = CallLog()
     name = system_prompt("safety", prompt_set).name
@@ -318,6 +338,28 @@ async def _cancel(task: asyncio.Task[Any] | None) -> None:
         pass
 
 
+async def _cancel_all(*tasks: asyncio.Task[Any] | None) -> None:
+    """Очистка потока (ревью R2-MAJOR, A8-2): сначала ``cancel()`` **всех** внутренних задач,
+    потом ожидание всех до завершения, и только потом — проброс отмены текущей задачи, если она
+    пришла во время ожидания. ``asyncio.wait`` при отмене ожидающего задачи не отменяет и не
+    бросает их недождавшимися; если текущую задачу отменили раньше (отмена уже летит из тела
+    генератора), она дойдёт до вызывающего сама после ``finally``."""
+    pending = {t for t in tasks if t is not None and not t.done()}
+    for task in pending:
+        task.cancel()
+    interrupted = False
+    while pending:
+        try:
+            _, pending = await asyncio.wait(pending)
+        except asyncio.CancelledError:
+            interrupted = True
+    for t in tasks:
+        if t is not None and t.done() and not t.cancelled():
+            t.exception()  # забрать исключение: «Task exception was never retrieved» не нужен
+    if interrupted:
+        raise asyncio.CancelledError
+
+
 async def stream_reply(
     models: AgentModels,
     context: OwnerContext,
@@ -332,8 +374,8 @@ async def stream_reply(
     """Ответ агента потоком (см. описание модуля). ``safety`` — результат ``screen()``, если API
     уже проверил реплику (порядок контракта, АР-30 — так и делает API); без него классификатор
     идёт параллельно (режим не по умолчанию для API). ``safety_dialog`` — вход параллельного
-    классификатора (``BuiltContext.safety_dialog``: последние реплики владельца до усечения);
-    по умолчанию — ``dialog``.
+    классификатора; по умолчанию — ``dialog.safety`` у диалога из сборки контекста
+    (``ContextDialog``: реплики владельца до усечения), иначе ``dialog``.
 
     Последнее событие — ``Done``, ``Crisis`` или ``ChatError``. Исключения, кроме ошибок модели,
     — ошибки кода: бросаются (API отвечает событием ``error`` с кодом ``internal``). Закрытие
@@ -406,7 +448,7 @@ async def stream_reply(
     safety_task: asyncio.Task[SafetyScreen] | None = None
     if safety is None:
         safety_task = asyncio.create_task(
-            screen(models, safety_dialog or dialog, prompt_set=prompt_set)
+            screen(models, safety_dialog or safety_turns(dialog), prompt_set=prompt_set)
         )
     agent_task = asyncio.create_task(pump())
     get_task: asyncio.Task[tuple[str, Any]] | None = None
@@ -562,6 +604,4 @@ async def stream_reply(
             safety_error=safety_error,
         )
     finally:
-        await _cancel(get_task)
-        await _cancel(agent_task)
-        await _cancel(safety_task)
+        await _cancel_all(get_task, agent_task, safety_task)

@@ -111,6 +111,20 @@ class Turn:
     text: str
 
 
+class ContextDialog(tuple[Turn, ...]):
+    """Реплики диалога из сборки контекста (``context.build_context``), возможно усечённые
+    бюджетом. ``safety`` — последние реплики владельца **до** усечения: вход второй линии
+    безопасности. ``chat.screen`` и параллельный режим ``chat.stream_reply`` берут именно его,
+    поэтому усечённый диалог на вход классификатора попасть не может (ревью 2.1 R2-MINOR-1)."""
+
+    safety: tuple[Turn, ...]
+
+    def __new__(cls, turns: Sequence[Turn], safety: Sequence[Turn]) -> ContextDialog:
+        obj = super().__new__(cls, tuple(turns))
+        obj.safety = tuple(safety)
+        return obj
+
+
 @dataclass(frozen=True)
 class Draft:
     """Черновик «чувство — ситуация — потребность — просьба» (§6.2 п.1). Не отправлен."""

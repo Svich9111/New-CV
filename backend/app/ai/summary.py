@@ -78,7 +78,11 @@ def needs_compression(turns: list[ConversationText], policy: CompressionPolicy) 
 
 def batch(turns: list[ConversationText], policy: CompressionPolicy) -> list[ConversationText]:
     """Пачка раунда: самые старые реплики вне последних ``keep_turns``, в пределах пачки."""
-    old = turns[: -policy.keep_turns]
+    return _take(turns[: -policy.keep_turns], policy)
+
+
+def _take(old: list[ConversationText], policy: CompressionPolicy) -> list[ConversationText]:
+    """Первые реплики в пределах ``batch_turns`` и ``batch_chars`` (но хотя бы одна)."""
     out: list[ConversationText] = []
     chars = 0
     for t in old[: policy.batch_turns]:
@@ -88,6 +92,24 @@ def batch(turns: list[ConversationText], policy: CompressionPolicy) -> list[Conv
         out.append(t)
         chars += size
     return out
+
+
+def read_limit(policy: CompressionPolicy) -> int:
+    """Сколько первых реплик после отметки читать за раунд: хватает и на пачку, и на решение
+    «пора ли» (если хвост не длиннее порога, он прочитан целиком) — R2-MINOR-3."""
+    return max(policy.trigger_turns, policy.batch_turns)
+
+
+def plan(
+    total: int, head: list[ConversationText], policy: CompressionPolicy
+) -> list[ConversationText] | None:
+    """Пачка раунда по числу реплик после отметки (``total``) и первым из них (``head``,
+    ``read_limit``); ``None`` — сжимать не пора."""
+    if total > policy.trigger_turns:
+        return _take(head[: max(total - policy.keep_turns, 0)], policy) or None
+    if not needs_compression(head, policy):
+        return None
+    return batch(head, policy) or None
 
 
 def summary_payload(previous: str, turns: list[ConversationText]) -> dict[str, Any]:
@@ -149,12 +171,15 @@ async def compress_history(
     summarized = 0
     for _ in range(policy.rounds):
         try:
-            summary, turns = await chat.read_history(sm, keys, user_id, conversation_id)
+            summary, total, head = await chat.read_history_head(
+                sm, keys, user_id, conversation_id, limit=read_limit(policy)
+            )
         except (OwnerGone, LookupError):
             return CompressionResult(
                 "gone", summarized, calls=tuple(log.records), rounds=done_rounds
             )
-        if not needs_compression(turns, policy):
+        old = plan(total, head, policy)
+        if old is None:
             status: Literal["skipped", "saved"] = "saved" if done_rounds else "skipped"
             return CompressionResult(
                 status,
@@ -163,7 +188,6 @@ async def compress_history(
                 prompt=prompt_name if done_rounds else None,
                 rounds=done_rounds,
             )
-        old = batch(turns, policy)
         try:
             text = await summarize(
                 models,
@@ -203,8 +227,10 @@ async def compress_history(
         done_rounds += 1
         summarized += len(old)
     try:
-        _, rest = await chat.read_history(sm, keys, user_id, conversation_id)
-        more = needs_compression(rest, policy)
+        _, total, head = await chat.read_history_head(
+            sm, keys, user_id, conversation_id, limit=read_limit(policy)
+        )
+        more = plan(total, head, policy) is not None
     except (OwnerGone, LookupError):
         more = False
     return CompressionResult(

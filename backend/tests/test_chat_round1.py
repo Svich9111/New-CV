@@ -495,3 +495,170 @@ async def test_classifier_sees_last_three_owner_turns_despite_truncation(
     seen = json.loads(clf.requests[-1]["messages"][0][1])["text"]
     assert all(f"владелец {i}" in seen for i in range(3))
     assert as_json(built.payload()).count("владелец") == 1
+
+
+# ================================================================= раунд 2 исправлений
+
+
+async def _no_pending_after_outer_cancel(make_gen: Any, wait_s: float) -> None:
+    before = asyncio.all_tasks()
+
+    async def consume() -> None:
+        async for _ in make_gen():
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(wait_s)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    left = [
+        t
+        for t in asyncio.all_tasks() - before
+        if t is not asyncio.current_task() and t is not task and not t.done()
+    ]
+    assert left == [], [t.get_coro() for t in left]
+
+
+@pytest.mark.parametrize("mode", ["screen_first", "parallel_gate", "parallel_streaming"])
+async def test_outer_cancel_mid_stream_leaves_no_running_tasks(mode: str) -> None:
+    """R2-MAJOR / A8-2: внешнюю задачу (обрыв SSE) отменили посреди потока — все вызовы модели
+    отменены и дождались, незавершённых задач нет, отмена дошла до вызывающего."""
+    agent = provider(size=2, chunk_delay_s=0.05)
+    if mode == "screen_first":
+        m = models(agent, ScriptedProvider(lambda *a: {"category": "none", "secondary": []}))
+        sc = await ai_chat.screen(m, TURNS)
+        await _no_pending_after_outer_cancel(
+            lambda: ai_chat.stream_reply(m, CTX, TURNS, safety=sc), 0.15
+        )
+    elif mode == "parallel_gate":  # отмена во время придержки (классификатор медлит)
+        m = models(agent, SlowSafety(5.0))
+        await _no_pending_after_outer_cancel(lambda: ai_chat.stream_reply(m, CTX, TURNS), 0.15)
+    else:  # отмена после вердикта, во время потока
+        m = models(agent, SlowSafety(0.01))
+        await _no_pending_after_outer_cancel(lambda: ai_chat.stream_reply(m, CTX, TURNS), 0.2)
+
+
+async def test_unreadable_rows_do_not_eat_read_limit(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """A8-3: нерасшифрованные строки не считаются в предел чтения — старая реплика, которая
+    помещается, остаётся в контексте."""
+    p = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
+    old = await owner_says(sessionmaker, p, "старая")
+    budget = ContextBudget(max_chars=len(system_prompt("dialog").text) + 2000)
+    n = turns_read_limit(budget.max_chars) + 7
+    async with engine.begin() as conn:
+        for _ in range(n):
+            await conn.execute(
+                text(
+                    "INSERT INTO conversation_messages (conversation_id, author, text_enc, created_at) "
+                    "VALUES (:c, 'agent', :t, clock_timestamp())"
+                ),
+                {"c": p.conv, "t": b"\x00broken"},
+            )
+    await owner_says(sessionmaker, p, "новая")
+    built = await build_context(sessionmaker, KEYS, p.user_id, p.conv, query="x", budget=budget)
+    assert [t.text for t in built.dialog] == ["старая", "новая"]
+    assert built.stats.turn_ids[0] == old and built.stats.unavailable["dialog"] == n
+
+
+async def test_unreadable_scan_cap_is_counted_as_loss(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    p = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
+    await owner_says(sessionmaker, p, "старая")
+    async with engine.begin() as conn:
+        for _ in range(30):
+            await conn.execute(
+                text(
+                    "INSERT INTO conversation_messages (conversation_id, author, text_enc, created_at) "
+                    "VALUES (:c, 'agent', :t, clock_timestamp())"
+                ),
+                {"c": p.conv, "t": b"\x00broken"},
+            )
+    await owner_says(sessionmaker, p, "новая")
+    async with user_scope(sessionmaker, p.user_id) as s:
+        turns, lost = await chat._turns_after(s, KEYS, p.user_id, p.conv, None, 2)
+    # предел 2 читаемых, потолок просмотра 20 строк: «старая» не достигнута — потеря учтена
+    assert [t.text for t in turns if t.text] == ["новая"]
+    assert lost == 20 - 1 + 1
+
+
+async def test_screen_always_uses_untruncated_owner_turns(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """R2-MINOR-1: из сборки контекста классификатор получает реплики до усечения — и через
+    ``screen(models, built)``, и через ``screen(models, built.dialog)``, и в параллельном режиме
+    без явного ``safety_dialog``."""
+    p = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
+    for i in range(3):
+        await chat.add_message(
+            sessionmaker, KEYS, p.user_id, p.conv, "owner", f"владелец {i} " + "в" * 3000
+        )
+    budget = ContextBudget(max_chars=len(system_prompt("dialog").text) + 4500)
+    built = await build_context(sessionmaker, KEYS, p.user_id, p.conv, query="x", budget=budget)
+    assert len(built.dialog) == 1 and len(built.dialog.safety) == 3
+    assert built.dialog.safety == built.safety_dialog
+    clf = ScriptedProvider(lambda *a: {"category": "none", "secondary": []})
+    agent = ScriptedStreamProvider(clf.handler, stream=lambda payload: json_chunks(ANSWER))
+    m = AgentModels(agent, agent, agent, clf, clf, clf)
+
+    def last_seen() -> str:
+        return str(json.loads(clf.requests[-1]["messages"][0][1])["text"])
+
+    for source in (built, built.dialog):
+        await ai_chat.screen(m, source)
+        assert all(f"владелец {i}" in last_seen() for i in range(3))
+    events = [e async for e in ai_chat.stream_reply(m, built.context, built.dialog)]
+    assert isinstance(events[-1], ai_chat.Done)
+    assert all(f"владелец {i}" in last_seen() for i in range(3))
+    # обычный диалог (не из сборки) — как раньше
+    await ai_chat.screen(m, TURNS)
+    assert last_seen() == TURNS[-1].text
+
+
+async def test_compression_round_decrypts_only_head(
+    sessionmaker: SM, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2-MINOR-3: раунд сжатия расшифровывает только первые ``read_limit`` реплик, а не хвост."""
+    p = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
+    ids = await add_turns(sessionmaker, p, 151)
+    calls = {"n": 0}
+    real = chat.open_row
+
+    def counting(*args: Any) -> Any:
+        calls["n"] += 1
+        return real(*args)
+
+    monkeypatch.setattr(chat, "open_row", counting)
+    policy = summary.CompressionPolicy(trigger_turns=20, keep_turns=6, batch_turns=10, rounds=1)
+    r = await summary.compress_history(
+        sessionmaker, KEYS, p.user_id, p.conv, AgentModels.single(Summarizer()), policy=policy
+    )
+    assert r.status == "saved" and r.summarized_turns == 10 and r.more
+    limit = summary.read_limit(policy)
+    assert calls["n"] <= 2 * (limit + 1)  # раунд + проверка «есть ли ещё», плюс сводка
+    monkeypatch.setattr(chat, "open_row", real)
+    for _ in range(20):
+        r = await summary.compress_history(
+            sessionmaker, KEYS, p.user_id, p.conv, AgentModels.single(Summarizer()), policy=policy
+        )
+        if not r.more:
+            break
+    assert not r.more
+    await assert_no_gap(sessionmaker, p, ids)
+
+
+def test_plan_short_tail_and_long_tail() -> None:
+    from datetime import UTC, datetime
+
+    from app.repositories.texts import ConversationText
+
+    now = datetime.now(UTC)
+    turns = [ConversationText(uuid.uuid4(), "owner", "т", now) for _ in range(30)]
+    policy = summary.CompressionPolicy(trigger_turns=20, keep_turns=6, batch_turns=10)
+    assert summary.plan(15, turns[:15], policy) is None
+    assert summary.plan(100, turns[:20], policy) == turns[:10]
+    assert summary.plan(22, turns[:20], policy) == turns[:10]
+    small = summary.CompressionPolicy(trigger_turns=20, keep_turns=6, batch_turns=40)
+    assert summary.plan(22, turns[:22], small) == turns[:16]  # последние 6 остаются

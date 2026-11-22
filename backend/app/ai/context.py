@@ -35,7 +35,14 @@ from typing import Any, Literal
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ai.calls import as_json
-from app.ai.dialog import SAFETY_TURNS, OwnerContext, PairMessage, Turn, ordered_payload
+from app.ai.dialog import (
+    SAFETY_TURNS,
+    ContextDialog,
+    OwnerContext,
+    PairMessage,
+    Turn,
+    ordered_payload,
+)
 from app.ai.embeddings import Embedder, EmbeddingError, check_dim, cosine
 from app.ai.knowledge import KnowledgeBase, KnowledgeFragment
 from app.ai.prompts import V0, Prompt, PromptSet, system_prompt
@@ -107,7 +114,7 @@ class BuiltContext:
 
     system: Prompt
     context: OwnerContext
-    dialog: tuple[Turn, ...]
+    dialog: ContextDialog  # реплики после усечения; ``dialog.safety`` — вход классификатора
     conversation_id: uuid.UUID
     stats: ContextStats
     # Последние реплики владельца до усечения (не больше ``SAFETY_TURNS``) — вход второй линии
@@ -317,7 +324,7 @@ async def build_context(
     return BuiltContext(
         system=system,
         context=context,
-        dialog=dialog,
+        dialog=ContextDialog(dialog, safety_dialog),
         conversation_id=conversation_id,
         stats=stats,
         safety_dialog=safety_dialog,
