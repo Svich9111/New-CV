@@ -29,7 +29,17 @@ PRIORITY: tuple[CrisisType, ...] = (
 # Черновика нет и ничего не смягчается при любой строке — это обеспечивает код (dialog.py,
 # pipeline.py), а не модель.
 ACTIONS: dict[CrisisType, frozenset[str]] = {
-    "violence": frozenset({"name_it", "no_tolerate", "help_contacts", "no_draft", "no_softening"}),
+    # Блок violence велит при опасности звонить в экстренные службы (О-19).
+    "violence": frozenset(
+        {
+            "name_it",
+            "no_tolerate",
+            "help_contacts",
+            "emergency_services",
+            "no_draft",
+            "no_softening",
+        }
+    ),
     "outgoing_threat": frozenset(
         {"not_sent", "no_softening", "explain_reason", "return_to_talk", "no_draft"}
     ),
@@ -60,6 +70,8 @@ LATE_BLOCKS: dict[str, str] = {
     "outgoing_threat_mixed": "v2",
     "outgoing_threat_mixed_chat": "v2",
     "author_safety_life": "v2",
+    "outgoing_threat_brief": "v2",
+    "outgoing_threat_brief_chat": "v2",
 }
 NOT_SENT_ACTIONS = frozenset({"not_sent", "explain_reason"})
 AUTHOR_SAFETY_ACTIONS = frozenset({"help_contacts", "emergency_services"})
@@ -109,6 +121,18 @@ def order(types: Iterable[str]) -> tuple[CrisisType, ...]:
     return tuple(t for t in PRIORITY if t in found)
 
 
+THREAT_BLOCKS = frozenset(
+    {
+        "outgoing_threat",
+        "outgoing_threat_chat",
+        "outgoing_threat_mixed",
+        "outgoing_threat_mixed_chat",
+        "outgoing_threat_brief",
+        "outgoing_threat_brief_chat",
+    }
+)
+
+
 def respond(
     types: Iterable[str],
     agent_reply: str | None = None,
@@ -119,41 +143,44 @@ def respond(
 ) -> CrisisResponse:
     """Ответ по протоколу §9.3. Текст определяется **набором** строк и контекстом, а не главной
     строкой и не порядком вторичных (ревью 0.5 R4-MAJOR-1). Главная строка (``primary`` от
-    агента, иначе по ``PRIORITY``; ``underage`` — всегда главная) идёт в событие и задаёт только
-    первый блок в ветке «Б».
+    агента, иначе по ``PRIORITY``; ``underage`` — всегда главная) идёт в событие и в правиле «Б»
+    задаёт блок после экстренного.
 
     Контекст: ``withheld = True`` — остановлено одобренное сообщение; ``False`` — личный чат
     (сообщения не было: ни «не отправлено», ни действия ``not_sent``).
 
     Таблица правил (T — есть ``outgoing_threat``; V — ``violence``; L — ``life_threat``;
-    H — ``self_harm``; U — ``underage``):
+    H — ``self_harm``; U — ``underage``). Ответ агента, если есть, — перед блоками.
 
-    ==  ==========================  ==============================================================
-    №   Условие                     Блоки по порядку
-    ==  ==========================  ==============================================================
-    А   T (действует автор)         1. ``outgoing_threat`` — сообщение, нет V/L/U (v0:
-                                       «не отправлено», «подумаем, как сказать»);
-                                       ``outgoing_threat_chat`` — чат, нет V/L/U;
-                                       ``outgoing_threat_mixed`` — сообщение, есть V, L или U;
-                                       ``outgoing_threat_mixed_chat`` — чат, есть V, L или U
-                                       (оба — без «подумаем, как сказать»: при насилии и
-                                       угрозе жизни §9.3 стр. 1; младше 18 доступа нет);
-                                    2. ``self_harm``, если H;
-                                    3. ``author_safety_life``, если L (безусловное «немедленно
-                                       звони в экстренные службы», §9.3 стр. 4); иначе
-                                       ``author_safety``, если V; блоков для пострадавшего
-                                       (``violence``, ``life_threat``: «вина не на тебе») нет;
-                                    4. ``underage``, если U.
-    Б   нет T                       0. ``not_sent``, если сообщение;
-                                    1. блок главной строки (кроме ``underage``);
-                                    2. остальные строки по ``PRIORITY``;
-                                    3. ``underage`` — последним, чтобы ответ не начинался с отказа.
-    ==  ==========================  ==============================================================
+    ==  =================  =====================================================================
+    №   Условие            Блоки по порядку
+    ==  =================  =====================================================================
+    А   T (угрожает        0. ``not_sent`` — сообщение и есть H или U (короткий блок отправителю
+        сам автор)            «не отправлено» не говорит);
+                           1. ``author_safety_life``, если L — «немедленно звони в экстренные
+                              службы» первым (§9.3 стр. 4, R5-MINOR-2);
+                           2. ``self_harm``, если H — поддержка раньше любого блока
+                              отправителю (§9.3 стр. 3, R5-MAJOR-1);
+                           3. блок отправителю (одно сообщение / чат):
+                              - есть H или U: ``outgoing_threat_brief`` / ``…_brief_chat`` — без
+                                «вернёмся, когда станет спокойнее», без «подумаем, как сказать»,
+                                без ``return_to_talk`` (R5-MAJOR-1, R5-MINOR-1);
+                              - иначе есть V или L: ``outgoing_threat_mixed`` / ``…_mixed_chat``
+                                — без «подумаем, как сказать» (§9.3 стр. 1);
+                              - иначе: ``outgoing_threat`` / ``outgoing_threat_chat``;
+                           4. ``author_safety``, если V и нет L; блоков пострадавшему
+                              («вина не на тебе», ``name_it``, ``no_tolerate``) нет;
+                           5. ``underage``, если U — последним.
+    Б   нет T              0. ``not_sent``, если сообщение;
+                           1. ``life_threat``, если L — первым (§9.3 стр. 4);
+                           2. блок главной строки (если не L и не U);
+                           3. остальные строки по ``PRIORITY``;
+                           4. ``underage`` — последним, чтобы ответ не начинался с отказа.
+    ==  =================  =====================================================================
 
-    Действия: объединение действий показанных строк (в «А» — без ``violence``/``life_threat``,
-    зато ``help_contacts`` и ``emergency_services`` при V или L); в «Б» для сообщения —
-    ``not_sent`` и ``explain_reason``; в чате ``not_sent`` нет никогда. Ответ агента (если есть)
-    — перед блоками."""
+    Действия: объединение действий показанных строк; в «А» при V или L — ещё ``help_contacts`` и
+    ``emergency_services``, при H или U — без ``return_to_talk``; для сообщения —
+    ``not_sent`` и ``explain_reason``; в чате ``not_sent`` нет никогда."""
     ordered = order([*(types or ()), *([primary] if primary else [])])
     if not ordered:
         raise ValueError("нет строки кризисного протокола")
@@ -166,19 +193,21 @@ def respond(
     used: dict[str, str] = {}
     names: list[str] = []
     actions: frozenset[str]
+    chat = "" if withheld else "_chat"
     if "outgoing_threat" in present:  # правило «А»
         danger = present & VICTIM_TYPES
-        mixed = bool(danger) or "underage" in present
-        names.append(
-            "outgoing_threat" + ("_mixed" if mixed else "") + ("" if withheld else "_chat")
-        )
+        brief = bool(present & {"self_harm", "underage"})
         shown: list[CrisisType] = ["outgoing_threat"]
+        if brief and withheld:
+            names.append("not_sent")
+        if "life_threat" in present:
+            names.append("author_safety_life")
         if "self_harm" in present:
             names.append("self_harm")
             shown.append("self_harm")
-        if "life_threat" in present:
-            names.append("author_safety_life")
-        elif "violence" in present:
+        flavor = "_brief" if brief else "_mixed" if danger else ""
+        names.append(f"outgoing_threat{flavor}{chat}")
+        if "violence" in present and "life_threat" not in present:
             names.append("author_safety")
         if "underage" in present:
             names.append("underage")
@@ -186,8 +215,13 @@ def respond(
         actions = frozenset().union(*(ACTIONS[t] for t in shown))
         if danger:
             actions |= AUTHOR_SAFETY_ACTIONS
+        if brief:
+            actions -= {"return_to_talk"}
     else:  # правило «Б»
-        sequence: list[CrisisType] = [t for t in (main, *rest) if t != "underage"]
+        sequence: list[CrisisType] = []
+        if "life_threat" in present:
+            sequence.append("life_threat")
+        sequence += [t for t in (main, *rest) if t not in ("underage", "life_threat")]
         if "underage" in present:
             sequence.append("underage")
         names = list(sequence)

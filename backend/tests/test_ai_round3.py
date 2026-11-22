@@ -65,7 +65,10 @@ async def test_mixed_message_keeps_help(prompt_set: prompts.PromptSet, victim: s
     notice = delivery.author_notice
     assert notice is not None and notice.primary == "outgoing_threat"
     safety = "author_safety_life" if victim == "life_threat" else "author_safety"  # раунд 4
-    assert notice.text == f"{block('outgoing_threat_mixed')}\n\n{block(safety)}"
+    pair = [block("outgoing_threat_mixed"), block(safety)]
+    if victim == "life_threat":  # раунд 5: «немедленно звони» — первым (R5-MINOR-2)
+        pair.reverse()
+    assert notice.text == "\n\n".join(pair)
     text = notice.text.casefold()
     for phrase in (*VICTIM_PHRASES, "подумаем, как сказать"):
         assert phrase not in text
@@ -73,7 +76,12 @@ async def test_mixed_message_keeps_help(prompt_set: prompts.PromptSet, victim: s
     assert text.count("не отправлено") == 1
     assert {"help_contacts", "emergency_services", "not_sent", "explain_reason"} <= notice.actions
     assert not {"name_it", "no_tolerate"} & notice.actions
-    expected = f"v0+outgoing_threat_mixed@v2+{safety}@v2" if prompt_set is prompts.V0 else "v2"
+    order = (  # раунд 5: при life_threat «немедленно звони» — первым
+        f"+{safety}@v2+outgoing_threat_mixed@v2"
+        if victim == "life_threat"
+        else f"+outgoing_threat_mixed@v2+{safety}@v2"
+    )
+    expected = f"v0{order}" if prompt_set is prompts.V0 else "v2"
     assert notice.template_version == expected
     assert f"crisis.{expected}" in delivery.prompts
 
@@ -170,8 +178,10 @@ def test_backlog_b48_mentions_refusal() -> None:
         ("уже третий раз за 2 недели", "за 2 недели уже третий раз", False),
         ("Ты опоздал в 19:30!", "Ты пришёл в 19.30, мне обидно.", False),
         ("в 19:00", "в 19 часов", False),
-        # Известный пропуск (docstring facts.py): у обоих чисел одни и те же соседи.
-        ("Ты обещал в 20, а пришёл в 23", "Ты пришёл в 20, а обещал в 23", False),
+        # Раунд 5: за предлогом берётся слово перед ним — обмен ловится.
+        ("Ты обещал в 20, а пришёл в 23", "Ты пришёл в 20, а обещал в 23", True),
+        # Известный пропуск (docstring facts.py): у обоих чисел соседи с одной основой.
+        ("Он сказал 5, она сказала 7", "Он сказал 7, она сказала 5", False),
     ],
 )
 def test_facts_number_word_pairs(original: str, adapted: str, differ: bool) -> None:

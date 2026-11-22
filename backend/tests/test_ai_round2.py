@@ -86,7 +86,10 @@ async def test_author_acts_gets_only_sender_template(
     # Полный текст ответа — блок отправителю (смешанный вариант) и нейтральная помощь, дословно
     # (раунд 3, R3-MAJOR-1): без текста пострадавшему, но и без потери помощи.
     safety = "author_safety_life" if "life_threat" in secondary else "author_safety"  # раунд 4
-    assert notice.text == "\n\n".join([block("outgoing_threat_mixed", "v2"), block(safety, "v2")])
+    pair = [block("outgoing_threat_mixed", "v2"), block(safety, "v2")]
+    if "life_threat" in secondary:  # раунд 5: «немедленно звони» — первым (R5-MINOR-2)
+        pair.reverse()
+    assert notice.text == "\n\n".join(pair)
     for phrase in VICTIM_PHRASES:
         assert phrase not in notice.text.casefold()
     assert not {"name_it", "no_tolerate"} & notice.actions

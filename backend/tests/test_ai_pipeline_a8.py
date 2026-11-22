@@ -222,15 +222,23 @@ async def test_message_multiple_crisis_types_all_blocks_verbatim() -> None:
     # для пострадавшего (violence) не добавляется; блок self_harm (о самом авторе) остаётся.
     # Раунд 3 (A3, R3-MAJOR-1): вместо блока пострадавшему — нейтральная помощь author_safety,
     # блок отправителю — смешанный вариант (crisis.v2), без «подумаем, как сказать».
-    v2 = prompts.load
-    assert notice.text == "\n\n".join(
-        [
-            v2("crisis", "v2", block="outgoing_threat_mixed").text,
-            block("self_harm"),
-            v2("crisis", "v2", block="author_safety").text,
-        ]
+    # Раунд 5 (A3, R5-MAJOR-1): при self_harm — поддержка первой (после not_sent), блок
+    # отправителю короткий, без «вернёмся… спокойнее» и «подумаем, как сказать».
+    assert notice.text == r5_blocks(
+        ["not_sent", "self_harm", "outgoing_threat_brief", "author_safety"]
     )
+    assert "return_to_talk" not in notice.actions
     assert delivery.safety_event == "outgoing_threat"
+
+
+def r5_blocks(names: list[str]) -> str:
+    """Раунд 5 (A3): ожидаемый текст по явному списку блоков (поздние — из v1/v2)."""
+    late = {"not_sent": "v1"}
+    out = []
+    for n in names:
+        version = "v0" if n in crisis.CRISIS_TYPES else late.get(n, "v2")
+        out.append(prompts.load("crisis", version, block=n).text)
+    return "\n\n".join(out)
 
 
 def test_crisis_templates_have_no_softening_words() -> None:
@@ -1056,10 +1064,23 @@ async def test_r2_every_stop_says_not_sent_once(category: str, secondary: list[s
         if "outgoing_threat" in kinds and kind in {"outgoing_threat", *crisis.VICTIM_TYPES}:
             danger = bool(kinds & crisis.VICTIM_TYPES)
             if kind == "outgoing_threat":
-                variant = "outgoing_threat_mixed" if danger else "outgoing_threat"
-                assert notice.text.startswith(
-                    prompts.load("crisis", "v0" if not danger else "v2", block=variant).text
+                # Раунд 5 (A3, R5-MAJOR-1, R5-MINOR-2): при self_harm — короткий блок
+                # отправителю; первым он идёт, только если нет self_harm и life_threat (тогда
+                # первыми — not_sent, «немедленно звони», поддержка).
+                brief = "self_harm" in kinds
+                variant = (
+                    "outgoing_threat_brief"
+                    if brief
+                    else "outgoing_threat_mixed"
+                    if danger
+                    else "outgoing_threat"
                 )
+                text_v = prompts.load(
+                    "crisis", "v0" if variant == "outgoing_threat" else "v2", block=variant
+                ).text
+                assert text_v in notice.text
+                if not (brief or "life_threat" in kinds):
+                    assert notice.text.startswith(text_v)
             else:
                 assert block(kind) not in notice.text  # блок пострадавшему не показан
                 life = "life_threat" in kinds
@@ -1845,17 +1866,22 @@ async def test_r3_non_llm_classifier_error_propagates() -> None:
 # ------------------------------------------- Р3-6. Блоки пострадавшему при outgoing_threat
 
 
+# Раунд 5 (A3, R5-MAJOR-1, R5-MINOR-2): ожидаемый порядок блоков задан явно по новой таблице.
 @pytest.mark.parametrize(
-    ("secondary", "kept"),
+    ("secondary", "kept", "expected"),
     [
-        (["violence"], ()),
-        (["life_threat"], ()),
-        (["self_harm"], ("self_harm",)),
-        (["violence", "self_harm", "life_threat"], ("self_harm",)),
+        (["violence"], (), ["outgoing_threat_mixed", "author_safety"]),
+        (["life_threat"], (), ["author_safety_life", "outgoing_threat_mixed"]),
+        (["self_harm"], ("self_harm",), ["not_sent", "self_harm", "outgoing_threat_brief"]),
+        (
+            ["violence", "self_harm", "life_threat"],
+            ("self_harm",),
+            ["not_sent", "author_safety_life", "self_harm", "outgoing_threat_brief"],
+        ),
     ],
 )
 async def test_r3_sender_template_without_victim_blocks(
-    secondary: list[str], kept: tuple[str, ...]
+    secondary: list[str], kept: tuple[str, ...], expected: list[str]
 ) -> None:
     delivery, _ = await run(
         ok_script(safety={"category": "threat_or_insult", "secondary": secondary}),
@@ -1866,23 +1892,12 @@ async def test_r3_sender_template_without_victim_blocks(
     # Раунд 3 (A3, R3-MAJOR-1): при вторичных violence/life_threat помощь не выбрасывается —
     # смешанный блок отправителю и нейтральный author_safety (crisis.v2) с help_contacts и
     # emergency_services; действий пострадавшему (name_it, no_tolerate) нет.
-    v2 = prompts.load
+    assert notice.text == r5_blocks(expected)
+    assert all(block(k) in notice.text for k in kept)
     if {"violence", "life_threat"} & set(secondary):
-        assert notice.text == "\n\n".join(
-            [
-                v2("crisis", "v2", block="outgoing_threat_mixed").text,
-                *(block(k) for k in kept),
-                # Раунд 4 (A3, R4-MINOR-2): при life_threat — безусловный author_safety_life.
-                v2(
-                    "crisis",
-                    "v2",
-                    block="author_safety_life" if "life_threat" in secondary else "author_safety",
-                ).text,
-            ]
-        )
         assert {"help_contacts", "emergency_services"} <= notice.actions
-    else:
-        assert notice.text == "\n\n".join([block("outgoing_threat"), *(block(k) for k in kept)])
+    if "self_harm" in secondary:
+        assert "return_to_talk" not in notice.actions
     assert VICTIM_PHRASE not in notice.text.casefold()
     assert not {"name_it", "no_tolerate"} & notice.actions
     assert notice.text.casefold().count("не отправлено") == 1
@@ -1911,17 +1926,22 @@ SUGGEST_WORDS = "подумаем, как сказать"
 # --------------------------------------------- Р4-1. Смешанный кризис: сообщение (§9.3, АР-28)
 
 
+# Раунд 5 (A3, R5-MAJOR-1, R5-MINOR-2): ожидаемый порядок блоков задан явно по новой таблице.
 @pytest.mark.parametrize(
-    ("secondary", "middle"),
+    ("secondary", "middle", "expected"),
     [
-        (["violence"], []),
-        (["life_threat"], []),
-        (["violence", "life_threat"], []),
-        (["self_harm", "violence"], ["self_harm"]),
+        (["violence"], [], ["outgoing_threat_mixed", "author_safety"]),
+        (["life_threat"], [], ["author_safety_life", "outgoing_threat_mixed"]),
+        (["violence", "life_threat"], [], ["author_safety_life", "outgoing_threat_mixed"]),
+        (
+            ["self_harm", "violence"],
+            ["self_harm"],
+            ["not_sent", "self_harm", "outgoing_threat_brief", "author_safety"],
+        ),
     ],
 )
 async def test_r4_mixed_message_full_text_and_actions(
-    secondary: list[str], middle: list[str]
+    secondary: list[str], middle: list[str], expected: list[str]
 ) -> None:
     delivery, bot = await run(
         ok_script(safety={"category": "threat_or_insult", "secondary": secondary}),
@@ -1929,17 +1949,18 @@ async def test_r4_mixed_message_full_text_and_actions(
     )
     notice = delivery.author_notice
     assert notice is not None and bot.roles == ["safety"]
-    # Раунд 4 (A3, R4-MINOR-2): при life_threat — безусловный author_safety_life.
-    safety = "author_safety_life" if "life_threat" in secondary else "author_safety"
-    expected = [b2("outgoing_threat_mixed"), *(block(k) for k in middle), b2(safety)]
-    assert notice.text == "\n\n".join(expected)
+    assert notice.text == r5_blocks(expected)
+    assert all(block(k) in notice.text for k in middle)
     assert {"help_contacts", "emergency_services", "not_sent", "no_draft"} <= notice.actions
     assert not VICTIM_ACTIONS & notice.actions
     low = notice.text.casefold()
     assert VICTIM_PHRASE not in low and SUGGEST_WORDS not in low
     assert low.count("не отправлено") == 1
     assert delivery.safety_event == "outgoing_threat"
-    assert notice.template_version == f"v0+outgoing_threat_mixed@v2+{safety}@v2"
+    late = [n for n in expected if n not in crisis.CRISIS_TYPES]
+    assert notice.template_version == "v0" + "".join(
+        f"+{n}@{'v1' if n == 'not_sent' else 'v2'}" for n in late
+    )
     assert delivery.prompts[-1] == f"crisis.{notice.template_version}"
 
 
@@ -1956,16 +1977,27 @@ async def test_r4_pure_threat_message_is_v0_block_and_version() -> None:
 # ------------------------------------------------ Р4-2. Смешанный кризис: личный чат
 
 
+# Раунд 5 (A3, R5-MAJOR-1, R5-MINOR-2): ожидаемый порядок блоков задан явно по новой таблице.
 @pytest.mark.parametrize(
-    ("secondary", "middle", "name"),
+    ("secondary", "middle", "name", "expected"),
     [
-        ([], [], "outgoing_threat_chat"),
-        (["violence"], [], "outgoing_threat_mixed_chat"),
-        (["life_threat", "self_harm"], ["self_harm"], "outgoing_threat_mixed_chat"),
+        ([], [], "outgoing_threat_chat", ["outgoing_threat_chat"]),
+        (
+            ["violence"],
+            [],
+            "outgoing_threat_mixed_chat",
+            ["outgoing_threat_mixed_chat", "author_safety"],
+        ),
+        (
+            ["life_threat", "self_harm"],
+            ["self_harm"],
+            "outgoing_threat_brief_chat",
+            ["author_safety_life", "self_harm", "outgoing_threat_brief_chat"],
+        ),
     ],
 )
 async def test_r4_chat_threat_by_agent_full_text(
-    secondary: list[str], middle: list[str], name: str
+    secondary: list[str], middle: list[str], name: str, expected: list[str]
 ) -> None:
     bot = Bot(
         {
@@ -1981,11 +2013,8 @@ async def test_r4_chat_threat_by_agent_full_text(
     )
     result = await dialog.reply(bot.models, CTX, TURNS)
     assert result.crisis is not None and result.draft is None
-    # Раунд 4 (A3, R4-MINOR-2): при life_threat — безусловный author_safety_life.
-    safety = "author_safety_life" if "life_threat" in secondary else "author_safety"
-    tail = [b2(safety)] if secondary and secondary != ["self_harm"] else []
-    expected = ["Я слышу, как ты зол.", b2(name), *(block(k) for k in middle), *tail]
-    assert result.reply == "\n\n".join(expected)
+    assert result.reply == "\n\n".join(["Я слышу, как ты зол.", r5_blocks(expected)])
+    assert b2(name) in result.reply and all(block(k) in result.reply for k in middle)
     low = result.reply.casefold()
     assert "не отправлено" not in low and "not_sent" not in result.crisis.actions
     assert VICTIM_PHRASE not in low and not VICTIM_ACTIONS & result.crisis.actions
@@ -2125,12 +2154,10 @@ def test_r4_facts_anchors(original: str, adapted: str, differ: bool) -> None:
 def test_r4_facts_known_gaps_documented() -> None:
     """Известные пропуски (описаны в facts.py; О-15): без общих соседних слов обмен не виден,
     в т.ч. когда единица меняет форму вместе с числом («2 часа, 5 минут» → «5 часов, 2 минуты»)."""
-    assert not facts.numbers_differ(
-        "Ты обещал в 20, а пришёл в 23", "Ты пришёл в 20, а обещал в 23"
-    )
-    assert not facts.numbers_differ(
-        "Обещал прийти к 7, пришёл к 9", "Пришёл к 7, обещал прийти к 9"
-    )
+    # Раунд 5 (A3, A8-12): соседи не идут через знаки препинания, но за предлогом берётся слово
+    # перед ним («обещал в 20», «пришёл к 9») — эти обмены теперь ловятся; это уже не пропуск.
+    assert facts.numbers_differ("Ты обещал в 20, а пришёл в 23", "Ты пришёл в 20, а обещал в 23")
+    assert facts.numbers_differ("Обещал прийти к 7, пришёл к 9", "Пришёл к 7, обещал прийти к 9")
     # Раунд 4 (A3, О-15): соседние слова сравниваются по основе («часа» = «часов») — обмен
     # «2 часа, 5 минут» → «5 часов, 2 минуты» теперь ловится; это уже не пропуск.
     assert facts.numbers_differ("2 часа, 5 минут", "5 часов, 2 минуты")
@@ -2354,7 +2381,21 @@ def test_r5_crisis_table_invariants(
         assert "вина за это не на тебе" not in low
         assert not {"name_it", "no_tolerate"} & acts
         assert any(n.startswith("outgoing_threat") for n in names)
-        assert names[0].startswith("outgoing_threat")
+        # Раунд 5 (A3, R5-MAJOR-1, R5-MINOR-1, R5-MINOR-2): блок отправителю первым, только если
+        # нет H, L, U; иначе перед ним — только not_sent, «немедленно звони» (L) и поддержка (H).
+        threat_at = next(i for i, n in enumerate(names) if n.startswith("outgoing_threat"))
+        if not (H or L or U):
+            assert threat_at == 0
+        else:
+            assert set(names[:threat_at]) <= {"not_sent", "author_safety_life", "self_harm"}
+        if H:
+            assert names.index("self_harm") < threat_at
+        if H or U:  # разговор не откладывается и не обещается
+            assert "спокойнее" not in low and "return_to_talk" not in acts
+    # Раунд 5 (A3, R5-MINOR-2): угроза жизни — «немедленно звони» первым блоком после not_sent.
+    if L:
+        first = next(n for n in names if n != "not_sent")
+        assert first in {"life_threat", "author_safety_life"}
     # Насилие без угрозы автора — назвать своим именем, не терпеть, контакты.
     if V and not T:
         assert "violence" in names and {"name_it", "no_tolerate", "help_contacts"} <= acts
@@ -2514,17 +2555,14 @@ def test_r5_stem_known_gaps() -> None:
     «дня»/«дней», «лет»/«года», «раза»/«суток»; обмен при них виден только модели смысла."""
     assert facts._stem("дня") != facts._stem("дней")
     assert not facts.numbers_differ("2 дня, 5 лет", "5 дней, 2 года")
-    assert not facts.numbers_differ("2 раза, 3 дня", "3 раза, 2 суток")
+    # Раунд 5 (A3, A8-12): соседи не идут через запятую — «раз» больше не сосед «3», обмен
+    # «2 раза, 3 дня» → «3 раза, 2 суток» ловится по «раз»; это уже не пропуск.
+    assert facts.numbers_differ("2 раза, 3 дня", "3 раза, 2 суток")
     # беглая гласная: «копеек»/«копейки» — разные основы
-    assert not facts.numbers_differ("2 рубля, 5 копеек", "5 рублей, 2 копейки")
+    # Раунд 5 (A3, A8-12): соседи не идут через запятую — обмен ловится по «рубл»; не пропуск.
+    assert facts.numbers_differ("2 рубля, 5 копеек", "5 рублей, 2 копейки")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MINOR A8-12: соседи числа берутся через знаки препинания — слово из соседнего "
-    "предложения/части становится «соседом», и законная перестановка частей фразы даёт ложное "
-    "расхождение (оригинал с предупреждением вместо адаптации, §6.2 п.5–6)",
-)
 @pytest.mark.parametrize(
     ("original", "adapted"),
     [

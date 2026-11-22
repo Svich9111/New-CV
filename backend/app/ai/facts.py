@@ -21,9 +21,13 @@
 против «90 минут»; лишний или пропавший предлог у одного из нескольких чисел («в 7 и в 9» →
 «в 7 и 9»).
 
-Известные пропуски (расхождение не ловится, остаётся модель смысла): обмен чисел, если рядом с
-ними в двух текстах нет разных общих слов: «Ты обещал в 20, а пришёл в 23» → «Ты пришёл в 20, а
-обещал в 23» (у обоих чисел соседи «в» и «а»); подобные перестройки фразы."""
+Известные пропуски (расхождение не ловится, остаётся модель смысла): обмен чисел, если у них
+соседи с одной основой или без соседей в своей части фразы: «Он сказал 5, она сказала 7» →
+наоборот («сказал» = «сказала» по основе); подобные перестройки фразы. Основа соседнего слова —
+срез одного окончания, поэтому не сводятся супплетивные формы и беглые гласные («дня» / «дней»,
+«лет» / «года», «копеек» / «копейки») и синонимы единиц («дня» / «суток»): обмен чисел при них
+виден только модели смысла (О-18). Соседи не берутся через знаки препинания (A8-12), поэтому обмен
+чисел между частями фразы, разделёнными запятой, тоже ловится лишь составом и диапазонами."""
 
 from __future__ import annotations
 
@@ -100,6 +104,7 @@ _REWRITES = ((re.compile(r"\bполчаса\b"), "30 минут"), (re.compile(r
 _DASH_RANGE = re.compile(r"(\d+)\s*[-–—]\s*(\d+)")
 
 
+_PUNCT = re.compile(r"[.,;:!?()«»\"„“”—–-]")
 _ENDINGS = tuple(
     sorted(
         (
@@ -130,6 +135,38 @@ def _prepare(text: str) -> str:
 
 
 Scan = tuple[list[str], list[tuple[str, str]], dict[str, Counter[str]]]
+
+
+_PREPOSITIONS = frozenset(
+    "в во к ко на за с со до от по через после около у о об из перед без".split()
+)
+
+
+def _is_number_token(token: re.Match[str]) -> bool:
+    return token.group(1) is not None or WORDS.get(token.group(3) or "") is not None
+
+
+def _neighbours(prepared: str, tokens: list[re.Match[str]], start: int, end: int) -> list[str]:
+    """Соседние слова группы чисел ``tokens[start..end]``: слово сразу перед и сразу после, а если
+    это предлог — ещё и следующее за ним слово («пришёл в 7» → «в», «пришёл»), кроме единицы
+    другого числа. Только в той же части фразы: через знак препинания сосед не берётся (A8-12)."""
+    words: list[str] = []
+    for step, edge in ((-1, start), (1, end)):
+        j, last = edge + step, edge
+        while 0 <= j < len(tokens):
+            word = tokens[j].group(3)
+            left, right = (j, last) if j < last else (last, j)
+            if word is None or _PUNCT.search(prepared[tokens[left].end() : tokens[right].start()]):
+                break
+            # За предлогом влево не берём единицу другого числа («третий раз за 2 недели»:
+            # «раз» — сосед «третий», а не «2»).
+            if last != edge and step < 0 and j > 0 and _is_number_token(tokens[j - 1]):
+                break
+            words.append(word)
+            if word not in _PREPOSITIONS:
+                break
+            last, j = j, j + step
+    return words
 
 
 def _scan(text: str) -> Scan:
@@ -186,9 +223,8 @@ def _scan(text: str) -> Scan:
             start -= 1
         while end + 1 < len(tokens) and is_number[end + 1]:
             end += 1
-        for j in (start - 1, end + 1):
-            if 0 <= j < len(tokens) and tokens[j].group(3) is not None:
-                anchors.setdefault(_stem(tokens[j].group(3)), Counter())[value] += 1
+        for word in _neighbours(prepared, tokens, start, end):
+            anchors.setdefault(_stem(word), Counter())[value] += 1
     return found, ranges, anchors
 
 
