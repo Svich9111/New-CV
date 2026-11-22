@@ -345,8 +345,12 @@ async def test_admin_role_has_no_access_to_conversations(engine: AsyncEngine) ->
                 text("SELECT has_table_privilege('feelings_admin', :t, 'SELECT')"), {"t": table}
             )
             assert row.scalar_one() is False, table
+        # 0011 (задача 2.6, АР-39): загрузка материала — функцией admin_kb_upload.
         row = await conn.execute(
-            text("SELECT has_table_privilege('feelings_admin', 'kb_documents', 'INSERT')")
+            text(
+                "SELECT has_function_privilege('feelings_admin', "
+                "'admin_kb_upload(text, text, text, text, text, bytea)', 'EXECUTE')"
+            )
         )
         assert row.scalar_one() is True
 

@@ -429,9 +429,46 @@ class MessageDraft(Base):
 
 
 class KbDocument(Base):
-    """§7 kb_documents: id, название, автор, подход, основание прав, статус индексации."""
+    """§7 kb_documents: id, название, автор, подход, основание прав, статус индексации.
+
+    0011 (АР-39): исходный файл (``source_*``) — только до конца индексации; ``index_error`` —
+    код причины сбоя без текста; аренда воркера индексации (``index_lease_*``, попытки)."""
 
     __tablename__ = "kb_documents"
+    __table_args__ = (
+        CheckConstraint(
+            "source_data IS NULL OR index_status IN ('uploaded', 'indexing')",
+            name="source_only_before_index",
+        ),
+        CheckConstraint(
+            "source_data IS NULL OR octet_length(source_data) BETWEEN 1 AND 20971520",
+            name="source_size",
+        ),
+        CheckConstraint(
+            "source_format IS NULL OR source_format IN ('pdf', 'epub', 'docx', 'txt')",
+            name="source_format",
+        ),
+        CheckConstraint(
+            "source_sha256 IS NULL OR octet_length(source_sha256) = 32", name="sha256_len"
+        ),
+        CheckConstraint(
+            "index_error IS NULL OR index_error ~ '^[a-z][a-z0-9_]{0,31}$'", name="error_code"
+        ),
+        CheckConstraint("btrim(rights_basis) <> ''", name="rights_basis_present"),
+        CheckConstraint("index_attempts >= 0", name="attempts_nonnegative"),
+        Index(
+            "uq_kb_documents_sha256_active",
+            "source_sha256",
+            unique=True,
+            postgresql_where=sa_text("source_sha256 IS NOT NULL AND index_status <> 'failed'"),
+        ),
+        Index(
+            "ix_kb_documents_index_queue",
+            "created_at",
+            "id",
+            postgresql_where=sa_text("index_status IN ('uploaded', 'indexing')"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
     title: Mapped[str] = mapped_column(String(300), nullable=False)
@@ -442,6 +479,17 @@ class KbDocument(Base):
         IndexStatus, nullable=False, server_default="uploaded"
     )
     created_at: Mapped[datetime] = created_at()
+    source_data: Mapped[bytes | None] = mapped_column(LargeBinary)
+    source_format: Mapped[str | None] = mapped_column(String(8))
+    source_size: Mapped[int | None] = mapped_column(Integer)
+    source_sha256: Mapped[bytes | None] = mapped_column(LargeBinary)
+    index_error: Mapped[str | None] = mapped_column(String(32))
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    index_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    index_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    index_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sa_text("0")
+    )
 
 
 class KbChunk(Base):
@@ -456,6 +504,9 @@ class KbChunk(Base):
             "embedding_model IS NULL OR (embedding IS NOT NULL AND embedding_model <> '')",
             name="model_has_vector",
         ),
+        CheckConstraint("ord IS NULL OR ord >= 0", name="ord_nonnegative"),
+        # 0011: порядок фрагмента в материале.
+        Index("uq_kb_chunks_document_ord", "document_id", "ord", unique=True),
         Index(
             "ix_kb_chunks_embedding_hnsw",
             "embedding",
@@ -473,6 +524,7 @@ class KbChunk(Base):
         ARRAY(String(64)), nullable=False, server_default=sa_text("'{}'")
     )
     problem_level: Mapped[int | None] = mapped_column(SmallInteger)
+    ord: Mapped[int | None] = mapped_column(Integer)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
     embedding_model: Mapped[str | None] = mapped_column(String(128))
 

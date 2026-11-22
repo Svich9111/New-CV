@@ -915,6 +915,16 @@ PIPELINE_FUNCS = [
     "kb_set_chunk_embedding(uuid, text, text)",  # 0008, задача 2.0v: воркер индексации
     "memory_claim_extraction(interval, interval, integer)",  # 0009, задача 2.4: воркер памяти
     "memory_claim_compaction(interval, interval, integer)",  # 0009
+    "kb_claim_index(interval, integer)",  # 0011, задача 2.6: воркер индексации
+    "kb_read_source(uuid, uuid)",  # 0011
+    "kb_add_chunk(uuid, uuid, integer, text, text[], integer)",  # 0011
+    "kb_finish_index(uuid, uuid)",  # 0011
+    "kb_fail_index(uuid, uuid, text)",  # 0011
+]
+# 0011, задача 2.6: функции администратора (feelings_admin) — загрузка и удаление материала.
+ADMIN_FUNCS = [
+    "admin_kb_upload(text, text, text, text, text, bytea)",
+    "admin_kb_delete(uuid)",
 ]
 
 
@@ -929,6 +939,10 @@ async def test_definer_functions_executable_only_by_intended_roles(engine: Async
 
         for f in APP_FUNCS + PIPELINE_FUNCS:
             for role in ("feelings_admin", "public"):
+                assert not await can(role, f), (role, f)
+        for f in ADMIN_FUNCS:
+            assert await can("feelings_admin", f), f
+            for role in ("feelings_app", "feelings_api", "feelings_worker", "public"):
                 assert not await can(role, f), (role, f)
         for f in APP_FUNCS:
             assert await can("feelings_app", f), f
@@ -946,7 +960,7 @@ async def test_definer_functions_executable_only_by_intended_roles(engine: Async
             )
         )
         definers = rows.all()
-        assert len(definers) == len(APP_FUNCS) + len(PIPELINE_FUNCS) - 1  # app_uid — не definer
+        assert len(definers) == len(APP_FUNCS) + len(PIPELINE_FUNCS) + len(ADMIN_FUNCS) - 1
         for name, cfg in definers:
             paths = [c for c in (cfg or []) if c.startswith("search_path=")]
             assert paths, name

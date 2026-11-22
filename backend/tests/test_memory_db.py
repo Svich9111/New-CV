@@ -280,7 +280,8 @@ async def test_column_privileges_b63(engine: AsyncEngine) -> None:
             assert await col("feelings_app", "conversations", "summary_enc", priv)
             for column in ("embedding", "embedding_model"):
                 assert not await col("feelings_admin", "kb_chunks", column, priv), column
-            assert await col("feelings_admin", "kb_chunks", "text", priv)
+            # 0011 (задача 2.6, АР-39): фрагменты пишет только воркер индексации.
+            assert not await col("feelings_admin", "kb_chunks", "text", priv)
             for table in ("memory_items", "agents", "conversations"):
                 assert not await col("feelings_worker", table, "id", priv), table
         row = await conn.execute(
@@ -360,8 +361,8 @@ async def test_text_change_clears_vector(sessionmaker: SM, engine: AsyncEngine) 
             {"c": chunk, "d": doc},
         )
         await _worker(c, "SELECT kb_set_chunk_embedding(:c, :v, 'kb-m')", c=chunk, v=vec(3))
+    # 0011: администратор фрагменты не меняет вовсе; смену текста проверяем в обход ролей.
     async with engine.begin() as c:
-        await c.execute(text("SET LOCAL ROLE feelings_admin"))
         await c.execute(text("UPDATE kb_chunks SET topic_tags = '{t}' WHERE id = :c"), {"c": chunk})
     assert await _row(engine, "SELECT embedding_model FROM kb_chunks WHERE id = :c", c=chunk) == (
         "kb-m",
@@ -370,6 +371,7 @@ async def test_text_change_clears_vector(sessionmaker: SM, engine: AsyncEngine) 
         "UPDATE kb_chunks SET embedding = NULL WHERE id = :c",
         "UPDATE kb_chunks SET embedding_model = NULL WHERE id = :c",
         "INSERT INTO kb_chunks (document_id, text, embedding_model) VALUES (:d, 'x', 'm')",
+        "UPDATE kb_chunks SET text = 'новый' WHERE id = :c",
     ):
         with pytest.raises(DBAPIError) as ei:
             async with engine.begin() as c:
@@ -377,7 +379,6 @@ async def test_text_change_clears_vector(sessionmaker: SM, engine: AsyncEngine) 
                 await c.execute(text(sql), {"c": chunk, "d": doc})
         assert _sqlstate(ei.value) == "42501", sql
     async with engine.begin() as c:
-        await c.execute(text("SET LOCAL ROLE feelings_admin"))
         await c.execute(text("UPDATE kb_chunks SET text = 'новый' WHERE id = :c"), {"c": chunk})
     assert tuple(
         await _row(

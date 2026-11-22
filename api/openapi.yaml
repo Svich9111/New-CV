@@ -735,6 +735,9 @@ paths:
     get:
       tags: [admin]
       summary: Материалы базы знаний (ФТ-20)
+      description: |
+        Все материалы со статусом индексации; при `failed` — код причины `index_error` (без
+        текста). Исходный файл не отдаётся (хранится только до конца индексации, АР-39).
       security: [{ adminBearer: [] }]
       responses:
         "200":
@@ -744,9 +747,19 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/KbDocument" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
     post:
       tags: [admin]
       summary: Загрузить PDF, EPUB, DOCX, TXT (ФТ-15)
+      description: |
+        Загружаются только материалы с правами на использование (ТЗ §6.4): `rights_basis`
+        обязателен и не пустой. Файл — не больше **20 МиБ** (20 971 520 байт), форматы `pdf`,
+        `epub`, `docx`, `txt` (определяет сервер по содержимому и расширению). Тот же файл
+        (SHA-256 содержимого) повторно не загружается, пока прежний не в `failed`. Материал
+        принимается в статусе `uploaded`; индексация — фоновая (разбор, фрагменты, метки,
+        векторы), итог — `indexed` или `failed` с кодом причины. Запись в журнал действий — без
+        текстов (`kb.upload`, АР-24). Функция БД — `admin_kb_upload` (АР-39).
       security: [{ adminBearer: [] }]
       requestBody:
         required: true
@@ -756,17 +769,69 @@ paths:
               type: object
               required: [file, title, rights_basis]
               properties:
-                file: { type: string, format: binary }
-                title: { type: string }
-                author: { type: string }
-                approach: { type: string }
-                rights_basis: { type: string, description: "Основание прав на использование (ТЗ §6.4)" }
+                file: { type: string, format: binary, description: "До 20 МиБ" }
+                title: { type: string, minLength: 1, maxLength: 300 }
+                author: { type: string, maxLength: 200 }
+                approach:
+                  type: string
+                  maxLength: 100
+                  description: Подход (ненасильственное общение, ЭФТ, метод Готтмана, теория привязанности…) — метка от администратора
+                rights_basis:
+                  type: string
+                  minLength: 1
+                  description: "Основание прав на использование (ТЗ §6.4)"
       responses:
         "202":
-          description: Принято к индексации
+          description: Принято к индексации (`index_status = uploaded`)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/KbDocument" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "409":
+          description: Код `duplicate_document` — этот файл уже загружен (SHA-256 содержимого)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                duplicate_document:
+                  value: { code: duplicate_document, message: Этот файл уже загружен }
+        "413":
+          description: Код `file_too_large` — файл больше 20 МиБ
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                file_too_large:
+                  value: { code: file_too_large, message: Файл больше 20 МиБ }
+        "415":
+          description: Код `unsupported_format` — не PDF, EPUB, DOCX или TXT
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                unsupported_format:
+                  value: { code: unsupported_format, message: Поддерживаются PDF, EPUB, DOCX и TXT }
+        "422": { $ref: "#/components/responses/Validation" }
+  /admin/kb/documents/{document_id}:
+    parameters:
+      - name: document_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [admin]
+      summary: Удалить материал вместе с фрагментами (ФТ-15)
+      description: |
+        Материал, его фрагменты и векторы удаляются сразу (функция БД `admin_kb_delete`, АР-39);
+        идущая индексация прекращается. Журнал — `kb.delete`, без текстов. Несуществующий
+        материал и повтор — 404.
+      security: [{ adminBearer: [] }]
+      responses:
+        "204": { description: Удалено }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /admin/prompts:
     get:
       tags: [admin]
@@ -808,7 +873,17 @@ paths:
 components:
   securitySchemes:
     bearer: { type: http, scheme: bearer }
-    adminBearer: { type: http, scheme: bearer, description: Отдельная учётная запись администратора }
+    adminBearer:
+      type: http
+      scheme: bearer
+      description: |
+        Отдельная учётная запись администратора, не Telegram (АР-39). Токен — случайная строка не
+        короче 32 байт; сервер хранит только SHA-256 действующих токенов в окружении
+        (`FEELINGS_ADMIN_TOKEN_SHA256`, через запятую — для ротации) и сравнивает SHA-256
+        предъявленного за постоянное время. Нет заголовка или токен неизвестен — 401
+        `unauthorized`; предъявлена сессия пользователя Mini App — 403 `admin_only`. Запросы
+        администратора выполняются под ролью БД `feelings_admin` (справочные таблицы, без доступа
+        к личным данным, ТЗ §9.1 п.5).
 
   parameters:
     InviteToken:
@@ -917,6 +992,14 @@ components:
           examples:
             service_unavailable:
               value: { code: service_unavailable, message: Приглашения временно недоступны }
+    AdminOnly:
+      description: Код `admin_only` — путь только для администратора (предъявлена сессия пользователя)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            admin_only:
+              value: { code: admin_only, message: Доступно только администратору }
     Validation:
       description: Ошибка данных
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -952,7 +1035,8 @@ components:
           type: string
           examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, underage, not_found, already_in_couple, own_invite,
                      couple_not_pending, invite_expired, invite_used, couple_not_active, version_conflict, blocked_by_safety,
-                     subscription_required, rate_limited, llm_unavailable, conflict_retry]
+                     subscription_required, rate_limited, llm_unavailable, conflict_retry,
+                     admin_only, duplicate_document, file_too_large, unsupported_format]
         message: { type: string, description: Понятное пользователю сообщение на русском }
 
     Session:
@@ -1186,7 +1270,7 @@ components:
 
     KbDocument:
       type: object
-      required: [id, title, rights_basis, index_status]
+      required: [id, title, rights_basis, index_status, created_at]
       properties:
         id: { type: string, format: uuid }
         title: { type: string }
@@ -1194,6 +1278,18 @@ components:
         approach: { type: [string, "null"] }
         rights_basis: { type: string }
         index_status: { type: string, enum: [uploaded, indexing, indexed, failed] }
+        index_error:
+          type: [string, "null"]
+          pattern: "^[a-z][a-z0-9_]{0,31}$"
+          description: >-
+            Код причины сбоя при `failed` (без текста материала), например `too_large`,
+            `too_many_pages`, `zip_bomb`, `encrypted`, `corrupt`, `empty_text`,
+            `attempts_exhausted` — перечень ведёт воркер индексации (A3)
+        source_format: { type: [string, "null"], enum: [pdf, epub, docx, txt, null] }
+        source_size: { type: [integer, "null"], minimum: 1, maximum: 20971520 }
+        sha256: { type: [string, "null"], pattern: "^[0-9a-f]{64}$", description: SHA-256 исходного файла }
+        created_at: { type: string, format: date-time }
+        indexed_at: { type: [string, "null"], format: date-time }
 
     PromptVersion:
       type: object
