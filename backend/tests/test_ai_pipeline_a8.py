@@ -2573,3 +2573,135 @@ def test_r5_stem_known_gaps() -> None:
 )
 def test_r5_facts_neighbours_do_not_cross_punctuation(original: str, adapted: str) -> None:
     assert not facts.numbers_differ(original, adapted)
+
+
+# ######################################################################## РАУНД 6 (A8)
+# Таблица crisis.respond после 1e77225 (поддержка первой при H, «немедленно» первым при L,
+# короткий блок отправителю), facts.py: соседи по предлогам и без пересечения пунктуации.
+# Свой перебор с инвариантами по тексту ответа (а не по именам блоков).
+
+
+def _r6_parts(r: crisis.CrisisResponse, reply: str | None) -> list[str]:
+    body = r.text[len(reply) + 2 :] if reply else r.text
+    return body.split("\n\n")
+
+
+@pytest.mark.parametrize(
+    ("types", "withheld", "primary", "reply", "pset"),
+    CASES,
+    ids=[
+        f"{'+'.join(sorted(t))}-{'msg' if w else 'chat'}-{p}-{'r' if r else 'n'}-{s.label()[:2]}"
+        for t, w, p, r, s in CASES
+    ],
+)
+def test_r6_crisis_text_invariants(
+    types: frozenset[str],
+    withheld: bool,
+    primary: str | None,
+    reply: str | None,
+    pset: prompts.PromptSet,
+) -> None:
+    r = crisis.respond(sorted(types), reply, primary=primary, prompt_set=pset, withheld=withheld)
+    parts = [p.casefold() for p in _r6_parts(r, reply)]
+    low = r.text.casefold()
+    T, V, L, H, U = (k in types for k in ALL_TYPES_ORDER)
+    not_sent_idx = [i for i, p in enumerate(parts) if p.startswith("сообщение не отправлено")]
+    head = parts[len(not_sent_idx) :] if not_sent_idx == [0] else parts
+    # §9.3 стр. 4: угроза жизни — первым делом (после «не отправлено») «немедленно … экстренные».
+    if L:
+        assert "немедленно" in head[0] and "экстренн" in head[0]
+    # §9.3 стр. 3: поддержка при самоповреждении — раньше любого текста об угрозе автора.
+    sh = next((i for i, p in enumerate(parts) if p.startswith("я рядом и продолжаю")), None)
+    th = next((i for i, p in enumerate(parts) if "угроз" in p and "оскорблен" in p), None)
+    if H:
+        assert sh is not None
+        if th is not None:
+            assert sh < th
+    # Разговор не откладывается при H и не обещается при U (R5-MAJOR-1, R5-MINOR-1).
+    if T and (H or U):
+        assert "спокойнее" not in low and "return_to_talk" not in r.actions
+    # Отказ в доступе — последний абзац; ничего после него.
+    if U:
+        assert parts[-1].startswith("этот сервис — только для тех, кому исполнилось 18")
+    # «Не отправлено» — ровно один раз (в отдельном блоке или в блоке отправителю).
+    assert low.count("не отправлено") == (1 if withheld else 0)
+    # Один абзац — одна мысль: блоки не повторяются, пустых нет.
+    assert len(parts) == len(set(parts)) and all(p.strip() for p in parts)
+    # При насилии и угрозе жизни (вкл. помощь автору-отправителю) — контакты и экстренные службы.
+    if V or L:
+        assert "«помощь»" in low and "экстренные службы" in low
+        assert {"help_contacts", "emergency_services"} <= r.actions
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR A8-15: младше 18 + самоповреждение — блок self_harm «Я рядом и продолжаю "
+    "разговор с тобой» и затем отказ «дальше вести разговор … я не смогу»: противоречие в одном "
+    "ответе подростку в кризисе (та же логика, что R5-MINOR-1 для блока отправителю)",
+)
+@pytest.mark.parametrize("withheld", [True, False], ids=["msg", "chat"])
+@pytest.mark.parametrize(
+    "types",
+    [
+        ["self_harm", "underage"],
+        ["self_harm", "underage", "violence"],
+        ["self_harm", "underage", "outgoing_threat"],
+    ],
+)
+def test_r6_underage_with_self_harm_no_contradiction(types: list[str], withheld: bool) -> None:
+    low = crisis.respond(types, withheld=withheld).text.casefold()
+    assert not ("продолжаю разговор" in low and "дальше вести разговор" in low)
+
+
+# --------------------------------------------- Р6-2. facts.py: предлоги и пунктуация
+
+R6_FACTS = [
+    # обмены — ловятся
+    ("Ты обещал в 20, а пришёл в 23", "Ты пришёл в 20, а обещал в 23", True),
+    ("Ты обещал в 20 а пришёл в 23", "Ты пришёл в 20 а обещал в 23", True),
+    ("Обещал прийти к 7, пришёл к 9", "Пришёл к 7, обещал прийти к 9", True),
+    ("Обещал 2 часа, ждала 5 часов", "Обещал 5 часов, ждала 2 часа", True),
+    ("Звонила 2 раза, писала 5 раз", "Звонила 5 раз, писала 2 раза", True),
+    ("Ждала с 7 до 9", "Ждала до 9 с 7", True),
+    # законные перестройки — не расхождение
+    ("Пришёл в 9, через 2 часа ушёл", "Через 2 часа ушёл, а пришёл в 9", False),
+    ("Пришёл в 9 — через 2 часа ушёл", "Через 2 часа ушёл, а пришёл в 9", False),
+    ("Жду с 7. Прошло 3 часа", "Прошло 3 часа, а я жду с 7", False),
+    ("Ты в 7 пришёл, а не в 9", "Ты пришёл не в 9, а в 7", False),
+    ("Я жду тебя уже 2 часа из-за 5 минут", "Из-за 5 минут я жду тебя уже 2 часа", False),
+    ("уже третий раз за 2 недели", "за 2 недели уже третий раз", False),
+    ("Купи 2,5 кило", "2,5 кило купи", False),
+    ("Приезжай 21.11, жду", "21.11 приезжай, жду", False),
+]
+
+
+@pytest.mark.parametrize(("original", "adapted", "differ"), R6_FACTS)
+def test_r6_facts_prepositions_and_punctuation(original: str, adapted: str, differ: bool) -> None:
+    assert facts.numbers_differ(original, adapted) is differ, (
+        facts._scan(original)[2],
+        facts._scan(adapted)[2],
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='MINOR A8-14: граница части фразы — только [.,;:!?()«»"„“”—–-]; многоточие «…», '
+    "перевод строки и «/» не разделяют, и законная перестановка частей снова даёт ложное "
+    "расхождение (класс A8-12)",
+)
+@pytest.mark.parametrize(
+    "original",
+    [
+        "Пришёл в 9… через 2 часа ушёл",
+        "Пришёл в 9\nчерез 2 часа ушёл",
+        "Пришёл в 9 / через 2 часа ушёл",
+    ],
+    ids=["ellipsis", "newline", "slash"],
+)
+def test_r6_facts_other_separators(original: str) -> None:
+    assert not facts.numbers_differ(original, "Через 2 часа ушёл, а пришёл в 9")
+
+
+def test_r6_facts_known_gap_same_stem_neighbours() -> None:
+    """Описанный в facts.py пропуск: соседи с одной основой («сказал»/«сказала»)."""
+    assert not facts.numbers_differ("Он сказал 5, она сказала 7", "Он сказал 7, она сказала 5")
