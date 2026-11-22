@@ -345,6 +345,8 @@ def _allowed_strings(s: dict[str, Any]) -> set[str]:
         s["relationship"],
         *s.get("owner_memory", []),
         *s["owner_turns"],
+        # 2.6 (A3): фрагменты базы знаний — справочный контекст сервера (§6.1 п.4), не личное.
+        *s.get("knowledge", []),
     }
     pm = s.get("partner_message")
     if pm:
@@ -482,6 +484,7 @@ def test_model_input_contains_only_owner_data(situations: list[dict[str, Any]]) 
         "owner_memory",
         "owner_turns",
         "partner_message",
+        "knowledge",  # 2.6 (A3): фрагменты базы знаний (§6.1 п.4)
     }
     rec = Recorder(EchoLeak())
     run.run_suite(situations, rec)

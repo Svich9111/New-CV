@@ -252,6 +252,7 @@ def test_request_contains_only_owner_data(situations: list[dict[str, Any]]) -> N
         "owner_memory",
         "owner_turns",
         "partner_message",
+        "knowledge",  # 2.6 (A3): фрагменты базы знаний (§6.1 п.4) — справочные, не личные
     }
     for s in by_check(situations, "privacy"):
         dumped = repr(run.build_request(s))

@@ -539,6 +539,8 @@ def test_owner_call_gets_only_owner_data() -> None:
             "approved_partner_message": (
                 {"direction": pm["direction"], "text": pm["original"]} if pm else None
             ),
+            # 2.6 (A3): фрагменты базы знаний — только у ситуаций, где они есть (§6.1 п.4).
+            **({"knowledge": s["knowledge"]} if s.get("knowledge") else {}),
         }, s["id"]
         dumped = json.dumps(body, ensure_ascii=False)
         for secret in s.get("partner_private_context", []):

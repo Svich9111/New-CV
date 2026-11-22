@@ -32,6 +32,7 @@ def role_of(schema: Mapping[str, Any]) -> str:
         ("memory_merge", "same"),
         ("profile_summary", "profile"),
         ("summary_forget", "rewritten"),
+        ("kb_tag", "tags"),
     ):
         if key in props:
             return role

@@ -184,6 +184,8 @@ def owner_payload(request: Any, turns: Sequence[str] | None = None) -> dict[str,
         "approved_partner_message": (
             {"direction": pm.direction, "text": pm.original} if pm is not None else None
         ),
+        # Фрагменты базы знаний (2.6) — только если есть в ситуации: вход прежних не меняется.
+        **({"knowledge": list(request.knowledge)} if getattr(request, "knowledge", ()) else {}),
     }
 
 

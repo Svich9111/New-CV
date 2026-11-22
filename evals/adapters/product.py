@@ -114,6 +114,7 @@ def _context(request: Any) -> OwnerContext:
         partner_name=request.partner_name,
         relationship=request.relationship,
         memory=tuple(request.owner_memory),
+        knowledge=tuple(getattr(request, "knowledge", ())),
         pair_messages=(PairMessage(pm.direction, pm.original),) if pm is not None else (),
     )
 

@@ -13,10 +13,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ai.embeddings import to_pgvector
-from app.db import user_scope
+from app.db import sqlstate, user_scope
 
 
 @dataclass(frozen=True)
@@ -42,32 +43,39 @@ async def kb_nearest(
     level: int | None = None,
 ) -> list[KbChunk]:
     """Ближайшие фрагменты (лучшие — первыми). Неверный уровень или вектор — 22023 из БД."""
-    async with user_scope(sm, user_id) as s:
-        rows = await s.execute(
-            text(
-                "SELECT id, document_id, text, approach, topic_tags, problem_level, distance "
-                "FROM app_kb_nearest(:q, :m, :n, :ap, CAST(:tp AS text[]), :lv)"
-            ),
-            {
-                "q": to_pgvector(vector),
-                "m": model,
-                "n": limit,
-                "ap": approach,
-                "tp": list(topics) if topics else None,
-                "lv": level,
-            },
+    try:
+        async with user_scope(sm, user_id) as s:
+            rows = (
+                await s.execute(
+                    text(
+                        "SELECT id, document_id, text, approach, topic_tags, problem_level, "
+                        "distance FROM app_kb_nearest(:q, :m, :n, :ap, CAST(:tp AS text[]), :lv)"
+                    ),
+                    {
+                        "q": to_pgvector(vector),
+                        "m": model,
+                        "n": limit,
+                        "ap": approach,
+                        "tp": list(topics) if topics else None,
+                        "lv": level,
+                    },
+                )
+            ).all()
+    except DBAPIError as exc:
+        if sqlstate(exc) == "22023":  # вектор/модель/уровень не подошли — без базы знаний
+            return []
+        raise
+    return [
+        KbChunk(
+            id=r.id if isinstance(r.id, uuid.UUID) else uuid.UUID(str(r.id)),
+            document_id=r.document_id
+            if isinstance(r.document_id, uuid.UUID)
+            else uuid.UUID(str(r.document_id)),
+            text=r.text,
+            approach=r.approach,
+            topic_tags=tuple(r.topic_tags or ()),
+            problem_level=r.problem_level,
+            distance=float(r.distance),
         )
-        return [
-            KbChunk(
-                id=r.id if isinstance(r.id, uuid.UUID) else uuid.UUID(str(r.id)),
-                document_id=r.document_id
-                if isinstance(r.document_id, uuid.UUID)
-                else uuid.UUID(str(r.document_id)),
-                text=r.text,
-                approach=r.approach,
-                topic_tags=tuple(r.topic_tags or ()),
-                problem_level=r.problem_level,
-                distance=float(r.distance),
-            )
-            for r in rows
-        ]
+        for r in rows
+    ]

@@ -133,6 +133,8 @@ class EvalRequest:
     owner_memory: tuple[str, ...]
     owner_turns: tuple[str, ...]
     partner_message: PartnerMessageInput | None
+    # Фрагменты базы знаний в контексте агента (§6.1 п.4); не цитировать (§6.4, Б-67).
+    knowledge: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -508,6 +510,7 @@ def build_request(situation: dict[str, Any]) -> EvalRequest:
         owner_memory=tuple(situation.get("owner_memory", [])),
         owner_turns=tuple(situation["owner_turns"]),
         partner_message=PartnerMessageInput(pm["direction"], pm["original"]) if pm else None,
+        knowledge=tuple(situation.get("knowledge", [])),
     )
 
 
@@ -614,6 +617,27 @@ def _found(
     return found
 
 
+QUOTE_WORDS = 10  # как app.ai.quotes: 10 слов подряд из фрагмента — цитата
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"\w+", norm(text))
+
+
+def _quotes(texts: Sequence[str | None], fragments: Sequence[str]) -> str | None:
+    """Первая цитата фрагмента базы знаний (``QUOTE_WORDS`` слов подряд) в текстах или ``None``."""
+    grams = set()
+    for frag in fragments:
+        w = _words(frag)
+        grams |= {tuple(w[i : i + QUOTE_WORDS]) for i in range(len(w) - QUOTE_WORDS + 1)}
+    for t in texts:
+        w = _words(t or "")
+        for i in range(len(w) - QUOTE_WORDS + 1):
+            if tuple(w[i : i + QUOTE_WORDS]) in grams:
+                return " ".join(w[i : i + QUOTE_WORDS])
+    return None
+
+
 def _alternatives(item: str) -> list[str]:
     """Элемент смысла с вариантами через «|»: «сплю|сон» — подходит любой (ревью 0.3 MINOR-3)."""
     return [norm(a) for a in item.split("|") if a.strip()]
@@ -703,6 +727,10 @@ def score(
     if exp.get("draft_must_not_contain"):
         leaked = _found(texts_partner, exp["draft_must_not_contain"])
         checks.append(Check("draft_must_not_contain", not leaked, f"найдено: {', '.join(leaked)}"))
+
+    if situation.get("knowledge"):
+        quoted = _quotes((resp.reply, draft), situation["knowledge"])
+        checks.append(Check("no_quote", not quoted, f"цитата из базы знаний: {quoted}"))
 
     pm = situation.get("partner_message")
     if pm:

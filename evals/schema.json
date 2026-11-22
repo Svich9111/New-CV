@@ -70,7 +70,7 @@
       }
     },
     "checks": {
-      "description": "Что проверяет ситуация. level — уровень и стратегия; meaning — сохранение смысла при адаптации (§2 п.3, §6.2 п.5–6); translator_not_advocate — §2 п.1; privacy — §9.2 п.2; injection — §9.2 п.3; crisis — §9.3; key_scenario — ТЗ §1; mark_and_original — пометка «адаптировано» и оригинал по запросу.",
+      "description": "Что проверяет ситуация. level — уровень и стратегия; meaning — сохранение смысла при адаптации (§2 п.3, §6.2 п.5–6); translator_not_advocate — §2 п.1; privacy — §9.2 п.2; injection — §9.2 п.3; crisis — §9.3; key_scenario — ТЗ §1; mark_and_original — пометка «адаптировано» и оригинал по запросу. no_quote — фрагменты базы знаний из контекста не цитируются (§6.4, Б-67).",
       "type": "array",
       "minItems": 1,
       "uniqueItems": true,
@@ -83,7 +83,8 @@
           "injection",
           "crisis",
           "key_scenario",
-          "mark_and_original"
+          "mark_and_original",
+          "no_quote"
         ]
       }
     },
@@ -121,6 +122,14 @@
       "items": {
         "type": "string",
         "minLength": 3
+      }
+    },
+    "knowledge": {
+      "description": "Фрагменты базы знаний, которые сервер передаёт агенту в контексте (§6.1 п.4). Выдуманные тексты; агент не должен их цитировать (§6.4, Б-67).",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 20
       }
     },
     "partner_private_context": {

@@ -19,6 +19,11 @@ from app.repositories import knowledge as kb_repo
 
 # §6.4: «агент получает 3–5 наиболее подходящих фрагментов».
 KNOWLEDGE_LIMIT = 5
+KNOWLEDGE_MIN = 3
+# Дальше этого косинусного расстояния фрагмент «не по теме» и в контекст не идёт. Значение
+# подобрано на заглушке эмбеддингов (HashingEmbedder): у текстов на другую тему расстояние
+# 0.9–1.0; для настоящей модели — настроить после её выбора (Б-66).
+KB_MAX_DISTANCE = 0.85
 
 
 @dataclass(frozen=True)
@@ -59,7 +64,8 @@ class DbKnowledgeBase:
     """База знаний в БД (``app_kb_nearest``). ``model`` — модель эмбеддинга, которой посчитан
     вектор запроса (``Embedder.model``): находятся только фрагменты с векторами той же модели.
     Без вектора — пусто (поиска по словам нет). Фильтры по меткам — подход, темы, уровень
-    проблемы §6.4 (``None`` — без фильтра)."""
+    проблемы §6.4 (``None`` — без фильтра; уровень — из прошлого ответа агента, если он известен
+    API). ``max_distance`` — порог «по теме» (``None`` — без порога)."""
 
     def __init__(
         self,
@@ -70,8 +76,10 @@ class DbKnowledgeBase:
         approach: str | None = None,
         topics: Sequence[str] | None = None,
         level: int | None = None,
+        max_distance: float | None = KB_MAX_DISTANCE,
     ) -> None:
         self._sm = sm
+        self._max_distance = max_distance
         self._user_id = user_id
         self._model = model
         self._approach = approach
@@ -85,16 +93,28 @@ class DbKnowledgeBase:
         vector: Sequence[float] | None,
         limit: int = KNOWLEDGE_LIMIT,
     ) -> list[KnowledgeFragment]:
+        """До ``limit`` (3–5, §6.4) ближайших фрагментов не дальше ``max_distance``. С уровнем
+        проблемы (если известен) — сначала фрагменты этого уровня; если их меньше
+        ``KNOWLEDGE_MIN``, недобор — без фильтра уровня (фрагменты без уровня — общие)."""
         if vector is None or limit <= 0:
             return []
-        chunks = await kb_repo.kb_nearest(
-            self._sm,
-            self._user_id,
-            vector,
-            self._model,
-            limit=limit,
-            approach=self._approach,
-            topics=self._topics,
-            level=self._level,
-        )
-        return [KnowledgeFragment(str(c.id), c.text, 1.0 - c.distance) for c in chunks]
+
+        async def nearest(level: int | None) -> list[kb_repo.KbChunk]:
+            return await kb_repo.kb_nearest(
+                self._sm,
+                self._user_id,
+                vector,
+                self._model,
+                limit=limit,
+                approach=self._approach,
+                topics=self._topics,
+                level=level,
+            )
+
+        found = await nearest(self._level)
+        if self._level is not None and len(found) < KNOWLEDGE_MIN:
+            seen = {c.id for c in found}
+            found += [c for c in await nearest(None) if c.id not in seen]
+        if self._max_distance is not None:
+            found = [c for c in found if c.distance <= self._max_distance]
+        return [KnowledgeFragment(str(c.id), c.text, 1.0 - c.distance) for c in found[:limit]]

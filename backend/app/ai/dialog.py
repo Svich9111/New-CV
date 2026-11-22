@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from app.ai import crisis
@@ -43,6 +43,7 @@ from app.ai.calls import (
 from app.ai.llm import LLMError, LLMRefusal
 from app.ai.models import AgentModels
 from app.ai.prompts import V0, PromptSet, system_prompt
+from app.ai.quotes import QuoteIndex, without_quotes
 
 Author = Literal["owner", "agent"]
 Direction = Literal["outgoing", "incoming"]
@@ -403,6 +404,9 @@ async def reply(
         answer = _AgentAnswer(level=5, reply="", draft_ready=False, crisis_type=None)
     else:
         answer = answer_or_exc
+        # §6.4, Б-67: текст базы знаний из контекста не цитируется — проверка в коде.
+        guarded, _ = without_quotes(answer.reply, QuoteIndex(context.knowledge))
+        answer = replace(answer, reply=guarded)
 
     agent_types = (
         (answer.crisis_type, *answer.crisis_secondary) if answer.crisis_type is not None else ()

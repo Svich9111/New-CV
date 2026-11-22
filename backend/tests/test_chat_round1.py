@@ -701,18 +701,22 @@ async def test_db_knowledge_base_in_context(sessionmaker: SM, engine: AsyncEngin
         await _kb_chunk(conn, draft_doc, to_pgvector(near), emb.model, ["деньги"], 2)
     p = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
     await owner_says(sessionmaker, p, "опять ссора из-за денег")
-    kb = DbKnowledgeBase(sessionmaker, p.user_id, emb.model, approach=approach)
+    # 2.6 (A3): порог «по теме» (max_distance) здесь отключён — проверяются фильтры функции.
+    kb = DbKnowledgeBase(sessionmaker, p.user_id, emb.model, approach=approach, max_distance=None)
     built = await build_context(
         sessionmaker, KEYS, p.user_id, p.conv, query="ссора из-за денег", embedder=emb, knowledge=kb
     )
     assert built.stats.knowledge_ids == (str(c_near), str(c_far))
     assert built.payload()["knowledge"] == [f"фрагмент {c_near}", f"фрагмент {c_far}"]
     filtered = DbKnowledgeBase(
-        sessionmaker, p.user_id, emb.model, approach=approach, topics=["отдых"]
+        sessionmaker, p.user_id, emb.model, approach=approach, topics=["отдых"], max_distance=None
     )
     assert [f.id for f in await filtered.search("x", vector=near)] == [str(c_far)]
-    by_level = DbKnowledgeBase(sessionmaker, p.user_id, emb.model, approach=approach, level=2)
-    assert [f.id for f in await by_level.search("x", vector=far)] == [str(c_near)]
+    by_level = DbKnowledgeBase(
+        sessionmaker, p.user_id, emb.model, approach=approach, level=2, max_distance=None
+    )
+    # 2.6 (A3): сначала фрагменты уровня, недобор до 3 — без фильтра уровня.
+    assert [f.id for f in await by_level.search("x", vector=far)] == [str(c_near), str(c_far)]
     assert await kb.search("x", vector=None) == []
     # Без эмбеддера в сборке — пусто (поиска по словам нет), сборка не падает.
     plain = await build_context(sessionmaker, KEYS, p.user_id, p.conv, query="x", knowledge=kb)

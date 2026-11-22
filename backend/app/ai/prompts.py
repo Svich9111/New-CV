@@ -24,7 +24,14 @@ ROLES = ("dialog", "draft", "safety", "tone", "adapt", "meaning", "crisis")
 # задаётся в своём модуле. ``summary`` — сжатие истории чата (задача 2.1, ``app/ai/summary.py``);
 # ``memory_extract``, ``memory_merge``, ``profile_summary`` — долговременная память (2.4,
 # ``app/ai/memory.py``).
-AUX_ROLES = ("summary", "memory_extract", "memory_merge", "profile_summary", "summary_forget")
+AUX_ROLES = (
+    "summary",
+    "memory_extract",
+    "memory_merge",
+    "profile_summary",
+    "summary_forget",
+    "kb_tag",
+)
 _VERSION = re.compile(r"^v[0-9]+$")
 
 

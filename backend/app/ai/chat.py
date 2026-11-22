@@ -61,6 +61,7 @@ from app.ai.llm import ChatMessage, LLMBadOutput, LLMError
 from app.ai.llm.errors import USER_MESSAGE_UNAVAILABLE
 from app.ai.models import AgentModels
 from app.ai.prompts import V0, PromptSet, system_prompt
+from app.ai.quotes import QuoteGuard, QuoteIndex
 
 if TYPE_CHECKING:
     from app.ai.context import BuiltContext
@@ -89,6 +90,8 @@ class Done:
     calls: tuple[CallRecord, ...]
     prompts: tuple[str, ...]
     safety_error: str | None = None
+    # Ответ содержал цитату базы знаний (§6.4, Б-67): начиная с неё заменён ``quotes.SAFE_TAIL``.
+    quote_blocked: bool = False
     kind: Literal["done"] = "done"
 
 
@@ -453,6 +456,8 @@ async def stream_reply(
     agent_task = asyncio.create_task(pump())
     get_task: asyncio.Task[tuple[str, Any]] | None = None
     parser = ReplyStream()
+    # §6.4: текст книг не цитируется — придержка и проверка кусков (Б-67, ``app.ai.quotes``).
+    guard = QuoteGuard(QuoteIndex(context.knowledge))
     pending: list[str] = []
     streamed: list[str] = []
     gate_open = safety is not None
@@ -515,6 +520,7 @@ async def stream_reply(
                     agent_exc = exc
                     await _cancel(agent_task)
                     break
+                piece = guard.feed(piece) if piece else ""
                 if piece:
                     pending.append(piece)
             elif item_kind == "end":
@@ -531,6 +537,10 @@ async def stream_reply(
                 answer = parser.answer()
             except LLMBadOutput as exc:
                 agent_exc = exc
+            else:
+                tail = guard.finish()
+                if tail:
+                    pending.append(tail)
         # Придержка — не дольше ``gate_timeout_s`` и тогда, когда агент дописал раньше вердикта
         # (A8-1): по её истечении проверенный ответ уходит, а вердикт ждётся до ``Done``.
         if safety_task is not None and agent_exc is None and pending and not gate_open:
@@ -584,7 +594,7 @@ async def stream_reply(
         if answer.crisis_type is not None:
             yield _crisis_event(
                 (answer.crisis_type, *answer.crisis_secondary),
-                agent_reply=answer.reply,
+                agent_reply=guard.shown.strip() if guard.blocked else answer.reply,
                 primary=answer.crisis_type,
                 streamed="".join(streamed),
                 prompt_set=prompt_set,
@@ -595,7 +605,8 @@ async def stream_reply(
             return
         level = min(answer.level, 4)  # уровень 5 без строки протокола — не кризис
         yield Done(
-            reply=answer.reply,
+            reply=guard.shown.strip() if guard.blocked else answer.reply,
+            quote_blocked=guard.blocked,
             level=level,
             strategy=STRATEGIES[level],
             suggest_draft=answer.draft_ready,
