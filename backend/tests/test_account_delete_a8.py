@@ -31,6 +31,9 @@ from app.core.crypto import Keyring, generate_key_entry, parse_keyring
 from app.db import user_scope
 from app.repositories import couples, texts, users
 from app.schemas import OnboardingRequest
+
+# 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
+from tests.conftest import TEST_FP
 from tests.test_couple_functions import _wait_lock_waiters
 
 SM = async_sessionmaker[AsyncSession]
@@ -143,7 +146,9 @@ async def _onboard(sm: SM, keys: Keyring, label: str, partner_name: str) -> Huma
     await texts.add_conversation_message(sm, keys, uid, conv, "agent", h.secrets_["agent_reply"])
     assert await texts.set_conversation_summary(sm, keys, uid, conv, h.secrets_["summary"])
     assert await texts.set_agent_profile_summary(sm, keys, uid, agent, h.secrets_["profile"])
-    await texts.add_memory_item(sm, keys, uid, agent, "fact", "owner_dialog", h.secrets_["memory"])
+    await texts.add_memory_item(
+        sm, keys, uid, agent, "fact", "owner_dialog", h.secrets_["memory"], fingerprints=TEST_FP
+    )
     return h
 
 

@@ -28,6 +28,17 @@ class Settings(BaseSettings):
     # «id:base64url(32 байта)» через запятую и id текущего; проверка — app.core.crypto.
     encryption_keys: SecretStr = SecretStr("")
     encryption_key_id: str = ""
+    # Ключ отпечатков записей памяти (задача 2.4, АР-36): base64url, не короче 32 байт; прежние
+    # ключи — через запятую (только для проверки удалённых). Проверка — app.core.fingerprint.
+    memory_fingerprint_key: SecretStr = SecretStr("")
+    memory_fingerprint_keys_old: SecretStr = SecretStr("")
+    # Воркер памяти (2.4): сессия завершена после паузы (Б-54, АР-36); аренда; сжатие (§6.3 п.3).
+    memory_session_gap_min: int = Field(default=30, ge=1, le=7 * 24 * 60)
+    memory_lease_min: int = Field(default=10, ge=1, le=24 * 60)
+    memory_compact_every_h: int = Field(default=168, ge=1)
+    memory_max_attempts: int = Field(default=5, ge=1)
+    # Роль входа фонового воркера: член feelings_worker и feelings_app (NOINHERIT, Б-69).
+    worker_database_url: str = ""
     session_ttl_s: int = 3600
     # Имя бота без «@» для ссылки-приглашения https://t.me/<бот>?startapp=<токен> (ФТ-03).
     # Не секрет; правила имени Telegram — 5–32 символа, латиница, цифры, «_».

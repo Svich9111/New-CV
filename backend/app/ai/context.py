@@ -44,7 +44,7 @@ from app.ai.dialog import (
     Turn,
     ordered_payload,
 )
-from app.ai.embeddings import Embedder, EmbeddingError, check_dim, cosine
+from app.ai.embeddings import Embedder, EmbeddingError, check_dim, check_model, cosine
 from app.ai.knowledge import KnowledgeBase, KnowledgeFragment
 from app.ai.prompts import V0, Prompt, PromptSet, system_prompt
 from app.core.crypto import Keyring
@@ -206,6 +206,7 @@ def fit(
 
 
 async def _embed_one(embedder: Embedder, query: str) -> list[float]:
+    check_model(embedder.model)  # до запроса: БД отклонила бы имя (22023, Б-64)
     [vector] = await embedder.embed([query])
     return check_dim(vector)
 
@@ -320,7 +321,7 @@ async def build_context(
         has_dialog_summary=bool(context.dialog_summary),
         dropped=dropped,
         unavailable=dict(rows.unavailable),
-        embedding_error=embedding_error,
+        embedding_error=embedding_error or rows.vector_rejected,
         over_budget=over,
     )
     return BuiltContext(

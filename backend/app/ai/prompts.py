@@ -21,8 +21,10 @@ DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parents[3] / "prompts"
 
 ROLES = ("dialog", "draft", "safety", "tone", "adapt", "meaning", "crisis")
 # Служебные роли вне ``PromptSet`` (не входят в эталонный набор диалога и конвейера): версия
-# задаётся в своём модуле. ``summary`` — сжатие истории чата (задача 2.1, ``app/ai/summary.py``).
-AUX_ROLES = ("summary",)
+# задаётся в своём модуле. ``summary`` — сжатие истории чата (задача 2.1, ``app/ai/summary.py``);
+# ``memory_extract``, ``memory_merge``, ``profile_summary`` — долговременная память (2.4,
+# ``app/ai/memory.py``).
+AUX_ROLES = ("summary", "memory_extract", "memory_merge", "profile_summary")
 _VERSION = re.compile(r"^v[0-9]+$")
 
 

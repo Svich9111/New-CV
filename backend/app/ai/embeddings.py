@@ -26,6 +26,7 @@ from typing import Protocol, runtime_checkable
 from app.models.base import EMBEDDING_DIM
 
 _WORD = re.compile(r"\w+", re.UNICODE)
+FLOAT4_MAX = 3.4028234663852886e38
 
 
 class EmbeddingError(Exception):
@@ -100,11 +101,24 @@ def check_dim(vector: Sequence[float], dim: int = EMBEDDING_DIM) -> list[float]:
     out = [float(v) for v in vector]
     if not all(math.isfinite(v) for v in out):
         raise EmbeddingError("в векторе не числа")
+    if any(abs(v) > FLOAT4_MAX for v in out):
+        # pgvector хранит float4: больше — 22023 в БД (Б-64, тест A8-V1); проверяем до запроса.
+        raise EmbeddingError("компонента вектора вне float4")
     if not any(out):
         # Нулевой вектор (реплика без слов) функция поиска отклоняет (22023, АР-35) — сразу
         # «по свежести», без ошибки в транзакции.
         raise EmbeddingError("нулевой вектор")
     return out
+
+
+MODEL_NAME_MAX = 128  # embedding_model varchar(128), проверка функций 0008
+
+
+def check_model(name: str) -> str:
+    """Имя модели, которое примет БД (непустое, до 128 символов) — иначе ``EmbeddingError``."""
+    if not isinstance(name, str) or not name.strip() or len(name) > MODEL_NAME_MAX:
+        raise EmbeddingError("имя модели эмбеддинга не подходит для БД")
+    return name
 
 
 def to_pgvector(vector: Sequence[float]) -> str:

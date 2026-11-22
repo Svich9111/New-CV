@@ -931,11 +931,6 @@ async def test_context_falls_back_to_recency(
     "emb_kind",
     ["float32_overflow", "long_model_name"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-V1 MINOR: вектор, который приложение пропускает, а БД отклоняет 22023 — сборка "
-    "контекста падает вместо отката на свежесть",
-)
 async def test_context_db_rejected_vector_falls_back(
     emb_kind: str, ctx_world: Any, sessionmaker: SM
 ) -> None:

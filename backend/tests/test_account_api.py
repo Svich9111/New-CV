@@ -28,6 +28,9 @@ from app.core.session import issue_token
 from app.db import sqlstate, user_scope
 from app.main import app
 from app.repositories import account, texts
+
+# 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
+from tests.conftest import TEST_FP
 from tests.contract import assert_matches
 from tests.test_account_export_db import _deliver, _withhold
 from tests.test_auth_api import SECRET, _init_data, _tg
@@ -126,7 +129,14 @@ async def _fill(sm: SM, engine: AsyncEngine, keys: Keyring, user: U) -> None:
     )
     await texts.set_agent_profile_summary(sm, keys, user.id, user.agent_id, _mark(user, "profile"))
     await texts.add_memory_item(
-        sm, keys, user.id, user.agent_id, "fact", "owner_dialog", _mark(user, "memory")
+        sm,
+        keys,
+        user.id,
+        user.agent_id,
+        "fact",
+        "owner_dialog",
+        _mark(user, "memory"),
+        fingerprints=TEST_FP,
     )
     await texts.create_draft(sm, keys, user.id, user.agent_id, _mark(user, "draft"))
 

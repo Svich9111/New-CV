@@ -48,6 +48,9 @@ from app.db import user_scope
 from app.main import app
 from app.repositories import account as account_repo
 from app.repositories import texts
+
+# 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
+from tests.conftest import TEST_FP
 from tests.contract import SPEC, assert_matches
 
 SM = async_sessionmaker[AsyncSession]
@@ -199,11 +202,18 @@ async def _person(
     await texts.set_conversation_summary(sm, keys, p.uid, p.conv, p.mark("conv-summary"))
     await texts.set_agent_profile_summary(sm, keys, p.uid, p.agent, p.mark("profile-summary"))
     mem = await texts.add_memory_item(
-        sm, keys, p.uid, p.agent, "fact", "owner_dialog", p.mark("mem")
+        sm, keys, p.uid, p.agent, "fact", "owner_dialog", p.mark("mem"), fingerprints=TEST_FP
     )
     p.ids.add(str(mem))
     gone = await texts.add_memory_item(
-        sm, keys, p.uid, p.agent, "preference", "owner_dialog", p.mark("mem-deleted")
+        sm,
+        keys,
+        p.uid,
+        p.agent,
+        "preference",
+        "owner_dialog",
+        p.mark("mem-deleted"),
+        fingerprints=TEST_FP,
     )
     # Удалённая запись (ФТ-13): текста нет, отпечаток остаётся — в выгрузку не входит.
     await _su(
@@ -650,7 +660,14 @@ async def test_corrupted_rows_of_every_kind_are_unavailable_and_logs_are_clean(
         sessionmaker, keys, a.uid, a.conv, "owner", a.mark("chat-good")
     )
     good_mem = await texts.add_memory_item(
-        sessionmaker, keys, a.uid, a.agent, "fact", "owner_dialog", a.mark("mem-good")
+        sessionmaker,
+        keys,
+        a.uid,
+        a.agent,
+        "fact",
+        "owner_dialog",
+        a.mark("mem-good"),
+        fingerprints=TEST_FP,
     )
     sent_bad = await _send(sessionmaker, engine, keys, a, b, "plain")
     sent_good = await _send(sessionmaker, engine, keys, a, b, "plain")

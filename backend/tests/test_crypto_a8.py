@@ -24,6 +24,9 @@ from app.config import ConfigError, get_settings
 from app.core import crypto
 from app.core.crypto import DecryptionError, KeyConfigError, Keyring, parse_keyring
 from app.repositories import texts
+
+# 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
+from tests.conftest import TEST_FP
 from tests.test_rls_isolation import World
 
 SM = async_sessionmaker[AsyncSession]
@@ -510,7 +513,9 @@ async def test_outsider_and_partner_do_not_read_foreign_texts(
     await texts.add_conversation_message(
         sm, ring, a.user_id, a.conversation_id, "owner", "исповедь"
     )
-    await texts.add_memory_item(sm, ring, a.user_id, a.agent_id, "fact", "owner_dialog", "память")
+    await texts.add_memory_item(
+        sm, ring, a.user_id, a.agent_id, "fact", "owner_dialog", "память", fingerprints=TEST_FP
+    )
     assert await texts.set_conversation_summary(sm, ring, a.user_id, a.conversation_id, "резюме")
     assert await texts.set_agent_profile_summary(sm, ring, a.user_id, a.agent_id, "профиль")
     open_draft = await texts.create_draft(sm, ring, a.user_id, a.agent_id, "ещё не отправлено")
@@ -518,7 +523,9 @@ async def test_outsider_and_partner_do_not_read_foreign_texts(
     for other in (w.b, w.c):
         # У каждого есть свои записи: чтение по чужому id не должно подмешать и их.
         u = other.user_id
-        await texts.add_memory_item(sm, ring, u, other.agent_id, "fact", "owner_dialog", "своё")
+        await texts.add_memory_item(
+            sm, ring, u, other.agent_id, "fact", "owner_dialog", "своё", fingerprints=TEST_FP
+        )
         await texts.add_conversation_message(sm, ring, u, other.conversation_id, "owner", "своё")
         assert await texts.list_conversation_messages(sm, ring, u, a.conversation_id) == []
         assert await texts.list_memory_items(sm, ring, u, a.agent_id) == []
@@ -529,7 +536,9 @@ async def test_outsider_and_partner_do_not_read_foreign_texts(
         assert not await texts.set_conversation_summary(sm, ring, u, a.conversation_id, "x")
         assert not await texts.set_agent_profile_summary(sm, ring, u, a.agent_id, "x")
         with pytest.raises(DBAPIError):
-            await texts.add_memory_item(sm, ring, u, a.agent_id, "fact", "owner_dialog", "x")
+            await texts.add_memory_item(
+                sm, ring, u, a.agent_id, "fact", "owner_dialog", "x", fingerprints=TEST_FP
+            )
         with pytest.raises(DBAPIError):
             await texts.add_conversation_message(sm, ring, u, a.conversation_id, "agent", "x")
         with pytest.raises(DBAPIError):
@@ -565,7 +574,14 @@ async def test_row_failures_do_not_break_neighbours_or_leak_to_log(
     ]
     mem = [
         await texts.add_memory_item(
-            sm, ring, a.user_id, a.agent_id, "fact", "owner_dialog", f"память{i} {tag}"
+            sm,
+            ring,
+            a.user_id,
+            a.agent_id,
+            "fact",
+            "owner_dialog",
+            f"память{i} {tag}",
+            fingerprints=TEST_FP,
         )
         for i in range(3)
     ]
@@ -777,7 +793,14 @@ async def test_no_plaintext_anywhere_after_all_seven_texts(
     assert await texts.set_conversation_summary(sm, ring, a.user_id, a.conversation_id, t["csum"])
     assert await texts.set_agent_profile_summary(sm, ring, a.user_id, a.agent_id, t["prof"])
     mem = await texts.add_memory_item(
-        sm, ring, a.user_id, a.agent_id, "sensitive_topic", "owner_dialog", t["mem"]
+        sm,
+        ring,
+        a.user_id,
+        a.agent_id,
+        "sensitive_topic",
+        "owner_dialog",
+        t["mem"],
+        fingerprints=TEST_FP,
     )
     unsent = await texts.create_draft(sm, ring, a.user_id, a.agent_id, t["draft"])
     d2 = await texts.create_draft(sm, ring, a.user_id, a.agent_id, "черновик-v1")

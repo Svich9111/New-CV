@@ -35,6 +35,9 @@ from app.core.crypto import Keyring, generate_key_entry, parse_keyring
 from app.db import user_scope
 from app.repositories import chat, couples, texts
 from app.repositories.chat import HistorySummary, OwnerGone
+
+# 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
+from tests.conftest import TEST_FP
 from tests.test_account_delete import _couple, _send_encrypted
 from tests.test_account_export_db import _deliver, _withhold
 from tests.test_couple_functions import ONBOARDED, SM
@@ -76,7 +79,9 @@ async def person(
     p = P(uid, aid, conv, label, [])
     assert await texts.set_agent_profile_summary(sm, KEYS, uid, aid, p.mark("profile"))
     for what in ("memory-money деньги отпуск", "memory-date годовщина"):
-        item = await texts.add_memory_item(sm, KEYS, uid, aid, "fact", "owner_dialog", p.mark(what))
+        item = await texts.add_memory_item(
+            sm, KEYS, uid, aid, "fact", "owner_dialog", p.mark(what), fingerprints=TEST_FP
+        )
         [vec] = await EMB.embed([p.mark(what)])
         # 2.0v (A3): вектор — функцией БД от имени владельца, с моделью (АР-35).
         assert await chat.set_memory_embedding(sm, uid, item, vec, EMB.model)
@@ -143,7 +148,7 @@ async def world(engine: AsyncEngine, sm: SM) -> World:
     # Удалённая запись памяти Анны (ФТ-13: метка удаления, текст и вектор стёрты).
     deleted = anna.mark("memory-deleted деньги отпуск")
     item = await texts.add_memory_item(
-        sm, KEYS, anna.user_id, anna.agent_id, "fact", "owner_dialog", deleted
+        sm, KEYS, anna.user_id, anna.agent_id, "fact", "owner_dialog", deleted, fingerprints=TEST_FP
     )
     async with engine.begin() as conn:
         await conn.execute(
@@ -356,6 +361,7 @@ async def test_memory_by_meaning_else_by_recency(sessionmaker: SM, engine: Async
         "preference",
         "owner_dialog",
         "Любит гулять в парке",
+        fingerprints=TEST_FP,
     )  # без вектора
     query = "опять деньги и отпуск"
     await owner_says(sessionmaker, p, query)
@@ -402,6 +408,7 @@ async def test_budget_truncation_order_keeps_system_and_last_turn(
             "fact",
             "owner_dialog",
             f"запись {i} " + "м" * 600,
+            fingerprints=TEST_FP,
         )
     for i in range(10):
         await chat.add_message(
@@ -460,7 +467,14 @@ async def test_budget_truncation_order_keeps_system_and_last_turn(
 async def test_budget_caps_single_items(sessionmaker: SM, engine: AsyncEngine) -> None:
     p = await person(engine, sessionmaker, "Вера", "Олег")
     await texts.add_memory_item(
-        sessionmaker, KEYS, p.user_id, p.agent_id, "fact", "owner_dialog", "д" * 5000
+        sessionmaker,
+        KEYS,
+        p.user_id,
+        p.agent_id,
+        "fact",
+        "owner_dialog",
+        "д" * 5000,
+        fingerprints=TEST_FP,
     )
     await owner_says(sessionmaker, p, "о" * 5000)
     built = await build_context(

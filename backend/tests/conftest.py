@@ -3,6 +3,7 @@
 Схема создаётся настоящей миграцией Alembic (а не create_all), чтобы тесты проверяли то,
 что будет развёрнуто. Данные — только выдуманные (CLAUDE.md)."""
 
+import base64
 import os
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.core.fingerprint import FingerprintKeys
 from app.db import make_engine, make_sessionmaker
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -76,6 +78,9 @@ def sessionmaker(app_engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
 # Выдуманный тестовый набор ключей шифрования (задача 4.2): без него сервис не стартует, поэтому
 # тесты запуска (lifespan) получают его из окружения. Тесты отказа старта убирают его сами.
 TEST_ENCRYPTION_KEYS = "t1:" + "A" * 43
+# Выдуманный ключ отпечатков памяти (задача 2.4, АР-36): base64url 32 байт.
+TEST_FINGERPRINT_KEY = "Zg" + "B" * 41
+TEST_FP = FingerprintKeys(base64.urlsafe_b64decode(TEST_FINGERPRINT_KEY + "="))
 
 
 @pytest.fixture(autouse=True)
@@ -84,6 +89,7 @@ def _encryption_keys_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FEELINGS_ENV", "test")
     monkeypatch.setenv("FEELINGS_ENCRYPTION_KEYS", TEST_ENCRYPTION_KEYS)
     monkeypatch.setenv("FEELINGS_ENCRYPTION_KEY_ID", "t1")
+    monkeypatch.setenv("FEELINGS_MEMORY_FINGERPRINT_KEY", TEST_FINGERPRINT_KEY)
 
 
 # Фикстура world (пара Анна и Игорь, посторонняя Ольга) доступна всем модулям тестов.

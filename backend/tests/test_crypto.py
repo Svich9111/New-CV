@@ -17,6 +17,9 @@ from app.config import ConfigError, Settings, get_settings
 from app.core import crypto
 from app.core.crypto import DecryptionError, Field, KeyConfigError, Keyring, parse_keyring
 from app.repositories import texts
+
+# 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
+from tests.conftest import TEST_FP
 from tests.test_rls_isolation import World
 
 ROW = uuid.UUID("00000000-0000-4000-8000-000000000001")
@@ -402,7 +405,7 @@ async def _write_everything(
     assert await texts.set_conversation_summary(sm, kr, a.user_id, a.conversation_id, t["summary"])
     assert await texts.set_agent_profile_summary(sm, kr, a.user_id, a.agent_id, t["profile"])
     mem_id = await texts.add_memory_item(
-        sm, kr, a.user_id, a.agent_id, "fact", "owner_dialog", t["memory"]
+        sm, kr, a.user_id, a.agent_id, "fact", "owner_dialog", t["memory"], fingerprints=TEST_FP
     )
     draft = await texts.create_draft(sm, kr, a.user_id, a.agent_id, t["draft"])
     assert await texts.update_draft_text(sm, kr, a.user_id, draft, t["edited"]) == 2
@@ -508,7 +511,14 @@ async def test_access_layer_respects_owner(
         )
     with pytest.raises(DBAPIError, match="row-level security"):
         await texts.add_memory_item(
-            sessionmaker, keys, c.user_id, a.agent_id, "fact", "owner_dialog", "x"
+            sessionmaker,
+            keys,
+            c.user_id,
+            a.agent_id,
+            "fact",
+            "owner_dialog",
+            "x",
+            fingerprints=TEST_FP,
         )
     with pytest.raises(DBAPIError, match="row-level security"):
         await texts.create_draft(sessionmaker, keys, c.user_id, a.agent_id, "x")
@@ -538,10 +548,24 @@ async def test_swapped_ciphertext_between_rows_is_rejected(
     """Поддельные данные: шифротекст, переставленный в другую строку, не расшифровывается."""
     a = encrypted_world.a
     first = await texts.add_memory_item(
-        sessionmaker, keys, a.user_id, a.agent_id, "fact", "owner_dialog", "первое"
+        sessionmaker,
+        keys,
+        a.user_id,
+        a.agent_id,
+        "fact",
+        "owner_dialog",
+        "первое",
+        fingerprints=TEST_FP,
     )
     second = await texts.add_memory_item(
-        sessionmaker, keys, a.user_id, a.agent_id, "fact", "owner_dialog", "второе"
+        sessionmaker,
+        keys,
+        a.user_id,
+        a.agent_id,
+        "fact",
+        "owner_dialog",
+        "второе",
+        fingerprints=TEST_FP,
     )
     async with engine.begin() as conn:
         await conn.execute(

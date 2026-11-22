@@ -28,6 +28,9 @@ def role_of(schema: Mapping[str, Any]) -> str:
         ("adapt", "adapted"),
         ("meaning", "problems"),
         ("summary", "summary"),
+        ("memory_extract", "items"),
+        ("memory_merge", "same"),
+        ("profile_summary", "profile"),
     ):
         if key in props:
             return role

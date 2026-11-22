@@ -25,12 +25,13 @@ from datetime import datetime
 from typing import Literal
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ai.embeddings import to_pgvector
 from app.core import crypto
 from app.core.crypto import Keyring
-from app.db import user_scope
+from app.db import sqlstate, user_scope
 from app.repositories.texts import Author, ConversationText, open_row
 
 # Статусы сообщения пары, которые владелец видел как доставленные (ТЗ §6.2 п.7, АР-25 п.1).
@@ -132,6 +133,8 @@ class ContextRows:
     memory: list[MemoryRow]  # лучшие — первыми
     pair: list[PairRow]  # новые — первыми
     unavailable: dict[str, int] = field(default_factory=dict)  # блок → сколько не расшифровано
+    # БД отклонила вектор или модель запроса (22023): память — по свежести (Б-64).
+    vector_rejected: bool = False
 
 
 def _uuid(value: object) -> uuid.UUID:
@@ -297,6 +300,7 @@ async def _memory(
     query_vector: Sequence[float] | None,
     limit: int,
     model: str | None = None,
+    rejected: list[bool] | None = None,
 ) -> tuple[list[MemoryRow], int]:
     """По смыслу — функцией БД ``app_memory_nearest`` (миграция 0008, АР-35; индекс HNSW): только
     своя память (``app_uid()``), не удалённые записи с текстом и с вектором модели ``model``
@@ -310,11 +314,26 @@ async def _memory(
     )
     found: list[tuple[uuid.UUID, str, bytes, Literal["vector", "recency"]]] = []
     if query_vector is not None and model and limit > 0:
-        rows = await s.execute(
-            text("SELECT id, type::text AS type, text_enc FROM app_memory_nearest(:q, :m, :n)"),
-            {"q": to_pgvector(query_vector), "m": model, "n": limit},
-        )
-        found += [(_uuid(r.id), r.type, r.text_enc, "vector") for r in rows][:limit]
+        # Точка сохранения (Б-64): отказ функции (22023 — вектор или модель не подошли) не
+        # обрывает транзакцию сборки — память берётся по свежести.
+        try:
+            async with s.begin_nested():
+                hits = (
+                    await s.execute(
+                        text(
+                            "SELECT id, type::text AS type, text_enc "
+                            "FROM app_memory_nearest(:q, :m, :n)"
+                        ),
+                        {"q": to_pgvector(query_vector), "m": model, "n": limit},
+                    )
+                ).all()
+        except DBAPIError as exc:
+            if sqlstate(exc) != "22023":
+                raise
+            hits = []
+            if rejected is not None:
+                rejected.append(True)
+        found += [(_uuid(r.id), r.type, r.text_enc, "vector") for r in hits][:limit]
     rest = limit - len(found)
     if rest > 0:
         rows = await s.execute(
@@ -413,8 +432,9 @@ async def read_context(
         turns, turns_lost = await _turns_after(
             s, keys, user_id, conversation_id, summary, turns_limit
         )
+        rejected: list[bool] = []
         memory, memory_lost = await _memory(
-            s, keys, user_id, agent_id, query_vector, memory_limit, query_model
+            s, keys, user_id, agent_id, query_vector, memory_limit, query_model, rejected
         )
         pair, pair_lost = await _pair(s, keys, user_id, pair_limit)
     profile, profile_reason = (
@@ -442,6 +462,7 @@ async def read_context(
         memory=memory,
         pair=pair,
         unavailable=unavailable,
+        vector_rejected=bool(rejected),
     )
 
 

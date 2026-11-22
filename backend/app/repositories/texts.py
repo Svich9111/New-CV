@@ -17,7 +17,7 @@
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from sqlalchemy import text
@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core import crypto
 from app.core.crypto import Keyring
+from app.core.fingerprint import FingerprintKeys
 from app.db import user_scope
 
 Author = Literal["owner", "agent"]
@@ -224,13 +225,23 @@ async def add_memory_item(
     memory_type: str,
     source: str,
     body: str,
+    *,
+    fingerprints: FingerprintKeys,
+    event_date: date | None = None,
+    confidence: float = 1.0,
+    source_message_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
+    """Запись памяти своего агента: текст — шифротекстом, отпечаток (АР-36) — обязателен, чтобы
+    удаление всегда оставляло отпечаток (Б-68: CHECK ``text_enc IS NULL OR fingerprint IS NOT
+    NULL``). Вектор — отдельно, функцией ``app_set_memory_embedding`` (Б-63)."""
     row_id = uuid.uuid4()
     async with user_scope(sm, user_id) as s:
         await s.execute(
             text(
-                "INSERT INTO memory_items (id, agent_id, type, source, text_enc) VALUES "
-                "(:i, :a, CAST(:ty AS memory_type), CAST(:so AS memory_source), :t)"
+                "INSERT INTO memory_items (id, agent_id, type, source, text_enc, fingerprint, "
+                "event_date, confidence, source_message_id) VALUES "
+                "(:i, :a, CAST(:ty AS memory_type), CAST(:so AS memory_source), :t, :fp, :d, "
+                ":c, :sm)"
             ),
             {
                 "i": row_id,
@@ -238,6 +249,10 @@ async def add_memory_item(
                 "ty": memory_type,
                 "so": source,
                 "t": keys.seal(crypto.MEMORY_TEXT, row_id, body),
+                "fp": fingerprints.of(agent_id, body),
+                "d": event_date,
+                "c": confidence,
+                "sm": source_message_id,
             },
         )
     return row_id
