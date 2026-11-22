@@ -137,6 +137,11 @@ SERVED_STATUSES = {
     # АР-25) — 403 нет; 401 — вход по общей схеме bearer, 422 у GET — неверный `type`.
     ("get", "/memory"): {"200", "401", "422"},
     ("delete", "/memory/{memory_id}"): {"204", "401", "404"},
+    # 2.6 этап 2 (app/api/admin_kb.py, tests/test_admin_kb_api.py; АР-39): вход администратора —
+    # 401 (нет/неизвестный токен), 403 admin_only (сессия Mini App); 413 — и предел тела запроса.
+    ("get", "/admin/kb/documents"): {"200", "401", "403"},
+    ("post", "/admin/kb/documents"): {"202", "401", "403", "409", "413", "415", "422"},
+    ("delete", "/admin/kb/documents/{document_id}"): {"204", "401", "403", "404"},
 }
 
 

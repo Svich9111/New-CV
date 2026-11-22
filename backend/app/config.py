@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     # Модели OpenRouter по ролям (гипотеза АР-19); ключ — OPENROUTER_API_KEY (не FEELINGS_).
     llm_writer_model: str = "anthropic/claude-sonnet-5.5"
     llm_classifier_model: str = "anthropic/claude-haiku-5.5"
+    # Админ-API базы знаний (задача 2.6; АР-39). Только SHA-256 (hex) действующих токенов
+    # администратора, через запятую — для ротации; пусто — админ-API закрыт (всегда 401).
+    admin_token_sha256: str = ""
+    # Подключение администратора: роль входа — член feelings_admin (Б-75), не feelings_api.
+    admin_database_url: str = ""
+    # Предел тела запроса на уровне сервера (байты): тело больше не читается целиком в память.
+    # Загрузка материала базы знаний — свой предел (20 МиБ файла + поля формы, app.api.admin_kb).
+    max_request_body_bytes: int = Field(default=1_048_576, ge=1024)
 
 
 MIN_SESSION_SECRET_LEN = 32
@@ -119,6 +127,29 @@ def check_dev_bot_config(settings: Settings) -> None:
     (`check_bot_config`) не ослабляет."""
     _check_bot_token(settings)
     _check_webapp_url(settings)
+
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def admin_token_hashes(settings: Settings) -> tuple[bytes, ...]:
+    """SHA-256 действующих токенов администратора (байты). Неверная запись — ``ConfigError``
+    (значение в текст ошибки не попадает)."""
+    out: list[bytes] = []
+    for raw in settings.admin_token_sha256.split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if not _SHA256_HEX.fullmatch(item):
+            raise ConfigError("FEELINGS_ADMIN_TOKEN_SHA256 must be comma-separated SHA-256 hex")
+        out.append(bytes.fromhex(item))
+    return tuple(out)
+
+
+def check_admin_config(settings: Settings) -> None:
+    """Токены администратора заданы — нужно и подключение администратора (Б-75)."""
+    if admin_token_hashes(settings) and not settings.admin_database_url:
+        raise ConfigError("FEELINGS_ADMIN_DATABASE_URL is empty while admin tokens are set")
 
 
 @lru_cache
