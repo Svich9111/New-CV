@@ -322,7 +322,7 @@ async def test_app_still_cannot_read_original_directly(
     assert _sqlstate(ei.value) == "42501"
 
 
-HEAD = "0007"
+HEAD = "0008"  # последняя миграция (0008 — задача 2.0v); после новой — обновить
 
 
 async def _funcs_state(engine: AsyncEngine) -> tuple[object, ...]:

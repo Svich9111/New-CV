@@ -4,10 +4,12 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 from openapi_spec_validator import validate
 
+from app.help import help_contacts
 from app.main import app
 
 SPEC_PATH = Path(__file__).resolve().parents[2] / "api" / "openapi.yaml"
@@ -56,7 +58,12 @@ def test_only_auth_and_health_are_public() -> None:
         for m, op in ops.items()
         if isinstance(op, dict) and op.get("security") == []
     ]
-    assert sorted(public) == [("get", "/health"), ("post", "/auth/telegram")]
+    # /help/contacts — публичный (Б-58, задача 2.0v): помощь доступна и без сессии (ТЗ §9.3).
+    assert sorted(public) == [
+        ("get", "/health"),
+        ("get", "/help/contacts"),
+        ("post", "/auth/telegram"),
+    ]
 
 
 # Служебные маршруты вне контракта клиента Mini App: их вызывает не клиент, а внешняя система.
@@ -124,20 +131,34 @@ SERVED_STATUSES = {
     # 409 conflict_retry — только из транзакции сохранения реплики владельца (АР-24).
     ("post", "/chat/messages"): {"200", "401", "403", "409", "422", "429"},
     ("get", "/chat/messages"): {"200", "401", "403", "422"},
-    # АР-33 (app/api/help.py): без онбординга и подписки. 401 (вход по общей схеме bearer)
-    # отдаётся, но в контракте не объявлен — страж ниже, карточка A1.
+    # АР-33 (app/api/help.py): без онбординга и подписки; с 2.0v — и без сессии (`security: []`,
+    # Б-58), 401 не отдаётся (сервер пока отдаёт — xfail ниже для A2).
     ("get", "/help/contacts"): {"200"},
 }
 
 
+def test_help_contacts_is_public_in_contract() -> None:
+    """Б-58 (задача 2.0v): контакты помощи доступны без сессии — путь публичный, 401/403 не
+    объявлены (ТЗ §9.3 «всегда»; прежний страж `test_help_contacts_declares_401` снят)."""
+    op = _spec()["paths"]["/help/contacts"]["get"]
+    assert op["security"] == []
+    assert set(op["responses"]) == {"200"}
+
+
 @pytest.mark.xfail(
     strict=True,
-    reason="контракт: у GET /help/contacts не объявлен 401, хотя путь требует входа "
-    "(общая схема bearer) — карточка A1 из отчёта 2.1 этап 2",
+    reason="A2: сервер отдаёт 401 на GET /help/contacts без сессии (app/api/help.py требует "
+    "CurrentUser); по контракту 2.0v путь публичный — снять зависимость входа и этот xfail",
 )
-def test_help_contacts_declares_401() -> None:
-    declared = set(_spec()["paths"]["/help/contacts"]["get"]["responses"])
-    assert "401" in declared
+async def test_help_contacts_served_without_session() -> None:
+    """Сервер следует контракту: без заголовка и с негодным токеном — 200 и тот же список."""
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for headers in ({}, {"Authorization": "Bearer nope"}):
+            resp = await client.get("/api/v1/help/contacts", headers=headers)
+            assert resp.status_code == 200, (headers, resp.status_code)
+            assert resp.json() == help_contacts()
+            assert resp.headers["Cache-Control"] == "no-store"
 
 
 def test_account_endpoints_do_not_declare_onboarding_required() -> None:

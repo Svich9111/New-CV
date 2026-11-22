@@ -254,6 +254,17 @@ class MemoryItem(Base):
             "source <> 'partner_message' OR source_message_id IS NOT NULL",
             name="partner_source_has_message",
         ),
+        # 0008 (АР-35): имя модели без вектора не хранится; удаление обнуляет оба поля.
+        CheckConstraint(
+            "embedding_model IS NULL OR (embedding IS NOT NULL AND embedding_model <> '')",
+            name="model_has_vector",
+        ),
+        Index(
+            "ix_memory_items_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -270,6 +281,8 @@ class MemoryItem(Base):
     )
     confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default=sa_text("1.0"))
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
+    # АР-5, АР-35: модель, которой сделан вектор; поиск — только по векторам текущей модели.
+    embedding_model: Mapped[str | None] = mapped_column(String(128))
     fingerprint: Mapped[bytes | None] = mapped_column(LargeBinary(32))
     created_at: Mapped[datetime] = created_at()
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -373,6 +386,16 @@ class KbChunk(Base):
         CheckConstraint(
             "problem_level IS NULL OR problem_level BETWEEN 1 AND 5", name="level_range"
         ),
+        CheckConstraint(
+            "embedding_model IS NULL OR (embedding IS NOT NULL AND embedding_model <> '')",
+            name="model_has_vector",
+        ),
+        Index(
+            "ix_kb_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -385,6 +408,7 @@ class KbChunk(Base):
     )
     problem_level: Mapped[int | None] = mapped_column(SmallInteger)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
+    embedding_model: Mapped[str | None] = mapped_column(String(128))
 
 
 class SafetyEvent(Base):

@@ -899,11 +899,15 @@ APP_FUNCS = [
     "app_delete_account()",  # 0005, задача 4.5
     "app_export_partner_messages()",  # 0006, задача 4.5 этап 2
     "app_export_safety_events()",  # 0007, задача 4.5 этап 2
+    "app_memory_nearest(text, text, integer)",  # 0008, задача 2.0v
+    "app_set_memory_embedding(uuid, text, text)",  # 0008
+    "app_kb_nearest(text, text, integer, text, text[], integer)",  # 0008
 ]
 PIPELINE_FUNCS = [
     "pipeline_original(uuid)",
     "pipeline_deliver(uuid, bytea, boolean, smallint, boolean)",
     "pipeline_withhold(uuid)",
+    "kb_set_chunk_embedding(uuid, text, text)",  # 0008, задача 2.0v: воркер индексации
 ]
 
 
