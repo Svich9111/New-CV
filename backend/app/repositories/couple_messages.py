@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -31,13 +31,12 @@ from app.db import user_scope
 from app.repositories.texts import open_row
 
 FEED_BATCH = 100  # предел одного вызова app_couple_feed (LEAST(..., 100))
-MAX_BATCHES = 50  # не больше 5000 просмотренных строк на страницу
 DELIVERED = ("delivered", "read", "answered")
 
-_FEED = (
-    "SELECT f.id, f.couple_id, f.outgoing, f.text_enc, f.is_adapted, f.harsh_tone_warning, "
-    "f.status::text AS status, f.reply_to_id, f.sent_at, f.read_at, pm.draft_id "
-    "FROM app_couple_feed(:l, :b) f LEFT JOIN partner_messages pm ON pm.id = f.id"
+_FEED_PAGE = (
+    "SELECT id, couple_id, outgoing, text_enc, is_adapted, harsh_tone_warning, "
+    "status::text AS status, reply_to_id, draft_id, sent_at, read_at "
+    "FROM app_couple_feed_page(:l, :ba, :bi)"
 )
 _CURRENT_COUPLE = (
     "SELECT c.id FROM couple_members cm JOIN couples c ON c.id = cm.couple_id "
@@ -102,52 +101,47 @@ async def read_page(
     limit: int,
     before: FeedPosition | None = None,
 ) -> tuple[list[FeedItem], FeedPosition | None]:
-    """Страница ленты текущей пары от новых к старым (``sent_at DESC, id DESC``), строго старше
-    ``before``. → (сообщения, позиция для следующей страницы или ``None`` — дальше нет).
-    Нерасшифрованное сообщение не пропускается: ``text = None``, код — в ``unavailable``."""
+    """Страница ленты текущей пары от новых к старым (``app_couple_feed_page``, 0012: порядок
+    ``(sent_at DESC, id DESC)``, курсор — ключ последней показанной строки, только текущая
+    активная пара). → (сообщения, позиция для следующей страницы или ``None``). Нерасшифрованное
+    не пропускается: ``text = None``, код — в ``unavailable``."""
     if not 1 <= limit <= FEED_BATCH:
         raise ValueError("limit")
-    items: list[FeedItem] = []
-    key = (before.sent_at, before.id) if before else None
+    ask = min(limit + 1, FEED_BATCH)
     async with user_scope(sm, user_id) as s:
-        couple = await _current_couple(s, user_id)
-        if couple is None:
-            return [], None
-        for _ in range(MAX_BATCHES):
-            # Функция отбирает строго «раньше p_before»; +1 мкс и отбор по ключу ниже не теряют
-            # сообщений с тем же временем, что у последнего показанного.
-            bound = key[0] + timedelta(microseconds=1) if key else None
-            rows = (await s.execute(text(_FEED), {"l": FEED_BATCH, "b": bound})).all()
-            ordered = sorted(rows, key=lambda r: (r.sent_at, _uuid(r.id)), reverse=True)
-            progressed = False
-            for r in ordered:
-                rk = (r.sent_at, _uuid(r.id))
-                if key is not None and rk >= key:
-                    continue
-                key, progressed = rk, True
-                if _uuid(r.couple_id) != couple:
-                    continue
-                if len(items) == limit:
-                    last = items[-1]
-                    return items, FeedPosition(last.sent_at, last.id)
-                body, reason = _open(keys, r)
-                items.append(
-                    FeedItem(
-                        id=rk[1],
-                        outgoing=bool(r.outgoing),
-                        text=body,
-                        is_adapted=bool(r.is_adapted),
-                        harsh_tone_warning=bool(r.harsh_tone_warning),
-                        status=r.status,
-                        reply_to_id=None if r.reply_to_id is None else _uuid(r.reply_to_id),
-                        sent_at=r.sent_at,
-                        read_at=r.read_at,
-                        unavailable=reason,
-                    )
-                )
-            if len(rows) < FEED_BATCH or not progressed:
-                break
-    return items, None
+        rows = (
+            await s.execute(
+                text(_FEED_PAGE),
+                {
+                    "l": ask,
+                    "ba": before.sent_at if before else None,
+                    "bi": before.id if before else None,
+                },
+            )
+        ).all()
+    items: list[FeedItem] = []
+    for r in rows[:limit]:
+        body, reason = _open(keys, r)
+        items.append(
+            FeedItem(
+                id=_uuid(r.id),
+                outgoing=bool(r.outgoing),
+                text=body,
+                is_adapted=bool(r.is_adapted),
+                harsh_tone_warning=bool(r.harsh_tone_warning),
+                status=r.status,
+                reply_to_id=None if r.reply_to_id is None else _uuid(r.reply_to_id),
+                sent_at=r.sent_at,
+                read_at=r.read_at,
+                unavailable=reason,
+            )
+        )
+    # Предел функции — 100: при limit = 100 полная страница означает «возможно, есть ещё»
+    # (следующая может оказаться пустой).
+    more = len(rows) > limit or (len(rows) == FEED_BATCH == limit)
+    if not more or not items:
+        return items, None
+    return items, FeedPosition(items[-1].sent_at, items[-1].id)
 
 
 async def _visible(s: AsyncSession, user_id: uuid.UUID, message_id: uuid.UUID) -> Any:
@@ -159,27 +153,40 @@ async def _visible(s: AsyncSession, user_id: uuid.UUID, message_id: uuid.UUID) -
     return row
 
 
+class _Undecryptable(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
 async def read_original(
     sm: async_sessionmaker[AsyncSession],
     keys: Keyring,
     user_id: uuid.UUID,
     message_id: uuid.UUID,
-) -> str:
+) -> tuple[str | None, str | None]:
     """Оригинал (ФТ-10): получателю доставленного — с фиксацией просмотра (``app_read_original``),
-    автору — свой текст без фиксации. Расшифровка — в той же транзакции: не удалась —
-    ``crypto.DecryptionError`` откатывает и отметку (просмотр засчитывается, только когда текст
-    показан, ТЗ §7). ``Gone`` — 404."""
-    async with user_scope(sm, user_id) as s:
-        row: Any = await _visible(s, user_id, message_id)
-        blob = (
-            await s.execute(text("SELECT app_read_original(:m)"), {"m": message_id})
-        ).scalar_one()
-        if blob is None:
-            raise Gone
-        draft = row.draft_id
-        if draft is None:
-            raise crypto.DecryptionError(crypto.CONTEXT_MISSING)
-        return keys.open(crypto.MESSAGE_ORIGINAL, _uuid(draft), blob)
+    автору — свой текст без фиксации. → (текст, None) или (None, код причины): расшифровка — в
+    той же транзакции, не удалась — транзакция откатывается вместе с отметкой (просмотр
+    засчитывается, только когда текст показан, ТЗ §7; АР-40). ``Gone`` — 404."""
+    try:
+        async with user_scope(sm, user_id) as s:
+            row: Any = await _visible(s, user_id, message_id)
+            blob = (
+                await s.execute(text("SELECT app_read_original(:m)"), {"m": message_id})
+            ).scalar_one()
+            if blob is None:
+                raise Gone
+            body, reason = open_row(
+                keys,
+                crypto.MESSAGE_ORIGINAL,
+                None if row.draft_id is None else _uuid(row.draft_id),
+                blob,
+            )
+            if reason is not None:
+                raise _Undecryptable(reason)  # откат: отметка просмотра не сохраняется
+            return body, None
+    except _Undecryptable as exc:
+        return None, exc.reason
 
 
 async def mark_read(

@@ -302,11 +302,11 @@ async def test_feed_cursor_newest_first_and_foreign_cursor_422(env: Env) -> None
         )
 
 
-async def test_feed_skips_undecryptable_without_failing(
+async def test_feed_shows_undecryptable_as_unavailable_text(
     env: Env, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Контракт: `PartnerMessage.text` — только строка. Нерасшифрованное не показывается, лента
-    не падает; в журнале — код причины без id."""
+    """Контракт (АР-40): `PartnerMessage.text` — `ExportText`. Нерасшифрованное не скрывается —
+    `UnavailableText` с кодом причины, лента не падает; в журнале — код причины без id."""
     caplog.set_level(logging.DEBUG)
     anna, igor = await _person(env, "Анна", "Игорь"), await _person(env, "Игорь", "Анна")
     await _pair(env, anna, igor)
@@ -319,7 +319,11 @@ async def test_feed_skips_undecryptable_without_failing(
             text("SELECT pipeline_deliver(:m, :t, false, 0::smallint, false)"),
             {"m": bad, "t": b"\x00broken"},
         )
-    assert [i["id"] for i in (await feed(env, igor))["items"]] == [str(ok)]
+    items = {i["id"]: i for i in (await feed(env, igor))["items"]}
+    assert set(items) == {str(ok), str(bad)}
+    assert items[str(ok)]["text"] == "читается"
+    assert items[str(bad)]["text"]["unavailable"] is True
+    assert_matches(items[str(bad)]["text"], "UnavailableText")
     assert "partner_messages.adapted_enc" in caplog.text and str(bad) not in caplog.text
 
 
@@ -357,7 +361,8 @@ async def test_original_to_recipient_records_view_once(env: Env) -> None:
         )
 
 
-async def test_original_undecryptable_is_404_and_view_not_recorded(env: Env) -> None:
+async def test_original_undecryptable_is_unavailable_and_view_not_recorded(env: Env) -> None:
+    """АР-40: оригинал не расшифровался — 200 с `UnavailableText`, просмотр не фиксируется."""
     sc = await scene(env)
     msg = sc.ids["plain"]
     async with env.engine.begin() as conn:  # черновик потерян — контекст оригинала недоступен
@@ -365,9 +370,10 @@ async def test_original_undecryptable_is_404_and_view_not_recorded(env: Env) -> 
             text("UPDATE partner_messages SET original_enc = :b WHERE id = :m"),
             {"b": b"\x00broken", "m": msg},
         )
-    _error(
-        await env.client.get(f"{FEED}/{msg}/original", headers=sc.igor.headers), 404, "not_found"
-    )
+    resp = await env.client.get(f"{FEED}/{msg}/original", headers=sc.igor.headers)
+    assert resp.status_code == 200 and resp.headers["cache-control"] == "no-store"
+    assert resp.json()["text"]["unavailable"] is True
+    assert_matches(resp.json()["text"], "UnavailableText")
     assert await viewed_at(env, msg) is None
 
 

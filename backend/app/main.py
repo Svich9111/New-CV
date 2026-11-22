@@ -5,7 +5,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import account, admin_kb, auth, chat, couple, couple_messages, help, memory
+from app.api import (
+    account,
+    admin_kb,
+    auth,
+    chat,
+    couple,
+    couple_messages,
+    drafts,
+    help,
+    memory,
+)
 from app.bot import webhook as bot_webhook
 from app.bot.client import BotApi
 from app.bot.dedup import UpdateDeduplicator
@@ -98,6 +108,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(couple.router, prefix="/api/v1")
 app.include_router(couple_messages.router, prefix="/api/v1")
+app.include_router(drafts.router, prefix="/api/v1")
 app.include_router(account.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(help.router, prefix="/api/v1")

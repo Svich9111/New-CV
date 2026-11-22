@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 import yaml
 from openapi_spec_validator import validate
 
@@ -148,6 +147,13 @@ SERVED_STATUSES = {
     ("get", "/couple/messages"): {"200", "401", "403", "422"},
     ("get", "/couple/messages/{message_id}/original"): {"200", "401", "403", "404", "409"},
     ("post", "/couple/messages/{message_id}/read"): {"204", "401", "403", "404"},
+    # 3.1 (app/api/drafts.py, tests/test_drafts_api.py; АР-40). 402 у send — с этапа 4.
+    ("post", "/drafts"): {"200", "201", "401", "403", "409", "422", "503"},
+    ("get", "/drafts/{draft_id}"): {"200", "401", "403", "404"},
+    ("patch", "/drafts/{draft_id}"): {"200", "401", "403", "404", "409", "422"},
+    ("post", "/drafts/{draft_id}/regenerate"): {"200", "401", "403", "404", "409", "422", "503"},
+    ("post", "/drafts/{draft_id}/reject"): {"204", "401", "403", "404", "409"},
+    ("post", "/drafts/{draft_id}/send"): {"202", "401", "403", "404", "409", "422"},
 }
 
 
@@ -406,11 +412,6 @@ def test_drafts_contract() -> None:
     } <= known
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="3.1: сервер ещё не публикует /drafts* — A2 (этап 2) снимает страж и вносит коды "
-    "в SERVED_STATUSES",
-)
 def test_drafts_are_served() -> None:
     served = {(m, p) for p, ms in _served_routes(app.routes) for m in ms}
     for method, path in DRAFT_OPERATIONS:
