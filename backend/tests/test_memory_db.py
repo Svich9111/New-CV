@@ -986,6 +986,60 @@ async def test_text_requires_fingerprint(sessionmaker: SM, engine: AsyncEngine) 
         )
 
 
+async def test_delete_memory_vs_delete_account_no_deadlock(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Ревью 2.4 р.2 MAJOR-1, АР-38: единый порядок «агент → записи памяти → диалоги».
+    Удаление записи (путь слоя доступа: агент, запись `FOR UPDATE`, `app_delete_memory`) и
+    удаление аккаунта того же владельца в обоих порядках идут по очереди — без 40P01."""
+    # Порядок 1: удаление записи взяло агента; удаление аккаунта ждёт; запись берётся уже
+    # после того, как удаление аккаунта встало в очередь.
+    p = await _person(engine)
+    item = await _memory(engine, p.agent, finger=fp())
+    async with user_scope(sessionmaker, p.uid) as s:
+        await s.execute(text("SELECT id FROM agents WHERE user_id = app_uid() FOR NO KEY UPDATE"))
+        deleting = asyncio.create_task(_app(sessionmaker, p.uid, "SELECT app_delete_account()"))
+        await asyncio.sleep(0.5)
+        assert not deleting.done()
+        await s.execute(text("SELECT id FROM memory_items WHERE id = :i FOR UPDATE"), {"i": item})
+        done = await s.execute(text("SELECT app_delete_memory(:i)"), {"i": item})
+        assert done.scalar_one() is True
+    await asyncio.wait_for(deleting, 10)  # без 40P01
+    assert await _row(engine, "SELECT count(*) FROM agents WHERE id = :a", a=p.agent) == (0,)
+
+    # Порядок 2: удаление аккаунта первым (не зафиксировано); удаление записи ждёт агента и
+    # после фиксации получает false — записи уже нет.
+    q = await _person(engine)
+    item = await _memory(engine, q.agent, finger=fp())
+    async with user_scope(sessionmaker, q.uid) as s:
+        await s.execute(text("SELECT app_delete_account()"))
+        forgetting = asyncio.create_task(
+            _app(sessionmaker, q.uid, "SELECT app_delete_memory(:i)", i=item)
+        )
+        await asyncio.sleep(0.5)
+        assert not forgetting.done()
+    assert await asyncio.wait_for(forgetting, 10) == [(False,)]
+    assert await _row(engine, "SELECT count(*) FROM memory_items WHERE id = :i", i=item) == (0,)
+
+    # Вектор записи — тот же порядок (агент FOR KEY SHARE → запись).
+    r = await _person(engine)
+    item = await _memory(engine, r.agent, finger=fp())
+    async with user_scope(sessionmaker, r.uid) as s:
+        await s.execute(text("SELECT app_delete_account()"))
+        setting = asyncio.create_task(
+            _app(
+                sessionmaker,
+                r.uid,
+                "SELECT app_set_memory_embedding(:i, :v, 'm-order')",
+                i=item,
+                v=vec(5),
+            )
+        )
+        await asyncio.sleep(0.5)
+        assert not setting.done()
+    assert await asyncio.wait_for(setting, 10) == [(False,)]
+
+
 # --- Б-65 и обратимость ------------------------------------------------------------------------
 
 

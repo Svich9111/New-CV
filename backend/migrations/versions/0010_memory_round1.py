@@ -15,8 +15,10 @@ MINOR-4, MINOR-7; BACKLOG Б-68.
    времени захвата (удаление во время сжатия оставит отметку — следующее сжатие). Удаление,
    поставившее отметку, держит строку агента до фиксации, а захват строки пропускает
    (``SKIP LOCKED``): выданное сжатие всегда видит удаление, отметка которого не новее захвата.
-   Порядок блокировок удаления: запись памяти → агент (как у воркера: записи памяти → агент в
-   ``…_done``), встречных ожиданий нет.
+   Порядок блокировок (ревью 2.4 р.2 MAJOR-1) — единый: **агент → записи памяти → диалоги**, как
+   каскад ``app_delete_account`` (пользователь → агент → память, диалоги). ``app_delete_memory``
+   первым шагом берёт строку агента ``FOR NO KEY UPDATE``, ``app_set_memory_embedding`` (тело
+   0008) — ``FOR KEY SHARE``; удаление записи и удаление аккаунта идут по очереди, без 40P01.
 2. **MINOR-4 — захват извлечения.** Кандидаты отбираются без блокировки (завершённая
    необработанная сессия или доставленное сообщение текущей пары старше паузы), строка агента
    блокируется ``FOR NO KEY UPDATE SKIP LOCKED`` по одному id — только у тех, кому выдаётся
@@ -67,6 +69,8 @@ def _replace(sql: str) -> str:
     return sql.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1)
 
 
+M0008 = _module("0008_vector_search.py")
+RESTORE_0008 = (_replace(M0008.SET_MEMORY_EMBEDDING),)
 RESTORE_0009 = tuple(
     _replace(fn)
     for fn in (
@@ -113,20 +117,48 @@ CREATE OR REPLACE FUNCTION app_delete_memory(p_item uuid) RETURNS boolean
     AS $f$
     DECLARE v_uid uuid := public.app_uid(); v_agent uuid;
     BEGIN@USER_CHECK@
+        -- Порядок блокировок (АР-38, ревью 2.4 р.2 MAJOR-1): агент → записи памяти → диалоги,
+        -- как каскад app_delete_account (пользователь → агент → память). Удаление аккаунта,
+        -- уже взявшее агента, — ждём его; после ожидания агента нет — false.
+        SELECT a.id INTO v_agent FROM public.agents a WHERE a.user_id = v_uid
+           FOR NO KEY UPDATE;
+        IF NOT FOUND THEN RETURN false; END IF;
         -- Чужая, уже удалённая или несуществующая запись — false (одинаково).
         UPDATE public.memory_items m
            SET text_enc = NULL, embedding = NULL, embedding_model = NULL, event_date = NULL,
                deleted_at = now()
-          FROM public.agents a
-         WHERE m.id = p_item AND a.id = m.agent_id AND a.user_id = v_uid
-           AND m.deleted_at IS NULL
-        RETURNING m.agent_id INTO v_agent;
+         WHERE m.id = p_item AND m.agent_id = v_agent AND m.deleted_at IS NULL;
         IF NOT FOUND THEN RETURN false; END IF;
         -- АР-37 п.1: сводка профиля пересобирается без удалённого при ближайшем сжатии, вне
-        -- периода. Порядок блокировок: запись памяти → агент.
+        -- периода (строка агента уже заблокирована).
         UPDATE public.agents SET memory_compaction_requested_at = clock_timestamp()
          WHERE id = v_agent;
         RETURN true;
+    END $f$
+"""
+)
+
+SET_MEMORY_EMBEDDING = _fill(
+    r"""
+CREATE OR REPLACE FUNCTION app_set_memory_embedding(p_item uuid, p_vec text, p_model text)
+    RETURNS boolean
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$
+    DECLARE
+        v_uid uuid := public.app_uid();
+        v public.vector;
+        v_agent uuid;
+    BEGIN@USER_CHECK@
+        v := public.embedding_arg(p_vec, p_model);
+        -- АР-38: агент (FOR KEY SHARE — не мешает чату и другим записям памяти, но ждёт
+        -- удаление аккаунта) → запись памяти.
+        SELECT a.id INTO v_agent FROM public.agents a WHERE a.user_id = v_uid FOR KEY SHARE;
+        IF NOT FOUND THEN RETURN false; END IF;
+        -- Чужая, удалённая, без текста или несуществующая запись — false (одинаково).
+        UPDATE public.memory_items m SET embedding = v, embedding_model = p_model
+         WHERE m.id = p_item AND m.agent_id = v_agent
+           AND m.deleted_at IS NULL AND m.text_enc IS NOT NULL;
+        RETURN FOUND;
     END $f$
 """
 )
@@ -401,12 +433,19 @@ CREATE OR REPLACE FUNCTION app_memory_compaction_done(p_token uuid) RETURNS bool
 def upgrade() -> None:
     for stmt in SCHEMA:
         op.execute(stmt)
-    for fn in (DELETE_MEMORY, CLAIM_EXTRACTION, CLAIM_COMPACTION, EXTRACTION_DONE, COMPACTION_DONE):
+    for fn in (
+        DELETE_MEMORY,
+        SET_MEMORY_EMBEDDING,
+        CLAIM_EXTRACTION,
+        CLAIM_COMPACTION,
+        EXTRACTION_DONE,
+        COMPACTION_DONE,
+    ):
         op.execute(fn)
 
 
 def downgrade() -> None:
-    for fn in RESTORE_0009:
+    for fn in RESTORE_0009 + RESTORE_0008:
         op.execute(fn)
     op.execute(
         "ALTER TABLE memory_items DROP CONSTRAINT IF EXISTS ck_memory_items_text_has_fingerprint"
