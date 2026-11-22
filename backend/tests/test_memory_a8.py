@@ -680,6 +680,11 @@ async def test_profile_keeps_deleted_until_next_compaction_period(
     assert await mem_ai.forget_memory(sessionmaker, KEYS, p.uid, item) is not None
     ctx = await build_context(sessionmaker, KEYS, p.uid, p.conv, query="привет")
     assert "ТАЙНАa8" not in ctx.context.profile_summary
+    # A8 р2 (строгая форма возвращена): с 0010 (АР-38) удаление ставит агента на сжатие вне
+    # периода — следующий захват (период 7 дней не истёк) его выдаёт.
+    again = [x for x in await mw.claim_compaction(async_sessionmaker(engine), every=every,
+             lease=timedelta(minutes=5), limit=100) if x.agent_id == p.agent]  # fmt: skip
+    assert len(again) == 1
 
 
 async def test_compaction_rolls_back_when_record_deleted_midway(
