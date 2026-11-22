@@ -560,7 +560,10 @@ async def test_models_not_configured_is_internal_error(
     env.rt.models = None
     anna = await _person(env.client)
     _, events = await post(env, anna, "Привет")
-    assert events == [("error", {"code": "internal", "message": chat_api.INTERNAL_MESSAGE})]
+    name, err = events[-1]
+    assert (len(events), name, err["code"]) == (1, "error", "internal")
+    # Ни одна линия не дала вердикта — в сообщении указание на помощь (АР-34 п.2).
+    assert err["message"].startswith(chat_api.INTERNAL_MESSAGE) and "112" in err["message"]
     assert env.rt.models is None  # ошибка не кешируется
     assert [i["author"] for i in await history(env, anna)] == ["owner"]
 
@@ -658,15 +661,227 @@ async def test_crisis_is_answered_when_limit_exhausted_and_counted(env: Env) -> 
     _error(resp, 429, "rate_limited")
 
 
-async def test_limit_store_failure_does_not_block_reply(env: Env) -> None:
-    class Broken:
-        async def acquire(self, *a: Any, **kw: Any) -> Any:
-            raise ConnectionError("redis down")
+class RefusingSafety:
+    """Классификатор, который не даёт вердикта (отказ или недоступность модели)."""
 
-    env.rt.limiter = Broken()
+    model = "refusing-safety"
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    async def complete_json(self, **kw: Any) -> StructuredResult:
+        self.calls += 1
+        raise self.exc
+
+    def stream_text(self, **kw: Any) -> Any:  # pragma: no cover — не вызывается
+        raise NotImplementedError
+
+
+async def test_no_verdict_over_limit_goes_to_agent_and_is_counted(env: Env) -> None:
+    """АР-34 п.1 (A8-E1): классификатор отказал при исчерпанном лимите — не 429: реплика идёт к
+    агенту (первая линия) и засчитывается."""
+    env.box.limit = 1
+    anna = await _person(env.client)
+    assert (await post(env, anna, "первая"))[1][-1][0] == "done"
+    p = stub()
+    env.use(p, RefusingSafety(LLMRefusal("no")))
+    resp, events = await post(env, anna, "я больше не могу")
+    assert resp.status_code == 200 and events[-1][0] == "done" and p.started == 1
+    env.use(stub())
+    env.box.limit = 2  # засчитана: 2 из 2
+    _error((await post(env, anna, "обычная"))[0], 429, "rate_limited")
+
+
+@pytest.mark.parametrize(
+    ("agent_exc", "code"),
+    [
+        (LLMUnavailable("down"), "unavailable"),
+        (LLMQuotaError("quota"), "quota"),
+        (LLMConfigError("no key"), "internal"),
+        (LLMRefusal("no"), "refusal"),
+        (LLMBadOutput("cut"), "bad_output"),
+    ],
+)
+async def test_both_lines_unavailable_error_points_to_help(
+    env: Env, agent_exc: BaseException, code: str
+) -> None:
+    """АР-34 п.2 (ревью MAJOR-1): вердикта второй линии нет и агент не ответил — `error` с
+    указанием на помощь (номер из списка контактов и раздел «Помощь»)."""
+    env.use(stub(chunks=[agent_exc]), RefusingSafety(LLMUnavailable("down")))
+    anna = await _person(env.client)
+    _, events = await post(env, anna, "Привет")
+    name, err = events[-1]
+    assert (name, err["code"]) == ("error", code)
+    assert "112" in err["message"] and "«Помощь»" in err["message"]
+
+
+async def test_error_with_verdict_has_no_extra_help_hint(env: Env) -> None:
+    """Вердикт «не кризис» есть — сообщение об ошибке обычное (без подмешанной подсказки)."""
+    env.use(stub(chunks=[LLMUnavailable("down")]))
+    anna = await _person(env.client)
+    _, events = await post(env, anna, "Привет")
+    assert events[-1][1]["code"] == "unavailable" and "112" not in events[-1][1]["message"]
+
+
+async def test_classifier_code_error_logged_as_error(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ошибка кода классификатора ответ не блокирует, но пишется в журнал уровнем error."""
+    caplog.set_level(logging.INFO)
+    env.use(stub(), RefusingSafety(RuntimeError("bug")))
     anna = await _person(env.client)
     _, events = await post(env, anna, "Привет")
     assert events[-1][0] == "done"
+    assert any(
+        r.levelno == logging.ERROR and "safety screen failed: RuntimeError" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_owner_turn_save_failure_crisis_still_answered(
+    env: Env, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ревью MINOR-1: реплику не удалось сохранить (не 409, не «владельца нет») — классификатор
+    по самой реплике; кризис — `crisis` с контактами и `message_id: null`, событие записано;
+    без кризиса — 500 (исходная ошибка)."""
+    anna = await _person(env.client)
+
+    async def broken(*a: Any, **kw: Any) -> Any:
+        raise RuntimeError("encryption failed")
+
+    monkeypatch.setattr(chat_repo, "add_owner_turn", broken)
+    p = stub(category="self_harm")
+    env.use(p)
+    _, events = await post(env, anna, "не хочу жить")
+    assert [n for n, _ in events] == ["crisis"]
+    assert events[0][1]["message_id"] is None and events[0][1]["contacts"] == help_contacts()
+    assert p.started == 0
+    await env.rt.drain()
+    async with engine.connect() as conn:
+        types = (
+            await conn.execute(
+                text("SELECT type::text FROM safety_events WHERE user_id = :u"), {"u": anna.id}
+            )
+        ).scalars()
+        assert list(types) == ["self_harm"]
+    env.use(stub())
+    with pytest.raises(RuntimeError, match="encryption failed"):
+        await env.client.post(API, headers=anna.headers, json={"text": "Привет"})
+
+
+async def test_safety_events_survive_client_leaving_during_crisis(
+    env: Env, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ревью MINOR-3: клиент ушёл, пока пишется кризисный ответ, — событие безопасности всё
+    равно записано (фоновая задача, уход клиента её не отменяет)."""
+    env.use(stub(category="violence"))
+    anna = await _person(env.client)
+    real = chat_repo.add_message
+
+    async def slow(*args: Any, **kw: Any) -> Any:
+        if args[4] == "agent":
+            await asyncio.sleep(1.0)
+        return await real(*args, **kw)
+
+    monkeypatch.setattr(chat_repo, "add_message", slow)
+    real_events = chat_repo.record_safety_events
+
+    async def slow_events(*args: Any, **kw: Any) -> Any:
+        await asyncio.sleep(0.5)
+        return await real_events(*args, **kw)
+
+    monkeypatch.setattr(chat_repo, "record_safety_events", slow_events)
+    raw = await raw_post(anna, "Он меня бьёт", disconnect_after_s=0.2)
+    assert "event: crisis" not in raw.body
+    await env.rt.drain()
+    async with engine.connect() as conn:
+        types = (
+            await conn.execute(
+                text("SELECT type::text FROM safety_events WHERE user_id = :u"), {"u": anna.id}
+            )
+        ).scalars()
+        assert list(types) == ["violence"]
+
+
+async def test_one_compression_task_per_conversation() -> None:
+    """Ревью MINOR-5: одна задача сжатия на диалог; запрос во время работы — один повтор после
+    неё, без параллельного вызова модели."""
+    rt = ChatRuntime()
+    conv, other = uuid.uuid4(), uuid.uuid4()
+    gate = asyncio.Event()
+    running, peak, runs = 0, 0, 0
+
+    async def job() -> None:
+        nonlocal running, peak, runs
+        running += 1
+        peak = max(peak, running)
+        runs += 1
+        await gate.wait()
+        running -= 1
+
+    for _ in range(4):
+        rt.compress(conv, job)
+    rt.compress(other, job)
+    await asyncio.sleep(0.05)
+    assert len(rt._compressing) == 2 and peak == 2  # по задаче на диалог
+    gate.set()
+    await rt.drain()
+    assert runs == 3  # conv: первый + один повтор; other: один
+    assert rt._compressing == {} and rt.background == set()
+
+
+async def test_limit_store_failure_breaker_and_process_counter(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    """АР-34 (ревью MINOR-2, тест О-1): хранилище лимита недоступно — ответ идёт; «выключатель»:
+    в паузе хранилище не опрашивается; лимит держит запасной счётчик процесса; журнал `error`
+    без id."""
+
+    class Broken:
+        calls = 0
+
+        async def acquire(self, *a: Any, **kw: Any) -> Any:
+            Broken.calls += 1
+            raise ConnectionError("redis down")
+
+    caplog.set_level(logging.INFO)
+    env.rt.limiter = Broken()
+    env.box.limit = 2
+    anna = await _person(env.client)
+    for i in range(2):
+        _, events = await post(env, anna, f"реплика {i}")
+        assert events[-1][0] == "done"
+    assert Broken.calls == 1  # после первого сбоя — пауза без попыток
+    resp, _ = await post(env, anna, "третья")
+    _error(resp, 429, "rate_limited")  # лимит не снят: считает запасной счётчик
+    errors = [
+        r for r in caplog.records if r.levelno == logging.ERROR and "limit store" in r.getMessage()
+    ]
+    assert len(errors) == 1 and "ConnectionError" in errors[0].getMessage()
+    assert str(anna.id) not in caplog.text
+    env.rt._limit_down_until = 0.0  # пауза истекла — снова пробуем хранилище
+    await post(env, anna, "четвёртая")
+    assert Broken.calls == 2
+
+
+async def test_slow_limit_store_does_not_delay_each_request(env: Env) -> None:
+    """Зависший Redis: не дольше `limit_timeout_s` на первый запрос, дальше — без ожидания."""
+
+    class Hanging:
+        async def acquire(self, *a: Any, **kw: Any) -> Any:
+            await asyncio.sleep(30)
+
+    env.rt.limiter = Hanging()
+    env.rt.limit_timeout_s = 0.2
+    anna = await _person(env.client)
+    t0 = time.monotonic()
+    await post(env, anna, "раз")
+    first = time.monotonic() - t0
+    t0 = time.monotonic()
+    await post(env, anna, "два")
+    second = time.monotonic() - t0
+    assert first < 2 and second < first
 
 
 async def test_memory_limit_window_and_force() -> None:

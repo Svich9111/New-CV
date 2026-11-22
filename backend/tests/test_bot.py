@@ -1456,10 +1456,14 @@ def test_poll_allows_only_dev_envs(env: str) -> None:
     poll_module.check_poll_config(_dev_settings(env=env))
 
 
-def test_poll_default_env_is_dev() -> None:
-    """По умолчанию Settings.env = "dev" — опрос разрешён (осознанно, для разработчика);
-    на продуктиве FEELINGS_ENV обязателен (bot/README.md)."""
-    assert Settings.model_fields["env"].default == "dev"
+def test_poll_default_env_is_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2.1 этап 2 MINOR-4: по умолчанию Settings.env = "production" — без явного FEELINGS_ENV
+    опрос не стартует (продуктив защищён); с FEELINGS_ENV=dev — разрешён (bot/README.md)."""
+    assert Settings.model_fields["env"].default == "production"
+    monkeypatch.delenv("FEELINGS_ENV", raising=False)
+    with pytest.raises(ConfigError):
+        poll_module.check_poll_config(_dev_settings())
+    monkeypatch.setenv("FEELINGS_ENV", "dev")
     poll_module.check_poll_config(_dev_settings())
 
 

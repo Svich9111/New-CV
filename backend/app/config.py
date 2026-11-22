@@ -11,7 +11,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="FEELINGS_", extra="ignore")
 
-    env: str = "dev"
+    # По умолчанию — продуктив (ревью 2.1 э.2 MINOR-4): сервер без явного FEELINGS_ENV
+    # выполняет все проверки продуктива (АР-33 — проверенные контакты помощи) и не даёт
+    # запустить опрос бота; разработка и тесты задают dev/test/local явно (.env.example).
+    env: str = "production"
     # Приложение — только под ролью входа feelings_api (АР-10); пароль задаётся окружением.
     database_url: str = "postgresql+asyncpg://feelings_api@localhost:5432/feelings"
     # Владелец схемы для Alembic; приложение под ним не работает.

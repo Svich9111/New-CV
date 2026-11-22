@@ -80,6 +80,8 @@ TEST_ENCRYPTION_KEYS = "t1:" + "A" * 43
 
 @pytest.fixture(autouse=True)
 def _encryption_keys_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Settings.env по умолчанию — продуктив (2.1 э.2 MINOR-4): тесты — явно окружение test.
+    monkeypatch.setenv("FEELINGS_ENV", "test")
     monkeypatch.setenv("FEELINGS_ENCRYPTION_KEYS", TEST_ENCRYPTION_KEYS)
     monkeypatch.setenv("FEELINGS_ENCRYPTION_KEY_ID", "t1")
 

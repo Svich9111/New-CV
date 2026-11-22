@@ -4,12 +4,15 @@
 
 1. вход (401), онбординг (403), тело (422);
 2. реплика владельца сохраняется шифротекстом **до** любого вызова модели — одной транзакцией
-   (``chat.add_owner_turn``; 40P01/40001 → 409 ``conflict_retry``, АР-24);
+   (``chat.add_owner_turn``; 40P01/40001 → 409 ``conflict_retry``, АР-24); иной сбой записи —
+   классификатор по самой реплике: кризис — ``crisis`` с ``message_id: null``, иначе 500;
 3. сборка контекста §6.1 (``build_context``) и вторая линия безопасности
    ``screen(models, built)`` — сборка передаётся целиком, классификатор видит реплики владельца
    до усечения бюджетом (правила этапа 2);
-4. дневной лимит (``app.core.limits``): исчерпан — 429 с ``Retry-After``; при кризисе реплика
-   засчитывается, но 429 не отдаётся (ТЗ §9.3, §11 п.5); 402 до этапа 4 не отдаётся;
+4. дневной лимит (``app.core.limits``): исчерпан — 429 с ``Retry-After``; при кризисе и без
+   вердикта второй линии реплика засчитывается, но 429 не отдаётся — ответит первая линия
+   (ТЗ §9.3, §11 п.5; АР-34 п.1); 402 до этапа 4 не отдаётся. Без вердикта второй линии каждое
+   ``error`` несёт указание на помощь (АР-34 п.2);
 5. поток SSE: ``stream_reply(..., safety=sc)`` в ``contextlib.aclosing`` → события ``delta``*,
    затем ровно одно из ``done`` / ``crisis`` / ``error``. Ответ агента сохраняется до
    завершающего события; склейка ``delta`` — ровно сохранённый текст.
@@ -36,11 +39,12 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import Receive, Scope, Send
 
@@ -56,7 +60,8 @@ from app.ai.summary import CompressionPolicy, compress_history
 from app.api.deps import AppSettings, Keys, OnboardedUser, SessionMaker, unauthorized
 from app.config import Settings
 from app.core.crypto import Keyring
-from app.core.limits import DailyLimit, LimitDecision, MemoryDailyLimit, window
+from app.core.limits import DailyLimit, LimitDecision, MemoryDailyLimit
+from app.db import RETRYABLE_SQLSTATES, sqlstate
 from app.errors import AppError
 from app.help import help_contacts
 from app.repositories import chat as chat_repo
@@ -73,9 +78,16 @@ KEEPALIVE_LINE = ": keep-alive\n\n"
 ERROR_CODES = frozenset({"refusal", "unavailable", "quota", "bad_output"})
 INTERNAL_MESSAGE = "Не получилось ответить — попробуйте ещё раз. Ваше сообщение сохранено."
 RATE_LIMITED_MESSAGE = "На сегодня лимит сообщений агенту исчерпан — продолжим завтра"
-CLIENT_CLOSED = 499  # клиент ушёл до ответа (как у nginx); тело никто не прочтёт
+# Служебный код журнала доступа (как у nginx): клиент ушёл до начала ответа, тело никто не
+# прочтёт. В контракте его нет — клиент его не видит (ревью 2.1 э.2 MINOR-7; объявление — A1).
+CLIENT_CLOSED = 499
 MIN_KEEP_TURNS = 6  # тест 2.1 О-5: после сжатия классификатор должен видеть 3 реплики владельца
 MAX_COMPRESSION_CALLS = 10  # «пока more» — но не бесконечно
+COMPRESSION_SLOTS = 2  # одновременных сжатий на процесс (разные диалоги)
+LIMIT_STORE_TIMEOUT_S = 0.5  # Redis отвечает за миллисекунды; дольше — считаем недоступным
+LIMIT_STORE_COOLDOWN_S = 30.0  # «выключатель»: после сбоя столько не ходим в Redis (АР-34)
+SAFETY_EVENTS_TIMEOUT_S = 10.0  # запись safety_events в фоне — не дольше
+SAFETY_EVENTS_WAIT_S = 1.0  # сколько кризисное событие ждёт этой записи (контакты не задерживать)
 CURSOR_DOMAIN = b"feelings/chat-cursor/v1\x00"
 
 Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -89,7 +101,9 @@ class ChatRuntime:
     """Модели, лимит и фоновые задачи чата (``app.state.chat``). Модели — из конфигурации
     (OpenRouter, имена — ``FEELINGS_LLM_*``; создаются при первом запросе и кешируются; ошибка
     не кешируется); в тестах — заглушки ``app.ai.stub``. Лимит — Redis (``lifespan``), без него —
-    счётчик в памяти."""
+    счётчик в памяти. Хранилище лимита недоступно (ошибка или дольше ``limit_timeout_s``) —
+    «выключатель» на ``limit_cooldown_s``: в это время Redis не опрашивается, считает запасной
+    счётчик процесса ``limit_fallback`` (АР-34), в журнал — ``error``."""
 
     models: AgentModels | None = None
     limiter: DailyLimit = field(default_factory=MemoryDailyLimit)
@@ -98,8 +112,17 @@ class ChatRuntime:
     budget: ContextBudget | None = None  # None — ``ContextBudget()`` по умолчанию
     compression: CompressionPolicy = field(default_factory=CompressionPolicy)
     prompt_set: PromptSet = V0
-    background: set[asyncio.Task[None]] = field(default_factory=set)
+    limit_fallback: MemoryDailyLimit = field(default_factory=MemoryDailyLimit)
+    limit_timeout_s: float = LIMIT_STORE_TIMEOUT_S
+    limit_cooldown_s: float = LIMIT_STORE_COOLDOWN_S
+    background: set[asyncio.Task[Any]] = field(default_factory=set)
     _models_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _limit_down_until: float | None = None
+    _compressing: dict[uuid.UUID, asyncio.Task[None]] = field(default_factory=dict)
+    _compress_again: set[uuid.UUID] = field(default_factory=set)
+    _compress_slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(COMPRESSION_SLOTS)
+    )
 
     def __post_init__(self) -> None:
         if self.compression.keep_turns < MIN_KEEP_TURNS:
@@ -115,10 +138,55 @@ class ChatRuntime:
                 )
         return self.models
 
-    def spawn(self, coro: Coroutine[Any, Any, None]) -> None:
+    def spawn(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
         task = asyncio.create_task(coro)
         self.background.add(task)
         task.add_done_callback(self.background.discard)
+        return task
+
+    async def acquire(self, user_id: uuid.UUID, limit: int, *, force: bool) -> LimitDecision:
+        """Дневной лимит с «выключателем» (АР-34): сбой хранилища не задерживает каждый запрос
+        и не снимает лимит — считает запасной счётчик процесса."""
+        now = asyncio.get_running_loop().time()
+        if self._limit_down_until is None or now >= self._limit_down_until:
+            try:
+                return await asyncio.wait_for(
+                    self.limiter.acquire(user_id, limit, force=force), self.limit_timeout_s
+                )
+            except Exception as exc:
+                self._limit_down_until = now + self.limit_cooldown_s
+                logger.error(
+                    "chat: daily limit store unavailable (%s); process counter for %ss",
+                    type(exc).__name__,
+                    self.limit_cooldown_s,
+                )
+        return await self.limit_fallback.acquire(user_id, limit, force=force)
+
+    def compress(
+        self, conversation_id: uuid.UUID, job: Callable[[], Coroutine[Any, Any, None]]
+    ) -> None:
+        """Одна задача сжатия на диалог (ревью MINOR-5): идёт — отмечается повтор после неё
+        (появились новые реплики), вторая параллельно не стартует; общий предел
+        ``COMPRESSION_SLOTS`` на процесс."""
+        running = self._compressing.get(conversation_id)
+        if running is not None and not running.done():
+            self._compress_again.add(conversation_id)
+            return
+
+        async def run() -> None:
+            try:
+                while True:
+                    async with self._compress_slots:
+                        await job()
+                    if conversation_id not in self._compress_again:
+                        break
+                    self._compress_again.discard(conversation_id)
+            finally:
+                if self._compressing.get(conversation_id) is asyncio.current_task():
+                    del self._compressing[conversation_id]
+                self._compress_again.discard(conversation_id)
+
+        self._compressing[conversation_id] = self.spawn(run())
 
     async def drain(self) -> None:
         """Дождаться фоновых задач (тесты)."""
@@ -257,6 +325,15 @@ class _Prepared:
     models_error: LLMError | None = None
     screen_ms: int = 0
 
+    @property
+    def crisis(self) -> bool:
+        return self.screen is not None and self.screen.is_crisis
+
+    @property
+    def no_verdict(self) -> bool:
+        """Вторая линия вердикта не дала (ошибка, отказ, недоступность, модели не созданы)."""
+        return self.screen is None or self.screen.verdict is None
+
 
 async def _prepare(
     rt: ChatRuntime,
@@ -292,36 +369,61 @@ async def _prepare(
         raise unauthorized() from exc
     except Exception as exc:
         logger.warning("chat: context build failed: %s", type(exc).__name__)
-    started = time.monotonic()
-    try:
-        # Сборка — целиком: ``screen`` берёт ``built.safety_dialog`` (до усечения бюджетом).
-        source: BuiltContext | list[Turn] = (
-            out.built if out.built is not None else [Turn("owner", body)]
-        )
-        out.screen = await screen(out.models, source, prompt_set=rt.prompt_set)
-    except Exception as exc:
-        # Ошибка кода классификатора ответ не блокирует (как ошибка модели второй линии).
-        logger.warning("chat: safety screen failed: %s", type(exc).__name__)
-        out.screen = SafetyScreen(None, "internal", system_prompt("safety", rt.prompt_set).name)
-    out.screen_ms = round((time.monotonic() - started) * 1000)
+    # Сборка — целиком: ``screen`` берёт ``built.safety_dialog`` (до усечения бюджетом).
+    source: BuiltContext | list[Turn] = (
+        out.built if out.built is not None else [Turn("owner", body)]
+    )
+    await _screen(rt, out.models, out, source)
     return out
 
 
-async def _acquire(
-    rt: ChatRuntime, settings: Settings, user_id: uuid.UUID, *, force: bool
-) -> LimitDecision:
+async def _prepare_unsaved(rt: ChatRuntime, settings: Settings, body: str) -> _Prepared:
+    """Реплику владельца сохранить не удалось (ревью MINOR-1): классификатор — по самой реплике,
+    чтобы кризисный ответ ушёл и в этом случае (§9.3)."""
+    out = _Prepared()
     try:
-        return await rt.limiter.acquire(user_id, settings.chat_daily_limit, force=force)
+        out.models = await rt.agent_models(settings)
+    except LLMError as exc:
+        out.models_error = exc
+        return out
+    await _screen(rt, out.models, out, [Turn("owner", body)])
+    return out
+
+
+async def _screen(
+    rt: ChatRuntime, models: AgentModels, out: _Prepared, source: BuiltContext | list[Turn]
+) -> None:
+    started = time.monotonic()
+    try:
+        out.screen = await screen(models, source, prompt_set=rt.prompt_set)
     except Exception as exc:
-        # Хранилище счётчика недоступно: ответ важнее учёта (лимит — защита расходов, §10).
-        logger.warning("chat: daily limit store unavailable: %s", type(exc).__name__)
-        return LimitDecision(True, 0, window(datetime.now(UTC))[1])
+        # Ошибка кода классификатора ответ не блокирует (как ошибка модели второй линии), но
+        # это дефект — в журнал уровнем error (ревью MAJOR-1).
+        logger.error("chat: safety screen failed: %s", type(exc).__name__)
+        out.screen = SafetyScreen(None, "internal", system_prompt("safety", rt.prompt_set).name)
+    out.screen_ms = round((time.monotonic() - started) * 1000)
 
 
-def _error_payload(code: str, message: str | None) -> dict[str, Any]:
+def help_hint() -> str:
+    """Указание на помощь для ``error`` без вердикта второй линии (АР-34 п.2): номера — из того
+    же списка, что ``GET /help/contacts`` (до проверки оператором — только 112)."""
+    phones = ", ".join(c["phone"] for c in help_contacts())
+    return (
+        f"Если вам сейчас тяжело или небезопасно — звоните {phones}; контакты служб помощи — "
+        "в разделе «Помощь»."
+    )
+
+
+def _error_payload(code: str, message: str | None, *, no_verdict: bool = False) -> dict[str, Any]:
+    """Тело события ``error``. Без вердикта классификатора (кризис не исключён) — с указанием на
+    помощь при любом коде (АР-34 п.2, ТЗ §9.3 «всегда», §2 п.7)."""
     if code in ERROR_CODES and message:
-        return {"code": code, "message": message}
-    return {"code": "internal", "message": INTERNAL_MESSAGE}
+        payload = {"code": code, "message": message}
+    else:
+        payload = {"code": "internal", "message": INTERNAL_MESSAGE}
+    if no_verdict:
+        payload["message"] = f"{payload['message']} {help_hint()}"
+    return payload
 
 
 @dataclass
@@ -342,10 +444,13 @@ class _Reply:
     sm: async_sessionmaker[AsyncSession]
     keys: Keyring
     user_id: uuid.UUID
-    conversation_id: uuid.UUID
+    conversation_id: uuid.UUID | None  # None — реплику владельца сохранить не удалось
     body: str
     prep: _Prepared
     out: _Outcome
+
+    def _err(self, code: str = "internal", message: str | None = None) -> dict[str, Any]:
+        return _error_payload(code, message, no_verdict=self.prep.no_verdict)
 
     async def produce(self, emit: Emit) -> None:
         """Производитель потока SSE (``EventStreamResponse``): ровно одно завершающее событие."""
@@ -358,7 +463,7 @@ class _Reply:
         except Exception as exc:
             logger.warning("chat: stream failed: %s", type(exc).__name__)
             if out.event is None:
-                await self._final(emit, "error", _error_payload("internal", None))
+                await self._final(emit, "error", self._err())
         finally:
             logger.info(
                 "chat reply: event=%s code=%s screen_ms=%s first_delta_ms=%s total_ms=%s "
@@ -381,8 +486,8 @@ class _Reply:
         prep, out = self.prep, self.out
         if prep.models is None:
             exc = prep.models_error
-            payload = _error_payload(exc.kind, exc.user_message) if exc else None
-            await self._final(emit, "error", payload or _error_payload("internal", None))
+            payload = self._err(exc.kind, exc.user_message) if exc else self._err()
+            await self._final(emit, "error", payload)
             return
         crisis_first = prep.screen is not None and prep.screen.is_crisis
         if prep.built is not None:
@@ -393,7 +498,7 @@ class _Reply:
             # зависит от контекста и идёт всегда (§9.3).
             context, dialog = OwnerContext("", ""), [Turn("owner", self.body)]
         else:
-            await self._final(emit, "error", _error_payload("internal", None))
+            await self._final(emit, "error", self._err())
             return
 
         streamed: list[str] = []
@@ -420,7 +525,7 @@ class _Reply:
                 elif isinstance(ev, Crisis):
                     await self._on_crisis(emit, ev)
                 else:
-                    await self._final(emit, "error", _error_payload(ev.code, ev.message))
+                    await self._final(emit, "error", self._err(ev.code, ev.message))
                 return
 
     async def _on_done(self, emit: Emit, ev: Done, streamed: list[str]) -> None:
@@ -432,13 +537,16 @@ class _Reply:
             await emit("delta", {"text": text})
         elif text.strip() != ev.reply.strip():
             logger.warning("chat: streamed text differs from the final reply")
-            await self._final(emit, "error", _error_payload("internal", None))
+            await self._final(emit, "error", self._err())
+            return
+        if self.conversation_id is None:  # pragma: no cover — без диалога поток только кризисный
+            await self._final(emit, "error", self._err())
             return
         message_id = await chat_repo.add_message(
             self.sm, self.keys, self.user_id, self.conversation_id, "agent", text
         )
         if message_id is None:  # владелец удалён во время ответа (Б-44)
-            await self._final(emit, "error", _error_payload("internal", None))
+            await self._final(emit, "error", self._err())
             return
         self._compress_later()
         await self._final(
@@ -446,18 +554,20 @@ class _Reply:
         )
 
     async def _on_crisis(self, emit: Emit, ev: Crisis) -> None:
-        """Кризисный ответ с контактами идёт всегда: сбой записи не отменяет событие (§9.3)."""
+        """Кризисный ответ с контактами идёт всегда: сбой записи не отменяет событие (§9.3).
+        Запись ``safety_events`` — фоновая задача (ревью MINOR-3): уход клиента её не отменяет;
+        событие ждёт её не дольше ``SAFETY_EVENTS_WAIT_S``, чтобы медленная БД не задерживала
+        контакты."""
+        events = self.rt.spawn(self._record_safety_events(ev.safety_events))
         message_id: uuid.UUID | None = None
-        try:
-            message_id = await chat_repo.add_message(
-                self.sm, self.keys, self.user_id, self.conversation_id, "agent", ev.text
-            )
-        except Exception as exc:
-            logger.warning("chat: crisis reply not saved: %s", type(exc).__name__)
-        try:
-            await chat_repo.record_safety_events(self.sm, self.user_id, ev.safety_events)
-        except Exception as exc:
-            logger.warning("chat: safety events not recorded: %s", type(exc).__name__)
+        if self.conversation_id is not None:
+            try:
+                message_id = await chat_repo.add_message(
+                    self.sm, self.keys, self.user_id, self.conversation_id, "agent", ev.text
+                )
+            except Exception as exc:
+                logger.error("chat: crisis reply not saved: %s", type(exc).__name__)
+        await asyncio.wait({events}, timeout=SAFETY_EVENTS_WAIT_S)  # не отменяет запись
         if message_id is not None:
             self._compress_later()
         await self._final(
@@ -471,11 +581,21 @@ class _Reply:
             },
         )
 
-    def _compress_later(self) -> None:
-        if self.prep.models is not None:
-            self.rt.spawn(self._compress(self.prep.models))
+    async def _record_safety_events(self, types: Sequence[str]) -> None:
+        try:
+            await asyncio.wait_for(
+                chat_repo.record_safety_events(self.sm, self.user_id, types),
+                SAFETY_EVENTS_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.error("chat: safety events not recorded: %s", type(exc).__name__)
 
-    async def _compress(self, models: AgentModels) -> None:
+    def _compress_later(self) -> None:
+        models, conversation_id = self.prep.models, self.conversation_id
+        if models is not None and conversation_id is not None:
+            self.rt.compress(conversation_id, lambda: self._compress(models, conversation_id))
+
+    async def _compress(self, models: AgentModels, conversation_id: uuid.UUID) -> None:
         """Сжатие истории в фоне: повтор, пока хвост длиннее порога (``more``); ошибка модели
         или кода пользователю не видна — сводка прежняя, повтор при следующей реплике."""
         status, rounds, error = "skipped", 0, None
@@ -485,7 +605,7 @@ class _Reply:
                     self.sm,
                     self.keys,
                     self.user_id,
-                    self.conversation_id,
+                    conversation_id,
                     models,
                     policy=self.rt.compression,
                 )
@@ -514,6 +634,12 @@ async def post_message(
         conversation_id, _ = await chat_repo.add_owner_turn(sm, keys, user_id, payload.text)
     except OwnerGone as exc:
         raise unauthorized() from exc
+    except DBAPIError as exc:
+        if sqlstate(exc) in RETRYABLE_SQLSTATES:
+            raise  # 409 conflict_retry (АР-24): ничего не сохранено, повтор безопасен
+        return await _unsaved_turn(request, rt, settings, sm, keys, user_id, payload.text, exc)
+    except Exception as exc:
+        return await _unsaved_turn(request, rt, settings, sm, keys, user_id, payload.text, exc)
     try:
         prep = await until_disconnect(
             request.receive,
@@ -522,8 +648,9 @@ async def post_message(
     except ClientGone:
         logger.info("chat reply: event=client_gone stage=prepare")
         return Response(status_code=CLIENT_CLOSED)
-    crisis = prep.screen is not None and prep.screen.is_crisis
-    decision = await _acquire(rt, settings, user_id, force=crisis)
+    # АР-34 п.1: кризис или нет вердикта второй линии — 429 не отдаётся, реплика засчитывается.
+    force = prep.crisis or prep.no_verdict
+    decision = await rt.acquire(user_id, settings.chat_daily_limit, force=force)
     if not decision.allowed:
         logger.info("chat reply: event=rate_limited")
         return JSONResponse(
@@ -532,6 +659,32 @@ async def post_message(
             headers={"Retry-After": str(decision.retry_after_s), "Cache-Control": "no-store"},
         )
     reply = _Reply(rt, sm, keys, user_id, conversation_id, payload.text, prep, _Outcome(started))
+    return EventStreamResponse(reply.produce, settings.chat_keepalive_s)
+
+
+async def _unsaved_turn(
+    request: Request,
+    rt: ChatRuntime,
+    settings: Settings,
+    sm: async_sessionmaker[AsyncSession],
+    keys: Keyring,
+    user_id: uuid.UUID,
+    body: str,
+    error: Exception,
+) -> Response:
+    """Реплику владельца сохранить не удалось (не 409 и не «владельца нет»; ревью MINOR-1):
+    классификатор — по самой реплике; кризис — поток из одного ``crisis`` с
+    ``message_id: null`` (контакты — всегда, §9.3); иначе — исходная ошибка (500)."""
+    started = time.monotonic()
+    logger.error("chat: owner turn not saved: %s", type(error).__name__)
+    try:
+        prep = await until_disconnect(request.receive, _prepare_unsaved(rt, settings, body))
+    except ClientGone:
+        return Response(status_code=CLIENT_CLOSED)
+    if not prep.crisis:
+        raise error
+    await rt.acquire(user_id, settings.chat_daily_limit, force=True)
+    reply = _Reply(rt, sm, keys, user_id, None, body, prep, _Outcome(started))
     return EventStreamResponse(reply.produce, settings.chat_keepalive_s)
 
 

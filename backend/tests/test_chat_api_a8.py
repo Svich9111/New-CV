@@ -590,11 +590,6 @@ async def test_agent_reply_save_failure_is_single_error(
     assert await turns_of(engine, w, anna.uid) == [("owner", "привет")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-E1 MAJOR: классификатор не дал вердикта (отказ) при исчерпанном лимите — "
-    "голый 429 без помощи",
-)
 async def test_classifier_refusal_over_limit_is_not_bare_429(w: World) -> None:
     """ТЗ §9.3 «кризисный ответ — всегда», §2 п.7, АР-30/32: вторая линия не дала вердикта
     (модель классификатора отказалась — типично именно на текстах о самоповреждении), лимит

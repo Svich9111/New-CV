@@ -53,7 +53,7 @@ RETRY_DELAYS_S: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
 FATAL_ERROR_CODES = frozenset({401, 404})
 # Опрос удаляет вебхук бота, поэтому разрешён только в явно непродуктивных окружениях (A8 1.4 D-5):
 # список разрешённых, а не запрещённых — «prd», «live» и т. п. не пройдут. По умолчанию
-# Settings.env = "dev": на продуктивном сервере FEELINGS_ENV обязателен и не dev/test/local.
+# Settings.env = "production" (2.1 э.2 MINOR-4): без явного FEELINGS_ENV опрос не стартует.
 DEV_ENVS = frozenset({"dev", "test", "local"})
 
 log = logging.getLogger("app.bot")
