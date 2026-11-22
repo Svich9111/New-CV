@@ -219,3 +219,51 @@ def test_onboarding_error_codes_are_described() -> None:
     assert {"underage", "onboarding_required", "unauthorized"} <= set(known)
     tz = spec["components"]["schemas"]["OnboardingRequest"]["properties"]["timezone"]
     assert tz["maxLength"] == 64  # колонка users.timezone — String(64)
+
+
+def test_chat_stream_contract() -> None:
+    """2.1 этап 2 (АР-32): события SSE личного чата, коды ошибок, ответы до потока, история."""
+    spec = _spec()
+    schemas = spec["components"]["schemas"]
+    post = spec["paths"]["/chat/messages"]["post"]
+    stream = post["responses"]["200"]
+    assert stream["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
+    events = {
+        _resolve(spec, ref)["x-sse-event"]: _resolve(spec, ref)
+        for ref in stream["content"]["text/event-stream"]["schema"]["oneOf"]
+    }
+    assert {name: set(s["required"]) for name, s in events.items()} == {
+        "delta": {"text"},
+        "done": {"message_id", "suggest_draft"},
+        "crisis": {"message_id", "text", "replace", "contacts"},
+        "error": {"code", "message"},
+    }
+    assert all(s["additionalProperties"] is False for s in events.values())
+    contacts = events["crisis"]["properties"]["contacts"]
+    assert contacts["items"] == {"$ref": "#/components/schemas/HelpContact"}
+    assert contacts["minItems"] == 1  # кризис — с контактами всегда (§9.3)
+    assert schemas["ChatErrorCode"]["enum"] == [
+        "refusal",
+        "unavailable",
+        "quota",
+        "bad_output",
+        "internal",
+    ]
+    responses = post["responses"]
+    assert {"200", "401", "402", "403", "409", "422", "429"} <= set(responses)
+    assert responses["403"] == {"$ref": "#/components/responses/OnboardingRequired"}
+    assert responses["409"] == {"$ref": "#/components/responses/ConflictRetry"}
+    assert "Не отдаётся до этапа 4" in responses["402"]["description"]
+    limited = _resolve(spec, responses["429"])
+    assert limited["headers"]["Retry-After"]["required"] is True
+    assert _example_codes(limited) == ["rate_limited"]
+    assert "402 и 429 в этом случае не возвращаются" in post["description"]
+    known = set(schemas["Error"]["properties"]["code"]["examples"])
+    assert {"rate_limited", "subscription_required", "validation_error", "conflict_retry"} <= known
+
+    get = spec["paths"]["/chat/messages"]["get"]
+    assert get["responses"]["200"]["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
+    assert get["responses"]["403"] == {"$ref": "#/components/responses/OnboardingRequired"}
+    message = schemas["ChatMessage"]
+    assert message["properties"]["author"]["enum"] == ["owner", "agent"]
+    assert message["properties"]["text"]["$ref"] == "#/components/schemas/ExportText"

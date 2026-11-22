@@ -271,32 +271,98 @@ paths:
     get:
       tags: [chat]
       summary: История личного чата с агентом (видит только владелец)
+      description: |
+        Реплики владельца (`author: owner`) и его агента (`author: agent`) из всех своих диалогов
+        одной лентой (деление на сессии — задача 2.4); партнёр и его агент эту ленту не видят
+        (ТЗ §2 п.4, §6). Сводка сжатия (`summary_enc`) не отдаётся; старые реплики после сжатия
+        в истории остаются. Кризисный ответ хранится и отдаётся как обычная реплика агента
+        (без контактов — они в `GET /help/contacts`).
+
+        **Порядок и курсор.** `items` — от новых к старым (`created_at DESC, id DESC`). Первая
+        страница (без `cursor`) — самые свежие `limit` реплик. `next_cursor` — непрозрачная
+        строка (сервер кодирует позицию последней реплики страницы, клиент её не разбирает
+        и не составляет сам); передаётся в `cursor` для следующей, более старой страницы;
+        `null` — старше реплик нет. Курсор, который сервер не выдавал (не разбирается), — 422
+        `validation_error`. Реплики, добавленные после выдачи курсора, на последующих
+        страницах не появляются и не сдвигают их — их даёт новая первая страница.
+
+        **Нерасшифровываемый текст** (повреждённая строка, неизвестный ключ; задача 4.2) не
+        роняет ответ и не пропускается: на месте `text` — объект `UnavailableText` с кодом
+        причины (в журнал — только код причины, без текста и id).
+
+        Требует завершённого онбординга (403 `onboarding_required`): личный чат — обработка
+        чувствительных данных по согласию (ФТ-02, ТЗ §4.1 п.2). Без онбординга свои реплики
+        доступны через `GET /me/export` (АР-25). Ответ не кэшируется (`Cache-Control: no-store`).
       parameters:
         - $ref: "#/components/parameters/Cursor"
         - $ref: "#/components/parameters/Limit"
       responses:
         "200":
-          description: OK
+          description: Страница истории (от новых к старым)
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [items, next_cursor]
                 properties:
                   items:
                     type: array
                     items: { $ref: "#/components/schemas/ChatMessage" }
-                  next_cursor: { type: [string, "null"] }
+                  next_cursor:
+                    type: [string, "null"]
+                    description: Курсор следующей (более старой) страницы; null — дальше реплик нет
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "422": { $ref: "#/components/responses/Validation" }
     post:
       tags: [chat]
       summary: Реплика владельца; ответ агента потоком (ФТ-05)
       description: |
-        Ответ — Server-Sent Events. События: `delta` {text}, `done` {message_id, suggest_draft: bool},
-        `crisis` {contacts} — кризисный протокол (ФТ-17), `error` {code, message} — отказ модели,
-        текст реплики не теряется (ТЗ §10). Первый символ — до 5 с в 95% случаев.
-        Порядок проверок: сначала классификатор безопасности, потом подписка и лимиты. При признаках
-        кризиса ответ с контактами помощи идёт всегда — 402 и 429 в этом случае не возвращаются
-        (ТЗ §9.3, §11 п.5).
+        **Обработка** (АР-30, АР-32). Проверки входа, онбординга и тела → реплика владельца
+        сохраняется (шифротекст) **до** любого вызова модели, поэтому при любом отказе дальше
+        она не теряется (ТЗ §10) → классификатор безопасности (вторая линия, ТЗ §9.3) по
+        контексту §6.1 → подписка и дневной лимит → поток ответа агента. Код ответа
+        выбирается до первого байта тела: 402/429 — после классификатора, но до потока.
+
+        **Кризис.** При признаках кризиса ответ по протоколу с контактами помощи идёт всегда —
+        402 и 429 в этом случае не возвращаются (ТЗ §9.3, §11 п.5); ни черновика, ни
+        смягчения.
+
+        **Ответы до потока** (тело JSON `Error`): 401; 403 `onboarding_required`; 422
+        `validation_error` (нет `text`, пустой или только из пробелов, длиннее 4000); 409
+        `conflict_retry` — только из транзакции сохранения реплики владельца, ничего не
+        сохранено, повтор безопасен (АР-24); 429 `rate_limited` — исчерпан дневной лимит
+        (ТЗ §10), реплика владельца **сохранена** и остаётся в истории без ответа агента, повтор
+        того же текста создаст новую реплику; 402 `subscription_required` — **не отдаётся до
+        этапа 4** (подписка, ТЗ §11), объявлен заранее.
+
+        **Поток** — ответ 200 `text/event-stream; charset=utf-8`, заголовки
+        `Cache-Control: no-store` и `X-Accel-Buffering: no`. Формат Server-Sent Events: каждое
+        событие — строка `event: <имя>`, строка `data: <JSON-объект в одну строку, UTF-8>` и
+        пустая строка. Имена и поля — схемы `ChatStreamDelta`, `ChatStreamDone`,
+        `ChatStreamCrisis`, `ChatStreamError` (имя события — `x-sse-event` схемы; в `data` оно
+        не повторяется). Строки-комментарии (начинаются с `:`) — поддержание соединения, клиент их
+        пропускает. Полей `id:` и `retry:` нет, возобновление потока (`Last-Event-ID`) не
+        поддерживается. Поток — ноль или больше `delta`, затем ровно одно завершающее событие
+        (`done`, `crisis` или `error`), после него соединение закрывается. Склейка всех `delta`
+        перед `done` — сохранённый текст реплики агента. Первый `delta` не ждёт полного ответа
+        модели; первый символ — до 5 с в 95% случаев (ТЗ §10).
+
+        **Отключение клиента.** Если клиент закрыл соединение до завершающего события, все
+        вызовы модели (агент и классификатор) отменяются и дожидаются (задача 2.1, правила
+        этапа 2); недописанный ответ агента не сохраняется, реплика владельца остаётся. Ответ,
+        сохранённый до отправки `done`/`crisis`, остаётся в истории, даже если событие не
+        дошло. После обрыва клиент перечитывает `GET /chat/messages`.
+
+        **Журналы.** Ни текст реплики владельца, ни куски и текст ответа агента не пишутся в
+        журналы, `audit_log` и `safety_events` (в `safety_events` — только тип события, ТЗ §7,
+        §9.3); в журнал запроса — имя завершающего события, код ошибки, длительности, модели и
+        расход.
       requestBody:
         required: true
         content:
@@ -304,15 +370,47 @@ paths:
             schema:
               type: object
               required: [text]
+              additionalProperties: false
               properties:
-                text: { type: string, minLength: 1, maxLength: 4000 }
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 4000
+                  description: Реплика владельца; только из пробелов — 422
       responses:
         "200":
-          description: Поток SSE
+          description: Поток SSE — события `delta`*, затем одно из `done`, `crisis`, `error`
+          headers:
+            Cache-Control:
+              description: Поток с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             text/event-stream:
-              schema: { type: string }
-        "402": { $ref: "#/components/responses/SubscriptionRequired" }
+              schema:
+                description: >-
+                  Последовательность событий SSE; `data` каждого события — JSON по схеме,
+                  которую выбирает имя события (`x-sse-event` схемы)
+                oneOf:
+                  - { $ref: "#/components/schemas/ChatStreamDelta" }
+                  - { $ref: "#/components/schemas/ChatStreamDone" }
+                  - { $ref: "#/components/schemas/ChatStreamCrisis" }
+                  - { $ref: "#/components/schemas/ChatStreamError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402":
+          description: >-
+            Код `subscription_required` (ТЗ §11). **Не отдаётся до этапа 4** (подписка и оплата):
+            до тех пор доступ ограничен только дневным лимитом (429). При кризисе не отдаётся
+            никогда (ТЗ §9.3, §11 п.5).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                subscription_required:
+                  value: { code: subscription_required, message: Подписка закончилась — продлите её, чтобы продолжить }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
+        "422": { $ref: "#/components/responses/Validation" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
   /chat/voice:
@@ -772,8 +870,24 @@ components:
       description: Подписка закончилась или исчерпан дневной лимит без подписки (ТЗ §11)
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     RateLimited:
-      description: Превышен дневной лимит запросов (ТЗ §10)
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      description: >-
+        Код `rate_limited`: исчерпан дневной лимит реплик в личном чате (ТЗ §10 «лимит запросов
+        на пользователя в сутки»). В лимит засчитываются реплики, принятые к ответу (200),
+        включая кризисные; реплика, получившая 429, не засчитывается. При кризисе 429 не
+        отдаётся (ТЗ §9.3, §11 п.5). Реплика владельца уже сохранена (см. `POST /chat/messages`).
+      headers:
+        Retry-After:
+          description: >-
+            Целое число секунд (не меньше 1) до начала следующего окна лимита, когда реплика
+            снова будет принята; окно и хранилище счётчика — решение A2 в отчёте задачи 2.1
+          required: true
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            rate_limited:
+              value: { code: rate_limited, message: На сегодня лимит сообщений агенту исчерпан — продолжим завтра }
 
   schemas:
     Error:
@@ -847,12 +961,111 @@ components:
 
     ChatMessage:
       type: object
+      description: Реплика личного чата (`conversation_messages`); видит только владелец
       required: [id, author, text, created_at]
+      additionalProperties: false
       properties:
         id: { type: string, format: uuid }
-        author: { type: string, enum: [owner, agent] }
-        text: { type: string }
+        author:
+          type: string
+          enum: [owner, agent]
+          description: "`owner` — реплика владельца, `agent` — ответ его агента (и кризисный ответ протокола)"
+        text:
+          description: Текст реплики или `UnavailableText`, если его не удалось расшифровать
+          $ref: "#/components/schemas/ExportText"
         created_at: { type: string, format: date-time }
+
+    ChatStreamDelta:
+      type: object
+      x-sse-event: delta
+      description: >-
+        Событие `delta` — очередной кусок ответа агента; клиент дописывает `text` к показанному.
+        Кусок не пустой; границы кусков произвольны (не по словам).
+      required: [text]
+      additionalProperties: false
+      properties:
+        text: { type: string, minLength: 1 }
+
+    ChatStreamDone:
+      type: object
+      x-sse-event: done
+      description: >-
+        Событие `done` — ответ агента завершён и сохранён; склейка всех `delta` — текст
+        сохранённой реплики.
+      required: [message_id, suggest_draft]
+      additionalProperties: false
+      properties:
+        message_id: { type: string, format: uuid, description: "id реплики агента (`ChatMessage.id`)" }
+        suggest_draft:
+          type: boolean
+          description: Агент готов предложить черновик сообщения партнёру; сам черновик — `POST /drafts` (задача 3.1)
+
+    ChatStreamCrisis:
+      type: object
+      x-sse-event: crisis
+      description: |
+        Событие `crisis` — кризисный протокол (ФТ-17, ТЗ §9.3): признаки найдены классификатором
+        безопасности или агентом. Идёт всегда, без 402/429; черновика нет (`suggest_draft` не
+        передаётся), ничего не смягчается.
+
+        `text` — итоговый ответ протокола (ответ агента, если был, и блоки шаблона
+        `prompts/crisis.v*.md`); он и сохраняется как реплика агента. `replace` — что делать
+        с уже показанными кусками `delta`: `true` — показанное заменяется на `text` целиком
+        (показанный текст — не начало `text`); `false` — `text` начинается с показанного
+        (без учёта пробелов по краям), клиент показывает `text` полностью. При порядке
+        «сначала классификатор» (АР-30) кризис от классификатора приходит до первого `delta`
+        и `replace` = false; `true` возможен, если кризис распознал сам агент и шаблон
+        протокола не начинается с его ответа, и при параллельном режиме (пересмотр АР-30).
+      required: [message_id, text, replace, contacts]
+      additionalProperties: false
+      properties:
+        message_id:
+          type: [string, "null"]
+          format: uuid
+          description: >-
+            id сохранённой реплики агента с `text`; null — сохранить не удалось (например,
+            аккаунт удалён во время ответа): событие с контактами отдаётся всё равно
+        text: { type: string, minLength: 1 }
+        replace: { type: boolean }
+        contacts:
+          type: array
+          minItems: 1
+          description: >-
+            Контакты служб помощи — те же записи и в том же порядке, что `GET /help/contacts`,
+            целиком в событии: показать помощь можно без второго запроса, даже если сеть или
+            сервер дальше недоступны. Не зависят от типа кризиса и не содержат данных пользователя.
+          items: { $ref: "#/components/schemas/HelpContact" }
+
+    ChatStreamError:
+      type: object
+      x-sse-event: error
+      description: |
+        Событие `error` — ответ агента не получен. **Реплика владельца сохранена** (ТЗ §10) и
+        есть в истории; повторить можно новой репликой. Куски `delta`, показанные до ошибки, не
+        сохранены — клиент помечает их как прерванный ответ или убирает. Резервная модель
+        пробуется только при недоступности основной до первого куска (АР-20); при отказе модели
+        резерва нет. Текст реплики и ответа в `error` и в журнал не попадает.
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code: { $ref: "#/components/schemas/ChatErrorCode" }
+        message: { type: string, minLength: 1, description: Понятное пользователю сообщение на русском }
+
+    ChatErrorCode:
+      type: string
+      description: |
+        Код события `error` (из `LLMError.kind` слоя модели, `app/ai/llm/errors.py`):
+        - `refusal` — модель отказалась отвечать на реплику;
+        - `unavailable` — модель недоступна (сеть, тайм-аут, перегрузка; резерв тоже не ответил
+          или куски уже шли);
+        - `quota` — исчерпан лимит/баланс поставщика модели (не дневной лимит пользователя —
+          он даёт 429 до потока);
+        - `bad_output` — ответ модели испорчен (не разбирается, обрезан);
+        - `internal` — всё остальное: ошибка кода, сервис не настроен или ключ отклонён
+          (`config`, `auth`, `bad_request`, `model_not_found`, `error`), сбой БД после начала
+          потока, в том числе не удалось сохранить ответ агента.
+        Новые коды добавляются в этот список; клиент любой незнакомый код показывает как `internal`.
+      enum: [refusal, unavailable, quota, bad_output, internal]
 
     Draft:
       type: object
@@ -959,7 +1172,9 @@ components:
         reason: { type: string, enum: [format, unknown_key, auth, encoding, context] }
 
     ExportText:
-      description: Расшифрованный текст или отметка о его недоступности
+      description: >-
+        Расшифрованный текст или отметка о его недоступности (выгрузка ФТ-21 и история
+        личного чата `GET /chat/messages`)
       oneOf:
         - { type: string }
         - { $ref: "#/components/schemas/UnavailableText" }
