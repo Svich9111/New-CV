@@ -532,6 +532,71 @@ async def test_send_blocked_draft_is_422(env: Env) -> None:
     )
 
 
+async def test_send_undecryptable_draft_refused_before_db_function(env: Env) -> None:
+    """3.1 р1 (ревью MINOR-2): нерасшифрованный черновик не отправляется — 409 `not_editable` до
+    `app_send_draft`, в `partner_messages` ничего; черновик остаётся `draft`; GET — 404 (Б-79)."""
+    anna, _ = await couple(env)
+    d = ok_draft(await create(env, anna))
+    async with env.engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE message_drafts SET text_enc = :b WHERE id = :d"),
+            {"b": b"\x00broken", "d": d["id"]},
+        )
+    before = await partner_messages(env)
+    _error(
+        await env.client.post(
+            f"{DRAFTS}/{d['id']}/send", headers=anna.headers, json={"expected_version": 1}
+        ),
+        409,
+        "not_editable",
+    )
+    assert await partner_messages(env) == before
+    async with env.engine.connect() as conn:
+        status = (
+            await conn.execute(
+                text("SELECT status::text FROM message_drafts WHERE id = :d"), {"d": d["id"]}
+            )
+        ).scalar_one()
+    assert status == "draft"
+    _error(await env.client.get(f"{DRAFTS}/{d['id']}", headers=anna.headers), 404, "not_found")
+
+
+async def test_long_model_draft_retried_shorter_then_clipped(env: Env) -> None:
+    """3.1 р1 (ревью MINOR-3): черновик модели длиннее 4000 (предел PATCH) — повтор с пожеланием
+    «короче»; снова длинный — обрезка по границе предложения; текст можно сохранить правкой."""
+    from app.ai.drafts import MAX_DRAFT_CHARS, SHORTER_WISH
+
+    anna, _ = await couple(env)
+    short = env.mark("short")
+    model = env.use(Model("Очень длинно. " * 400, short))
+    d = ok_draft(await create(env, anna))
+    assert d["text"] == short
+    assert model.calls["draft"][-1]["revision"]["wish"] == SHORTER_WISH
+    long_ = "Мне важно, чтобы мы обсуждали траты заранее. " * 120
+    env.use(Model(long_))
+    d2 = ok_draft(await create(env, anna))
+    assert len(d2["text"]) <= MAX_DRAFT_CHARS and d2["text"].endswith(".")
+    assert long_.startswith(d2["text"])
+    # «Другой вариант» — тот же предел.
+    env.use(Model(long_ + "!"))
+    r = ok_draft(await env.client.post(f"{DRAFTS}/{d['id']}/regenerate", headers=anna.headers), 200)
+    assert len(r["text"]) <= MAX_DRAFT_CHARS
+    e = await env.client.patch(
+        f"{DRAFTS}/{d2['id']}",
+        headers=anna.headers,
+        json={"text": d2["text"], "expected_version": 1},
+    )
+    assert e.status_code == 200, e.text
+
+
+def test_clip_draft_boundaries() -> None:
+    from app.ai.drafts import clip_draft
+
+    assert clip_draft("Коротко.", 100) == "Коротко."
+    assert clip_draft("Раз. Два. Три четыре пять", 12) == "Раз. Два."
+    assert clip_draft("словословослово " * 3, 20) == "словословослово"
+
+
 async def test_race_send_and_patch_same_version(env: Env) -> None:
     """Одновременные «Отправить» и правка одной версии: проходит ровно одно; ушло — именно то,
     что автор видел (оригинал = текст этой версии), правка не теряется молча."""

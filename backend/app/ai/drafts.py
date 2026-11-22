@@ -20,8 +20,9 @@
 
 from __future__ import annotations
 
+import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -45,6 +46,12 @@ AVOID_QUOTE_WISH = (
     "Сформулируй своими словами владельца, без фраз из книг и статей, коротко и по схеме."
 )
 ANOTHER_WISH = "Другой вариант: сформулируй иначе, другими словами, сохранив смысл и просьбу."
+# 3.1 р1 (A2), ревью MINOR-3: текст черновика — не длиннее, чем принимает правка автором
+# (`PATCH /drafts/{id}`, 4000). Длиннее — ещё одна попытка с пожеланием «короче», затем обрезка
+# по границе предложения (автор видит и правит черновик до «Отправить»; кода ошибки нет).
+MAX_DRAFT_CHARS = 4000
+SHORTER_WISH = "Короче: сохрани чувство, потребность и просьбу, убери лишнее."
+_SENTENCE_END = re.compile(r"[.!?…](?=\s|$)")
 
 DraftErrorCode = Literal[
     "no_turns",  # в разговоре нет реплик владельца — писать не по чему
@@ -151,12 +158,27 @@ async def _generate(
         )
         quoted = _has_quote(result, built)
         same = previous is not None and normalize(result.text) == normalize(previous)
-        if not quoted and not same:
+        too_long = len(result.text) > MAX_DRAFT_CHARS
+        if not quoted and not same and not too_long:
             return result
         if attempt == RETRIES:
-            raise DraftError("quote" if quoted else "same")
-        revision = Revision(result.text, AVOID_QUOTE_WISH if quoted else ANOTHER_WISH)
+            if quoted or same:
+                raise DraftError("quote" if quoted else "same")
+            return replace(result, text=clip_draft(result.text))
+        wish_ = AVOID_QUOTE_WISH if quoted else ANOTHER_WISH if same else SHORTER_WISH
+        revision = Revision(result.text, wish_)
     raise AssertionError("недостижимо")  # pragma: no cover
+
+
+def clip_draft(body: str, limit: int = MAX_DRAFT_CHARS) -> str:
+    """3.1 р1 (A2): текст не длиннее ``limit`` — по последней границе предложения в пределе
+    (если она есть во второй половине), иначе — по последнему пробелу; пробелы по краям убраны."""
+    if len(body) <= limit:
+        return body
+    head = body[:limit]
+    ends = [m.end() for m in _SENTENCE_END.finditer(head)]
+    cut = ends[-1] if ends and ends[-1] >= limit // 2 else head.rfind(" ")
+    return (head[:cut] if cut > 0 else head).strip()
 
 
 def _result(

@@ -53,6 +53,15 @@ class VersionConflict(Exception):
     """``expected_version`` не текущая (409 ``version_conflict``)."""
 
 
+class Unreadable(Exception):
+    """Текст черновика не расшифровывается (3.1 р1, ревью MINOR-2): отправлять нельзя —
+    партнёр получил бы нечитаемое сообщение. Для API — 409 ``not_editable`` (Б-79)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class Blocked(Exception):
     """Черновик остановлен проверкой безопасности (422 ``blocked_by_safety``)."""
 
@@ -212,13 +221,15 @@ async def send(
                 raise NotEditable
             if int(row.version) != expected_version:
                 raise VersionConflict
+            body, reason = open_row(keys, crypto.DRAFT_TEXT, draft_id, row.text_enc)
+            if reason is not None:
+                raise Unreadable(reason)  # до app_send_draft: шифротекст не копируется
             msg_id = (
                 await s.execute(
                     text("SELECT app_send_draft(:d, :v)"), {"d": draft_id, "v": expected_version}
                 )
             ).scalar_one()
             m = (await s.execute(text(_SENT), {"m": msg_id})).one()
-            body, reason = open_row(keys, crypto.DRAFT_TEXT, draft_id, row.text_enc)
     except DBAPIError as exc:
         code = sqlstate(exc)
         if code == "FA001":

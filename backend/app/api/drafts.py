@@ -318,6 +318,12 @@ async def send_draft(
         raise _not_editable() from exc
     except repo.VersionConflict as exc:
         raise _version_conflict() from exc
+    except repo.Unreadable as exc:
+        # 3.1 р1 (A2), ревью MINOR-2: отдельного кода в контракте нет (Б-79, A1) — not_editable.
+        logger.warning("draft unavailable: reason=%s", exc.reason)
+        raise AppError(
+            409, "not_editable", "Текст черновика недоступен — попросите агента написать заново"
+        ) from exc
     except repo.Blocked as exc:
         raise AppError(
             422, "blocked_by_safety", "Черновик остановлен проверкой безопасности"
