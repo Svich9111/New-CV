@@ -30,6 +30,7 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -121,6 +122,13 @@ class World:
 
 @pytest.fixture
 async def w(sessionmaker: SM) -> AsyncIterator[World]:
+    async with world_for(sessionmaker) as world:
+        yield world
+
+
+@asynccontextmanager
+async def world_for(sessionmaker: SM) -> AsyncIterator[World]:
+    """Окружение теста (приложение с заглушками моделей); общий для файлов A8 по чату."""
     keys = parse_keyring(generate_key_entry("a8c"), "a8c")
     env = Env()
     agent = FakeModel(stream=_chunks(_answer(REPLY)))
