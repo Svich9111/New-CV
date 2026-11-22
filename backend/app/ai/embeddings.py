@@ -8,6 +8,10 @@
   слов и их общих частей («деньги» / «денег»), что достаточно для тестов и локальной работы;
 - ``None`` вместо эмбеддера — поиска по смыслу нет, память берётся по свежести.
 
+Поиск по смыслу — в БД, функциями ``app_memory_nearest`` / ``app_kb_nearest`` (миграция 0008,
+АР-35): приложение передаёт вектор текстом (``to_pgvector``) и имя модели (``Embedder.model``);
+находятся только векторы той же модели. Прямого доступа приложения к pgvector нет.
+
 Вектор запроса и векторы памяти должны быть сделаны одной моделью: смена модели требует
 пересчёта всех векторов (АР-5). В тексты ошибок и журналы тексты не попадают (CLAUDE.md)."""
 
@@ -52,9 +56,13 @@ class HashingEmbedder:
             raise ValueError("dim")
         self._dim = dim
 
+    MODEL = "stub-hashing-trigram-v1"
+
     @property
     def model(self) -> str:
-        return f"stub-hashing-trigram-{self._dim}"
+        """Фиксированное имя: векторы в БД помечаются им (``embedding_model``, АР-35) и ищутся
+        только среди векторов той же модели."""
+        return self.MODEL
 
     @property
     def dim(self) -> int:
@@ -92,6 +100,10 @@ def check_dim(vector: Sequence[float], dim: int = EMBEDDING_DIM) -> list[float]:
     out = [float(v) for v in vector]
     if not all(math.isfinite(v) for v in out):
         raise EmbeddingError("в векторе не числа")
+    if not any(out):
+        # Нулевой вектор (реплика без слов) функция поиска отклоняет (22023, АР-35) — сразу
+        # «по свежести», без ошибки в транзакции.
+        raise EmbeddingError("нулевой вектор")
     return out
 
 

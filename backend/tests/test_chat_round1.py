@@ -5,27 +5,26 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import uuid
 from typing import Any
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.ai import chat as ai_chat
 from app.ai import dialog, summary
 from app.ai.calls import as_json
 from app.ai.context import MIN_TURN_CHARS, ContextBudget, build_context, size, turns_read_limit
 from app.ai.dialog import OwnerContext, Turn
-from app.ai.embeddings import HashingEmbedder
+from app.ai.embeddings import HashingEmbedder, to_pgvector
 from app.ai.llm import FallbackProvider, LLMUnavailable, StructuredResult
 from app.ai.models import AgentModels
 from app.ai.prompts import system_prompt
 from app.ai.stub import ScriptedProvider, ScriptedStreamProvider, json_chunks
 from app.db import user_scope
 from app.repositories import chat
-from app.repositories.chat import HistorySummary, parse_vector, rank_by_similarity
+from app.repositories.chat import HistorySummary
 from tests.test_account_delete import _couple, _send_encrypted
 from tests.test_account_export_db import _deliver
 from tests.test_chat_context import KEYS, P, owner_says, person
@@ -179,74 +178,88 @@ def test_batch_respects_chars_and_takes_at_least_one() -> None:
     assert len(summary.batch(turns, tiny)) == 1
 
 
-# ----------------------------------------------------------------- MAJOR-4, MINOR-6: поиск памяти
+# ----------------------------------------------------------------- MAJOR-4 → 2.0v: поиск памяти в БД
+# 2.0v (A3): косинус в приложении (``rank_by_similarity``, ``parse_vector``, ``to_thread``) убран —
+# поиск идёт функцией БД ``app_memory_nearest`` (миграция 0008, АР-35). Прежние тесты расчёта в
+# приложении заменены проверками того же требования (поиск по смыслу без нагрузки на цикл
+# событий и без чтения векторов приложением).
 
 
-async def test_similarity_runs_off_event_loop(
+async def test_memory_search_goes_through_db_function(
     sessionmaker: SM, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     p = await person(engine, sessionmaker, "Вера", "Олег")
     await owner_says(sessionmaker, p, "деньги отпуск")
-    seen: list[bool] = []
-    real = chat.rank_by_similarity
+    statements: list[str] = []
+    real_execute = AsyncSession.execute
 
-    def spy(*args: Any) -> list[uuid.UUID]:
-        seen.append(threading.current_thread() is threading.main_thread())
-        return real(*args)
+    async def spy(self: AsyncSession, statement: Any, *args: Any, **kwargs: Any) -> Any:
+        statements.append(str(statement))
+        return await real_execute(self, statement, *args, **kwargs)
 
-    monkeypatch.setattr(chat, "rank_by_similarity", spy)
+    monkeypatch.setattr(AsyncSession, "execute", spy)
     built = await build_context(sessionmaker, KEYS, p.user_id, p.conv, query="деньги", embedder=EMB)
-    assert seen == [False] and built.stats.memory_search == "vector"
+    assert built.stats.memory_search == "vector"
+    assert built.stats.memory_ids[0] == p.memory[0]  # «деньги отпуск» — ближе всех
+    assert any("app_memory_nearest" in st for st in statements)
+    # Приложение не читает векторы и не считает близость само.
+    assert not any("embedding" in st and "app_memory_nearest" not in st for st in statements)
+    assert not hasattr(chat, "rank_by_similarity") and not hasattr(chat, "parse_vector")
 
 
-async def test_scan_limit_default_lowered() -> None:
-    import inspect
-
-    assert inspect.signature(chat.read_context).parameters["memory_scan_limit"].default == 200
-
-
-class _Obj:
-    def __init__(self, values: list[float], method: str) -> None:
-        setattr(self, method, lambda: list(values))
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "[1,0.5,-2]",
-        [1.0, 0.5, -2.0],
-        (1, 0.5, -2),
-        _Obj([1, 0.5, -2], "to_list"),
-        _Obj([1, 0.5, -2], "tolist"),
-    ],
-)
-def test_parse_vector_driver_and_codec_types(raw: object) -> None:
-    assert parse_vector(raw) == [1.0, 0.5, -2.0]
-
-
-@pytest.mark.parametrize("raw", [None, 5, "1,2", "[a,b]", ["x"], b"[1]"])
-def test_parse_vector_garbage_is_none(raw: object) -> None:
-    assert parse_vector(raw) is None
-
-
-def test_rank_skips_wrong_dimension_and_orders_ties_by_id() -> None:
-    a, b, c = sorted(uuid.uuid4() for _ in range(3))
-    rows: list[tuple[uuid.UUID, object]] = [(b, "[1,0]"), (a, "[1,0]"), (c, "[1,0,0]")]
-    assert rank_by_similarity([1.0, 0.0], rows, 5) == [a, b]
-
-
-async def test_parse_vector_reads_what_driver_returns(
+async def test_vector_of_other_model_not_found_memory_by_recency(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
-    p = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
-    async with user_scope(sessionmaker, p.user_id) as s:
-        raw = (
-            await s.execute(
-                text("SELECT embedding FROM memory_items WHERE id = :i"), {"i": p.memory[0]}
+    """АР-5/АР-35: векторы другой модели не сравниваются — поиск по смыслу их не находит,
+    память берётся по свежести."""
+
+    class OtherModel(HashingEmbedder):
+        MODEL = "другая-модель-v2"
+
+    p = await person(engine, sessionmaker, "Вера", "Олег")
+    await owner_says(sessionmaker, p, "деньги отпуск")
+    built = await build_context(
+        sessionmaker, KEYS, p.user_id, p.conv, query="деньги", embedder=OtherModel()
+    )
+    assert built.stats.memory_search == "recency" and not built.stats.embedding_error
+    assert built.stats.memory_ids == (p.memory[1], p.memory[0])  # новые первыми
+
+
+async def test_query_without_words_falls_back_to_recency(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Нулевой вектор (реплика без слов) функция отклонила бы (22023) — сборка заранее идёт по
+    свежести, транзакция не ломается."""
+    p = await person(engine, sessionmaker, "Вера", "Олег")
+    await owner_says(sessionmaker, p, "!!!")
+    built = await build_context(sessionmaker, KEYS, p.user_id, p.conv, query="!!!", embedder=EMB)
+    assert built.stats.embedding_error and built.stats.memory_search == "recency"
+
+
+async def test_set_memory_embedding_only_own_live_record(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    a = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
+    b = await person(engine, sessionmaker, "Олег", "Вера", chat_turns=False)
+    [vec] = await EMB.embed(["деньги"])
+    assert await chat.set_memory_embedding(sessionmaker, a.user_id, a.memory[0], vec, EMB.model)
+    assert not await chat.set_memory_embedding(sessionmaker, a.user_id, b.memory[0], vec, EMB.model)
+    async with engine.begin() as conn:  # удаление по ФТ-13: текст, вектор и модель — вместе
+        await conn.execute(
+            text(
+                "UPDATE memory_items SET deleted_at = now(), text_enc = NULL, embedding = NULL, "
+                "embedding_model = NULL WHERE id = :i"
+            ),
+            {"i": a.memory[1]},
+        )
+    assert not await chat.set_memory_embedding(sessionmaker, a.user_id, a.memory[1], vec, EMB.model)
+    async with engine.connect() as conn:
+        model = (
+            await conn.execute(
+                text("SELECT embedding_model FROM memory_items WHERE id = :i"), {"i": a.memory[0]}
             )
         ).scalar_one()
-    vec = parse_vector(raw)
-    assert vec is not None and len(vec) == 1024
+    assert model == EMB.model == HashingEmbedder().model == "stub-hashing-trigram-v1"
 
 
 # ----------------------------------------------------------------- MINOR-7, MINOR-10: гонки
@@ -662,3 +675,54 @@ def test_plan_short_tail_and_long_tail() -> None:
     assert summary.plan(22, turns[:20], policy) == turns[:10]
     small = summary.CompressionPolicy(trigger_turns=20, keep_turns=6, batch_turns=40)
     assert summary.plan(22, turns[:22], small) == turns[:16]  # последние 6 остаются
+
+
+# ================================================================= 2.0v (A3): база знаний в БД
+
+
+async def test_db_knowledge_base_in_context(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """§6.1 п.4, §6.4: фрагменты по теме — функцией ``app_kb_nearest`` через ``DbKnowledgeBase``;
+    только материалы ``indexed`` и векторы той же модели; фильтры по меткам; без вектора — пусто."""
+    from app.ai.knowledge import DbKnowledgeBase
+    from tests.test_vector_search_db import _kb_chunk, _kb_document
+
+    class KbModel(HashingEmbedder):
+        MODEL = f"kb-test-{uuid.uuid4().hex[:8]}"
+
+    emb = KbModel()
+    approach = f"ННО-{uuid.uuid4().hex[:6]}"
+    [near, far] = await emb.embed(["ссора из-за денег", "погода и прогулки"])
+    async with engine.begin() as conn:
+        doc = await _kb_document(conn, approach)
+        draft_doc = await _kb_document(conn, approach, status="indexing")
+        c_near = await _kb_chunk(conn, doc, to_pgvector(near), emb.model, ["деньги"], 2)
+        c_far = await _kb_chunk(conn, doc, to_pgvector(far), emb.model, ["отдых"], 1)
+        await _kb_chunk(conn, doc, to_pgvector(near), "другая-модель", ["деньги"], 2)
+        await _kb_chunk(conn, draft_doc, to_pgvector(near), emb.model, ["деньги"], 2)
+    p = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
+    await owner_says(sessionmaker, p, "опять ссора из-за денег")
+    kb = DbKnowledgeBase(sessionmaker, p.user_id, emb.model, approach=approach)
+    built = await build_context(
+        sessionmaker, KEYS, p.user_id, p.conv, query="ссора из-за денег", embedder=emb, knowledge=kb
+    )
+    assert built.stats.knowledge_ids == (str(c_near), str(c_far))
+    assert built.payload()["knowledge"] == [f"фрагмент {c_near}", f"фрагмент {c_far}"]
+    filtered = DbKnowledgeBase(
+        sessionmaker, p.user_id, emb.model, approach=approach, topics=["отдых"]
+    )
+    assert [f.id for f in await filtered.search("x", vector=near)] == [str(c_far)]
+    by_level = DbKnowledgeBase(sessionmaker, p.user_id, emb.model, approach=approach, level=2)
+    assert [f.id for f in await by_level.search("x", vector=far)] == [str(c_near)]
+    assert await kb.search("x", vector=None) == []
+    # Без эмбеддера в сборке — пусто (поиска по словам нет), сборка не падает.
+    plain = await build_context(sessionmaker, KEYS, p.user_id, p.conv, query="x", knowledge=kb)
+    assert plain.stats.knowledge_ids == ()
+
+
+async def test_db_knowledge_base_empty_until_2_6(sessionmaker: SM, engine: AsyncEngine) -> None:
+    from app.ai.knowledge import DbKnowledgeBase
+
+    p = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
+    kb = DbKnowledgeBase(sessionmaker, p.user_id, f"никто-{uuid.uuid4().hex[:6]}")
+    [vec] = await EMB.embed(["деньги"])
+    assert await kb.search("деньги", vector=vec) == []

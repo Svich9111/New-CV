@@ -312,9 +312,11 @@ async def _mem(
     mid = uuid.uuid4()
     await c.execute(
         text(
+            # 2.0v (A3): вектор помечается моделью (АР-35, embedding_model) — поиск находит
+            # только векторы модели эмбеддера запроса; без модели запись по смыслу не ищется.
             "INSERT INTO memory_items (id, agent_id, type, text_enc, source, embedding, "
-            "created_at, deleted_at) VALUES (:i, :a, 'fact', :t, 'owner_dialog', "
-            "CAST(:v AS vector), :w, :d)"
+            "embedding_model, created_at, deleted_at) VALUES (:i, :a, 'fact', :t, "
+            "'owner_dialog', CAST(:v AS vector), :em, :w, :d)"
         ),
         {
             "i": mid,
@@ -322,6 +324,7 @@ async def _mem(
             # Удалённая запись (ФТ-13): текст и вектор стёрты (CHECK deleted_has_no_content).
             "t": None if deleted else KEYS.seal(crypto.MEMORY_TEXT, mid, body),
             "v": None if vector is None or deleted else to_pgvector(vector),
+            "em": None if vector is None or deleted else HashingEmbedder.MODEL,
             "w": when,
             "d": datetime.now(UTC) if deleted else None,
         },
@@ -676,9 +679,8 @@ async def test_isolation_is_enforced_by_database_not_code(
         # Внутренние функции слоя с id партнёра — внутри области Анны.
         turns, _ = await chat_repo._turns_after(s, KEYS, world.igor, world.igor_conv, None, None)
         assert turns == []
-        mem, _ = await chat_repo._memory(
-            s, KEYS, world.igor, world.igor_agent, None, limit=50, scan_limit=50
-        )
+        # 2.0v (A3): параметра scan_limit больше нет — поиск по смыслу делает функция БД.
+        mem, _ = await chat_repo._memory(s, KEYS, world.igor, world.igor_agent, None, limit=50)
         assert mem == []
         own, summ, _ = await chat_repo._summary(s, KEYS, world.igor, world.igor_conv)
         assert (own, summ) == (False, None)
@@ -769,7 +771,9 @@ async def test_deleted_memory_leaves_context(
     async with engine.begin() as c:
         await c.execute(
             text(
-                "UPDATE memory_items SET deleted_at = now(), text_enc = NULL, embedding = NULL "
+                # 2.0v (A3): удаление обнуляет и модель вектора (CHECK 0008).
+                "UPDATE memory_items SET deleted_at = now(), text_enc = NULL, embedding = NULL, "
+                "embedding_model = NULL "
                 "WHERE id = :m"
             ),
             {"m": mid},

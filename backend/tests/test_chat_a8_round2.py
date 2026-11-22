@@ -11,7 +11,6 @@ import asyncio
 import itertools
 import json
 import random
-import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -545,25 +544,19 @@ async def test_similarity_off_event_loop_and_scan_limit(
     sessionmaker: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Ревью MAJOR-4 (Б-55): косинус по векторам памяти считается не в потоке цикла событий и не
-    больше чем по 200 свежим векторам; цикл событий в это время отвечает."""
+    """Ревью MAJOR-4 (Б-55). 2.0v (A3): косинус в приложении убран — поиск по смыслу делает
+    функция БД ``app_memory_nearest`` (АР-35, индекс HNSW). Требование то же и строже: цикл
+    событий не занят расчётом (в приложении расчёта нет вовсе), а поиск больше не ограничен
+    200 свежими векторами — самая старая, но самая близкая запись находится первой."""
     emb = HashingEmbedder()
     async with engine.begin() as c:
         uid, agent = await _user(c, name="Ян")
         conv = await _conv(c, agent)
         await _turn(c, conv, "owner", "деньги ссора", at(0))
-        vecs = await emb.embed([f"запись {i} деньги" for i in range(230)])
-        for i, v in enumerate(vecs):
-            await _mem(c, agent, f"M{i}", at(10 + i), vector=v)
-    loop_thread = threading.get_ident()
-    calls: list[tuple[int, int]] = []
-    real = chat_repo.rank_by_similarity
-
-    def spy(query: Sequence[float], rows: Sequence[tuple[uuid.UUID, object]], limit: int) -> Any:
-        calls.append((threading.get_ident(), len(rows)))
-        return real(query, rows, limit)
-
-    monkeypatch.setattr(chat_repo, "rank_by_similarity", spy)
+        bodies = ["деньги ссора"] + [f"запись {i} про погоду" for i in range(1, 230)]
+        vecs = await emb.embed(bodies)
+        ids = [await _mem(c, agent, f"M{i}", at(10 + i), vector=v) for i, v in enumerate(vecs)]
+    assert not hasattr(chat_repo, "rank_by_similarity")
     ticks = 0
 
     async def ticker() -> None:
@@ -575,7 +568,6 @@ async def test_similarity_off_event_loop_and_scan_limit(
     t = asyncio.create_task(ticker())
     ctx = await build_context(sessionmaker, KEYS, uid, conv, query="деньги ссора", embedder=emb)
     t.cancel()
-    assert calls and all(th != loop_thread for th, _ in calls)
-    assert all(n <= 200 for _, n in calls)
     assert ctx.stats.memory_search == "vector" and len(ctx.context.memory) == 8
+    assert ctx.stats.memory_ids[0] == ids[0]  # старше 200 свежих, но ближе всех
     assert ticks > 0

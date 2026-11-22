@@ -44,16 +44,6 @@ KEYS: Keyring = parse_keyring(generate_key_entry("k1"), "k1")
 EMB = HashingEmbedder()
 
 
-async def set_embedding(engine: AsyncEngine, item: uuid.UUID, vec: Sequence[float]) -> None:
-    """Вектор записи памяти пишет суперпользователь: у ``feelings_app`` нет EXECUTE на функции
-    pgvector (миграция 0001), запись векторов приложением — после миграции A1 (задача 2.4)."""
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("UPDATE memory_items SET embedding = CAST(:v AS vector) WHERE id = :i"),
-            {"v": to_pgvector(vec), "i": item},
-        )
-
-
 @dataclass
 class P:
     user_id: uuid.UUID
@@ -88,7 +78,8 @@ async def person(
     for what in ("memory-money деньги отпуск", "memory-date годовщина"):
         item = await texts.add_memory_item(sm, KEYS, uid, aid, "fact", "owner_dialog", p.mark(what))
         [vec] = await EMB.embed([p.mark(what)])
-        await set_embedding(engine, item, vec)
+        # 2.0v (A3): вектор — функцией БД от имени владельца, с моделью (АР-35).
+        assert await chat.set_memory_embedding(sm, uid, item, vec, EMB.model)
         p.memory.append(item)
     if chat_turns:
         assert await chat.add_message(sm, KEYS, uid, conv, "owner", p.mark("chat-owner"))
@@ -157,8 +148,8 @@ async def world(engine: AsyncEngine, sm: SM) -> World:
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "UPDATE memory_items SET deleted_at = now(), text_enc = NULL, embedding = NULL "
-                "WHERE id = :i"
+                "UPDATE memory_items SET deleted_at = now(), text_enc = NULL, embedding = NULL, "
+                "embedding_model = NULL WHERE id = :i"
             ),
             {"i": item},
         )
@@ -571,16 +562,28 @@ async def test_current_conversation_is_stable(sessionmaker: SM, engine: AsyncEng
     assert await chat.current_conversation(sessionmaker, p.user_id) == p.conv
 
 
-async def test_app_role_has_no_pgvector_functions_yet(
+async def test_app_role_searches_memory_only_through_db_function(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
-    """Страж для A1: пока у ``feelings_app`` нет EXECUTE на функции pgvector, близость памяти
-    считается в приложении (``repositories.chat._memory``). Когда миграция выдаст права (или
-    функцию поиска), этот тест упадёт — тогда поиск переносится в БД (``<=>``, индекс)."""
+    """2.0v (A3), замена стража 2.1: прямого доступа приложения к функциям pgvector по-прежнему
+    нет (``<=>``, приведение к ``vector``), поиск по смыслу — только функцией
+    ``app_memory_nearest`` (АР-35), и она отдаёт только свою память."""
     p = await person(engine, sessionmaker, "Вера", "Олег", chat_turns=False)
-    with pytest.raises(Exception, match="permission denied for function"):
-        async with user_scope(sessionmaker, p.user_id) as s:
-            await s.execute(
-                text("SELECT embedding <=> embedding FROM memory_items WHERE id = :i"),
-                {"i": p.memory[0]},
+    other = await person(engine, sessionmaker, "Олег", "Вера", chat_turns=False)
+    for sql in (
+        "SELECT embedding <=> embedding FROM memory_items WHERE id = :i",
+        "SELECT CAST(CAST('[1,2]' AS text) AS vector) FROM memory_items WHERE id = :i",
+    ):
+        with pytest.raises(Exception, match="permission denied for function"):
+            async with user_scope(sessionmaker, p.user_id) as s:
+                await s.execute(text(sql), {"i": p.memory[0]})
+    [vec] = await EMB.embed([other.mark("memory-money деньги отпуск")])
+    async with user_scope(sessionmaker, p.user_id) as s:
+        ids = [
+            r.id
+            for r in await s.execute(
+                text("SELECT id FROM app_memory_nearest(:q, :m, 50)"),
+                {"q": to_pgvector(vec), "m": EMB.model},
             )
+        ]
+    assert set(ids) == set(p.memory)  # чужая память не находится даже по её вектору

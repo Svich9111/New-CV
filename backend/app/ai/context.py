@@ -5,10 +5,11 @@
 1. системный промпт (``dialog.vN``) — отдельным системным сообщением;
 2. профиль владельца (имя/обращение, имя партнёра из своего онбординга) и сводка памяти
    (``agents.profile_summary_enc``);
-3. записи памяти по смыслу текущей реплики (``Embedder``; векторы — в pgvector, близость пока
-   считается в приложении, см. ``repositories.chat._memory``; без эмбеддинга или при его
+3. записи памяти по смыслу текущей реплики (``Embedder``; поиск в БД функцией
+   ``app_memory_nearest`` по векторам той же модели, АР-35; без эмбеддинга или при его
    ошибке — по свежести), не больше ``ContextBudget.memory_items``; удалённые — никогда;
-4. фрагменты базы знаний по теме (``KnowledgeBase``; до 2.6 пусто);
+4. фрагменты базы знаний по теме (``KnowledgeBase``: в API — ``DbKnowledgeBase`` с моделью
+   эмбеддера, функция ``app_kb_nearest``; до 2.6 база пуста);
 5. краткое содержание предыдущих реплик (``conversations.summary_enc``) и **все** реплики после
    отметки сводки в пределах бюджета (без разрыва между сводкой и репликами, ``turns_read_limit``);
 6. одобренные и доставленные сообщения текущей пары, относящиеся к теме (по смыслу при наличии
@@ -274,6 +275,7 @@ async def build_context(
         user_id,
         conversation_id,
         query_vector=vector,
+        query_model=embedder.model if embedder is not None and vector is not None else None,
         memory_limit=budget.memory_items,
         turns_limit=turns_read_limit(budget.max_chars),
         pair_limit=budget.pair_candidates,

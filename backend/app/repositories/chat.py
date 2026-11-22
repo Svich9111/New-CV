@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 from collections.abc import Iterable, Sequence
@@ -28,7 +27,7 @@ from typing import Literal
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.ai.embeddings import cosine
+from app.ai.embeddings import to_pgvector
 from app.core import crypto
 from app.core.crypto import Keyring
 from app.db import user_scope
@@ -290,42 +289,6 @@ async def _turns_head(
     return int(total), head
 
 
-def parse_vector(raw: object) -> list[float] | None:
-    """Вектор из того, что отдал драйвер: текст pgvector ``[x1,x2,...]`` (asyncpg без кодека —
-    так сейчас), список/кортеж, объект кодека pgvector/numpy (``to_list()`` / ``tolist()``).
-    Нераспознанное — ``None`` (запись идёт в добор по свежести)."""
-    for method in ("to_list", "tolist"):
-        convert = getattr(raw, method, None)
-        if callable(convert):
-            raw = convert()
-            break
-    if isinstance(raw, list | tuple):
-        try:
-            return [float(v) for v in raw]
-        except (TypeError, ValueError):
-            return None
-    if not isinstance(raw, str) or not raw.startswith("[") or not raw.endswith("]"):
-        return None
-    try:
-        return [float(v) for v in raw[1:-1].split(",") if v]
-    except ValueError:
-        return None
-
-
-def rank_by_similarity(
-    query: Sequence[float], rows: Sequence[tuple[uuid.UUID, object]], limit: int
-) -> list[uuid.UUID]:
-    """id ближайших по косинусу (при равенстве — по id). Чистый расчёт без ввода-вывода:
-    вызывается в отдельном потоке (``asyncio.to_thread``), чтобы не держать цикл событий."""
-    scored: list[tuple[float, str, uuid.UUID]] = []
-    for rid, raw in rows:
-        vec = parse_vector(raw)
-        if vec is not None and len(vec) == len(query):
-            scored.append((-cosine(query, vec), str(rid), rid))
-    scored.sort()
-    return [rid for _, _, rid in scored[:limit]]
-
-
 async def _memory(
     s: AsyncSession,
     keys: Keyring,
@@ -333,61 +296,40 @@ async def _memory(
     agent_id: uuid.UUID,
     query_vector: Sequence[float] | None,
     limit: int,
-    scan_limit: int,
+    model: str | None = None,
 ) -> tuple[list[MemoryRow], int]:
-    """По смыслу — косинусная близость к вектору реплики среди записей с вектором (не больше
-    ``scan_limit`` самых свежих); недобор — по свежести. Удалённые записи (ФТ-13:
-    ``deleted_at``, текст и вектор стёрты) не берутся никогда.
-
-    Близость считается в приложении, в отдельном потоке (``asyncio.to_thread``), по не более
-    чем ``scan_limit`` векторам: у ``feelings_app`` нет EXECUTE на функции pgvector
-    (``REVOKE ALL ON ALL FUNCTIONS … FROM PUBLIC``, миграция 0001), поэтому ни ``<=>``, ни
-    ``CAST(… AS vector)`` в запросах приложения не работают. Перенос в БД (функция поиска,
-    индекс) — миграция A1 (Б-55). Читаются только векторы, тексты — только выбранных."""
+    """По смыслу — функцией БД ``app_memory_nearest`` (миграция 0008, АР-35; индекс HNSW): только
+    своя память (``app_uid()``), не удалённые записи с текстом и с вектором модели ``model``
+    (``Embedder.model``); вектор передаётся текстом, прямого доступа к pgvector у приложения нет.
+    Недобор — по свежести (и весь блок по свежести, если вектора или модели нет). Удалённые
+    записи (ФТ-13: ``deleted_at``, текст, вектор и модель стёрты) не берутся никогда."""
     base = (
         "FROM memory_items m JOIN agents a ON a.id = m.agent_id "
         "WHERE m.agent_id = :a AND a.user_id = :u AND m.deleted_at IS NULL "
         "AND m.text_enc IS NOT NULL "
     )
-    chosen: list[tuple[uuid.UUID, Literal["vector", "recency"]]] = []
-    if query_vector is not None and limit > 0:
+    found: list[tuple[uuid.UUID, str, bytes, Literal["vector", "recency"]]] = []
+    if query_vector is not None and model and limit > 0:
         rows = await s.execute(
-            text(
-                "SELECT m.id, m.embedding " + base + "AND m.embedding IS NOT NULL "
-                "ORDER BY COALESCE(m.updated_at, m.created_at) DESC, m.id LIMIT :n"
-            ),
-            {"a": agent_id, "u": user_id, "n": scan_limit},
+            text("SELECT id, type::text AS type, text_enc FROM app_memory_nearest(:q, :m, :n)"),
+            {"q": to_pgvector(query_vector), "m": model, "n": limit},
         )
-        candidates = [(_uuid(r.id), r.embedding) for r in rows]
-        best = await asyncio.to_thread(rank_by_similarity, list(query_vector), candidates, limit)
-        chosen += [(rid, "vector") for rid in best]
-    rest = limit - len(chosen)
+        found += [(_uuid(r.id), r.type, r.text_enc, "vector") for r in rows][:limit]
+    rest = limit - len(found)
     if rest > 0:
         rows = await s.execute(
             text(
-                "SELECT m.id " + base + "AND NOT (m.id = ANY(CAST(:seen AS uuid[]))) "
-                "ORDER BY COALESCE(m.updated_at, m.created_at) DESC, m.id LIMIT :n"
-            ),
-            {"a": agent_id, "u": user_id, "seen": [rid for rid, _ in chosen], "n": rest},
-        )
-        chosen += [(_uuid(r.id), "recency") for r in rows]
-    if not chosen:
-        return [], 0
-    texts_by_id = {
-        _uuid(r.id): (r.type, r.text_enc)
-        for r in await s.execute(
-            text(
                 "SELECT m.id, m.type::text AS type, m.text_enc "
                 + base
-                + "AND m.id = ANY(CAST(:ids AS uuid[]))"
+                + "AND NOT (m.id = ANY(CAST(:seen AS uuid[]))) "
+                "ORDER BY COALESCE(m.updated_at, m.created_at) DESC, m.id LIMIT :n"
             ),
-            {"a": agent_id, "u": user_id, "ids": [rid for rid, _ in chosen]},
+            {"a": agent_id, "u": user_id, "seen": [f[0] for f in found], "n": rest},
         )
-    }
+        found += [(_uuid(r.id), r.type, r.text_enc, "recency") for r in rows]
     out: list[MemoryRow] = []
     lost = 0
-    for row_id, how in chosen:
-        mtype, blob = texts_by_id[row_id]
+    for row_id, mtype, blob, how in found:
         body, _ = open_row(keys, crypto.MEMORY_TEXT, row_id, blob)
         if body is None:
             lost += 1
@@ -456,8 +398,8 @@ async def read_context(
     conversation_id: uuid.UUID,
     *,
     query_vector: Sequence[float] | None = None,
+    query_model: str | None = None,
     memory_limit: int = 8,
-    memory_scan_limit: int = 200,
     turns_limit: int | None = None,
     pair_limit: int = 20,
 ) -> ContextRows:
@@ -472,7 +414,7 @@ async def read_context(
             s, keys, user_id, conversation_id, summary, turns_limit
         )
         memory, memory_lost = await _memory(
-            s, keys, user_id, agent_id, query_vector, memory_limit, memory_scan_limit
+            s, keys, user_id, agent_id, query_vector, memory_limit, query_model
         )
         pair, pair_lost = await _pair(s, keys, user_id, pair_limit)
     profile, profile_reason = (
@@ -741,6 +683,27 @@ async def save_history_summary(
 
 
 # --------------------------------------------------------------------------- память и события
+
+
+async def set_memory_embedding(
+    sm: async_sessionmaker[AsyncSession],
+    user_id: uuid.UUID,
+    item_id: uuid.UUID,
+    vector: Sequence[float],
+    model: str,
+) -> bool:
+    """Вектор и модель записи своей памяти (для 2.4) — функцией ``app_set_memory_embedding``
+    (АР-35). Чужая, удалённая, без текста или несуществующая — False. Удаление записи (2.4)
+    обнуляет ``text_enc``, ``embedding`` и ``embedding_model`` одним UPDATE (CHECK 0001, 0008)."""
+    async with user_scope(sm, user_id) as s:
+        return bool(
+            (
+                await s.execute(
+                    text("SELECT app_set_memory_embedding(:i, :v, :m)"),
+                    {"i": item_id, "v": to_pgvector(vector), "m": model},
+                )
+            ).scalar_one()
+        )
 
 
 async def record_safety_events(
