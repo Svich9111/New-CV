@@ -143,20 +143,14 @@ SERVED_STATUSES = {
     ("get", "/admin/kb/documents"): {"200", "401", "403"},
     ("post", "/admin/kb/documents"): {"202", "401", "403", "409", "413", "415", "422"},
     ("delete", "/admin/kb/documents/{document_id}"): {"204", "401", "403", "404"},
-    # 3.3 (app/api/couple_messages.py, tests/test_couple_messages_api.py; АР-11, АР-25). Сервер
-    # отдаёт ещё 401/403 onboarding_required (все три), 422 у ленты (курсор, limit) и 404 у
-    # «прочитано» — в контракте не объявлены; стражи ниже, карточка A1 (отчёт 3.3).
-    ("get", "/couple/messages"): {"200"},
-    ("get", "/couple/messages/{message_id}/original"): {"200", "404", "409"},
-    ("post", "/couple/messages/{message_id}/read"): {"204"},
+    # 3.3 (app/api/couple_messages.py, tests/test_couple_messages_api.py; АР-11, АР-25, АР-40):
+    # все три — 401 и 403 onboarding_required; лента — 422 (курсор, limit); «прочитано» — 404.
+    ("get", "/couple/messages"): {"200", "401", "403", "422"},
+    ("get", "/couple/messages/{message_id}/original"): {"200", "401", "403", "404", "409"},
+    ("post", "/couple/messages/{message_id}/read"): {"204", "401", "403", "404"},
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="контракт 3.3: у /couple/messages* не объявлены 401, 403 onboarding_required, 422 "
-    "ленты, 404 «прочитано» — карточка A1 из отчёта 3.3",
-)
 def test_couple_messages_declare_served_errors() -> None:
     paths = _spec()["paths"]
     assert {"401", "403", "422"} <= set(paths["/couple/messages"]["get"]["responses"])
@@ -166,11 +160,6 @@ def test_couple_messages_declare_served_errors() -> None:
     assert {"401", "403", "404"} <= set(read)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="контракт 3.3: PartnerMessage.text и текст оригинала — только строка; нужен "
-    "ExportText (UnavailableText для нерасшифрованного) и Cache-Control: no-store — карточка A1",
-)
 def test_couple_messages_allow_unavailable_text_and_no_store() -> None:
     spec = _spec()
     text_schema = spec["components"]["schemas"]["PartnerMessage"]["properties"]["text"]
@@ -349,3 +338,80 @@ def test_chat_stream_contract() -> None:
     message = schemas["ChatMessage"]
     assert message["properties"]["author"]["enum"] == ["owner", "agent"]
     assert message["properties"]["text"]["$ref"] == "#/components/schemas/ExportText"
+
+
+# --- 3.1: черновики (АР-40) ------------------------------------------------------------------
+
+DRAFT_OPERATIONS = (
+    ("post", "/drafts"),
+    ("get", "/drafts/{draft_id}"),
+    ("patch", "/drafts/{draft_id}"),
+    ("post", "/drafts/{draft_id}/regenerate"),
+    ("post", "/drafts/{draft_id}/reject"),
+    ("post", "/drafts/{draft_id}/send"),
+)
+
+
+def test_drafts_contract() -> None:
+    """3.1 (АР-40): кризис — 2xx с протоколом и контактами (клиент всегда показывает помощь),
+    различается по `kind`; ошибки черновика и модели объявлены; версии в правке и отправке."""
+    spec = _spec()
+    paths, schemas = spec["paths"], spec["components"]["schemas"]
+    create = paths["/drafts"]["post"]["responses"]
+    assert create["201"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Draft"
+    }
+    assert create["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/DraftCrisis"
+    }
+    regen = paths["/drafts/{draft_id}/regenerate"]["post"]["responses"]
+    assert regen["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/DraftOutcome"
+    }
+    outcome = schemas["DraftOutcome"]
+    assert outcome["discriminator"]["propertyName"] == "kind"
+    assert set(outcome["discriminator"]["mapping"]) == {"draft", "crisis"}
+    crisis = schemas["DraftCrisis"]
+    assert crisis["properties"]["kind"]["const"] == "crisis"
+    assert crisis["properties"]["contacts"]["minItems"] == 1
+    assert crisis["properties"]["contacts"]["items"] == {"$ref": "#/components/schemas/HelpContact"}
+    assert {"kind", "text", "contacts"} <= set(crisis["required"])
+    assert schemas["Draft"]["properties"]["kind"]["const"] == "draft"
+    for method, path in DRAFT_OPERATIONS:
+        responses = paths[path][method]["responses"]
+        assert responses["401"] == {"$ref": "#/components/responses/Unauthorized"}, path
+        assert responses["403"] == {"$ref": "#/components/responses/OnboardingRequired"}, path
+    for path in ("/drafts", "/drafts/{draft_id}/regenerate"):
+        responses = paths[path]["post"]["responses"]
+        assert responses["503"] == {"$ref": "#/components/responses/DraftModelError"}
+        assert responses["422"] == {"$ref": "#/components/responses/DraftInvalid"}
+    patch_body = paths["/drafts/{draft_id}"]["patch"]["requestBody"]["content"]
+    assert patch_body["application/json"]["schema"]["required"] == ["text", "expected_version"]
+    send = paths["/drafts/{draft_id}/send"]["post"]
+    assert send["requestBody"]["content"]["application/json"]["schema"]["required"] == [
+        "expected_version"
+    ]
+    assert "processing" in send["description"] and "АР-40" in send["description"]
+    known = set(schemas["Error"]["properties"]["code"]["examples"])
+    assert {
+        "not_editable",
+        "no_turns",
+        "bad_reply_target",
+        "draft_quote",
+        "same_variant",
+        "llm_unavailable",
+        "llm_refusal",
+        "version_conflict",
+        "couple_not_active",
+    } <= known
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="3.1: сервер ещё не публикует /drafts* — A2 (этап 2) снимает страж и вносит коды "
+    "в SERVED_STATUSES",
+)
+def test_drafts_are_served() -> None:
+    served = {(m, p) for p, ms in _served_routes(app.routes) for m in ms}
+    for method, path in DRAFT_OPERATIONS:
+        assert (method.upper(), "/api/v1" + path) in served

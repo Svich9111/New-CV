@@ -358,6 +358,8 @@ class PartnerMessage(Base):
         CheckConstraint("author_id <> recipient_id", name="author_not_recipient"),
         CheckConstraint("tone_score IS NULL OR tone_score BETWEEN 0 AND 3", name="tone_range"),
         CheckConstraint("NOT is_adapted OR adapted_enc IS NOT NULL", name="adapted_has_text"),
+        # 0012: лента текущей пары страницами по (sent_at, id) — app_couple_feed_page.
+        Index("ix_partner_messages_couple_sent", "couple_id", "sent_at", "id"),
         # 0009: доставленные получателю по порядку (delivered_at, id) — извлечение памяти (ФТ-14).
         Index(
             "ix_partner_messages_recipient_delivered",

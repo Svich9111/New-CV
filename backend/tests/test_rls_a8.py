@@ -907,6 +907,7 @@ APP_FUNCS = [
     "app_memory_forgotten(bytea[])",  # 0009
     "app_memory_extraction_done(uuid, uuid, uuid)",  # 0009
     "app_memory_compaction_done(uuid)",  # 0009
+    "app_couple_feed_page(integer, timestamp with time zone, uuid)",  # 0012, задача 3.3
 ]
 PIPELINE_FUNCS = [
     "pipeline_original(uuid)",
