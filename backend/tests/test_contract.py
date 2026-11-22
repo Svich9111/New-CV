@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 import yaml
 from openapi_spec_validator import validate
 
@@ -131,9 +132,25 @@ SERVED_STATUSES = {
     ("post", "/chat/messages"): {"200", "401", "403", "409", "422", "429"},
     ("get", "/chat/messages"): {"200", "401", "403", "422"},
     # АР-33 (app/api/help.py): без онбординга и подписки; с 2.0v — и без сессии (`security: []`,
-    # Б-58), 401 не отдаётся (сервер пока отдаёт — xfail ниже для A2).
+    # Б-58), 401 не отдаётся.
     ("get", "/help/contacts"): {"200"},
+    # 2.4 этап 2 (app/api/memory.py, tests/test_memory_api.py; АР-36): без онбординга (АР-17).
+    # Сервер отдаёт ещё 401 (вход по общей схеме bearer) и 422 у GET (неверный `type`), в
+    # контракте не объявлены — стражи ниже, карточка A1.
+    ("get", "/memory"): {"200"},
+    ("delete", "/memory/{memory_id}"): {"204", "404"},
 }
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="контракт: у /memory и /memory/{memory_id} не объявлены 401 (вход) и 422 у GET "
+    "(неверный type) — карточка A1 из отчёта 2.4 этап 2",
+)
+def test_memory_declares_401_and_422() -> None:
+    paths = _spec()["paths"]
+    assert {"401", "422"} <= set(paths["/memory"]["get"]["responses"])
+    assert "401" in paths["/memory/{memory_id}"]["delete"]["responses"]
 
 
 def test_help_contacts_is_public_in_contract() -> None:

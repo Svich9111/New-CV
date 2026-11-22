@@ -332,3 +332,24 @@ class HelpContact(BaseModel):
     phone: str
     description: str
     round_the_clock: bool | None = None
+
+
+# --- Память агента (задача 2.4, этап 2; контракт `/memory`, MemoryItem) --------------------
+
+MemoryTypeName = Literal[
+    "fact", "date", "preference", "sensitive_topic", "observation", "from_partner"
+]
+
+
+class MemoryItem(BaseModel):
+    id: uuid.UUID
+    type: MemoryTypeName
+    text: str
+    event_date: date | None
+    source: Literal["owner_dialog", "agent_inference", "partner_message"]
+    confidence: float = Field(ge=0, le=1)
+    created_at: datetime
+
+
+class MemoryPage(BaseModel):
+    items: list[MemoryItem]
