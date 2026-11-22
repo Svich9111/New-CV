@@ -6,15 +6,16 @@
 переписка пары — обработка чувствительных данных по согласию; после отказа по возрасту доступа
 нет (ТЗ §9.3). Свои данные без онбординга — `GET /me/export` (АР-25).
 
-Только текущая активная пара (`repositories.couple_messages`); после выхода — пустая лента и 404.
+Только текущая активная пара (`app_couple_feed_page`, АР-40); после выхода — пустая лента и 404.
 Лента — от новых к старым, курсор непрозрачный (позиция + HMAC, привязан к владельцу; чужой или
 испорченный — 422). Автору — его оригинал (версию для получателя автор не видит, АР-25 п.3),
 получателю — версия для получателя с пометкой `is_adapted`; недоставленное получателю не видно.
-Сообщение, текст которого не расшифровался, в ленте не показывается: `PartnerMessage.text` в
-контракте — только строка (карточка A1, отчёт 3.3); в журнал — код причины и колонка.
+Нерасшифрованный текст не скрывается: в `text` — `UnavailableText` с кодом причины (контракт —
+`ExportText`, АР-40); в журнал — код причины и колонка.
 
 Оригинал — получателю доставленного (просмотр фиксируется) и автору; чужое, недоставленное и
-бывшей пары — 404, неразличимо; не расшифровался — 404 и отметка просмотра откатывается.
+бывшей пары — 404, неразличимо; не расшифровался — 200 с `UnavailableText`, отметка просмотра
+откатывается (засчитывается только показанный текст, АР-40).
 «Прочитано» — получатель доставленного; повтор и уже отвеченное — 204 без изменений.
 40P01/40001 → 409 `conflict_retry` (общий обработчик, АР-24). Ответы — `no-store`."""
 
@@ -32,10 +33,10 @@ from fastapi import APIRouter, Query, Response
 from pydantic import BaseModel
 
 from app.api.deps import AppSettings, Keys, OnboardedUser, SessionMaker
-from app.core import crypto
 from app.errors import AppError, not_found
 from app.repositories import couple_messages as repo
 from app.repositories.couple_messages import FeedPosition, Gone
+from app.schemas import ExportText, UnavailableText
 
 router = APIRouter(tags=["messages"])
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ CURSOR_DOMAIN = b"feelings/couple-feed-cursor/v1\x00"
 class PartnerMessage(BaseModel):
     id: uuid.UUID
     direction: Literal["outgoing", "incoming"]
-    text: str
+    text: ExportText
     is_adapted: bool
     harsh_tone_warning: bool
     status: Literal["processing", "withheld", "delivered", "read", "answered"]
@@ -61,7 +62,7 @@ class FeedPage(BaseModel):
 
 
 class OriginalText(BaseModel):
-    text: str
+    text: ExportText
 
 
 # --------------------------------------------------------------------------- курсор
@@ -132,7 +133,7 @@ async def feed(
             PartnerMessage(
                 id=r.id,
                 direction="outgoing" if r.outgoing else "incoming",
-                text=r.text,
+                text=r.text if r.text is not None else UnavailableText(reason=r.unavailable),
                 is_adapted=r.is_adapted,
                 harsh_tone_warning=r.harsh_tone_warning,
                 status=r.status,
@@ -141,7 +142,6 @@ async def feed(
                 read_at=r.read_at,
             )
             for r in rows
-            if r.text is not None
         ],
         next_cursor=encode_cursor(secret, user_id, after) if after is not None else None,
     )
@@ -153,14 +153,11 @@ async def original(
 ) -> OriginalText:
     msg = _message_id(message_id)
     try:
-        body = await repo.read_original(sm, keys, user_id, msg)
+        body, reason = await repo.read_original(sm, keys, user_id, msg)
     except Gone as exc:
         raise not_found() from exc
-    except crypto.DecryptionError as exc:
-        logger.warning("couple original unavailable: reason=%s", exc.reason)
-        raise not_found() from exc
     response.headers["Cache-Control"] = "no-store"
-    return OriginalText(text=body)
+    return OriginalText(text=body if body is not None else UnavailableText(reason=reason))
 
 
 @router.post("/couple/messages/{message_id}/read", status_code=204)
