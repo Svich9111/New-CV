@@ -1052,7 +1052,19 @@ async def test_r2_every_stop_says_not_sent_once(category: str, secondary: list[s
     for kind in kinds:
         # Раунд 4 (A3, R4-MAJOR-1): при outgoing_threat в наборе блок отправителю — по составу
         # строк, а блоки пострадавшему заменяет author_safety[_life] (правило «А» crisis.respond).
+        # Раунд 5 (A8): пропуск заменён строгой проверкой того, что вместо них стоит.
         if "outgoing_threat" in kinds and kind in {"outgoing_threat", *crisis.VICTIM_TYPES}:
+            danger = bool(kinds & crisis.VICTIM_TYPES)
+            if kind == "outgoing_threat":
+                variant = "outgoing_threat_mixed" if danger else "outgoing_threat"
+                assert notice.text.startswith(
+                    prompts.load("crisis", "v0" if not danger else "v2", block=variant).text
+                )
+            else:
+                assert block(kind) not in notice.text  # блок пострадавшему не показан
+                life = "life_threat" in kinds
+                helper = "author_safety_life" if life else "author_safety"
+                assert prompts.load("crisis", "v2", block=helper).text in notice.text
             continue
         assert block(kind) in notice.text
     assert TEXT not in notice.text
@@ -2244,3 +2256,282 @@ def test_r4_hint_guard_nfd(original: str, hint: str) -> None:
 
 def test_r4_hint_guard_nfd_keeps_clean_hint() -> None:
     assert pipeline.hint_guard(HINT_OK, "Ты опять отменил ужин! Мне обидно.") is None
+
+
+# ######################################################################## РАУНД 5 (A8)
+# crisis.respond по таблице правил (afcf570). Собственный полный перебор: все непустые наборы
+# строк §9.3 × контекст (сообщение/чат) × главная строка × ответ агента × набор промптов.
+# Инварианты — из ТЗ §9.3 и §2 п.7, а не из таблицы A3.
+
+import itertools  # noqa: E402
+
+ALL_TYPES = tuple(crisis.CRISIS_TYPES)
+SUBSETS = [
+    frozenset(c) for n in range(1, len(ALL_TYPES) + 1) for c in itertools.combinations(ALL_TYPES, n)
+]
+
+
+def all_blocks(version: str) -> dict[str, str]:
+    """Все блоки шаблона версии (и поздние из v1/v2) — для разбора ответа на блоки."""
+    names = {*ALL_TYPES, *crisis.LATE_BLOCKS}
+    out: dict[str, str] = {}
+    for name in names:
+        for v in (version, crisis.LATE_BLOCKS.get(name, version)):
+            try:
+                out[name] = prompts.load("crisis", v, block=name).text
+                break
+            except prompts.PromptError:
+                continue
+    return out
+
+
+def split_blocks(text: str, version: str) -> list[str]:
+    by_text = {t: n for n, t in all_blocks(version).items()}
+    parts = text.split("\n\n")
+    names = [by_text.get(p) for p in parts]
+    assert all(names), [p[:40] for p, n in zip(parts, names, strict=True) if not n]
+    return [n for n in names if n]
+
+
+CASES = [
+    (types, withheld, primary, reply, pset)
+    for types in SUBSETS
+    for withheld in (True, False)
+    for primary in (None, *sorted(types))
+    for reply in (None, "Я рядом.")
+    for pset in (prompts.V0, prompts.V2)
+]
+
+
+@pytest.mark.parametrize(
+    ("types", "withheld", "primary", "reply", "pset"),
+    CASES,
+    ids=[
+        f"{'+'.join(sorted(t))}-{'msg' if w else 'chat'}-{p}-{'r' if r else 'n'}-{s.label()[:2]}"
+        for t, w, p, r, s in CASES
+    ],
+)
+def test_r5_crisis_table_invariants(
+    types: frozenset[str],
+    withheld: bool,
+    primary: str | None,
+    reply: str | None,
+    pset: prompts.PromptSet,
+) -> None:
+    r = crisis.respond(sorted(types), reply, primary=primary, prompt_set=pset, withheld=withheld)
+    version = pset.version("crisis")
+    text, acts, low = r.text, r.actions, r.text.casefold()
+    body = text
+    if reply:
+        assert text.startswith(reply + "\n\n")  # ответ агента — первым
+        body = text[len(reply) + 2 :]
+    names = split_blocks(body, version)  # ответ — только из блоков шаблона, дословно
+    assert len(names) == len(set(names))  # без повторов
+    T, V, L, H, U = (k in types for k in ALL_TYPES_ORDER)
+
+    # Событие: главная строка из набора; младше 18 — всегда главная (§9.3 стр. 5).
+    assert r.primary in types and set(r.types) == set(types)
+    if U:
+        assert r.primary == "underage"
+    elif primary:
+        assert r.primary == primary
+
+    # §2 п.2: «не отправлено» — только если сообщение и было; ровно один раз.
+    if withheld:
+        assert low.count("не отправлено") == 1 and {"not_sent", "explain_reason"} <= acts
+    else:
+        assert "не отправлено" not in low and "not_sent" not in acts
+    # Черновика нет ни при одной строке; ничего не смягчается при угрозах/насилии/жизни/возрасте.
+    assert "no_draft" in acts
+    if T or V or L or U:
+        assert "no_softening" in acts
+
+    # §9.3 стр. 1: при насилии, угрозе жизни и младше 18 — не «подобрать слова».
+    if V or L or U:
+        assert "подумаем, как сказать" not in low and "подберём слова" not in low
+    # Автор сам угрожает — не говорим ему «вина не на тебе», без действий пострадавшему.
+    if T:
+        assert "вина за это не на тебе" not in low
+        assert not {"name_it", "no_tolerate"} & acts
+        assert any(n.startswith("outgoing_threat") for n in names)
+        assert names[0].startswith("outgoing_threat")
+    # Насилие без угрозы автора — назвать своим именем, не терпеть, контакты.
+    if V and not T:
+        assert "violence" in names and {"name_it", "no_tolerate", "help_contacts"} <= acts
+    # Помощь при насилии или угрозе жизни есть всегда.
+    if V or L:
+        assert "help_contacts" in acts and "экстренные службы" in low
+    # §9.3 стр. 4: угроза жизни — немедленно в экстренные службы.
+    if L:
+        assert "emergency_services" in acts and "немедленно" in low
+    # §9.3 стр. 3: самоповреждение — остаёмся в разговоре, круглосуточная помощь.
+    if H:
+        assert "self_harm" in names and {"stay_in_conversation", "crisis_line_24h"} <= acts
+        assert "круглосуточной" in low
+    # §9.3 стр. 5: младше 18 — отказ в доступе последним; ответ с отказа не начинается,
+    # если есть что сказать до него.
+    if U:
+        assert names[-1] == "underage" and "no_access" in acts
+        if len(names) > 1:
+            assert names[0] != "underage"
+    else:
+        assert "underage" not in names and "no_access" not in acts
+    # Не сообщение — нет блока not_sent; сообщение без T — not_sent первым.
+    if withheld and not T:
+        assert names[0] == "not_sent"
+    if not withheld:
+        assert "not_sent" not in names
+    # Версия: V2 — без суффиксов; V0 — суффикс у каждого позднего блока.
+    if version == "v2":
+        assert r.template_version == "v2"
+    else:
+        late = [n for n in names if n in crisis.LATE_BLOCKS]
+        assert r.template_version == "v0" + "".join(f"+{n}@{crisis.LATE_BLOCKS[n]}" for n in late)
+
+
+ALL_TYPES_ORDER = ("outgoing_threat", "violence", "life_threat", "self_harm", "underage")
+
+
+@pytest.mark.parametrize("types", SUBSETS, ids=["+".join(sorted(t)) for t in SUBSETS])
+@pytest.mark.parametrize("withheld", [True, False], ids=["msg", "chat"])
+def test_r5_crisis_text_depends_on_set_not_order(types: frozenset[str], withheld: bool) -> None:
+    """Текст и действия не зависят от порядка, повторов и мусора во входе."""
+    base = crisis.respond(sorted(types), withheld=withheld)
+    noisy = [*sorted(types, reverse=True), *sorted(types), "none", "", "xyz", "threat_or_insult"]
+    other = crisis.respond(noisy, withheld=withheld)
+    assert (other.text, other.actions, other.primary) == (base.text, base.actions, base.primary)
+    if "outgoing_threat" in types:  # правило «А»: главная строка текст не меняет
+        for p in types:
+            alt = crisis.respond(sorted(types), primary=p, withheld=withheld)
+            assert (alt.text, alt.actions) == (base.text, base.actions)
+
+
+@pytest.mark.parametrize("bad", [[], ["none"], ["", "xyz"], [None]])
+def test_r5_crisis_empty_or_unknown_is_error(bad: list[Any]) -> None:
+    with pytest.raises(ValueError):
+        crisis.respond(bad)
+    with pytest.raises(ValueError):
+        crisis.respond(bad, primary="xyz")
+
+
+async def test_r5_pipeline_duplicates_and_none_in_secondary() -> None:
+    delivery, _ = await run(
+        ok_script(safety={"category": "violence", "secondary": ["violence", "none", "violence"]}),
+        forbid=("tone", "adapt", "meaning"),
+    )
+    assert delivery.status == "withheld" and delivery.safety_events == ("violence",)
+    assert delivery.author_notice is not None
+    assert delivery.author_notice.text == f"{crisis.NOT_SENT}\n\n{block('violence')}"
+
+
+async def test_r5_pipeline_unknown_secondary_is_bad_output_not_delivered() -> None:
+    bot = Bot(ok_script(safety={"category": "none", "secondary": ["murder"]}), forbid=("tone",))
+    with pytest.raises(LLMBadOutput):
+        await pipeline.process(bot.models, pipeline.approve(TEXT, confirmed=True))
+
+
+@pytest.mark.parametrize(
+    "agent",
+    [
+        {"crisis_type": "violence", "crisis_secondary": ["violence", "violence"]},
+        {"crisis_type": "self_harm", "crisis_secondary": []},
+        {"crisis_type": "underage", "crisis_secondary": ["outgoing_threat"]},
+    ],
+)
+async def test_r5_dialog_crisis_matches_table(agent: dict[str, Any]) -> None:
+    bot = Bot(
+        {
+            "dialog": dialog_answer(reply="Я рядом.", level=5, **agent),
+            "safety": {"category": "none", "secondary": []},
+        },
+        forbid=("draft",),
+    )
+    result = await dialog.reply(bot.models, CTX, TURNS)
+    expected = crisis.respond(
+        [agent["crisis_type"], *agent["crisis_secondary"]],
+        "Я рядом.",
+        primary=agent["crisis_type"],
+    )
+    assert result.crisis is not None and result.reply == expected.text
+    assert "не отправлено" not in result.reply.casefold()
+
+
+# --------------------------------------------- Р5-2. facts.py: основы соседних слов (О-15)
+
+R5_FACTS = [
+    # обмен ловится благодаря основам
+    ("2 часа, 5 минут", "5 часов, 2 минуты", True),
+    ("Ждала 2 недели, а ты обещал 3 дня", "Ждала 3 недели, а ты обещал 2 дня", True),
+    ("Звонила 2 раза, писала 5 раз", "Звонила 5 раз, писала 2 раза", True),
+    # законные перестройки — не расхождение
+    ("Ждала 2 часа, а ты пришёл в 9", "Ты пришёл в 9, а я ждала 2 часа", False),
+    ("2 часа и 5 минут", "2 часа и 5 минут", False),
+    ("уже третий раз за 2 недели", "за 2 недели уже третий раз", False),
+    ("опоздал на 2 часа в пятницу", "в пятницу опоздал на 2 часа", False),
+]
+
+
+@pytest.mark.parametrize(("original", "adapted", "differ"), R5_FACTS)
+def test_r5_facts_stems(original: str, adapted: str, differ: bool) -> None:
+    assert facts.numbers_differ(original, adapted) is differ, (
+        facts._scan(original)[2],
+        facts._scan(adapted)[2],
+    )
+
+
+@pytest.mark.parametrize(
+    ("word", "stem"),
+    [
+        ("часа", "час"),
+        ("часов", "час"),
+        ("час", "час"),
+        ("минуты", "минут"),
+        ("минут", "минут"),
+        ("рублей", "рубл"),
+        ("рубля", "рубл"),
+        ("раза", "раз"),
+        ("раз", "раз"),
+        ("дня", "дня"),  # короткое слово не режется
+        ("до", "до"),
+    ],
+)
+def test_r5_stem_examples(word: str, stem: str) -> None:
+    assert facts._stem(word) == stem
+
+
+def test_r5_stem_collisions_only_in_safe_direction() -> None:
+    """Совпадение основ разных слов («мама»/«маме» = одно; «часы»-предмет = «час»-время) может
+    дать лишнее предупреждение, но не пропуск: проверяем, что расхождение остаётся видимым."""
+    assert facts._stem("часы") == facts._stem("часа")
+    # «часы за 2 тысячи, ждала 5 часов» → честная перестройка, соседи сохраняются — без ложного
+    assert not facts.numbers_differ(
+        "Купил часы за 2 тысячи, ждала 5 часов", "Ждала 5 часов, а ты купил часы за 2 тысячи"
+    )
+
+
+def test_r5_stem_known_gaps() -> None:
+    """О-18 (не дефект кода): супплетивные формы и синонимы единиц основой не сводятся —
+    «дня»/«дней», «лет»/«года», «раза»/«суток»; обмен при них виден только модели смысла."""
+    assert facts._stem("дня") != facts._stem("дней")
+    assert not facts.numbers_differ("2 дня, 5 лет", "5 дней, 2 года")
+    assert not facts.numbers_differ("2 раза, 3 дня", "3 раза, 2 суток")
+    # беглая гласная: «копеек»/«копейки» — разные основы
+    assert not facts.numbers_differ("2 рубля, 5 копеек", "5 рублей, 2 копейки")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MINOR A8-12: соседи числа берутся через знаки препинания — слово из соседнего "
+    "предложения/части становится «соседом», и законная перестановка частей фразы даёт ложное "
+    "расхождение (оригинал с предупреждением вместо адаптации, §6.2 п.5–6)",
+)
+@pytest.mark.parametrize(
+    ("original", "adapted"),
+    [
+        ("Пришёл в 9, через 2 часа ушёл", "Через 2 часа ушёл, а пришёл в 9"),
+        ("Опоздал на 5 минут, 2 раза", "2 раза опоздал на 5 минут"),
+        ("Жду с 7. Прошло 3 часа", "Прошло 3 часа, а я жду с 7"),
+    ],
+)
+def test_r5_facts_neighbours_do_not_cross_punctuation(original: str, adapted: str) -> None:
+    assert not facts.numbers_differ(original, adapted)
