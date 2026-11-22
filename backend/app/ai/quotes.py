@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable
 
 from app.core.fingerprint import normalize
@@ -29,8 +30,22 @@ SAFE_TAIL = (
 _WORD = re.compile(r"\w+", re.UNICODE)
 
 
+def _visible(text: str) -> tuple[str, list[int]]:
+    """Текст без невидимых символов (категория Cf: мягкий перенос, нулевая ширина…) и
+    комбинируемых знаков (Mn, Me: ударения и т. п.) — их пользователь не видит, а слово они режут
+    (тест A8-K1). Второе — исходная позиция каждого оставшегося символа."""
+    keep: list[str] = []
+    where: list[int] = []
+    for i, ch in enumerate(text):
+        if unicodedata.category(ch) in ("Cf", "Mn", "Me"):
+            continue
+        keep.append(ch)
+        where.append(i)
+    return "".join(keep), where
+
+
 def _norm_words(text: str) -> list[str]:
-    return normalize(text).split()
+    return normalize(_visible(text)[0]).split()
 
 
 class QuoteIndex:
@@ -50,10 +65,11 @@ class QuoteIndex:
 
 def _spans(text: str) -> list[tuple[int, str]]:
     """(начало слова в исходном тексте, нормализованное слово) — нормализация по слову."""
+    clean, where = _visible(text)
     out: list[tuple[int, str]] = []
-    for m in _WORD.finditer(text):
-        for w in _norm_words(m.group()):
-            out.append((m.start(), w))
+    for m in _WORD.finditer(clean):
+        for w in normalize(m.group()).split():
+            out.append((where[m.start()], w))
     return out
 
 

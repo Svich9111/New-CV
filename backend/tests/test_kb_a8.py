@@ -596,7 +596,9 @@ async def kb_corpus(engine: AsyncEngine) -> tuple[uuid.UUID, str]:
     uid = uuid.uuid4()
     async with engine.begin() as c:
         await c.execute(text("INSERT INTO users (id, telegram_id) VALUES (:i, :t)"),
-                        {"i": uid, "t": 790_000_000_000 + rng.randrange(10**9)})  # fmt: skip
+                        # 2.6 р1 (A3): id Telegram — случайный, не из зерна корпуса: корпус
+                        # строится в двух тестах, одно зерно давало одинаковый id (23505).
+                        {"i": uid, "t": 790_000_000_000 + uuid.uuid4().int % 10**9})  # fmt: skip
     return uid, approach
 
 
@@ -616,10 +618,6 @@ async def test_search_three_to_five_on_topic(engine: AsyncEngine, sessionmaker: 
     assert await kb.search("q", vector=off, limit=5) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-K3 MINOR: добор до 3 считается до порога «по теме» — с уровнем находится 1",
-)
 async def test_search_with_level_fills_to_three_on_topic(
     engine: AsyncEngine, sessionmaker: SM
 ) -> None:
@@ -728,18 +726,8 @@ async def test_stream_and_nonstream_never_show_quote() -> None:
 @pytest.mark.parametrize(
     "evasion",
     [
-        pytest.param(
-            "soft_hyphen",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="A8-K1 MINOR: мягкий перенос/нулевая "
-                "ширина внутри слов обходят проверку цитат",
-            ),
-        ),
-        pytest.param(
-            "zero_width",
-            marks=pytest.mark.xfail(strict=True, reason="A8-K1 MINOR"),
-        ),
+        "soft_hyphen",
+        "zero_width",
     ],
 )
 def test_invisible_chars_do_not_bypass_guard(evasion: str) -> None:
@@ -864,8 +852,6 @@ async def test_admin_chunked_body_limit(admin: httpx.AsyncClient) -> None:
     assert r.status_code == 413
 
 
-@pytest.mark.xfail(strict=True, reason="A8-K2 MINOR: TXT в CP1251 разбирается воркером, но "
-                   "загрузка отклоняет его как 415")  # fmt: skip
 async def test_admin_accepts_cp1251_txt(admin: httpx.AsyncClient) -> None:
     """Карточка 2.6 («TXT UTF-8/CP1251»): разборщик понимает CP1251, а `detect_format` при загрузке
     требует UTF-8 — CP1251-файл получает 415 и в индексацию не попадает."""

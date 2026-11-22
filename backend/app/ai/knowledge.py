@@ -111,10 +111,15 @@ class DbKnowledgeBase:
                 level=level,
             )
 
-        found = await nearest(self._level)
+        def on_topic(chunks: list[kb_repo.KbChunk]) -> list[kb_repo.KbChunk]:
+            if self._max_distance is None:
+                return chunks
+            return [c for c in chunks if c.distance <= self._max_distance]
+
+        # Минимум 3 считается после порога «по теме» (тест A8-K3): фрагменты нужного уровня, но
+        # другой темы, в минимум не засчитываются.
+        found = on_topic(await nearest(self._level))
         if self._level is not None and len(found) < KNOWLEDGE_MIN:
             seen = {c.id for c in found}
-            found += [c for c in await nearest(None) if c.id not in seen]
-        if self._max_distance is not None:
-            found = [c for c in found if c.distance <= self._max_distance]
+            found += [c for c in on_topic(await nearest(None)) if c.id not in seen]
         return [KnowledgeFragment(str(c.id), c.text, 1.0 - c.distance) for c in found[:limit]]
