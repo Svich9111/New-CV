@@ -1470,7 +1470,18 @@ components:
         text: { $ref: "#/components/schemas/ExportText" }
         is_adapted: { type: boolean, description: "Пометка «адаптировано» (ФТ-09)" }
         harsh_tone_warning: { type: boolean, description: "ТЗ §6.2 п.6" }
-        status: { type: string, enum: [processing, withheld, delivered, read, answered], description: "Получателю — только delivered/read/answered. processing и withheld (остановлено безопасностью, ТЗ §9.3) видит только автор" }
+        status: { type: string, enum: [processing, withheld, delivered, read, answered], description: "Получателю — только delivered/read/answered. processing и withheld (не доставлено, причина — withheld_reason) видит только автор" }
+        withheld_reason:
+          type: [string, "null"]
+          enum: [safety, model_refusal, pipeline_error, attempts_exhausted, couple_ended, null]
+          description: |
+            Почему сообщение не доставлено (только автору и только при `status: withheld`; иначе
+            null или поле отсутствует; АР-44). `safety` — признаки насилия, угрозы, кризиса (ТЗ
+            §9.3, АР-28): клиент показывает «не отправлено» и помощь (`GET /help/contacts`);
+            `model_refusal` — модель отказалась обработать (АР-27), нужно новое «Отправить»;
+            `pipeline_error` — сбой обработки, текст сохранён у автора; `attempts_exhausted` —
+            сервис не смог обработать за отведённые попытки; `couple_ended` — пара распалась или
+            партнёр удалил аккаунт до доставки (ТЗ §4.5 п.2).
         reply_to_id: { type: [string, "null"], format: uuid }
         sent_at: { type: string, format: date-time }
         read_at: { type: [string, "null"], format: date-time }

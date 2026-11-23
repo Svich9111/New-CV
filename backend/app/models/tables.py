@@ -368,6 +368,32 @@ class PartnerMessage(Base):
             "id",
             postgresql_where=sa_text("delivered_at IS NOT NULL"),
         ),
+        # 0013 (АР-44): причина остановки — только коды и только у withheld; аренда целиком.
+        CheckConstraint(
+            "withheld_reason IS NULL OR withheld_reason IN ('safety', 'model_refusal', "
+            "'pipeline_error', 'attempts_exhausted', 'couple_ended')",
+            name="withheld_reason_code",
+        ),
+        CheckConstraint(
+            "withheld_reason IS NULL OR status = 'withheld'", name="withheld_reason_status"
+        ),
+        CheckConstraint(
+            "(work_lease_token IS NULL) = (work_lease_until IS NULL)", name="work_lease_whole"
+        ),
+        CheckConstraint("work_attempts >= 0", name="work_attempts_nonnegative"),
+        # 0013: очередь конвейера (processing) и очередь уведомлений получателю (Б-47).
+        Index(
+            "ix_partner_messages_processing",
+            "sent_at",
+            "id",
+            postgresql_where=sa_text("status = 'processing'"),
+        ),
+        Index(
+            "ix_partner_messages_notify",
+            "delivered_at",
+            "id",
+            postgresql_where=sa_text("status = 'delivered' AND notify_done_at IS NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -408,6 +434,14 @@ class PartnerMessage(Base):
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     original_viewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Служебные колонки конвейера вне §7 (0013, АР-44; как АР-36): причина остановки — видна
+    # автору; аренда сообщения воркером (processing — конвейер, delivered — уведомление);
+    # notify_done_at — уведомление получателю отправлено или не нужно. Меняют только функции.
+    withheld_reason: Mapped[str | None] = mapped_column(String(32))
+    work_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    work_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    work_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sa_text("0"))
+    notify_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class MessageDraft(Base):

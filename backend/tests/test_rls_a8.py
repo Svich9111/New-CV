@@ -922,6 +922,12 @@ PIPELINE_FUNCS = [
     "kb_add_chunk(uuid, uuid, integer, text, text[], integer)",  # 0011
     "kb_finish_index(uuid, uuid)",  # 0011
     "kb_fail_index(uuid, uuid, text)",  # 0011
+    "pipeline_claim(interval, integer, integer)",  # 0013, задача 3.2: воркер конвейера
+    "pipeline_read(uuid, uuid)",  # 0013
+    "pipeline_deliver_leased(uuid, uuid, bytea, boolean, smallint, boolean, safety_event_type[])",
+    "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[])",  # 0013
+    "pipeline_claim_notify(interval, integer, integer)",  # 0013: очередь уведомлений (Б-47)
+    "pipeline_notify_done(uuid, uuid)",  # 0013
 ]
 # 0011, задача 2.6: функции администратора (feelings_admin) — загрузка и удаление материала.
 ADMIN_FUNCS = [
