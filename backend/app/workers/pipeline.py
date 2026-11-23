@@ -36,10 +36,16 @@
      конвейера → ``pipeline_release(…, 5 с · 2^попытка, true)`` — повтор через короткую задержку
      (бюджет §10), предел попыток ставит БД (``attempts_exhausted``).
 
-   Запись исхода при сбое соединения/записи повторяется с тем же токеном (до ``true``/``false``,
-   ограниченно, с паузой; запись по токену идемпотентна, 0014): иначе отказ модели после
-   истечения аренды превратился бы в доставку (тест 3.2 D1). Такой проход — ``error`` с
-   ``recorded`` = что в итоге записано.
+   Запись исхода при **временной** ошибке (соединение, класс 08/53/57, сериализация/взаимная
+   блокировка) повторяется с тем же токеном (до ``true``/``false``) с растущей паузой — до
+   истечения собственной аренды минус запас (запись по токену идемпотентна, 0014): иначе отказ
+   модели после истечения аренды превратился бы в доставку (тесты 3.2 D1, R2-D1).
+   Детерминированная ошибка (22023, ``ValueError`` и т. п.) не повторяется. Такой проход —
+   ``error`` с ``recorded`` = что в итоге записано; ``unknown`` — повтор ответил «не моё»
+   (``lost``/``false``) после сбоя: первая запись, вероятно, прошла, а ответ потерян. В журнале
+   такой проход — по записанному исходу, без «error» (ревью 3.2 R2-MINOR-5).
+   Остаточный риск: БД недоступна дольше аренды (или процесс убит между отказом и записью) —
+   исход не записан, сообщение захватят снова и обработают заново (АР-45 (в)).
 
    ``lost``/``false``/``couple_ended`` — штатные исходы (аренду перехватили, аккаунт автора
    удалён, пара распалась или получатель ушёл — Б-44): без повтора и без текста в журнале.
@@ -60,10 +66,12 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Literal, TypeVar
 
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ai import pipeline
@@ -72,12 +80,36 @@ from app.ai.models import AgentModels
 from app.ai.prompts import V0, V1, V2, PromptSet
 from app.config import ConfigError
 from app.core.crypto import DecryptionError, Keyring
+from app.db import sqlstate
 from app.repositories import pipeline_work as pw
 from app.repositories.pipeline_work import PipelineClaim, WithholdReason
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# Срок повтора записи исхода для текущего сообщения (аренда минус запас), ставит ``_guard``.
+_DEADLINE: ContextVar[float | None] = ContextVar("pipeline_write_deadline", default=None)
+
+# Временные ошибки БД: соединение (08), ресурсы (53), остановка/перезапуск сервера (57),
+# сериализация и взаимная блокировка — повтор той же записи имеет смысл.
+TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "53", "57"})
+TRANSIENT_SQLSTATES = frozenset({"40001", "40P01"})
+
+
+def transient_db_error(exc: BaseException) -> bool:
+    """Ошибка соединения или временная ошибка БД (повторять); иначе — детерминированная."""
+    if isinstance(exc, OSError | TimeoutError):  # ConnectionError — подкласс OSError
+        return True
+    if isinstance(exc, DBAPIError):
+        if exc.connection_invalidated:
+            return True
+        code = sqlstate(exc)
+        if code is None:
+            return isinstance(exc, OperationalError | InterfaceError)
+        return code[:2] in TRANSIENT_SQLSTATE_CLASSES or code in TRANSIENT_SQLSTATES
+    return False
+
 
 # Виды ошибок модели, после которых сообщение повторяется через короткую задержку (одобрение не
 # израсходовано, Б-48). На адаптации и смысле они уже дают «оригинал с предупреждением» (АР-27) —
@@ -100,7 +132,7 @@ Status = Literal[
     "lost",  # аренду перехватили, сообщение удалено с аккаунтом автора, черновик не «sent»
     "retry",  # недоступность и т. п. — аренда снята, повтор через короткую задержку
     "paused",  # ошибка настройки модели — воркер на паузе, аренда снята без расхода попытки
-    "error",  # сбой БД: исход записан повтором (recorded) или повтор после аренды (recorded=None)
+    "error",  # сбой БД: исход записан повтором (recorded), иначе повтор после аренды (None)
 ]
 
 
@@ -142,9 +174,11 @@ class PipelineSettings:
     retry_cap: timedelta = timedelta(hours=1)
     # Пауза воркера (выключатель) при ошибке настройки модели (АР-45 п.2).
     pause: timedelta = timedelta(minutes=5)
-    # Повтор записи исхода при сбое соединения/записи (D1): число повторов и пауза (растёт).
-    write_retries: int = 5
+    # Повтор записи исхода при временной ошибке БД (D1, R2-MINOR-1): первая пауза, рост ×2 до
+    # предела; повторы — до истечения своей аренды минус запас ``write_margin_s``.
     write_retry_pause_s: float = 0.2
+    write_retry_max_pause_s: float = 5.0
+    write_margin_s: float = 15.0
 
     @property
     def timeout_s(self) -> float:
@@ -152,6 +186,12 @@ class PipelineSettings:
             return self.process_timeout_s
         lease_s = self.lease.total_seconds()
         return max(lease_s - 30.0, lease_s / 2)
+
+    @property
+    def write_window_s(self) -> float:
+        """Сколько от захвата можно повторять запись исхода: аренда минус запас."""
+        lease_s = self.lease.total_seconds()
+        return lease_s - self.write_margin_s if lease_s > self.write_margin_s else lease_s / 2
 
     def retry_delay(self, attempts: int) -> timedelta:
         delay: timedelta = self.retry_base * (2 ** max(attempts, 0))
@@ -164,7 +204,9 @@ class PipelineOutcome:
     reason: str | None = None  # причина остановки или вид ошибки — без текста
     attempts: int = 0
     adapted: bool = False
-    recorded: str | None = None  # при ``error``: исход, записанный повтором записи
+    # При ``error``: исход, записанный повтором записи; ``unknown`` — после сбоя повтор ответил
+    # «не моё» (первая запись, вероятно, прошла, ответ потерян).
+    recorded: str | None = None
 
 
 class PipelineWorker:
@@ -213,39 +255,48 @@ class PipelineWorker:
 
     async def _guard(self, c: PipelineClaim) -> PipelineOutcome:
         """Сбой одного сообщения не останавливает проход: аренда истечёт, сообщение повторится."""
+        token = _DEADLINE.set(time.monotonic() + self.settings.write_window_s)
         try:
             result = await self.handle(c)
         except Exception as exc:
             result = PipelineOutcome("error", type(exc).__name__, c.attempts)
-        log = logger.warning if result.status in ("retry", "error", "paused") else logger.info
+        finally:
+            _DEADLINE.reset(token)
+        # Исход записан повтором — в журнале записанный исход, а не «error» (R2-MINOR-5); вид
+        # сбоя записи — в reason.
+        shown = result.recorded if result.status == "error" and result.recorded else result.status
+        log = logger.warning if shown in ("retry", "error", "paused") else logger.info
         log(
-            "pipeline message: status=%s reason=%s attempt=%d adapted=%s recorded=%s",
-            result.status,
-            result.reason,
+            "pipeline message: status=%s reason=%s attempt=%d adapted=%s",
+            shown,
+            f"write_retried:{result.reason}" if shown != result.status else result.reason,
             result.attempts,
             result.adapted,
-            result.recorded,
         )
         return result
 
     # ----------------------------------------------------------------- запись исхода (D1)
 
     async def _write(self, op: Callable[[], Awaitable[T]]) -> tuple[T, str | None]:
-        """Запись исхода по токену с повтором при сбое соединения/записи (та же запись, тот же
-        токен — идемпотентно, 0014). → (результат, вид первого сбоя или ``None``). Повторы
-        исчерпаны — исключение (повтор после аренды; для отказа аренда не снимается)."""
+        """Запись исхода по токену с повтором при временной ошибке БД (та же запись, тот же
+        токен — идемпотентно, 0014) с растущей паузой — до истечения своей аренды минус запас.
+        → (результат, вид первого сбоя или ``None``). Детерминированная ошибка или время
+        вышло — исключение (повтор после аренды; для отказа аренда не снимается)."""
         cfg = self.settings
+        deadline = _DEADLINE.get() or time.monotonic() + cfg.write_window_s
         failed: str | None = None
-        for n in range(cfg.write_retries + 1):
+        pause = cfg.write_retry_pause_s
+        while True:
             try:
                 return await op(), failed
             except Exception as exc:
+                left = deadline - time.monotonic()
+                if not transient_db_error(exc) or left <= 0:
+                    raise
                 failed = failed or type(exc).__name__
                 logger.warning("pipeline finish write failed: %s", type(exc).__name__)
-                if n == cfg.write_retries:
-                    raise
-                await asyncio.sleep(cfg.write_retry_pause_s * (n + 1))
-        raise AssertionError("unreachable")  # pragma: no cover
+                await asyncio.sleep(min(pause, left))
+                pause = min(pause * 2, cfg.write_retry_max_pause_s)
 
     @staticmethod
     def _done(
@@ -257,7 +308,9 @@ class PipelineWorker:
     ) -> PipelineOutcome:
         if failed is None:
             return PipelineOutcome(status, reason, c.attempts, adapted)
-        return PipelineOutcome("error", failed, c.attempts, recorded=status)
+        # «Не моё» после сбоя: первая запись, вероятно, зафиксирована, ответ потерян.
+        recorded = "unknown" if status == "lost" else status
+        return PipelineOutcome("error", failed, c.attempts, recorded=recorded)
 
     async def _withhold(
         self,

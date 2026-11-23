@@ -1831,12 +1831,6 @@ async def test_r2_refusal_write_retried_until_recorded(
     assert mid not in await feed(sessionmaker, duo.igor.user_id)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-3.2-R2-D1 (MINOR): повтор записи исхода ограничен ~3 с (5 повторов по 0,2·n с); "
-    "сбой БД дольше — отказ не записан, аренда истекает, сообщение обрабатывается заново и "
-    "может быть доставлено без нового «Отправить» (Б-48)",
-)
 async def test_r2_refusal_not_delivered_after_long_db_outage(
     sessionmaker: SM, engine: AsyncEngine, duo: Duo, monkeypatch: pytest.MonkeyPatch
 ) -> None:

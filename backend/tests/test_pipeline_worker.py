@@ -52,6 +52,7 @@ from app.workers.pipeline import (
     PipelineSettings,
     PipelineWorker,
     resolve_prompt_set,
+    transient_db_error,
 )
 from tests.conftest import TEST_FP
 from tests.test_couple_functions import LEAVE, SM, _call
@@ -922,8 +923,8 @@ async def test_write_retries_exhausted_keeps_lease(
     pair: tuple[P, P, uuid.UUID],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """D1: запись так и не прошла (повторы исчерпаны) — ``error``; аренда для отказа не
-    снимается досрочно: до её истечения сообщение никому не выдаётся."""
+    """D1, R2-MINOR-1: запись не прошла до истечения своей аренды минус запас — ``error``;
+    аренда для отказа не снимается досрочно: до её истечения сообщение никому не выдаётся."""
     anna, _igor, _ = pair
     mid = await send(sessionmaker, anna, HARSH)
 
@@ -932,8 +933,16 @@ async def test_write_retries_exhausted_keeps_lease(
 
     monkeypatch.setattr(pw, "withhold", down)
     model = Model(fail={"safety": [LLMRefusal("отказ")]})
-    w = worker(engine, model, write_retries=2, write_retry_pause_s=0.01)
+    w = worker(
+        engine,
+        model,
+        lease=timedelta(seconds=30),
+        write_margin_s=29.6,  # окно повторов записи — 0,4 с
+        write_retry_pause_s=0.01,
+    )
+    t0 = time.monotonic()
     assert [(o.status, o.recorded) for o in await w.run_once()] == [("error", None)]
+    assert 0.3 < time.monotonic() - t0 < 5
     row = await _msg(engine, mid)
     assert row is not None and row["status"] == "processing" and row["work_lease_token"]
     assert await worker(engine, Model()).run_once() == []
@@ -1026,3 +1035,61 @@ async def test_continuous_loop_slow_message_does_not_block_new(
         release.set()
         stop.set()
         await task
+
+
+async def test_write_deterministic_error_not_retried(
+    sessionmaker: SM,
+    engine: AsyncEngine,
+    pair: tuple[P, P, uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2-MINOR-5: детерминированная ошибка записи (22023, ``ValueError``) не повторяется —
+    сразу ``error``, одна попытка записи."""
+    anna, _igor, _ = pair
+    await send(sessionmaker, anna, HARSH)
+    calls: list[int] = []
+
+    async def bad(*_a: Any, **_kw: Any) -> bool:
+        calls.append(1)
+        raise ValueError("bad argument")
+
+    monkeypatch.setattr(pw, "withhold", bad)
+    out = await worker(engine, Model(fail={"safety": [LLMRefusal("отказ")]})).run_once()
+    assert [(o.status, o.reason, o.recorded) for o in out] == [("error", "ValueError", None)]
+    assert calls == [1]
+    assert not transient_db_error(ValueError("x")) and transient_db_error(ConnectionError("x"))
+
+
+async def test_write_committed_answer_lost_logged_without_error(
+    sessionmaker: SM,
+    engine: AsyncEngine,
+    pair: tuple[P, P, uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R2-MINOR-5: запись прошла, ответ потерян — повтор отвечает «не моё»: ``recorded =
+    unknown``; в журнале записанный исход и вид сбоя, без «error»; доставка одна."""
+    anna, igor, _ = pair
+    mid = await send(sessionmaker, anna, HARSH)
+    real = pw.deliver
+    n = {"calls": 0}
+
+    async def lost_answer(*a: Any, **kw: Any) -> str:
+        n["calls"] += 1
+        result = await real(*a, **kw)
+        if n["calls"] == 1:
+            raise ConnectionError("answer lost")
+        return result
+
+    monkeypatch.setattr(pw, "deliver", lost_answer)
+    caplog.set_level(logging.INFO)
+    out = await worker(engine, Model(), write_retry_pause_s=0.01).run_once()
+    assert [(o.status, o.recorded) for o in out] == [("error", "unknown")]
+    lines = [r.getMessage() for r in caplog.records if r.name == "app.workers.pipeline"]
+    final = [m for m in lines if m.startswith("pipeline message:")]
+    assert final == [
+        "pipeline message: status=unknown reason=write_retried:ConnectionError attempt=1 "
+        "adapted=False"
+    ]
+    assert "status=error" not in "\n".join(lines)
+    assert (await recipient_feed(sessionmaker, igor.user_id))[mid].text == HARSH_ADAPTED
