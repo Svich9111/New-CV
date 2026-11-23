@@ -2,16 +2,20 @@
 
 Запуск (из корня репозитория, python3 ≥ 3.10, без зависимостей):
 
-    python3 -I infra/deploy/gen_secrets.py [--dir КАТАЛОГ]
+    python3 -I infra/deploy/gen_secrets.py [--dir КАТАЛОГ] [--admin-token]
 
 ``--dir`` — куда писать .env, admin-token.txt и secrets/ (по умолчанию — рядом со скриптом;
 для локальной проверки комплекта — временный каталог, compose запускается с ``--env-file``).
+``--admin-token`` — включить админ-API базы знаний (АР-39): создать токен администратора. Без
+флага ``FEELINGS_ADMIN_TOKEN_SHA256`` остаётся пустым — админ-API закрыт (как обещает шаблон);
+включить позже — повторный запуск с флагом (ревью 0.8, MINOR-10).
 
 - нет .env — создаётся из .env.prod.example с правами 600;
 - генерируются только ПУСТЫЕ значения; заданные не меняются (повторный запуск безопасен,
   ротация — вручную по docs/ADMIN.md);
 - пароль суперпользователя БД — в secrets/postgres_superuser_password (600), не в .env;
-- токен администратора пишется в infra/deploy/admin-token.txt (600), в .env — только его SHA-256;
+- с ``--admin-token``: токен администратора пишется в admin-token.txt (600), в .env — только
+  его SHA-256; файл передать администратору защищённым каналом и удалить;
 - в вывод попадают только имена заполненных переменных.
 
 Вручную остаются: FEELINGS_DOMAIN, FEELINGS_TLS, FEELINGS_TELEGRAM_BOT_TOKEN,
@@ -75,7 +79,13 @@ def _write_private(path: Path, text: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Заполняет пустые секреты стенда")
     parser.add_argument("--dir", type=Path, default=HERE)
-    base = parser.parse_args().dir.resolve()
+    parser.add_argument(
+        "--admin-token",
+        action="store_true",
+        help="создать токен администратора и открыть админ-API базы знаний",
+    )
+    args = parser.parse_args()
+    base = args.dir.resolve()
     env = base / ".env"
     admin_token_file = base / "admin-token.txt"
     secrets_dir = base / "secrets"
@@ -107,6 +117,9 @@ def main() -> int:
         if name in GENERATORS:
             value = GENERATORS[name]()
         elif name == "FEELINGS_ADMIN_TOKEN_SHA256":
+            if not args.admin_token:
+                print(f"{name} пуст — админ-API закрыт (включить: --admin-token)")
+                continue
             if admin_token_file.exists():
                 print(
                     f"{admin_token_file.name} уже есть — хеш не создан (удалите файл или задайте хеш)"

@@ -5,8 +5,13 @@
 #   - infra/deploy/.env (600) — секреты приложения и пароли ролей входа; compose читает его сам
 #     (лежит рядом) и раздаёт каждому сервису только нужные ему значения;
 #   - infra/deploy/secrets/postgres_superuser_password (600) — пароль суперпользователя БД,
-#     отдельно от .env: нужен только при первом создании тома (postgres) и для db-init; в
-#     контейнеры приложения не попадает (docker secret, файл /run/secrets/…).
+#     отдельно от .env (docker secret, файл /run/secrets/…; в контейнеры приложения не
+#     попадает). Пароль из файла задаётся только при первом создании тома и нужен db-init; сам
+#     файл entrypoint образа postgres читает при КАЖДОМ старте — он обязан существовать
+#     (после db-init допустима пустая заглушка 600, docs/DEPLOY.md §4). Внутри контейнера
+#     postgres суперпользователь входит по локальному сокету без пароля (на этом построены
+#     backup.sh и restore-check.sh): доступ к Docker и так равен доступу суперпользователя —
+#     группа docker равносильна root (bootstrap.sh).
 # В этом файле нет ни одного значения секрета: обязательные переменные — `:?`.
 #
 # Наружу — только Caddy: 80 (сертификат, переадресация) и 443 (HTTPS, HTTP/3). БД и Redis —
@@ -30,12 +35,21 @@ x-hardening: &hardening
   logging: *logging
 
 # Образ сервера (API, воркеры, миграции): непривилегированный пользователь `feelings` (uid 10001).
+# FEELINGS_ENV на стенде — только staging или production (ревью 0.8, MINOR-8): dev/local/test
+# разрешают опрос бота (он удаляет вебхук) и ослабляют проверки. Значение compose проверить не
+# умеет, поэтому проверяет точка входа: иначе контейнер завершается с кодом 64 до запуска
+# процесса, а `dc up -d` сообщает о сбое (caddy ждёт healthy api). Команда сервиса — в "$@".
 x-backend: &backend
   <<: *hardening
   image: feelings-backend:${FEELINGS_IMAGE_TAG:?задайте FEELINGS_IMAGE_TAG}
   build:
     context: ../..
     dockerfile: infra/backend.Dockerfile
+  entrypoint:
+    - /bin/sh
+    - -c
+    - 'case "$$FEELINGS_ENV" in staging|production) exec "$$@" ;; esac; echo "FEELINGS_ENV=$$FEELINGS_ENV: на стенде допустимы только staging и production (docs/DEPLOY.md §12)" >&2; exit 64'
+    - env-guard
   read_only: true
   tmpfs: ["/tmp"]
   cap_drop: ["ALL"]
@@ -126,7 +140,8 @@ services:
       FEELINGS_ENCRYPTION_KEY_ID: ${FEELINGS_ENCRYPTION_KEY_ID:?задайте FEELINGS_ENCRYPTION_KEY_ID}
       FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
       FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Обязателен: без него воркер памяти не стартует, ответы агента — ошибка (DEPLOY §0).
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?задайте OPENROUTER_API_KEY}
       FEELINGS_ADMIN_TOKEN_SHA256: ${FEELINGS_ADMIN_TOKEN_SHA256:-}
       FEELINGS_CHAT_DAILY_LIMIT: ${FEELINGS_CHAT_DAILY_LIMIT:-100}
       FEELINGS_MAX_REQUEST_BODY_BYTES: ${FEELINGS_MAX_REQUEST_BODY_BYTES:-1048576}
@@ -161,7 +176,7 @@ services:
       FEELINGS_MEMORY_FINGERPRINT_KEYS_OLD: ${FEELINGS_MEMORY_FINGERPRINT_KEYS_OLD:-}
       FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
       FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?задайте OPENROUTER_API_KEY}
     healthcheck: *worker-health
     networks: [data, egress]
     depends_on:
@@ -177,7 +192,25 @@ services:
       FEELINGS_WORKER_DATABASE_URL: *worker-db
       FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
       FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?задайте OPENROUTER_API_KEY}
+    healthcheck: *worker-health
+    networks: [data, egress]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # Воркер конвейера входящего (3.2): без него отправленные сообщения остаются «в обработке».
+  worker-pipeline:
+    <<: *backend
+    command: ["python", "-m", "app.workers.pipeline"]
+    restart: "on-failure:5"
+    environment:
+      FEELINGS_ENV: ${FEELINGS_ENV}
+      FEELINGS_WORKER_DATABASE_URL: *worker-db
+      FEELINGS_ENCRYPTION_KEYS: ${FEELINGS_ENCRYPTION_KEYS}
+      FEELINGS_ENCRYPTION_KEY_ID: ${FEELINGS_ENCRYPTION_KEY_ID}
+      FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
+      FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?задайте OPENROUTER_API_KEY}
     healthcheck: *worker-health
     networks: [data, egress]
     depends_on:
@@ -190,7 +223,8 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      # Только при первом создании тома; дальше пароль суперпользователя нужен лишь db-init.
+      # Пароль задаётся только при первом создании тома; файл читается при каждом старте
+      # (должен существовать — после db-init допустима пустая заглушка 600).
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_superuser_password
       POSTGRES_DB: feelings
     secrets: [postgres_superuser_password]

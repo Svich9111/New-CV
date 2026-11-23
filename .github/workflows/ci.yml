@@ -10,21 +10,33 @@ on:
 jobs:
   backend:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: feelings_test
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 10
     env:
       TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/feelings_test
+      # Журнал сервера — в смонтированный каталог: тесты «пароль не попал в журнал»
+      # (test_login_roles_a8.py, test_owner_migrations.py) выполняются, а не пропускаются
+      # (ревью 0.8, MINOR-5). Сервисный контейнер Actions не принимает аргументы postgres —
+      # поэтому сервер запускается шагом docker run.
+      A8_SERVER_LOG: ${{ github.workspace }}/.pglog/postgresql.log
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+      # Версия pgvector закреплена — та же, что на стенде (infra/deploy/docker-compose.prod.yml),
+      # чтобы проверки прав функций vector шли на одной версии расширения (ревью 0.8, MINOR-11).
+      - name: PostgreSQL 16 + pgvector 0.8.0
+        run: |
+          mkdir -p .pglog && chmod 777 .pglog
+          docker run -d --name pg -p 5432:5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=feelings_test \
+            -v "$PWD/.pglog:/pglog" \
+            pgvector/pgvector:0.8.0-pg16 \
+            -c logging_collector=on -c log_directory=/pglog -c log_filename=postgresql.log \
+            -c log_file_mode=0644 -c log_rotation_size=0
+          for i in $(seq 1 60); do
+            docker exec pg pg_isready -U postgres -d feelings_test -h 127.0.0.1 && break
+            sleep 2
+          done
+          docker exec pg pg_isready -U postgres -d feelings_test -h 127.0.0.1
+          test -r "$A8_SERVER_LOG"
       # test_login_roles.py запускает infra/db/roles.sql настоящим psql (нужен ≥ 15, \getenv).
       - run: psql --version
       - run: make backend-lint

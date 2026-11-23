@@ -1,10 +1,11 @@
 # Локальная разработка: PostgreSQL 16 + pgvector и Redis; по профилю `workers` — миграции,
-# роли входа и фоновые воркеры памяти и базы знаний (Б-69). Продуктив — задача 4.7.
+# роли входа и фоновые воркеры памяти, базы знаний и конвейера (Б-69). Продуктив — задача 4.7.
 # Порты привязаны к 127.0.0.1 — БД и Redis не публикуются наружу (справка по инфраструктуре, раздел 5);
 # у миграций, ролей и воркеров портов нет совсем.
 #
 #   make db-up     — только postgres и redis (как раньше);
-#   make dev-up    — всё, включая воркеры: postgres → migrate → db-roles → worker-memory, worker-kb.
+#   make dev-up    — всё, включая воркеры: postgres → migrate → db-roles → worker-memory, worker-kb,
+#                    worker-pipeline.
 #
 # Значения ${…} подставляются из корневого .env (`--env-file .env` в Makefile); пароли ролей
 # входа — FEELINGS_*_DB_PASSWORD (см. .env.example, docs/ADMIN.md). Пустой пароль — db-roles
@@ -24,7 +25,7 @@ x-backend: &backend
 
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:0.8.0-pg16
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -56,7 +57,7 @@ services:
   # роли feelings_* создаёт миграция 0001. Повторный запуск безопасен (пароли обновляются).
   db-roles:
     profiles: ["workers"]
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:0.8.0-pg16
     restart: "no"
     entrypoint: ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "/db/roles.sql"]
     environment:
@@ -88,6 +89,14 @@ services:
   worker-kb:
     <<: *backend
     command: ["python", "-m", "app.workers.kb"]
+    environment: *worker-env
+    depends_on: *worker-deps
+
+  # Воркер конвейера входящего (3.2): отправленные сообщения → безопасность, тон, адаптация →
+  # доставка. Нужны ключи шифрования и OPENROUTER_API_KEY из .env.
+  worker-pipeline:
+    <<: *backend
+    command: ["python", "-m", "app.workers.pipeline"]
     environment: *worker-env
     depends_on: *worker-deps
 

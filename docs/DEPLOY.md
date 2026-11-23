@@ -44,8 +44,10 @@ alias dc='docker compose -f infra/deploy/docker-compose.prod.yml'
    - поставить `"verified_by_operator": true`;
    - провести изменение через репозиторий (`docs/ADMIN.md` §8).
 
-   Обходить проверку нельзя. `FEELINGS_ENV=dev`/`local` на стенде не используется: эти значения
-   разрешают режим опроса бота, а он удаляет вебхук.
+   Обходить проверку нельзя. `FEELINGS_ENV=dev`/`local`/`test` на стенде не используется: эти
+   значения разрешают режим опроса бота, а он удаляет вебхук. Compose это проверяет: точка входа
+   API, воркеров и `migrate` при `FEELINGS_ENV`, отличном от `staging`/`production`, завершает
+   контейнер с кодом 64 и сообщением `на стенде допустимы только staging и production`.
 2. **Тестовый бот** в @BotFather (не продуктивный): токен и имя.
 3. **Ключ OpenRouter для стенда.** Без него ответы агента приходят ошибкой, а воркер памяти не
    стартует.
@@ -93,7 +95,12 @@ SSH лучше запретить.
 Секреты — только в переменных окружения из `infra/deploy/.env` на сервере (600, владелец
 `feelings`). Исключение — пароль суперпользователя БД: он в отдельном файле
 `infra/deploy/secrets/postgres_superuser_password` (600), который compose передаёт как docker
-secret только `postgres` (при первом создании тома) и `db-init`. В Git нет ни одного значения:
+secret только `postgres` и `db-init`. Образ postgres задаёт пароль из файла только при первом
+создании тома, но сам файл читает при каждом старте (он должен существовать). Пароль нужен
+только `db-init` — по сети. Внутри контейнера postgres суперпользователь входит по локальному
+сокету без пароля (так работают `backup.sh` и `restore-check.sh`): доступ к Docker на сервере и
+так равен доступу суперпользователя БД (группа docker равносильна root, §2). В Git нет ни одного
+значения:
 
 - шаблон пустой;
 - в compose у обязательных переменных стоит `:?`, и без них он не запускается;
@@ -107,6 +114,8 @@ secret только `postgres` (при первом создании тома) �
 ```bash
 cd /opt/feelings/app
 python3 -I infra/deploy/gen_secrets.py      # создаёт .env и secrets/ (600), печатает только имена
+# админ-API базы знаний по умолчанию ЗАКРЫТ (FEELINGS_ADMIN_TOKEN_SHA256 пуст); открыть — с флагом:
+# python3 -I infra/deploy/gen_secrets.py --admin-token   # токен — в admin-token.txt (600)
 nano infra/deploy/.env                       # заполнить значения, отмеченные «вручную» в таблице
 ```
 
@@ -122,8 +131,8 @@ nano infra/deploy/.env                       # заполнить значени
 | `FEELINGS_SESSION_SECRET` | Оператор | `secrets.token_urlsafe(48)` | `api` |
 | `FEELINGS_ENCRYPTION_KEYS` (+ `_KEY_ID`) | Оператор, резервная копия отдельно от БД | `k1:` + base64url(32 байта) | `api`, `worker-memory` |
 | `FEELINGS_MEMORY_FINGERPRINT_KEY` (+ `_OLD`) | Оператор, не удалять никогда (АР-37) | base64url(32 байта) | `worker-memory` |
-| `FEELINGS_ADMIN_TOKEN_SHA256` | Оператор, токен — у администратора | `gen_secrets.py`: токен в `admin-token.txt` (передать и удалить), в `.env` только SHA-256 | `api` |
-| `OPENROUTER_API_KEY` | Оператор | Кабинет OpenRouter, вручную | `api`, воркеры |
+| `FEELINGS_ADMIN_TOKEN_SHA256` (необязателен; пусто — админ-API закрыт) | Оператор, токен — у администратора | `gen_secrets.py --admin-token`: токен в `admin-token.txt` (передать и удалить), в `.env` только SHA-256 | `api` |
+| `OPENROUTER_API_KEY` (обязателен: без него compose не запускается) | Оператор | Кабинет OpenRouter, вручную | `api`, воркеры |
 
 Команды генерации приведены в `.env.prod.example`. Вручную также задаются несекретные значения:
 
@@ -156,8 +165,19 @@ curl -fsS https://стенд.домен/api/v1/health    # {"status":"ok"}
 ```
 
 После `db-init` пароль суперпользователя для работы не нужен. Файл можно перенести в хранилище
-секретов: тогда для повторного `db-init` его нужно вернуть на место, а `dc up` требует, чтобы файл
-существовал, — оставьте пустую заглушку с правами 600.
+секретов: тогда для повторного `db-init` (ротация пароля владельца, восстановление из копии, §10)
+его нужно вернуть на место. `dc up` требует, чтобы файл существовал (его читает entrypoint
+postgres при каждом старте), — оставьте пустую заглушку с правами 600. Учтите: заглушка не
+закрывает суперпользователя — внутри контейнера postgres он входит по сокету без пароля (§3).
+
+`db-init` (`infra/db/init-owner.sql`) кроме владельца схемы и vector:
+
+- создаёт групповые роли `feelings_app`/`feelings_worker`/`feelings_admin`/`feelings_api` от
+  имени владельца (как миграция 0001) — нужно для восстановления копии на новый сервер (§10);
+- отзывает у PUBLIC права уровня базы `TEMPORARY` и `CREATE` (АР-10) — их не переносит
+  `pg_dump`;
+- задаёт для всех сеансов владельца `log_statement = none` и `log_min_error_statement = panic`:
+  текст запроса с паролем (`db-roles`) не попадёт в журнал PostgreSQL даже при сбое.
 
 **Проверки после запуска:**
 
@@ -211,10 +231,15 @@ curl -fsS https://стенд.домен/api/v1/health
 - **Схема менялась — только по подтверждению оператора.**
   1. `dc stop api worker-memory worker-kb`.
   2. `infra/deploy/backup.sh`.
-  3. `dc --profile ops run --rm migrate alembic downgrade <ревизия>` (под `feelings_owner`).
-  4. Прежние образы, затем `dc up -d`.
+  3. `dc --profile ops run --rm migrate alembic downgrade <ревизия>` (под `feelings_owner`;
+     образ — ещё новый: в нём есть шаги отката новых миграций).
+  4. `git checkout <прежний коммит>` — вместе с кодом возвращаются compose-файл, Caddyfile и
+     `infra/db/*.sql` прежней версии.
+  5. В `.env` — прежняя метка `FEELINGS_IMAGE_TAG`, затем `dc up -d`.
+  6. `curl -fsS https://стенд.домен/api/v1/health`.
 
-  Если downgrade невозможен — восстановление из копии, снятой перед обновлением (раздел 10).
+  Если downgrade невозможен — восстановление на том же сервере из копии, снятой перед
+  обновлением (§10, «Восстановление на том же сервере»), после шага 4.
 - **Вебхук** при откате не трогается.
 
 ## 8. Постоянное хранение
@@ -237,13 +262,15 @@ Redis хранит только дневные счётчики, на диск �
 - токены администратора — §7;
 - пароль владельца схемы — повторный `db-init` (нужен файл-секрет суперпользователя).
 
-## 10. Резервное копирование и проверка восстановления
+## 10. Резервное копирование и восстановление
 
-Требование ТЗ §10: ежедневно, хранение 30 дней, проверка восстановления раз в квартал.
+Требование ТЗ §10: ежедневно, хранение 30 дней, проверка восстановления раз в квартал. ТЗ §7:
+удалённое пользователем уходит и из копий в течение 30 дней.
 
 ```bash
-infra/deploy/backup.sh          # pg_dump -Fc → /opt/feelings/backups/feelings-ДАТА.dump (600), удаление старше 30 дней
-infra/deploy/restore-check.sh   # свежая копия → временная база → проверки → временная база удаляется
+infra/deploy/backup.sh                      # pg_dump -Fc → /opt/feelings/backups/feelings-ДАТА-ВРЕМЯ-НС.dump (600)
+infra/deploy/restore-check.sh               # свежая копия → временная база → проверки → удаление
+infra/deploy/restore-check.sh --db feelings # только проверки рабочей базы (после восстановления)
 ```
 
 Расписание (`crontab -e` пользователя `feelings`; время UTC):
@@ -253,19 +280,48 @@ infra/deploy/restore-check.sh   # свежая копия → временная
 43 3 1 1,4,7,10 *  cd /opt/feelings/app && infra/deploy/restore-check.sh >> /opt/feelings/backups/restore-check.log 2>&1
 ```
 
+Ротация журналов cron (в них только имена файлов, имена таблиц и числа строк) —
+`/etc/logrotate.d/feelings-backup` (root, один раз):
+
+```
+/opt/feelings/backups/backup.log /opt/feelings/backups/restore-check.log {
+    su feelings feelings
+    monthly
+    rotate 3
+    compress
+    missingok
+    notifempty
+    create 600 feelings feelings
+}
+```
+
+Проверка: `sudo logrotate -d /etc/logrotate.d/feelings-backup`.
+
 **`backup.sh`:**
 
-- проверяет, что архив читается (`pg_restore --list`);
-- пишет копию атомарно (через `.partial`);
+- один запуск за раз: `flock` на `backups/.backup.lock`; ручной запуск перед обновлением ждёт
+  копию из cron до 30 минут;
+- имя уникально (время до наносекунд); существующий файл не перезаписывается;
+- пишет копию атомарно (через `.partial`) и проверяет, что архив читается (`pg_restore --list`);
+- срок хранения `FEELINGS_BACKUP_KEEP_DAYS` (по умолчанию 30; допустимо целое 2…30, иначе
+  отказ): копия удаляется на запуске, когда ей больше (KEEP_DAYS − 1) суток без 2 часов. При
+  ежедневном запуске ни одна копия не живёт 30 суток (ТЗ §7) — с запасом на сдвиг времени
+  запуска. Если сервер был выключен, просроченное удаляется при следующем запуске;
 - печатает только имена файлов.
 
-**`restore-check.sh`:**
+**`restore-check.sh`** восстанавливает копию тем же порядком, что и настоящее восстановление:
+пустая временная база `feelings_restore_check_<время>` → `infra/db/init-owner.sql` (с
+`keep_owner_password=1`: пароль владельца не меняется) → `pg_restore --exit-on-error`. Проверяет:
 
-- восстанавливает копию в `feelings_restore_check_<время>` с `--exit-on-error`;
-- проверяет версию схемы, расширение vector и политики RLS;
-- печатает имена таблиц и число строк — без содержимого;
-- удаляет временную базу в любом случае;
-- рабочую базу не трогает.
+- версию схемы, расширение vector, политики RLS, число строк таблиц (печатает только имена и
+  числа);
+- права уровня базы: ни PUBLIC, ни `feelings_app`/`feelings_api`/`feelings_worker`/
+  `feelings_admin` не могут создавать временные таблицы и схемы (АР-10); `pg_dump` без
+  `--create` этих прав не переносит — их возвращает `init-owner.sql`;
+- функции vector не исполняют PUBLIC и роли приложения (АР-35);
+- объекты приложения во владении `feelings_owner`; `feelings_api` — член только `feelings_app`.
+
+Временная база удаляется в любом случае; рабочую базу проверка не трогает.
 
 Важно:
 
@@ -274,11 +330,59 @@ infra/deploy/restore-check.sh   # свежая копия → временная
   (`scp`), не дольше 30 дней.
 - Тексты в копии зашифрованы ключами приложения. Без ключей из `.env` копия бесполезна, а с ними
   содержит личные данные: храните отдельно и с правами 600.
-- Роли кластера в `pg_dump` не входят. При восстановлении на новый сервер порядок такой:
-  1. `dc up -d postgres`;
-  2. `db-init`;
-  3. `pg_restore` (по подтверждению);
-  4. `db-roles`.
+- Роли кластера и права уровня базы в `pg_dump` не входят. Их создаёт и задаёт `db-init`
+  (`init-owner.sql`), поэтому он выполняется **до** `pg_restore` в обоих сценариях ниже.
+
+### Восстановление на том же сервере — только по подтверждению оператора
+
+Например, когда откат схемы (§7) невозможен. Рабочая база удаляется и создаётся заново.
+
+```bash
+cd /opt/feelings/app
+git checkout <коммит, с которого снята копия>   # версия схемы копии = версии кода (alembic_version)
+# в .env — метка образов этого коммита (FEELINGS_IMAGE_TAG); при необходимости dc build
+DUMP=/opt/feelings/backups/feelings-<дата>.dump
+dc stop caddy api worker-memory worker-kb
+infra/deploy/backup.sh                      # копия текущего состояния — на случай ошибки
+dc exec -T postgres psql -X -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  -c 'DROP DATABASE feelings WITH (FORCE)' -c 'CREATE DATABASE feelings'
+# нужен файл-секрет суперпользователя (§4): вернуть из хранилища, если там заглушка
+dc --profile ops run --rm db-init           # владелец, групповые роли, права базы, vector
+dc exec -T postgres pg_restore -U postgres -d feelings --exit-on-error < "$DUMP"
+dc --profile ops run --rm db-roles          # роли входа (пароли из .env)
+infra/deploy/restore-check.sh --db feelings # права базы, vector, владельцы, RLS
+dc up -d
+curl -fsS https://стенд.домен/api/v1/health
+```
+
+`DROP DATABASE` удаляет и настройки владельца в этой базе (`session_preload_libraries`) — их
+возвращает `db-init`.
+
+### Восстановление на новый сервер — только по подтверждению оператора
+
+Нужны: копия (`.dump`), `.env` и `secrets/` из хранилища секретов (те же пароли ролей и **те же
+ключи шифрования** — иначе тексты не расшифровать).
+
+```bash
+# §1–2: DNS на новый IP, bootstrap.sh, клон репозитория в /opt/feelings/app
+cd /opt/feelings/app
+git checkout <коммит, с которого снята копия>
+install -m 600 <из хранилища>/.env infra/deploy/.env
+install -m 700 -d infra/deploy/secrets
+install -m 600 <из хранилища>/postgres_superuser_password infra/deploy/secrets/
+DUMP=/opt/feelings/backups/feelings-<дата>.dump  # скопировать на сервер (scp), права 600
+dc build
+dc up -d postgres redis                     # новый том; суперпользователь — из файла-секрета
+dc --profile ops run --rm db-init           # владелец, групповые роли, права базы, vector
+dc exec -T postgres pg_restore -U postgres -d feelings --exit-on-error < "$DUMP"
+dc --profile ops run --rm db-roles          # роли входа
+infra/deploy/restore-check.sh --db feelings
+dc up -d
+curl -fsS https://стенд.домен/api/v1/health
+```
+
+Вебхук бота указывает на домен, а не на IP: после смены A-записи повторная регистрация не нужна;
+при смене домена — §5 (по подтверждению).
 
 ## 11. Локальная проверка комплекта (без сервера)
 
@@ -289,14 +393,20 @@ infra/deploy/restore-check.sh   # свежая копия → временная
    - `FEELINGS_DOMAIN=localhost`;
    - `FEELINGS_TLS=internal` — собственный центр Caddy, без публичного ACME;
    - выдуманный токен бота формата Telegram — нужен только чтобы API прошёл проверку настроек;
-   - `FEELINGS_ENV=local`, потому что список контактов не проверен; отказ при `staging` проверяется
-     отдельно;
+   - `FEELINGS_ENV=staging` (другие значения compose не пропустит);
+   - выдуманный `OPENROUTER_API_KEY` (обязателен для compose; настоящий не нужен);
    - `FEELINGS_SECRETS_DIR=$TMP/secrets`.
-3. Запуск:
-   `docker compose -f infra/deploy/docker-compose.prod.yml --env-file $TMP/.env …`, затем
-   `db-init` → `migrate` → `db-roles` → `up -d`.
-4. Проверка: `curl -k https://localhost/api/v1/health`.
-5. Уборка: `down -v` и удаление `$TMP`.
+3. Список контактов помощи в репозитории не проверен, поэтому API при `staging` не стартует
+   (АР-33) — это проверяется первым. Для остальной проверки — только в `$TMP`, не в репозитории:
+   копия `backend/app/help_contacts.json` с `"verified_by_operator": true` и файл
+   `$TMP/override.yml`, который подключает её к `api` томом только на чтение
+   (`$TMP/help_contacts.json:/srv/backend/app/help_contacts.json:ro`).
+4. Запуск:
+   `docker compose -f infra/deploy/docker-compose.prod.yml -f $TMP/override.yml --env-file $TMP/.env …`,
+   затем `db-init` → `migrate` → `db-roles` → `up -d`.
+5. Проверка: `curl -k https://localhost/api/v1/health`; `backup.sh` и `restore-check.sh` с
+   `FEELINGS_BACKUP_DIR=$TMP/backups` и `FEELINGS_DEPLOY_ENV_FILE=$TMP/.env`.
+6. Уборка: `down -v` и удаление `$TMP`.
 
 За прокси с подменой TLS образы собираются так:
 
@@ -311,8 +421,10 @@ docker build --network host --secret id=build_ca,src=<CA> --build-arg HTTPS_PROX
 
 - Подключать продуктивного бота или реальную переписку.
 - Публиковать порты БД, Redis и API. `ports:` есть только у `caddy`.
-- Обходить проверку контактов помощи. Ставить `FEELINGS_ENV=dev`/`local`.
-- Включать журнал доступа Caddy: в пути `/invites/<токен>` есть токен приглашения.
+- Обходить проверку контактов помощи (в том числе подменой `help_contacts.json` томом, как в
+  локальной проверке §11). Ставить `FEELINGS_ENV=dev`/`local`/`test` — compose откажет.
+- Включать журнал доступа Caddy или убирать фильтр журнала ошибок в `Caddyfile`: в пути
+  `/invites/<токен>` есть токен приглашения, в заголовках — секрет вебхука.
 - Запускать несколько процессов API. Защита от повторной доставки обновлений бота и фоновые
   задачи живут в памяти процесса.
 - Выполнять `dc down -v`. Запускать миграции без подтверждения оператора.

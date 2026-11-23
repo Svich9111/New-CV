@@ -103,7 +103,12 @@ DO $log$ BEGIN
 END $log$;
 \endif
 \else
+-- Владельцу схемы init-owner.sql задаёт log_min_error_statement = panic на уровне роли
+-- (ревью 0.8, MINOR-9) — тогда текст запроса при ошибке не пишется и предупреждать не о чем.
+SELECT current_setting('log_min_error_statement') <> 'panic' AS err_logged \gset
+\if :err_logged
 \echo 'ВНИМАНИЕ: не суперпользователь — при ошибке запроса текст с паролем может попасть в журнал (log_min_error_statement).'
+\endif
 \endif
 \endif
 -- Транзакция — после настроек журнала: выборка log_transaction_sample_rate решается в начале

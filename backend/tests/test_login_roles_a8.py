@@ -536,7 +536,8 @@ def test_login_role_with_own_members_refused(tag: Tag) -> None:
     sql(f"CREATE ROLE {m} LOGIN IN ROLE {x}")
     done = run({"FEELINGS_WORKER_DB_PASSWORD": pw()}, x, tag.name("a"))
     assert "feelings_app" not in settable(m)
-    assert done.returncode != 0
+    # Отказ именно из-за членов роли (ревью 0.8, MINOR-4), а не по другой причине.
+    assert done.returncode != 0 and "есть члены" in done.stderr and m in done.stderr, done.stderr
 
 
 def test_login_role_with_direct_table_privileges_refused(tag: Tag) -> None:
@@ -544,7 +545,7 @@ def test_login_role_with_direct_table_privileges_refused(tag: Tag) -> None:
     sql(f"CREATE ROLE {a} NOLOGIN")
     sql(f"GRANT SELECT ON public.users TO {a}")
     done = run({"FEELINGS_ADMIN_DB_PASSWORD": pw()}, tag.name("w"), a)
-    assert done.returncode != 0
+    assert done.returncode != 0 and "собственные права" in done.stderr, done.stderr
 
 
 # ------------------------------------------------------------------ журналирование паролей
@@ -589,7 +590,15 @@ def test_superuser_sampled_logging_password_not_logged(tag: Tag, opts: str) -> N
 
 
 @pytest.mark.parametrize(
-    "setting", ["log_statement = 'ddl'", "log_statement = 'all'", "log_min_duration_statement = 0"]
+    "setting",
+    [
+        "log_statement = 'ddl'",
+        "log_statement = 'all'",
+        "log_min_duration_statement = 0",
+        # Выборочное журналирование (ревью 0.8, MINOR-4): без суперпользователя тоже отказ.
+        "log_transaction_sample_rate = 1",
+        "log_min_duration_sample = 0",
+    ],
 )
 def test_non_superuser_logged_refused_without_allow(tag: Tag, setting: str) -> None:
     """Без суперпользователя при журналировании запросов — отказ до первого запроса с паролем

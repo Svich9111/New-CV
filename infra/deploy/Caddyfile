@@ -3,6 +3,34 @@
 # сертификата и переадресация на HTTPS).
 # Журнал доступа Caddy не ведётся: в пути может быть токен приглашения (/invites/<токен>),
 # журнал доступа API (uvicorn) его маскирует (app.core.logging).
+#
+# Журнал ошибок Caddy (логгер http.log.error) при ответе 5xx — например, 502, пока API
+# перезапускается при выкладке, а Telegram шлёт вебхуки, — пишет объект запроса: адрес с токеном
+# приглашения и заголовки, в том числе X-Telegram-Bot-Api-Secret-Token (Caddy сам скрывает только
+# Cookie и Authorization). Проверено (ревью 0.8, MINOR-1): без фильтра в журнале
+# "uri":"/api/v1/invites/<токен>". Поэтому у журнала по умолчанию (в него идут и ошибки HTTP)
+# адрес и заголовки запроса удаляются, IP-адреса укорачиваются; остаются метод, хост, статус,
+# текст ошибки и её номер (err_id).
+{
+	log default {
+		output stderr
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers delete
+				request>remote_ip ip_mask {
+					ipv4 24
+					ipv6 48
+				}
+				request>client_ip ip_mask {
+					ipv4 24
+					ipv6 48
+				}
+			}
+		}
+	}
+}
 
 {$FEELINGS_DOMAIN} {
 	# FEELINGS_TLS: почта для Let's Encrypt (стенд) или `internal` — собственный центр Caddy,

@@ -73,7 +73,7 @@
 
 ### Создание и смена паролей
 
-Порядок: однократно `infra/db/init-owner.sql` (суперпользователь: владелец схемы `feelings_owner`, расширение vector; АР-41) → `alembic upgrade head` под `feelings_owner` → `infra/db/roles.sql` под `feelings_owner` (он создал групповые роли и может выдавать членство в них). Пароль суперпользователя после init не нужен.
+Порядок: однократно `infra/db/init-owner.sql` (суперпользователь: владелец схемы `feelings_owner`, групповые роли от его имени, права уровня базы — у PUBLIC отозваны `TEMPORARY` и `CREATE`, расширение vector, журнал сеансов владельца без текста запросов; АР-41) → `alembic upgrade head` под `feelings_owner` → `infra/db/roles.sql` под `feelings_owner` (у него ADMIN на групповые роли). Пароль суперпользователя после init не нужен — кроме повторного init и восстановления из копии (`docs/DEPLOY.md` §10).
 
 ```bash
 # Пароль: ≥ 32 символов A-Z a-z 0-9 _ - (подставляется в URL без кодирования)
