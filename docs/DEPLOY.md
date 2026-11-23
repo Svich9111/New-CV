@@ -159,7 +159,7 @@ dc --profile ops run --rm migrate
 # роли входа feelings_api, feelings_worker_login, feelings_admin_login — под feelings_owner
 dc --profile ops run --rm db-roles
 
-dc up -d                                   # caddy, api, worker-memory, worker-kb
+dc up -d                                   # caddy, api, worker-memory, worker-kb, worker-pipeline
 dc ps                                      # все — healthy
 curl -fsS https://стенд.домен/api/v1/health    # {"status":"ok"}
 ```
