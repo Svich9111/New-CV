@@ -516,11 +516,29 @@ async def read_original(
 # --- Конвейер (задача 3.2): сессия уже под ролью feelings_worker --------------------------
 
 
+async def pipeline_read(
+    s: AsyncSession, keys: Keyring, message_id: uuid.UUID, token: uuid.UUID
+) -> str | None:
+    """Одобренный оригинал для воркера конвейера по своей аренде (0013, Б-39, Б-48):
+    ``pipeline_read`` отдаёт шифротекст и id черновика (контекст расшифровки) только если
+    сообщение в ``processing``, токен аренды свой и черновик отправлен автором («Отправить»).
+    ``None`` — нет (аренду перехватили, сообщение удалено с аккаунтом автора, черновик не
+    ``sent``): одобрение не выдаётся. Не расшифровался — ``DecryptionError`` (не мусор)."""
+    row = (
+        await s.execute(
+            text("SELECT original_enc, draft_id FROM pipeline_read(:m, :t)"),
+            {"m": message_id, "t": token},
+        )
+    ).one_or_none()
+    return None if row is None else _open_original(keys, row.draft_id, row.original_enc)
+
+
 async def pipeline_read_original(
     s: AsyncSession, keys: Keyring, message_id: uuid.UUID, draft_id: uuid.UUID
 ) -> str | None:
-    """Оригинал для конвейера. `pipeline_original` отдаёт только байты, поэтому id черновика
-    приходит из задания конвейера (BACKLOG); неверный id — DecryptionError, не мусор."""
+    """Устаревшее (Б-83): без проверки аренды и статуса черновика — только тестовые данные;
+    воркер 3.2 читает ``pipeline_read``. `pipeline_original` отдаёт только байты, поэтому id
+    черновика передаёт вызывающий; неверный id — DecryptionError, не мусор."""
     blob = (
         await s.execute(text("SELECT pipeline_original(:m)"), {"m": message_id})
     ).scalar_one_or_none()
@@ -537,8 +555,10 @@ async def pipeline_deliver(
     tone: int,
     harsh: bool,
 ) -> bool:
-    """Доставка версии для получателя (адаптированной или копии оригинала) — шифруется с
-    контекстом `partner_messages|adapted_enc|<id сообщения>`. False — сообщения нет или оно
+    """Устаревшее (Б-83): без аренды — только тестовые данные; воркер 3.2 доставляет
+    ``pipeline_work.deliver`` (``pipeline_deliver_leased``). Доставка версии для получателя
+    (адаптированной или копии оригинала) — шифруется с контекстом
+    `partner_messages|adapted_enc|<id сообщения>`. False — сообщения нет или оно
     уже не в конвейере (в т.ч. удалено вместе с аккаунтом автора, пока доставка ждала пару;
     АР-23). Получатель удалил аккаунт — доставка проходит без версии для получателя."""
     res = await s.execute(

@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     memory_max_attempts: int = Field(default=5, ge=1)
     # Роль входа фонового воркера: член feelings_worker и feelings_app (NOINHERIT, Б-69).
     worker_database_url: str = ""
+    # Воркер конвейера входящего (3.2, АР-44): аренда сообщения (повтор после недоступности
+    # модели — по её истечении), предел попыток, опрос очереди (бюджет §10 — до 30 с).
+    pipeline_lease_s: int = Field(default=180, ge=30, le=24 * 60 * 60)
+    pipeline_max_attempts: int = Field(default=5, ge=1, le=100)
+    pipeline_poll_s: float = Field(default=1.0, gt=0, le=60)
+    pipeline_batch: int = Field(default=5, ge=1, le=100)
     session_ttl_s: int = 3600
     # Имя бота без «@» для ссылки-приглашения https://t.me/<бот>?startapp=<токен> (ФТ-03).
     # Не секрет; правила имени Telegram — 5–32 символа, латиница, цифры, «_».
