@@ -483,3 +483,315 @@ def test_process_stops_gracefully_on_sigterm(tmp_path: Path) -> None:
             proc.kill()
         proc.communicate(timeout=10)
     assert code == 0
+
+
+# =========================================================================== раунд 2 (A8)
+# Ревью 3.5 р.1: MAJOR-1 (SIGTERM), MINOR-1 (401/404 и 429 дольше аренды), MINOR-2 (срок при
+# поиске чата). Проверки — в непрерывном цикле и на настоящих процессах, с пределом попыток 1:
+# любой расход попытки на паузе привёл бы к отметке без отправки (уведомление потеряно).
+
+
+async def _run_until(w: Any, cond: Any, *, limit_s: float = 15.0, poll_s: float = 0.05) -> None:
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run_forever(poll_s=poll_s, stop=stop))
+    try:
+        end = time.monotonic() + limit_s
+        while not await cond():
+            assert time.monotonic() < end, "условие не наступило"
+            assert not task.done(), task
+            await asyncio.sleep(0.05)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 10)
+
+
+async def _notified(engine: AsyncEngine, mid: uuid.UUID) -> bool:
+    row = await _msg(engine, mid)
+    return row is not None and row["notify_done_at"] is not None
+
+
+@pytest.mark.parametrize("code", [401, 404])
+async def test_bad_token_in_loop_waits_and_sends_once_after_fix_without_spending_attempts(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID], code: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """ТЗ §10, §4.4 п.3; ревью MINOR-1: неверный токен бота (401/404) три паузы подряд при
+    ``max_attempts=1`` — уведомление не помечается сделанным, попытка не расходуется; после
+    исправления токена — ровно одно уведомление получателю. Журнал — без токена и chat_id."""
+    anna, igor, _ = pair
+    mid = await delivered(sessionmaker, engine, anna)
+    tg = FakeTg(tg_error(code), tg_error(code), tg_error(code))
+    w = nworker(engine, tg, max_attempts=1, pause=timedelta(seconds=0.4))
+    caplog.set_level(logging.INFO, logger="app.workers.notify")
+
+    async def sent() -> bool:
+        return len(tg.sent) == 1 and await _notified(engine, mid)
+
+    await _run_until(w, sent)
+    await w.api.aclose()
+    assert len(tg.requests) == 4 and len(tg.sent) == 1
+    igor_chat = await chat_of(engine, igor.user_id)
+    assert tg.sent[0]["chat_id"] == igor_chat
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    # Все три паузы и отправка — первая попытка: паузы попытку не израсходовали.
+    assert logged.count(f"status=paused reason=http_{code} attempt=1") == 3
+    assert "status=sent reason=None attempt=1" in logged
+    for s in (TOKEN, TOKEN.split(":")[1], str(igor_chat), str(mid), str(igor.user_id)):
+        assert s not in logged, s
+
+
+async def test_429_longer_than_lease_in_loop_deferred_without_spending_attempt(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID],
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """MINOR-1: 429 с ``retry_after`` дольше окна аренды при ``max_attempts=1`` — отсрочка без
+    расхода попытки; до конца отсрочки повторного запроса нет; затем — ровно одно уведомление."""
+    anna, _igor, _ = pair
+    mid = await delivered(sessionmaker, engine, anna)
+    tg = FakeTg(tg_error(429, retry_after=2))
+    t0 = time.monotonic()
+    times: list[float] = []
+    orig = tg.handler
+
+    async def stamped(request: httpx.Request) -> httpx.Response:
+        times.append(time.monotonic() - t0)
+        return await orig(request)
+
+    tg.handler = stamped  # type: ignore[method-assign]
+    w = nworker(engine, tg, max_attempts=1, lease=timedelta(seconds=2), margin=timedelta(seconds=1))
+
+    async def sent() -> bool:
+        return len(tg.sent) == 1 and await _notified(engine, mid)
+
+    caplog.set_level(logging.INFO, logger="app.workers.notify")
+    await _run_until(w, sent)
+    await w.api.aclose()
+    assert len(tg.requests) == 2 and len(tg.sent) == 1
+    assert times[1] - times[0] >= 1.8, times  # повтор — не раньше retry_after
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "status=retry reason=http_429 attempt=1" in logged
+    assert "status=sent reason=None attempt=1" in logged
+
+
+async def test_release_failure_falls_back_to_lease_without_crash(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """Сбой БД при снятии аренды (``pipeline_notify_release``) — не падение и не отметка:
+    аренда остаётся (повтор после её истечения), в журнале только класс ошибки."""
+    anna, _igor, _ = pair
+    mid = await delivered(sessionmaker, engine, anna)
+
+    async def broken(*_a: Any, **_k: Any) -> bool:
+        raise OSError("db down postgresql://w:pw@h/x")
+
+    monkeypatch.setattr(nw, "release", broken)
+    tg = FakeTg(tg_error(401))
+    w = nworker(engine, tg)
+    caplog.set_level(logging.INFO, logger="app.workers.notify")
+    assert statuses(await w.run_once()) == [("paused", "http_401")]
+    await w.api.aclose()
+    row = await _msg(engine, mid)
+    assert row is not None and row["notify_done_at"] is None
+    assert row["work_lease_token"] is not None  # аренда не снята — истечёт сама
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "notify release failed: OSError" in logged and "w:pw@" not in logged
+
+
+async def test_lookup_connection_timeout_is_retried_within_lease(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """MINOR-2, обратная ветка: ``TimeoutError`` от БД при поиске чата, когда срок отправки ещё
+    не вышел (тайм-аут соединения), — временный сбой: повтор в пределах аренды, одно
+    уведомление; ни отметки ``unknown``, ни ``deadline``."""
+    from app.repositories import users
+
+    anna, _igor, _ = pair
+    mid = await delivered(sessionmaker, engine, anna)
+    original = users.notification_chat_id
+    calls: list[int] = []
+
+    async def flaky(sm: Any, uid: uuid.UUID) -> int | None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError
+        return await original(sm, uid)
+
+    monkeypatch.setattr(users, "notification_chat_id", flaky)
+    tg = FakeTg()
+    w = nworker(engine, tg)
+    assert statuses(await w.run_once()) == [("sent", None)]
+    await w.api.aclose()
+    assert len(calls) == 2 and len(tg.requests) == 1
+    assert await _notified(engine, mid)
+
+
+async def test_lookup_deadline_with_one_attempt_sends_nothing_twice(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """MINOR-2: срок вышел при поиске чата — запрос к Telegram не отправлялся, статус ``retry``,
+    отметки нет, аренда не снята досрочно (повтор — после её истечения, не раньше)."""
+    from app.repositories import users
+
+    anna, _igor, _ = pair
+    mid = await delivered(sessionmaker, engine, anna)
+    original = users.notification_chat_id
+
+    async def slow(sm: Any, uid: uuid.UUID) -> int | None:
+        await asyncio.sleep(1.0)
+        return await original(sm, uid)
+
+    monkeypatch.setattr(users, "notification_chat_id", slow)
+    tg = FakeTg()
+    w = nworker(engine, tg, lease=timedelta(seconds=3), margin=timedelta(seconds=2.5))
+    assert statuses(await w.run_once()) == [("retry", "deadline")]
+    row = await _msg(engine, mid)
+    assert row is not None and row["notify_done_at"] is None
+    assert row["work_lease_token"] is not None  # аренда держится до конца
+    other = nworker(engine, tg)
+    assert await other.run_once() == []  # другая копия до истечения не получает
+    await w.api.aclose()
+    await other.api.aclose()
+    assert tg.requests == []
+
+
+# --------------------------------------------------------------------------- сигналы
+
+
+_SIGNALS_PROBE = (
+    "import asyncio, os, signal\n"
+    "from app.workers.signals import stop_on_signals\n"
+    "async def main():\n"
+    "    stop = asyncio.Event()\n"
+    "    try:\n"
+    "        with stop_on_signals(stop, name='probe'):\n"
+    "            os.kill(os.getpid(), signal.SIGTERM)\n"
+    "            await asyncio.wait_for(stop.wait(), 5)\n"
+    "            print('STOP_SET', flush=True)\n"
+    "            os.kill(os.getpid(), signal.SIGINT)\n"
+    "            await asyncio.sleep(10)\n"
+    "            print('NOT_CANCELLED', flush=True)\n"
+    "    except asyncio.CancelledError:\n"
+    "        print('CANCELLED', flush=True)\n"
+    "    print('RESTORED', signal.getsignal(signal.SIGTERM) == signal.SIG_DFL, flush=True)\n"
+    "asyncio.run(main())\n"
+)
+
+
+def test_stop_on_signals_first_sets_stop_second_cancels_then_restores() -> None:
+    """Обработчик сигналов (MAJOR-1): первый SIGTERM — только ``stop``; второй сигнал (SIGINT)
+    — отмена главной задачи сразу, без 10 с ожидания; после блока обработчик снят."""
+    t0 = time.monotonic()
+    r = subprocess.run(  # noqa: S603 — свой интерпретатор и свой код
+        [sys.executable, "-c", _SIGNALS_PROBE], cwd=BACKEND,
+        env=_proc_env(PYTHONPATH=str(BACKEND)), capture_output=True, text=True, timeout=30,
+        check=False,
+    )  # fmt: skip
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out[-1000:]
+    assert "STOP_SET" in out and "CANCELLED" in out and "NOT_CANCELLED" not in out
+    assert "RESTORED True" in out
+    assert time.monotonic() - t0 < 8
+
+
+# --------------------------------------------------------------------------- конвейер
+
+
+# Процесс конвейера как ``python -m app.workers.pipeline`` (настоящий ``_main`` и обработчик
+# сигналов). Модель — заглушка с паузой на первом вызове; каждый вызов печатается.
+_PIPELINE_SLOW = (
+    "import asyncio, logging, sys\n"
+    "from app.ai.models import AgentModels\n"
+    "from app.ai.stub import ScriptedProvider\n"
+    "import app.ai.models as m\n"
+    "def answer(role, payload, system):\n"
+    "    if role == 'safety':\n"
+    "        return {'category': 'none', 'secondary': []}\n"
+    "    if role == 'tone':\n"
+    "        return {'tone': 0, 'signals': []}\n"
+    "    if role == 'adapt':\n"
+    "        return {'adapted': payload['original'], 'reply_hint': 'x'}\n"
+    "    return {'problems': []}\n"
+    "class Slow(ScriptedProvider):\n"
+    "    async def complete_json(self, **kw):\n"
+    "        from app.ai.stub import role_of\n"
+    "        role = role_of(kw['schema'])\n"
+    "        print('MODEL_CALL', role, flush=True)\n"
+    "        if role == 'safety':\n"
+    "            await asyncio.sleep(2.0)\n"
+    "        return await super().complete_json(**kw)\n"
+    "async def _models(*a, **k):\n"
+    "    return AgentModels.single(Slow(answer))\n"
+    "m.openrouter_models_async = _models\n"
+    "import app.workers.pipeline as p\n"
+    "logging.basicConfig(level=logging.INFO, stream=sys.stdout)\n"
+    "asyncio.run(p._main())\n"
+)
+
+
+async def test_pipeline_process_sigterm_mid_model_delivers_once_and_exits_zero(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID], tmp_path: Path
+) -> None:
+    """MAJOR-1 у ``worker-pipeline``: SIGTERM, пока идёт вызов модели, — начатое сообщение
+    дорабатывается и доставляется (один проход конвейера, по одному вызову каждой роли), код
+    выхода 0; сообщение, отправленное после сигнала, не захватывается (без аренды и попытки);
+    после истечения аренды доставленное повторно не обрабатывается."""
+    from app.core.crypto import generate_key_entry, parse_keyring
+    from app.repositories import texts
+    from tests.conftest import TEST_DATABASE_URL
+    from tests.test_pipeline_db import _claim
+
+    anna, _igor, _ = pair
+    entry = generate_key_entry("a8r2")
+    keys = parse_keyring(entry, "a8r2")
+
+    async def send_with(body: str) -> uuid.UUID:
+        did = await texts.create_draft(sessionmaker, keys, anna.user_id, anna.agent_id, body)
+        return await texts.send_draft(sessionmaker, anna.user_id, did, 1)
+
+    first = await send_with(CALM)
+    log = tmp_path / "pipeline.log"
+    env = _proc_env(
+        FEELINGS_PIPELINE_PROMPT_SET="v0",
+        FEELINGS_WORKER_DATABASE_URL=TEST_DATABASE_URL,
+        FEELINGS_ENCRYPTION_KEYS=entry,
+        FEELINGS_ENCRYPTION_KEY_ID="a8r2",
+        FEELINGS_PIPELINE_POLL_S="0.2",
+        PYTHONPATH=str(BACKEND),
+    )
+    with log.open("w") as fh:
+        proc = subprocess.Popen(  # noqa: S603, ASYNC220 — свой код запуска; ожидание — в потоке
+            [sys.executable, "-c", _PIPELINE_SLOW], cwd=BACKEND, env=env,
+            stdout=fh, stderr=subprocess.STDOUT, text=True,
+        )  # fmt: skip
+        try:
+            end = time.monotonic() + 30
+            while "MODEL_CALL safety" not in log.read_text():
+                assert proc.poll() is None, log.read_text()[-2000:]
+                assert time.monotonic() < end, log.read_text()[-2000:]
+                await asyncio.sleep(0.05)
+            os.kill(proc.pid, signal.SIGTERM)
+            await asyncio.sleep(0.3)  # сигнал обработан, цикл больше не захватывает
+            second = await send_with("Второе сообщение после сигнала")
+            code = await asyncio.to_thread(proc.wait, 20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(10)
+    out = log.read_text()
+    assert code == 0, out[-2000:]
+    assert "SIGTERM received" in out and "pipeline worker stopped" in out
+    assert "status=delivered" in out
+    for role in ("safety", "tone", "adapt", "meaning"):
+        assert out.count(f"MODEL_CALL {role}") <= 1, out
+    assert out.count("MODEL_CALL safety") == 1
+    row = await _msg(engine, first)
+    assert row is not None and row["status"] == "delivered" and row["work_lease_token"] is None
+    row = await _msg(engine, second)
+    assert row is not None and row["status"] == "processing"
+    assert row["work_lease_token"] is None and row["work_attempts"] == 0
+    assert CALM not in out
+    await _expire(engine, first)
+    assert first not in await _claim(engine)  # доставленное конвейер больше не выдаёт
