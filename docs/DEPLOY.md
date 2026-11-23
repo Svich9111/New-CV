@@ -141,7 +141,7 @@ dc build                                   # образы feelings-backend и fe
 dc up -d postgres redis                    # том pgdata создаётся, суперпользователь — из файла-секрета
 dc ps                                      # postgres, redis — healthy
 
-# однократно, суперпользователем: владелец схемы feelings_owner и расширение vector (АР-П1)
+# однократно, суперпользователем: владелец схемы feelings_owner и расширение vector (АР-41)
 dc --profile ops run --rm db-init
 
 # ТОЛЬКО по подтверждению оператора: миграции под feelings_owner (не суперпользователь)
