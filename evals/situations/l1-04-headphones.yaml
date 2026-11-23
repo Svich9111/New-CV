@@ -1,0 +1,31 @@
+id: l1-04-headphones
+title: Покупка без обсуждения
+status: draft
+review_note: Черновик A3 — ждёт утверждения психологом (Д5)
+level: 1
+tags: [деньги]
+checks: [level, meaning]
+owner: {name: Лейла, age: 29, partner_name: Руслан}
+relationship: В браке два года, копят на отпуск
+owner_turns:
+  - Руслан купил себе наушники за двенадцать тысяч и даже не сказал. Мы же договорились копить на отпуск.
+partner_message:
+  direction: outgoing
+  original: Мог бы и спросить, прежде чем тратить из общих. Мы же откладываем на отпуск.
+  expected_tone: 1
+  expected_delivery: as_is
+  meaning:
+    facts: [Руслан потратил общие деньги без обсуждения, Пара копит на отпуск]
+    request: null
+    implied_need: Обсуждать траты из общих денег заранее
+  must_keep: [спросить, отпуск]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
+expected:
+  strategy: listen_and_request
+  draft: optional
+  agent_should:
+    - Отразить досаду из-за нарушенной договорённости
+    - Помочь сформулировать правило для общих трат
+  agent_must_not:
+    - Осуждать Руслана
+    - Превращать разовую покупку в разговор о характере

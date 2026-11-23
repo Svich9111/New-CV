@@ -53,61 +53,127 @@
     ],
   };
 
-  // Черновики по схеме «чувство — ситуация — потребность — просьба» (§4.3, §6.2)
+  // Черновики по схеме «чувство — ситуация — потребность — просьба» (§4.3, §6.2).
+  // recap — как агент ПОЛУЧАТЕЛЯ пересказывает этот текст: только слова из самого текста (§6.2, §9.2 п.2).
+  // memory — запись в памяти получателя из одобренного текста (§6.3): без домыслов, с верным родом автора.
+  // Варианты Игоря строятся только из того, что Аня отправила, — без её личного чата и памяти (§2 п.4, §6.3).
   const DRAFTS = {
-    anna: [
-      {
-        text:
-          "Игорь, мне грустно, когда наши планы отменяются в последний момент — в этом месяце так было уже три раза. " +
-          "Мне важно проводить с тобой время и чувствовать, что оно важно и тебе. " +
-          "Давай договоримся: если что-то меняется, ты предупреждаешь заранее. И выберем вечер на этой неделе, который точно будет нашим?",
-        parts: [
-          ["Чувство", "мне грустно"],
-          ["Ситуация", "планы отменяются в последний момент, третий раз за месяц"],
-          ["Потребность", "время вместе и ощущение, что оно важно обоим"],
-          ["Просьба", "предупреждать заранее и выбрать вечер на неделе"],
-        ],
-      },
-      {
-        text:
-          "Игорь, сегодня мне стало одиноко, когда наш вечер снова сорвался. " +
-          "Я скучаю по нашему времени вдвоём. " +
-          "Можешь предупреждать об изменениях заранее? И давай вместе выберем вечер на выходных.",
-        parts: [
-          ["Чувство", "мне одиноко"],
-          ["Ситуация", "вечер снова сорвался"],
-          ["Потребность", "время вдвоём"],
-          ["Просьба", "предупреждать заранее, выбрать вечер на выходных"],
-        ],
-      },
-    ],
-    igor: [
-      {
-        text:
-          "Аня, мне жаль, что тебе грустно из-за отменённых вечеров. " +
-          "Наше время мне тоже важно — я просто не замечал, как часто это стало происходить. " +
-          "Давай в субботу поужинаем вдвоём, а если что-то поменяется, я скажу заранее.",
-        parts: [
-          ["Чувство", "мне жаль, что тебе грустно"],
-          ["Ситуация", "отменённые вечера"],
-          ["Потребность", "наше время важно и мне"],
-          ["Просьба", "ужин вдвоём в субботу"],
-        ],
-      },
-      {
-        text:
-          "Аня, я прочитал и понял, что тебе было обидно. Мне важно, чтобы ты чувствовала, что ты для меня главная. " +
-          "Можем сегодня вечером спокойно поговорить об этом?",
-        parts: [
-          ["Чувство", "понимаю, что тебе было обидно"],
-          ["Ситуация", "твоё сообщение"],
-          ["Потребность", "чтобы ты чувствовала себя важной"],
-          ["Просьба", "поговорить сегодня вечером"],
-        ],
-      },
-    ],
+    anna: {
+      main: [
+        {
+          text:
+            "Игорь, мне грустно, когда наши планы отменяются в последний момент — в этом месяце так было уже три раза. " +
+            "Мне важно проводить с тобой время и чувствовать, что оно важно и тебе. " +
+            "Давай договоримся: если что-то меняется, ты предупреждаешь заранее. И выберем вечер на этой неделе, который точно будет нашим?",
+          parts: [
+            ["Чувство", "мне грустно"],
+            ["Ситуация", "планы отменяются в последний момент, три раза за месяц"],
+            ["Потребность", "проводить время вместе и чувствовать, что оно важно обоим"],
+            ["Просьба", "предупреждать заранее и выбрать вечер на этой неделе"],
+          ],
+          recap:
+            "Она пишет, что ей грустно, когда ваши планы отменяются в последний момент, — в этом месяце так было три раза. " +
+            "Ей важно проводить с тобой время. Она просит предупреждать заранее, если что-то меняется, и выбрать вечер на этой неделе.",
+          memory: "Аня просит предупреждать заранее, если планы меняются, и выбрать вечер на этой неделе",
+        },
+        {
+          text:
+            "Игорь, сегодня мне стало одиноко, когда наш вечер снова сорвался. " +
+            "Я скучаю по нашему времени вдвоём. " +
+            "Можешь предупреждать об изменениях заранее? И давай вместе выберем вечер на выходных.",
+          parts: [
+            ["Чувство", "мне одиноко"],
+            ["Ситуация", "вечер снова сорвался"],
+            ["Потребность", "время вдвоём"],
+            ["Просьба", "предупреждать заранее, выбрать вечер на выходных"],
+          ],
+          recap:
+            "Она пишет, что ей стало одиноко, когда ваш вечер снова сорвался, и что она скучает по вашему времени вдвоём. " +
+            "Она просит предупреждать об изменениях заранее и вместе выбрать вечер на выходных.",
+          memory: "Аня просит предупреждать об изменениях заранее и выбрать вечер на выходных",
+        },
+      ],
+    },
+    igor: {
+      // Ответ на известный вариант Ани: оба её варианта — об отменённых вечерах и просьбе предупреждать заранее
+      reply: [
+        {
+          text:
+            "Аня, мне жаль, что наши вечера срывались. " +
+            "Наше время мне тоже важно — я не думал, что это происходит так часто. " +
+            "Давай в субботу поужинаем вдвоём, а если что-то поменяется, я скажу заранее.",
+          parts: [
+            ["Чувство", "мне жаль"],
+            ["Ситуация", "вечера срывались"],
+            ["Потребность", "наше время важно и мне"],
+            ["Просьба", "ужин вдвоём в субботу"],
+          ],
+          recap:
+            "Он пишет, что ему жаль, что ваши вечера срывались, и что ваше время ему тоже важно. " +
+            "Он предлагает поужинать вдвоём в субботу и обещает сказать заранее, если что-то поменяется.",
+          memory: "Игорь обещал сказать заранее, если планы поменяются, и предложил поужинать вдвоём в субботу",
+        },
+        {
+          text:
+            "Аня, я прочитал твоё сообщение, и мне стало не по себе. Мне тоже важно наше время вдвоём. " +
+            "Можем сегодня вечером спокойно поговорить об этом?",
+          parts: [
+            ["Чувство", "мне не по себе"],
+            ["Ситуация", "твоё сообщение"],
+            ["Потребность", "наше время вдвоём"],
+            ["Просьба", "поговорить сегодня вечером"],
+          ],
+          recap: "Он пишет, что ему стало не по себе от твоего сообщения и что ваше время вдвоём ему тоже важно. Он предлагает спокойно поговорить сегодня вечером.",
+          memory: "Игорь предложил спокойно поговорить сегодня вечером",
+        },
+      ],
+      // Входящего нет или текст Ани неизвестен — ничего ей не приписываем
+      neutral: [
+        {
+          text: "Аня, мне важно спокойно поговорить с тобой, без спешки. Давай сегодня вечером?",
+          parts: [
+            ["Чувство", "мне важно"],
+            ["Ситуация", "хочется поговорить без спешки"],
+            ["Потребность", "спокойный разговор"],
+            ["Просьба", "поговорить сегодня вечером"],
+          ],
+          recap: "Он пишет, что ему важно спокойно поговорить с тобой, без спешки, и предлагает сегодня вечером.",
+          memory: "Игорь предложил спокойно поговорить сегодня вечером",
+        },
+        {
+          text: "Аня, я хочу лучше понимать, что для тебя важно. Расскажешь, когда будет удобно?",
+          parts: [
+            ["Чувство", "хочу понимать тебя"],
+            ["Ситуация", "наш разговор"],
+            ["Потребность", "понимать, что для тебя важно"],
+            ["Просьба", "рассказать, когда будет удобно"],
+          ],
+          recap: "Он пишет, что хочет лучше понимать, что для тебя важно, и просит рассказать, когда тебе будет удобно.",
+          memory: "Игорь попросил рассказать, что для Ани важно, когда ей будет удобно",
+        },
+      ],
+    },
   };
   const EXAMPLE_EDIT = "Ты вечно всё отменяешь в последний момент.";
+
+  // Смягчение — только заранее заданные фразы целиком (это прототип, не модель; §2 п.3, §6.2 п.5).
+  // Остальной текст передаётся как есть: факты, просьбы и чувства не трогаются; замены без родовых окончаний.
+  const SOFTEN = [
+    {
+      from: "Ты вечно всё отменяешь в последний момент",
+      to: "Мне кажется, отмены в последний момент стали повторяться слишком часто",
+      word: "вечно",
+      why: "обобщение заменено наблюдением автора; факт — отмены в последний момент — сохранён",
+      recap: (a) => "Ещё " + (a.fem ? "она пишет, что, как ей кажется," : "он пишет, что, как ему кажется,") + " отмены в последний момент стали повторяться слишком часто.",
+    },
+    {
+      from: "Ты опять меня не слышишь",
+      to: "Мне кажется, сейчас ты меня не слышишь",
+      word: "опять",
+      why: "упрёк заменён тем, как это ощущает автор; суть — «ты меня не слышишь» — сохранена",
+      recap: (a) => "Ещё " + (a.fem ? "она пишет, что, как ей кажется, сейчас ты её не слышишь." : "он пишет, что, как ему кажется, сейчас ты его не слышишь."),
+    },
+  ];
 
   // Тексты агента: сначала отражает чувство, потом уточняет, потом предлагает (§2, §4.2)
   const SCRIPT = {
@@ -125,9 +191,9 @@
     },
     igor: {
       greeting: "Привет, Игорь. Как ты? Можно рассказать что угодно — это видишь только ты.",
-      suggest: ["Я не думал, что это её так задевает. Мне правда важно время с ней."],
+      suggest: ["Я не думал, что для неё это так важно. Мне правда важно время с ней."],
       replies: [
-        "Похоже, ты не ожидал, что для неё это настолько важно, и тебе сейчас немного не по себе. Это понятно — и то, что тебе важно ваше время, хорошо слышно.\n\nМожно ответить коротко, а главное обсудить вживую — например, за ужином. Подготовить ответ Ане?",
+        "Похоже, ты не ожидал, что для неё это так важно, и тебе сейчас немного не по себе. Это понятно — и то, что тебе важно ваше время, хорошо слышно.\n\nМожно ответить коротко, а самое важное обсудить вживую — например, за ужином. Подготовить ответ Ане?",
       ],
       options: false,
     },
@@ -201,25 +267,74 @@
     toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
   }
 
-  // Имитация адаптации агентом получателя (§4.4, §6.2): меняется форма, не смысл.
+  // Имитация адаптации агентом получателя (§4.4, §6.2): меняются только фразы из SOFTEN.
+  // segs — куски текста; у изменённых есть from (как было), чтобы подсветить разницу.
   function adaptText(text) {
-    const rules = [
-      [/Ты вечно всё отменяешь в последний момент\.?/g, "Мне кажется, отмены в последний момент стали повторяться слишком часто."],
-      [/(?<![а-яё])(вечно|всегда)(?![а-яё])/giu, "часто"],
-      [/(?<![а-яё])никогда(?![а-яё])/giu, "редко"],
-      [/[Тт]ебе (вообще )?плевать на меня\.?/g, "Мне не хватает ощущения, что я тебе важна."],
-    ];
-    let out = text;
-    for (const [re, rep] of rules) out = out.replace(re, rep);
-    return { text: out, adapted: out !== text };
+    const segs = [];
+    const changes = [];
+    let i = 0;
+    for (;;) {
+      let best = null;
+      for (const r of SOFTEN) {
+        const k = text.indexOf(r.from, i);
+        if (k !== -1 && (!best || k < best.k)) best = { k, r };
+      }
+      if (!best) { if (i < text.length) segs.push({ t: text.slice(i) }); break; }
+      if (best.k > i) segs.push({ t: text.slice(i, best.k) });
+      segs.push({ t: best.r.to, from: best.r.from });
+      changes.push(best.r);
+      i = best.k + best.r.from.length;
+    }
+    return { text: segs.map((x) => x.t).join(""), adapted: changes.length > 0, segs, changes };
   }
-  const HARSH = /(?<![а-яё])(вечно|всегда|никогда|плевать)(?![а-яё])/iu;
+  const softenable = (text) => SOFTEN.filter((r) => text.indexOf(r.from) !== -1);
 
-  function partnerMemoryFrom(text, author) {
+  // Какой заготовленный вариант отправлен. Только точное совпадение (N-1): допускаются лишь дописанные
+  // фразы из SOFTEN — их смысл агент получателя знает и пересказывает отдельно. Любая другая правка —
+  // и агент получателя уже не пересказывает заготовку, а предлагает прочитать сообщение.
+  const norm = (t) => t.replace(/\s+/g, " ").trim();
+  function findVariant(author, original) {
+    let core = original;
+    for (const r of SOFTEN) core = core.split(r.from + ".").join(" ").split(r.from).join(" ");
+    core = norm(core);
+    const sets = DRAFTS[author];
+    for (const name of Object.keys(sets)) {
+      const idx = sets[name].findIndex((v) => norm(v.text) === core);
+      if (idx !== -1) return { set: name, idx };
+    }
+    return null;
+  }
+  const variantOf = (author, ref) => (ref ? DRAFTS[author][ref.set][ref.idx] : null);
+
+  function draftSetFor(persona) {
+    if (persona === "anna") return "main";
+    const last = S.messages.filter((m) => m.to === "igor").slice(-1)[0];
+    return last && last.variant ? "reply" : "neutral";
+  }
+
+  // Запись в памяти получателя — только из одобренного текста (§6.3, ФТ-14)
+  // Для неизвестного текста — дословная цитата отправленного, без пересказа
+  function partnerMemoryFrom(author, ref, original) {
+    const v = variantOf(author, ref);
+    if (v) return v.memory;
     const a = NAMES[author];
-    if (/заранее/i.test(text)) return a.nom + (a.fem ? " просила" : " просил") + " предупреждать об изменениях планов заранее";
-    if (/суббот/i.test(text)) return a.nom + (a.fem ? " предложила" : " предложил") + " поужинать вдвоём в субботу";
-    return a.nom + (a.fem ? " написала" : " написал") + ", что ей важно ваше время вместе";
+    return a.nom + (a.fem ? " написала" : " написал") + " (дословно): «" + original + "»";
+  }
+
+  // Пересказ входящего агентом получателя — только из того, что автор отправил (§6.2, §9.2 п.2)
+  function recapFor(m, viewer) {
+    const a = NAMES[m.from];
+    const v = variantOf(m.from, m.variant);
+    const head = a.nom + (a.fem ? " прислала" : " прислал") + " тебе сообщение.";
+    const ask = viewer === "igor"
+      ? "Как ты это воспринял? Что первым пришло в голову?"
+      : "Как тебе этот ответ? Что хочется сказать — или, может, лучше обсудить это вживую?";
+    if (!v) {
+      return head + " Пересказывать его своими словами не буду — лучше прочитай " + (a.fem ? "её" : "его") +
+        " слова. Если хочешь, вместе разберёмся, что для " + (a.fem ? "неё" : "него") + " важно и что ответить.\n\n" + ask;
+    }
+    const extra = (m.changes || []).map((r) => " " + r.recap(a)).join("");
+    return head + " " + v.recap + extra + "\n\n" + ask;
   }
 
   // ---------- Навигация ----------
@@ -282,12 +397,27 @@
     render();
   }
 
-  function openDraft() {
+  function ensureDraft() {
     const u = me();
     if (!u.draft) {
-      const v = DRAFTS[S.persona][0];
-      u.draft = { idx: 0, text: v.text, edited: false };
+      const set = draftSetFor(S.persona);
+      u.draft = { set, idx: 0, text: DRAFTS[S.persona][set][0].text, edited: false, confirmVariant: false };
     }
+    return u.draft;
+  }
+  const draftVariants = () => DRAFTS[S.persona][me().draft.set];
+
+  function nextVariant() {
+    const u = me();
+    const list = draftVariants();
+    const idx = (u.draft.idx + 1) % list.length;
+    u.draft = { set: u.draft.set, idx, text: list[idx].text, edited: false, confirmVariant: false };
+    toast("Агент предложил другой вариант");
+    render();
+  }
+
+  function openDraft() {
+    ensureDraft();
     go("draft");
   }
 
@@ -298,6 +428,7 @@
     if (!original) return;
     const to = other(S.persona);
     const ad = adaptText(original);
+    const variant = findVariant(S.persona, original);
     // Ответ на последнее входящее отмечаем «отвечено»
     S.messages.forEach((m) => { if (m.to === S.persona && m.from === to) m.status = "replied"; });
     S.messages.push({
@@ -307,6 +438,9 @@
       original,
       delivered: ad.text,
       adapted: ad.adapted,
+      segs: ad.segs,
+      changes: ad.changes,
+      variant,
       status: "delivered",
       time: S.messages.length ? "20:15" : "19:42",
       originalViewed: false,
@@ -314,7 +448,7 @@
     S.users[to].memory.push({
       id: "pm" + ++memSeq,
       cat: "partner",
-      text: partnerMemoryFrom(original, S.persona),
+      text: partnerMemoryFrom(S.persona, variant, original),
       src: "одобренное сообщение " + NAMES[S.persona].gen + " · сегодня",
     });
     u.draft = null;
@@ -336,16 +470,7 @@
       if (S.persona === "igor") u.stage = 0;
       else u.stage = SCRIPT.anna.replies.length + 1;
       const incoming = S.messages.filter((m) => m.to === S.persona).slice(-1)[0];
-      const p = P();
-      let text;
-      if (S.persona === "igor") {
-        text =
-          "Аня прислала тебе сообщение. Похоже, ей грустно из-за отменённых вечеров и важно, чтобы ваше время было ценным и для тебя. " +
-          "Её просьба — предупреждать заранее и выбрать вечер вдвоём.\n\nКак ты это воспринял? Что первым пришло в голову?";
-      } else {
-        text = p.nom + " ответил. Кажется, он тебя услышал. Как тебе его ответ? Что хочется сказать в ответ — или, может, лучше обсудить это вживую?";
-      }
-      if (incoming) u.chat.push({ from: "agent", text });
+      if (incoming) u.chat.push({ from: "agent", text: recapFor(incoming, S.persona) });
     }
     go("chat");
   }
@@ -514,7 +639,7 @@
           '<div class="list" style="margin-top:20px">' +
           '<button type="button" class="list__row" data-action="go" data-to="memory"><span>Что агент помнит</span><span class="chev">›</span></button>' +
           '<button type="button" class="list__row" data-action="go" data-to="profile"><span>Профиль и пара</span><span class="chev">›</span></button>' +
-          '<button type="button" class="list__row" data-action="go" data-to="subscription"><span>Подписка</span><span class="small muted">' + (S.subscription.status === "paid" ? "активна" : "пробный период") + "</span></button>" +
+          '<button type="button" class="list__row" data-action="go" data-to="subscription"><span>Подписка</span><span class="small muted">' + (S.subscription.status === "paid" ? "активна" : S.pairActive ? "пробный период" : "начнётся с пары") + "</span></button>" +
           '<button type="button" class="list__row" data-action="go" data-to="help"><span>Помощь</span><span class="chev">›</span></button>' +
           "</div></section>",
         main: { text: "Поговорить с агентом", action: () => go("chat") },
@@ -546,9 +671,13 @@
         chat: true,
         html:
           '<section class="chat" data-screen="chat" aria-live="polite">' +
-          '<div class="chat-day">Сегодня · этот разговор видишь только ты</div>' + msgs +
+          '<div class="chat-day">Сегодня · этот разговор видишь только ты</div>' +
+          msgs +
           (u.typing ? '<div class="msg msg--agent msg--typing" data-typing>Агент печатает…</div>' : "") + options +
           "</section>" +
+          // Низ чата закреплён: вход в «Помощь» виден всегда, при любой длине ленты (§9.3, N-3)
+          '<div class="chat-bottom">' +
+          '<button type="button" class="help-link" data-action="go" data-to="help">Если тебе сейчас опасно или очень тяжело — Помощь</button>' +
           (suggest.length && !u.typing
             ? '<div class="chips" data-suggest><span class="tiny muted" style="width:100%">Подсказка прототипа — нажми, чтобы вставить:</span>' +
               suggest.map((s) => '<button type="button" class="chip" data-action="suggest" data-text="' + esc(s) + '">' + esc(s) + "</button>").join("") + "</div>"
@@ -556,19 +685,18 @@
           (u.recording ? '<div class="recording" data-recording>● Идёт запись (имитация). Нажми на микрофон ещё раз, чтобы закончить.</div>' : "") +
           '<div class="composer">' +
           '<button type="button" class="icon-btn" data-action="mic" aria-label="' + (u.recording ? "Закончить запись" : "Записать голосовое") + '" aria-pressed="' + u.recording + '">' + MIC + "</button>" +
-          '<textarea id="chat-input" rows="1" data-model="input" placeholder="Напиши, что тебя беспокоит" aria-label="Сообщение агенту">' + esc(u.input) + "</textarea>" +
+          '<textarea id="chat-input" rows="1" data-model="input" placeholder="Что тебя беспокоит?" aria-label="Сообщение агенту">' + esc(u.input) + "</textarea>" +
           '<button type="button" class="icon-btn icon-btn--fill" data-action="send-agent" aria-label="Отправить агенту">' + SEND + "</button>" +
-          "</div>",
-        main: hasOwn ? { text: S.persona === "anna" ? "Подготовить сообщение " + p.dat : "Подготовить ответ " + p.dat, action: openDraft } : null,
+          "</div></div>",
+        main: hasOwn || u.replyContext ? { text: S.persona === "anna" ? "Подготовить сообщение " + p.dat : "Подготовить ответ " + p.dat, action: openDraft } : null,
       };
     },
 
     draft() {
       const u = me();
       const p = P();
-      if (!u.draft) u.draft = { idx: 0, text: DRAFTS[S.persona][0].text, edited: false };
-      const d = u.draft;
-      const v = DRAFTS[S.persona][d.idx];
+      const d = ensureDraft();
+      const v = draftVariants()[d.idx];
       return {
         html:
           '<section data-screen="draft">' +
@@ -586,6 +714,11 @@
           '<button type="button" class="btn" data-action="edit">Править</button>' +
           '<button type="button" class="btn" data-action="variant">Другой вариант</button>' +
           "</div>" +
+          (d.confirmVariant
+            ? '<div class="confirm" data-confirm-variant role="group" aria-label="Заменить твой текст?"><span class="small">Твоя правка пропадёт, а агент подставит новый вариант. Заменить?</span>' +
+              '<button type="button" class="btn btn--fill" data-action="variant-confirm">Заменить</button>' +
+              '<button type="button" class="btn btn--ghost" data-action="variant-cancel">Оставить мой текст</button></div>'
+            : "") +
           '<div class="btn-row"><button type="button" class="btn btn--text" data-action="discard">Не отправлять</button></div>' +
           "</section>",
         main: {
@@ -593,6 +726,7 @@
           disabled: !S.pairActive || !d.text.trim(),
           hint: !S.pairActive ? "Отправка откроется, когда " + p.nom + " примет приглашение" : !d.text.trim() ? "Текст пустой — нечего отправлять" : "",
           action: sendDraft,
+          guard: true,
           id: "send",
         },
       };
@@ -616,11 +750,12 @@
             '<article class="partner-card" data-msg="incoming" data-id="' + m.id + '">' +
             '<div class="partner-card__head"><span>От ' + esc(author.gen) + " · " + m.time + "</span>" +
             (m.adapted ? '<span class="badge" data-adapted>✎ адаптировано</span>' : '<span class="badge">без изменений</span>') + "</div>" +
-            '<div class="partner-card__text" data-delivered>' + esc(m.delivered) + "</div>" +
+            '<div class="partner-card__text" data-delivered>' + segsHtml(m, "to") + "</div>" +
             (m.adapted
-              ? '<p class="small muted">Твой агент смягчил резкие слова. Смысл, факты и просьба ' + esc(author.gen) + " сохранены.</p>"
+              ? '<div class="small muted" data-what-changed><b>Что изменил твой агент</b> (выделено) — фраз: ' + m.changes.length + ".<ul>" +
+                m.changes.map((r) => "<li>" + esc(r.why) + "</li>").join("") + "</ul>Остальное — слово в слово, как " + (author.fem ? "написала " : "написал ") + esc(author.nom) + ".</div>"
               : '<p class="small muted">Передано так, как ' + (author.fem ? "написала" : "написал") + " " + esc(author.nom) + ".</p>") +
-            (shown ? '<div class="original" data-original><span class="original__label">Оригинал — как ' + (author.fem ? "написала и одобрила " : "написал и одобрил ") + esc(author.nom) + "</span>" + esc(m.original) + "</div>" : "") +
+            (shown ? '<div class="original" data-original><span class="original__label">Оригинал — как ' + (author.fem ? "написала и одобрила " : "написал и одобрил ") + esc(author.nom) + " (отличия выделены)</span>" + segsHtml(m, "from") + "</div>" : "") +
             '<div class="btn-row">' +
             (m.adapted ? '<button type="button" class="btn btn--ghost" data-action="toggle-original" data-id="' + m.id + '">' + (shown ? "Скрыть оригинал" : "Показать оригинал") + "</button>" : "") +
             '<button type="button" class="btn btn--fill" data-action="reply">Ответить с агентом</button>' +
@@ -674,7 +809,7 @@
       const u = me();
       const p = P();
       const sw = (key, label) =>
-        '<div class="list__row"><span>' + label + '</span><button type="button" class="switch" role="switch" aria-checked="' + u.notify[key] + '" data-action="toggle-notify" data-key="' + key + '">' +
+        '<div class="list__row"><span>' + label + '</span><button type="button" class="switch" role="switch" aria-label="' + label + '" aria-checked="' + u.notify[key] + '" data-action="toggle-notify" data-key="' + key + '">' +
         '<span class="switch__text">' + (u.notify[key] ? "вкл" : "выкл") + '</span><span class="switch__track" aria-hidden="true"></span></button></div>';
       const sheet = u.sheet
         ? '<div class="sheet-backdrop" data-sheet="' + u.sheet + '"><div class="sheet" role="dialog" aria-modal="true">' +
@@ -714,6 +849,7 @@
       const u = me();
       const sub = S.subscription;
       const paid = sub.status === "paid";
+      const before = !S.pairActive && !paid; // §11 п.2–3: до создания пары пробный период не идёт, оплатить нечего
       const plans = [
         ["month", "Месяц", "390 ⭐"],
         ["year", "Год", "3 290 ⭐"],
@@ -724,13 +860,15 @@
           "<h1>Подписка на пару</h1>" +
           '<p class="muted">Платит один — доступ получают оба. Статус видите вы оба.</p>' +
           '<div class="card card--soft" data-sub="' + sub.status + '"><div class="row row--between"><b>Статус</b>' +
-          (paid ? '<span class="badge badge--solid">активна</span>' : '<span class="badge">пробный период</span>') + "</div>" +
+          (paid ? '<span class="badge badge--solid">активна</span>' : before ? '<span class="badge">ещё не начался</span>' : '<span class="badge">пробный период</span>') + "</div>" +
           '<p class="small" style="margin:8px 0 0">' +
           (paid
             ? "Активна до 21 декабря. " + (sub.paidBy === S.persona ? "Оплачено тобой." : "Оплатил" + (NAMES[sub.paidBy].fem ? "а " : " ") + NAMES[sub.paidBy].nom + ".")
-            : "Осталось 7 дней — до 28 ноября. Отсчёт идёт с момента создания пары.") +
+            : before
+              ? "Пробный период — 7 дней — начнётся, когда пара будет создана. Пока разговоры с агентом бесплатны в пределах дневного лимита."
+              : "Пробный период: осталось 7 дней — до 28 ноября. Отсчёт идёт с момента создания пары.") +
           "</p></div>" +
-          (paid
+          (paid || before
             ? ""
             : "<h2>Тариф</h2>" +
               plans.map(([id, name, price]) =>
@@ -739,12 +877,13 @@
                 '<span class="plan__price">' + price + "</span>" + (u.plan === id ? '<span class="tiny">выбран</span>' : "") + "</button>").join("") +
               '<p class="tiny muted">Цены — пример для макета; окончательные задаются в настройках (ТЗ §11, [уточняется]). Оплата — Telegram Stars.</p>') +
           "<h2>Что входит</h2>" +
-          '<ul class="small" style="padding-left:20px;margin:0 0 12px"><li>Разговоры с агентом без дневного лимита</li><li>Сообщения партнёру с адаптацией</li><li>Память агента</li></ul>' +
+          '<ul class="small" style="padding-left:20px;margin:0 0 12px"><li>Разговоры с агентом — с увеличенным дневным лимитом [уточняется]</li><li>Сообщения партнёру с адаптацией</li><li>Память агента</li></ul>' +
           '<div class="note"><span class="note__icon">i</span><span>Контакты помощи и кризисная поддержка работают без подписки. Когда подписка закончится, история и память сохранятся.</span></div>' +
           "</section>",
-        main: paid
+        main: paid || before
           ? null
           : {
+              guard: true,
               text: "Оплатить " + (u.plan === "year" ? "3 290 ⭐" : "390 ⭐") + " · Telegram Stars",
               action: () => { sub.status = "paid"; sub.paidBy = S.persona; toast("Окно оплаты Telegram Stars (имитация): оплачено. Подписка активна у вас обоих"); render(); },
             },
@@ -753,9 +892,9 @@
 
     help() {
       const contacts = [
-        ["Экстренные службы", "000 (заглушка)", "если есть угроза жизни — звони сразу"],
-        ["Круглосуточная психологическая помощь", "8 800 000-00-00 (заглушка)", "анонимно, бесплатно"],
-        ["Помощь при домашнем насилии", "8 800 000-00-01 (заглушка)", "консультация и убежище"],
+        ["Экстренные службы", "000", "tel:000", "если есть угроза жизни — звони сразу"],
+        ["Круглосуточная психологическая помощь", "8 800 000-00-00", "tel:+78000000000", "анонимно, бесплатно"],
+        ["Помощь при домашнем насилии", "8 800 000-00-01", "tel:+78000000001", "консультация и убежище"],
       ];
       return {
         html:
@@ -763,7 +902,7 @@
           '<div class="card card--soft" data-disclaimer><b>«Чувства AI» не заменяет психолога.</b><p class="small" style="margin:6px 0 0">Сервис не оказывает психологических и медицинских услуг и не ставит диагнозов. Если тяжело справляться — обратись к специалисту.</p></div>' +
           "<h2>Если тебе или кому-то рядом опасно</h2>" +
           '<div class="note note--stub" data-stub><span class="note__icon">!</span><span><b>Заглушка.</b> Номера ниже выдуманы. Настоящий список служб по странам проверяется перед запуском (ТЗ §9.3, [уточняется]).</span></div>' +
-          contacts.map(([n, ph, d]) => '<div class="contact"><div>' + n + '</div><div class="contact__phone">' + ph + '</div><div class="small muted">' + d + "</div></div>").join("") +
+          contacts.map(([n, ph, tel, d]) => '<div class="contact"><div>' + n + '</div><a class="contact__phone" href="' + tel + '">' + ph + ' <span class="small">(заглушка)</span></a><div class="small muted">' + d + "</div></div>").join("") +
           '<p class="small muted">Контакты помощи доступны всегда, даже без подписки.</p>' +
           "<h2>Правила</h2>" +
           '<ul class="small" style="padding-left:20px;margin:0 0 12px">' +
@@ -784,26 +923,53 @@
     },
   };
 
+  // Текст сообщения с выделением изменённых фраз: "to" — доставленная версия, "from" — оригинал
+  function segsHtml(m, side) {
+    if (!m.segs) return esc(side === "to" ? m.delivered : m.original);
+    return m.segs.map((x) => (x.from ? '<mark class="changed">' + esc(side === "to" ? x.t : x.from) + "</mark>" : esc(x.t))).join("");
+  }
+
   function draftMeta() {
     const d = me().draft;
     if (!d) return "";
-    return "Вариант " + (d.idx + 1) + " из " + DRAFTS[S.persona].length + (d.edited ? " · изменено тобой" : " · от агента");
+    return "Вариант " + (d.idx + 1) + " из " + draftVariants().length + (d.edited ? " · изменено тобой" : " · от агента");
   }
+  // Подсказка — только для фраз, которые агент получателя действительно умеет смягчить (SOFTEN)
   function draftHint() {
     const d = me().draft;
     if (!d) return "";
-    const m = d.text.match(HARSH);
-    if (!m) return "";
-    return '<div class="note" data-harsh-hint><span class="note__icon">i</span><span>В тексте есть «' + esc(m[0]) + "». Агент " + esc(P().gen) +
-      " может смягчить форму — смысл и просьба сохранятся, а оригинал " + esc(P().nom) + " сможет открыть.</span></div>";
+    const found = softenable(d.text);
+    if (!found.length) return "";
+    return found.map((r) => '<div class="note" data-harsh-hint><span class="note__icon">i</span><span>В тексте есть «' + esc(r.word) + "». Фразу «" + esc(r.from) + "» агент " + esc(P().gen) +
+      " смягчит: «" + esc(r.to) + "». Остальной текст дойдёт слово в слово, а твой оригинал " + esc(P().nom) + " сможет открыть.</span></div>").join("");
   }
 
   // ---------- Отрисовка ----------
+  // Защита от двойного касания (§2 п.2). Если нажатие MainButton само привело к необратимому действию
+  // (main.guard: «Отправить», «Оплатить»), кнопка первые GUARD_MS не принимает нажатий: второе касание
+  // «Подготовить сообщение» не превратится в «Отправить». Кнопка при этом выглядит и остаётся доступной (без мигания серым).
+  const GUARD_MS = 600;
   let mainAction = null;
+  let mainKey = null;
+  let guardUntil = 0;
+  let guardKey = null; // защита действует только для того действия, на котором включилась
+  let guardTimer = null;
+  let viaMain = false; // идёт обработка нажатия MainButton
   function applyMain(def) {
     const wrap = document.getElementById("tg-main-wrap");
     const btn = document.getElementById("tg-main");
     const hint = document.getElementById("tg-main-hint");
+    const key = def.main ? current() + "|" + def.main.text : "none";
+    if (key !== mainKey && viaMain && def.main && def.main.guard) {
+      guardUntil = Date.now() + GUARD_MS;
+      guardKey = key;
+      btn.setAttribute("data-guard", "");
+      clearTimeout(guardTimer);
+      guardTimer = setTimeout(() => btn.removeAttribute("data-guard"), GUARD_MS + 10);
+    } else if (key !== mainKey) {
+      btn.removeAttribute("data-guard");
+    }
+    mainKey = key;
     if (!def.main) { wrap.hidden = true; mainAction = null; return; }
     wrap.hidden = false;
     btn.textContent = def.main.text;
@@ -846,7 +1012,7 @@
     if (!t) return;
     if (t.id === "tg-back") { haptic(t); back(); return; }
     if (t.id === "tg-close") { toast("В Telegram это закрыло бы Mini App"); return; }
-    if (t.id === "tg-main") { if (!t.disabled && mainAction) { haptic(t); mainAction(); } return; }
+    if (t.id === "tg-main") { if (!t.disabled && mainAction && !(mainKey === guardKey && Date.now() < guardUntil)) { haptic(t); viaMain = true; try { mainAction(); } finally { viaMain = false; } } return; }
     if (t.dataset.persona) { S.persona = t.dataset.persona; document.getElementById("toast").classList.remove("show"); render(true); return; }
     if (t.dataset.themeSet) { setTheme(t.dataset.themeSet); return; }
     const u = me();
@@ -873,14 +1039,13 @@
         if (u.draft && u.draft.text.indexOf(EXAMPLE_EDIT) === -1) { u.draft.text = u.draft.text.trim() + " " + EXAMPLE_EDIT; u.draft.edited = true; }
         render();
         break;
-      case "variant": {
-        const n = DRAFTS[S.persona].length;
-        const idx = (u.draft.idx + 1) % n;
-        u.draft = { idx, text: DRAFTS[S.persona][idx].text, edited: false };
-        toast("Агент предложил другой вариант");
-        render();
+      case "variant":
+        // Правку автора молча не стираем (§2 п.2): сначала спрашиваем
+        if (u.draft.edited) { u.draft.confirmVariant = true; render(); }
+        else nextVariant();
         break;
-      }
+      case "variant-confirm": nextVariant(); break;
+      case "variant-cancel": u.draft.confirmVariant = false; render(); break;
       case "discard":
         u.draft = null;
         u.chat.push({ from: "agent", text: "Хорошо, ничего не отправляю — черновик удалён. Иногда важно просто проговорить. Я рядом, если захочешь вернуться к этому." });
@@ -948,6 +1113,11 @@
     if (v === "draft") { openDraft(); return; }
     if (v === "welcome") me().slide = 0;
     go(v);
+  });
+
+  // Хук только для check.mjs: чистая функция адаптации, состояние наружу не отдаётся
+  window.ChuvstvaProto = Object.freeze({
+    adaptText: (t) => { const r = adaptText(String(t)); return { text: r.text, adapted: r.adapted }; },
   });
 
   // ---------- Старт ----------

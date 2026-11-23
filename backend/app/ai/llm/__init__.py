@@ -1,0 +1,46 @@
+"""Слой абстракции над языковой моделью (задача 0.4, ТЗ §10).
+
+Работа с моделью в продукте и в эталонном наборе — только через этот пакет."""
+
+from app.ai.llm.base import ChatMessage, LLMProvider, StructuredResult, Usage
+from app.ai.llm.claude import HAIKU, OPUS, SONNET, ClaudeProvider
+from app.ai.llm.errors import (
+    LLMAuthError,
+    LLMBadOutput,
+    LLMConfigError,
+    LLMError,
+    LLMModelNotFound,
+    LLMQuotaError,
+    LLMRefusal,
+    LLMRequestError,
+    LLMUnavailable,
+)
+from app.ai.llm.fallback import FallbackProvider
+from app.ai.llm.openrouter import OpenRouterProvider, fetch_price
+from app.ai.llm.pricing import PRICES, Price, cost_usd
+
+__all__ = [
+    "HAIKU",
+    "OPUS",
+    "PRICES",
+    "SONNET",
+    "ChatMessage",
+    "ClaudeProvider",
+    "FallbackProvider",
+    "LLMAuthError",
+    "LLMBadOutput",
+    "LLMConfigError",
+    "LLMError",
+    "LLMModelNotFound",
+    "LLMProvider",
+    "LLMQuotaError",
+    "LLMRefusal",
+    "LLMRequestError",
+    "LLMUnavailable",
+    "OpenRouterProvider",
+    "Price",
+    "StructuredResult",
+    "Usage",
+    "cost_usd",
+    "fetch_price",
+]

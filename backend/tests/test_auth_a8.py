@@ -571,6 +571,11 @@ async def test_protected_endpoint_listed_in_app_requires_session(
 ) -> None:
     """Все маршруты приложения, кроме входа, health и документации, требуют сессию."""
     public = {"/api/v1/auth/telegram", "/api/v1/health"}
+    # 2.0v (A2): контакты помощи публичны (контракт security: []) — без сессии 200, не 401.
+    help_path = "/api/v1/help/contacts"
+    r = await client.get(help_path)
+    assert r.status_code == 200 and r.json(), r.text
+    public.add(help_path)
     checked = 0
     for path, ops in app.openapi()["paths"].items():
         if path in public or "{" in path:
@@ -704,6 +709,11 @@ async def test_service_starts_with_good_keys(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setenv("FEELINGS_TELEGRAM_BOT_TOKEN", BOT_TOKEN)
     monkeypatch.setenv("FEELINGS_SESSION_SECRET", SECRET)
+    # Задача 1.3: без имени бота сервис тоже не стартует (ссылки-приглашения).
+    monkeypatch.setenv("FEELINGS_BOT_USERNAME", "FeelingsTestBot")
+    # Задача 1.4: и без секрета вебхука и адреса Mini App.
+    monkeypatch.setenv("FEELINGS_TELEGRAM_WEBHOOK_SECRET", "w" * 40)
+    monkeypatch.setenv("FEELINGS_WEBAPP_URL", "https://app.example.test/")
     saved = app.state.sessionmaker
     app.state.sessionmaker = None
     get_settings.cache_clear()

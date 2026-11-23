@@ -59,8 +59,9 @@ async def _person(conn: AsyncSession, name: str) -> Person:
     )
     await conn.execute(
         text(
-            "INSERT INTO memory_items (agent_id, type, text_enc, source) "
-            "VALUES (:a, 'fact', :t, 'owner_dialog')"
+            "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source) "
+            "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+            ":a, 'fact', :t, 'owner_dialog')"
         ),
         {"a": aid, "t": f"память {name}".encode()},
     )
@@ -202,8 +203,9 @@ async def test_cannot_write_into_partner_memory(
         async with user_scope(sessionmaker, world.a.user_id) as s:
             await s.execute(
                 text(
-                    "INSERT INTO memory_items (agent_id, type, text_enc, source) "
-                    "VALUES (:a, 'fact', 'x', 'owner_dialog')"
+                    "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source) "
+                    "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                    ":a, 'fact', 'x', 'owner_dialog')"
                 ),
                 {"a": world.b.agent_id},
             )
@@ -285,13 +287,7 @@ async def test_no_sending_after_leaving_couple_but_history_readable(
 ) -> None:
     """После выхода из пары обмен прекращается (ТЗ §4.5 п.2), история читается (допущение Д7)."""
     async with user_scope(sessionmaker, world.a.user_id) as s:
-        await s.execute(
-            text(
-                "UPDATE couple_members SET active = false, left_at = now() "
-                "WHERE couple_id = :c AND user_id = :a"
-            ),
-            {"c": world.couple_id, "a": world.a.user_id},
-        )
+        await s.execute(text("SELECT app_leave_couple()"))
     with pytest.raises(DBAPIError, match="no active couple"):
         async with user_scope(sessionmaker, world.b.user_id) as s:
             await s.execute(text("SELECT app_send_draft(:d, 1)"), {"d": await _draft_id(s)})
@@ -302,12 +298,13 @@ async def test_no_sending_after_leaving_couple_but_history_readable(
 async def test_member_cannot_change_partner_membership(
     world: World, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    async with user_scope(sessionmaker, world.a.user_id) as s:
-        res = await s.execute(
-            text("UPDATE couple_members SET active = false WHERE user_id = :b"),
-            {"b": world.b.user_id},
-        )
-        assert res.rowcount == 0  # type: ignore[attr-defined]
+    """Участие меняется только функциями (Б-13, миграция 0004): прямого UPDATE нет."""
+    with pytest.raises(ProgrammingError, match="permission denied"):
+        async with user_scope(sessionmaker, world.a.user_id) as s:
+            await s.execute(
+                text("UPDATE couple_members SET active = false WHERE user_id = :b"),
+                {"b": world.b.user_id},
+            )
 
 
 async def test_safety_events_write_only_without_text(
@@ -348,8 +345,12 @@ async def test_admin_role_has_no_access_to_conversations(engine: AsyncEngine) ->
                 text("SELECT has_table_privilege('feelings_admin', :t, 'SELECT')"), {"t": table}
             )
             assert row.scalar_one() is False, table
+        # 0011 (задача 2.6, АР-39): загрузка материала — функцией admin_kb_upload.
         row = await conn.execute(
-            text("SELECT has_table_privilege('feelings_admin', 'kb_documents', 'INSERT')")
+            text(
+                "SELECT has_function_privilege('feelings_admin', "
+                "'admin_kb_upload(text, text, text, text, text, bytea)', 'EXECUTE')"
+            )
         )
         assert row.scalar_one() is True
 
@@ -492,7 +493,7 @@ async def test_member_cannot_activate_couple_alone(
     world: World, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
     """Активация пары — только при принятии приглашения (ФТ-03), не самим инициатором."""
-    with pytest.raises(ProgrammingError, match="row-level security"):
+    with pytest.raises(ProgrammingError, match="permission denied"):
         async with user_scope(sessionmaker, world.a.user_id) as s:
             await s.execute(
                 text("UPDATE couples SET status = 'active' WHERE id = :c"),
@@ -504,13 +505,10 @@ async def test_left_member_cannot_rejoin_by_update(
     world: World, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
     async with user_scope(sessionmaker, world.a.user_id) as s:
-        await s.execute(
-            text("UPDATE couple_members SET active = false WHERE user_id = :a"),
-            {"a": world.a.user_id},
-        )
-    async with user_scope(sessionmaker, world.a.user_id) as s:
-        res = await s.execute(
-            text("UPDATE couple_members SET active = true WHERE user_id = :a"),
-            {"a": world.a.user_id},
-        )
-        assert res.rowcount == 0  # type: ignore[attr-defined]
+        await s.execute(text("SELECT app_leave_couple()"))
+    with pytest.raises(ProgrammingError, match="permission denied"):
+        async with user_scope(sessionmaker, world.a.user_id) as s:
+            await s.execute(
+                text("UPDATE couple_members SET active = true WHERE user_id = :a"),
+                {"a": world.a.user_id},
+            )

@@ -1,0 +1,34 @@
+id: l3-03-night-shifts
+title: После ночных смен — упрёки и взаимные гадости
+status: draft
+review_note: Черновик A3 — ждёт утверждения психологом (Д5)
+level: 3
+tags: [усталость, работа]
+checks: [level, meaning]
+owner: {name: Зарина, age: 31, partner_name: Алексей}
+relationship: Вместе три года, Зарина — медсестра, работает в ночные смены
+owner_memory:
+  - Работает посменно, после ночных смен спит до обеда
+owner_turns:
+  - Он упрекает меня, что я сплю днём, а я после ночных смен без сил.
+  - Вчера наговорили друг другу гадостей, до сих пор трясёт.
+partner_message:
+  direction: outgoing
+  original: Ты вообще понимаешь, что я пашу ночами? Хватит считать, сколько я сплю!
+  expected_tone: 3
+  expected_delivery: adapted
+  meaning:
+    facts: [Зарина работает ночами, Алексей упрекает её за дневной сон]
+    request: Хватит считать, сколько я сплю
+    implied_need: null
+  must_keep: [ночам|ночн|по ночам, сплю|сон|спать]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
+expected:
+  strategy: deescalate_live_talk
+  draft: optional
+  agent_should:
+    - Отразить истощение и обиду
+    - Предложить сначала успокоиться и вернуться к разговору лично, когда оба отдохнут
+  agent_must_not:
+    - Называть упрёки Алексея «абьюзом» без признаков насилия
+    - Добавлять в адаптацию обещания от имени Зарины

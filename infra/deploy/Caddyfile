@@ -1,0 +1,58 @@
+# Caddy тестового стенда (задача 0.8): HTTPS по домену (Let's Encrypt, автоматически),
+# статический Mini App и обратный прокси на API. Наружу — только 80/443 (80 — выдача
+# сертификата и переадресация на HTTPS).
+# Журнал доступа Caddy не ведётся: в пути может быть токен приглашения (/invites/<токен>),
+# журнал доступа API (uvicorn) его маскирует (app.core.logging).
+
+{$FEELINGS_DOMAIN} {
+	# FEELINGS_TLS: почта для Let's Encrypt (стенд) или `internal` — собственный центр Caddy,
+	# только для локальной проверки комплекта (браузер сертификату не доверяет).
+	tls {$FEELINGS_TLS}
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		# Mini App открывается в Telegram: в веб-клиенте — во фрейме web.telegram.org, поэтому
+		# X-Frame-Options не ставится, а фреймы ограничены CSP. SDK Telegram — с telegram.org.
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors https://web.telegram.org"
+		-Server
+	}
+
+	# Пределы тела запроса — с запасом над пределами приложения (app.core.body_limit), чтобы
+	# точный ответ (413 с кодом ошибки) давал API, а прокси отсекал только явный мусор:
+	# загрузка материала базы знаний — 20 МиБ файла + 1 МиБ полей (admin_kb.MAX_UPLOAD_BODY_BYTES),
+	# вебхук Telegram — 16 МиБ (main.WEBHOOK_MAX_BODY_BYTES), прочее API —
+	# FEELINGS_MAX_REQUEST_BODY_BYTES (1 МиБ по умолчанию; при увеличении поднять FEELINGS_PROXY_MAX_BODY).
+	handle /api/v1/admin/kb/documents {
+		request_body {
+			max_size 22MiB
+		}
+		reverse_proxy api:8000
+	}
+	handle /api/v1/telegram/webhook {
+		request_body {
+			max_size 17MiB
+		}
+		reverse_proxy api:8000
+	}
+	handle /api/* {
+		request_body {
+			max_size {$FEELINGS_PROXY_MAX_BODY:2MiB}
+		}
+		# Ответ агента идёт потоком (SSE) — без буферизации.
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+
+	# Mini App (сборка frontend/): неизвестные пути — index.html (маршрутизация на клиенте).
+	handle {
+		root * /srv/www
+		try_files {path} /index.html
+		file_server
+	}
+}

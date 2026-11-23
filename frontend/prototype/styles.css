@@ -130,7 +130,7 @@ button { cursor: pointer; }
 .tg-header {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: 96px 1fr 96px;
+  grid-template-columns: 84px minmax(0, 1fr) 84px;
   align-items: center;
   height: 52px;
   padding: 0 8px;
@@ -149,6 +149,8 @@ button { cursor: pointer; }
   gap: 4px;
 }
 .tg-back[hidden], .tg-close[hidden] { display: none; }
+/* Значок «✕» — псевдоэлементом: доступное имя кнопки — aria-label «Закрыть» */
+.tg-close::before { content: "✕"; font-size: 18px; line-height: 1; }
 .tg-title { text-align: center; font-weight: 600; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tg-title small { display: block; font-weight: 400; font-size: 12px; color: var(--text-muted); }
 .tg-menu { justify-self: end; color: var(--text-muted); font-size: 20px; padding: 8px; }
@@ -233,7 +235,8 @@ p { margin: 0 0 12px; }
   white-space: nowrap;
 }
 .badge--solid { background: var(--text); color: var(--bg); border-color: var(--text); }
-.badge--love { color: var(--accent); border-color: var(--accent); }
+/* Метка «непрочитанное»: текст цветом --text (контраст), красные — только точка и рамка как знак близости */
+.badge--love { color: var(--text); border-color: var(--accent); }
 
 .heart { width: 14px; height: 14px; fill: var(--accent); vertical-align: -2px; flex: 0 0 auto; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; }
@@ -424,7 +427,10 @@ p { margin: 0 0 12px; }
 /* --- Помощь --- */
 .contact { padding: 12px 0; border-bottom: 1px solid var(--line); }
 .contact:last-child { border-bottom: 0; }
-.contact__phone { font-weight: 700; font-size: 18px; }
+.contact__phone { display: inline-block; font-weight: 700; font-size: 18px; color: var(--text); text-underline-offset: 3px; padding: 4px 0; }
+.contact__phone .small { font-weight: 400; color: var(--text-muted); }
+.chat-bottom { position: sticky; bottom: -8px; margin: 0 -16px -8px; padding: 4px 16px 8px; background: var(--bg); display: flex; flex-direction: column; z-index: 1; }
+.help-link { align-self: center; border: 0; background: transparent; font-size: 13px; color: var(--text-muted); text-decoration: underline; text-underline-offset: 3px; padding: 4px 8px; }
 
 /* --- Тост --- */
 .toast {
@@ -443,5 +449,13 @@ p { margin: 0 0 12px; }
 }
 .toast.show { opacity: 1; transform: none; }
 
-.sheet-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: flex-end; z-index: 5; }
+/* Затемнение — только под шапкой: «Назад» Telegram нативная и остаётся доступной */
+.sheet-backdrop { position: absolute; inset: 53px 0 0 0; background: rgba(0,0,0,.4); display: flex; align-items: flex-end; z-index: 5; }
 .sheet { background: var(--bg); width: 100%; border-radius: 20px 20px 0 0; padding: 20px 16px 24px; }
+
+/* Выделение фраз, изменённых агентом получателя (не красным) */
+mark.changed { background: var(--bg-secondary); color: inherit; text-decoration: underline dotted; text-underline-offset: 4px; border-radius: 4px; padding: 0 2px; }
+:root[data-theme="dark"] mark.changed { background: #2c2c2c; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) mark.changed { background: #2c2c2c; } }
+[data-what-changed] { margin: 0 0 10px; }
+[data-what-changed] ul { margin: 4px 0; padding-left: 18px; }

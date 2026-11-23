@@ -1,0 +1,179 @@
+"""Фоновый воркер индексации базы знаний (ТЗ §6.4, §10; задача 2.6; АР-39).
+
+Цикл: ``kb_claim_index`` (аренда, ``SKIP LOCKED`` — две копии не дублируют работу; брошенный
+материал с истёкшей арендой захватывается снова — догон после перезапуска) → исходник → разбор в
+отдельном процессе с тайм-аутом и пределом памяти (``app.kb.parse.parse_isolated``) →
+нормализация и фрагменты (``app.kb.chunk``) → метки моделью (``app.kb.tag``; сбой — пустые) →
+векторы (эмбеддер; нет — без векторов) → одна транзакция: фрагменты, векторы, завершение.
+Сбой разбора — ``kb_fail_index(код)``; попыток больше ``max_attempts`` — ``attempts_exhausted``;
+``NULL``/``false`` функций — работа брошена (аренду перехватили, материал удалён администратором).
+Журнал — id материала, статус, код, число фрагментов; текстов книг нет."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Literal
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.ai.embeddings import Embedder, EmbeddingError, check_dim, check_model
+from app.ai.models import AgentModels
+from app.kb.chunk import ChunkParams, split_chunks
+from app.kb.parse import ParseError, ParseLimits, parse, parse_isolated
+from app.kb.tag import tag_chunks
+from app.repositories import kb_work
+from app.repositories.kb_work import ChunkRow, IndexClaim, LeaseLost
+
+logger = logging.getLogger(__name__)
+
+ATTEMPTS_EXHAUSTED = "attempts_exhausted"
+NO_CHUNKS = "empty_text"
+TOO_MANY_CHUNKS = "too_many_chunks"
+EMBED_BATCH = 64
+
+
+@dataclass(frozen=True)
+class KbSettings:
+    lease: timedelta = timedelta(minutes=30)
+    batch: int = 2
+    max_attempts: int = 3
+    max_chunks: int = 5000
+    limits: ParseLimits = field(default_factory=ParseLimits)
+    chunking: ChunkParams = field(default_factory=ChunkParams)
+    isolate: bool = True  # разбор в отдельном процессе (тайм-аут, память); False — только тесты
+
+
+@dataclass(frozen=True)
+class IndexOutcome:
+    status: Literal["indexed", "failed", "lost", "error"]
+    code: str | None = None
+    chunks: int = 0
+
+
+class KbWorker:
+    def __init__(
+        self,
+        *,
+        worker_sm: async_sessionmaker[AsyncSession],
+        models: AgentModels | None = None,
+        embedder: Embedder | None = None,
+        settings: KbSettings | None = None,
+    ) -> None:
+        self.sm = worker_sm
+        self.models = models
+        self.embedder = embedder
+        self.settings = settings or KbSettings()
+
+    async def run_once(self) -> list[IndexOutcome]:
+        out = []
+        for claim in await kb_work.claim_index(
+            self.sm, lease=self.settings.lease, limit=self.settings.batch
+        ):
+            try:
+                result = await self.index(claim)
+            except Exception as exc:  # сбой одной задачи не останавливает проход
+                logger.warning("kb index %s failed: %s", claim.document_id, type(exc).__name__)
+                result = IndexOutcome("error", "internal")
+            log = logger.error if result.status == "failed" else logger.info
+            log(
+                "kb index %s: status=%s code=%s chunks=%d",
+                claim.document_id,
+                result.status,
+                result.code,
+                result.chunks,
+            )
+            out.append(result)
+        return out
+
+    async def _fail(self, claim: IndexClaim, code: str) -> IndexOutcome:
+        ok = await kb_work.fail(self.sm, claim, code)
+        return IndexOutcome("failed" if ok else "lost", code)
+
+    async def _parse(self, data: bytes, fmt: str) -> str:
+        limits = self.settings.limits
+        if self.settings.isolate:
+            return await asyncio.to_thread(parse_isolated, data, fmt, limits)
+        return parse(data, fmt, limits)
+
+    async def index(self, claim: IndexClaim) -> IndexOutcome:
+        s = self.settings
+        if claim.attempts > s.max_attempts:
+            return await self._fail(claim, ATTEMPTS_EXHAUSTED)
+        try:
+            data, approach = await kb_work.read_source(self.sm, claim)
+        except LeaseLost:
+            return IndexOutcome("lost")
+        try:
+            text = await self._parse(data, claim.source_format)
+        except ParseError as exc:
+            return await self._fail(claim, exc.code)
+        del data  # исходник в памяти не держим дольше нужного
+        chunks = split_chunks(text, s.chunking)
+        if not chunks:
+            return await self._fail(claim, NO_CHUNKS)
+        if len(chunks) > s.max_chunks:
+            return await self._fail(claim, TOO_MANY_CHUNKS)
+        tags = await tag_chunks(self.models, chunks, approach=approach)
+        vectors: list[list[float] | None] = [None] * len(chunks)
+        model = None
+        if self.embedder is not None:
+            try:
+                model = check_model(self.embedder.model)
+                vectors = []
+                for start in range(0, len(chunks), EMBED_BATCH):
+                    part = await self.embedder.embed(chunks[start : start + EMBED_BATCH])
+                    vectors += [check_dim(v) for v in part]
+            except EmbeddingError:
+                model, vectors = None, [None] * len(chunks)  # без векторов — поиск не найдёт
+        rows = [
+            ChunkRow(c, t.topics, t.level, v) for c, t, v in zip(chunks, tags, vectors, strict=True)
+        ]
+        try:
+            await kb_work.write_index(self.sm, claim, rows, model)
+        except LeaseLost:
+            return IndexOutcome("lost")
+        return IndexOutcome("indexed", None, len(rows))
+
+    async def run_forever(self, *, poll_s: float = 30.0, stop: asyncio.Event | None = None) -> None:
+        stop = stop or asyncio.Event()
+        while not stop.is_set():
+            try:
+                done = await self.run_once()
+            except Exception as exc:
+                logger.warning("kb worker pass failed: %s", type(exc).__name__)
+                done = []
+            if not done:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=poll_s)
+                except TimeoutError:
+                    pass
+
+
+async def _main() -> None:  # pragma: no cover — запуск процесса (нужна роль входа воркера)
+    from app.ai.models import openrouter_models_async
+    from app.config import ConfigError, get_settings
+    from app.db import make_engine, make_sessionmaker
+
+    settings = get_settings()
+    if not settings.worker_database_url:
+        raise ConfigError("FEELINGS_WORKER_DATABASE_URL не задан (роль входа воркера, Б-69)")
+    try:
+        models: AgentModels | None = await openrouter_models_async(
+            settings.llm_writer_model, settings.llm_classifier_model
+        )
+    except Exception:  # без ключа — метки пустые, индексация идёт
+        models = None
+    worker = KbWorker(
+        worker_sm=make_sessionmaker(make_engine(settings.worker_database_url)),
+        models=models,
+        embedder=None,  # модель эмбеддингов не выбрана (Б-66)
+    )
+    await worker.run_forever()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(_main())

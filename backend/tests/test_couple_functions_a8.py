@@ -64,8 +64,9 @@ async def _user(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> uu
         ).scalar_one()
         await conn.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, text_enc, source) "
-                "VALUES (:a, 'fact', :t, 'owner_dialog')"
+                "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source) "
+                "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":a, 'fact', :t, 'owner_dialog')"
             ),
             {"a": aid, "t": f"память {name}".encode()},
         )
@@ -454,14 +455,10 @@ async def _active_couple(sm: SM, engine: AsyncEngine) -> tuple[uuid.UUID, uuid.U
     return a, b, couple
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Б-13 (BACKLOG): у feelings_app остался UPDATE couple_members(active, left_at) — "
-    "партнёр выходит в обход app_leave_couple, пара остаётся active с одним участником",
-)
 async def test_b13_direct_member_leave_denied(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Б-13 (миграция 0004): прямой UPDATE couple_members от приложения — 42501, пара цела."""
     _, b, couple = await _active_couple(sessionmaker, engine)
-    try:
+    with pytest.raises(DBAPIError) as ei:
         async with user_scope(sessionmaker, b) as s:
             await s.execute(
                 text(
@@ -470,31 +467,25 @@ async def test_b13_direct_member_leave_denied(sessionmaker: SM, engine: AsyncEng
                 ),
                 {"u": b},
             )
-    except DBAPIError:
-        pass
-    # Ожидаемо: либо отказ, либо согласованный итог как у app_leave_couple.
+    assert _sqlstate(ei.value) == "42501", ei.value
+    assert "permission denied" in str(ei.value)
     st = await _state(engine, couple)
-    assert st["active_members"] in (0, 2), st
-    assert st["status"] == ("active" if st["active_members"] == 2 else "dissolved"), st
+    assert st == {"status": "active", "active_members": 2, "active_invites": 0}, st
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Б-13 (BACKLOG): у feelings_app остался UPDATE couples(status, dissolved_at) — пара "
-    "распускается в обход app_leave_couple, участники остаются active и не могут создать пару",
-)
 async def test_b13_direct_dissolve_denied(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Б-13 (миграция 0004): прямой UPDATE couples от приложения — 42501, пара цела."""
     a, _, couple = await _active_couple(sessionmaker, engine)
-    try:
+    with pytest.raises(DBAPIError) as ei:
         async with user_scope(sessionmaker, a) as s:
             await s.execute(
                 text("UPDATE couples SET status = 'dissolved', dissolved_at = now() WHERE id = :c"),
                 {"c": couple},
             )
-    except DBAPIError:
-        pass
+    assert _sqlstate(ei.value) == "42501", ei.value
+    assert "permission denied" in str(ei.value)
     st = await _state(engine, couple)
-    assert st["status"] == ("dissolved" if st["active_members"] == 0 else "active"), st
+    assert st == {"status": "active", "active_members": 2, "active_invites": 0}, st
 
 
 async def test_leave_recovers_inconsistent_couple(sessionmaker: SM, engine: AsyncEngine) -> None:
@@ -681,12 +672,9 @@ async def test_race_age_revocation_vs_accept(
         assert (await _state(engine, couple))["status"] == "active"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="D-4 (A8, раунд 2): app_issue_invite не требует онбординга — после ответа "
-    "«мне нет 18» участник ожидающей пары продолжает выдавать ссылки (ТЗ §9.3)",
-)
 async def test_issue_invite_requires_onboarding(sessionmaker: SM, engine: AsyncEngine) -> None:
-    uid, _, _ = await _pending(sessionmaker, engine, "FB8-Ссылка")
+    uid, couple, _ = await _pending(sessionmaker, engine, "FB8-Ссылка")
     await _unset(engine, uid, "age_confirmed_at")
     await _fails(sessionmaker, uid, "FB008", ISSUE, h=_token())
+    # Ни одной новой ссылки (D-4, миграция 0004): активной остаётся только первая.
+    assert (await _state(engine, couple))["active_invites"] == 1

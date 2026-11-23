@@ -127,3 +127,18 @@ async def get_me(sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID) -> Me
         onboarding_completed=row.onboarded,
         has_active_couple=row.has_couple,
     )
+
+
+async def notification_chat_id(
+    sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID
+) -> int | None:
+    """Чат Telegram получателя уведомления — в его собственной области (RLS: только своя
+    строка). None — пользователь удалён (ФТ-21) или помечен удалённым: уведомлять некого."""
+    async with user_scope(sm, user_id) as s:
+        value = (
+            await s.execute(
+                text("SELECT telegram_id FROM users WHERE id = :id AND deleted_at IS NULL"),
+                {"id": user_id},
+            )
+        ).scalar_one_or_none()
+    return None if value is None else int(value)

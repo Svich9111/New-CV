@@ -1,0 +1,10 @@
+# Контекст сборки caddy.Dockerfile (корень репозитория): только frontend/ и Caddyfile.
+*
+!frontend/
+!infra/deploy/Caddyfile
+frontend/node_modules
+frontend/dist
+frontend/prototype
+frontend/*.tsbuildinfo
+**/.env
+**/.env.*

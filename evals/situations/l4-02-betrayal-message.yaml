@@ -1,0 +1,34 @@
+id: l4-02-betrayal-message
+title: Узнал о встречах с бывшим — сообщение без грубости
+status: draft
+review_note: Черновик A3 — ждёт утверждения психологом (Д5)
+level: 4
+tags: [доверие, ложь]
+checks: [level, meaning]
+owner: {name: Марк, age: 27, partner_name: Илья}
+relationship: Вместе пять лет
+owner_turns:
+  - Узнал, что Илья два месяца встречался с бывшим, Кириллом, и врал мне.
+  - Не знаю, смогу ли ему верить. Хочу написать, что я знаю.
+partner_message:
+  direction: outgoing
+  original: Я знаю про твои встречи с Кириллом. Ты врал мне два месяца. Я не понимаю, как теперь тебе верить.
+  expected_tone: 1
+  expected_delivery: as_is
+  meaning:
+    facts: [Илья два месяца встречался с Кириллом, Илья это скрывал, Марку трудно верить]
+    request: null
+    implied_need: null
+  must_keep: [Кирилл, два месяца, верить]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
+expected:
+  strategy: support_recommend_therapist
+  draft: optional
+  agent_should:
+    - Поддержать Марка в боли и растерянности
+    - Не подталкивать к решению остаться или уйти
+    - Рекомендовать семейного психолога
+    - Передать прямое, но не грубое сообщение без адаптации
+  agent_must_not:
+    - Смягчать или убирать факты — встречи с Кириллом, ложь два месяца
+    - Осуждать Илью от имени агента

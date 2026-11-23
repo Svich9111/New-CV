@@ -1,4 +1,4 @@
-"""0.7b: выдача и принятие приглашения, выход из пары — функции миграции 0002.
+"""0.7b: выдача и принятие приглашения, выход из пары — функции миграций 0002–0004.
 
 ФТ-03, ФТ-04; ТЗ §4.1 п.3–6, §4.5 п.2, §7; АР-7, АР-12, АР-13. Данные заводит
 суперпользователь (`engine`), действия — под ролью приложения (`sessionmaker` + `user_scope`).
@@ -16,6 +16,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.db import user_scope
+from tests.conftest import alembic
 
 _tg = itertools.count(7_000_000)
 SM = async_sessionmaker[AsyncSession]
@@ -52,8 +53,9 @@ async def _user(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> uu
         )
         await conn.execute(
             text(
-                "INSERT INTO memory_items (agent_id, type, text_enc, source) "
-                "VALUES (:a, 'fact', :t, 'owner_dialog')"
+                "INSERT INTO memory_items (fingerprint, agent_id, type, text_enc, source) "
+                "VALUES (sha256(convert_to(CAST(gen_random_uuid() AS text), 'UTF8')), "  # Б-68 (A1): отпечаток
+                ":a, 'fact', :t, 'owner_dialog')"
             ),
             {"a": aid, "t": f"память {name}".encode()},
         )
@@ -232,9 +234,9 @@ async def test_accept_expired_invite(sessionmaker: SM, engine: AsyncEngine, sql:
 
 
 async def test_accept_revoked_invite(sessionmaker: SM, engine: AsyncEngine) -> None:
-    uid, _, token = await _pending(sessionmaker, engine)
-    async with user_scope(sessionmaker, uid) as s:  # отзыв напрямую, по политике invites_revoke
-        await s.execute(
+    _, _, token = await _pending(sessionmaker, engine)
+    async with engine.begin() as conn:  # отзыв в обход функций (у приложения прав нет, Б-13)
+        await conn.execute(
             text("UPDATE invites SET status = 'revoked' WHERE token_hash = :h"), {"h": token}
         )
     await _fails(sessionmaker, await _user(engine, "Ада"), "FB003", ACCEPT, h=token)
@@ -546,3 +548,141 @@ async def test_execute_only_for_app_role(engine: AsyncEngine, f: str) -> None:
                 text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"), {"r": role, "f": f}
             )
             assert row.scalar_one() is allowed, (role, f)
+
+
+# --- Задача 1.3: миграция 0004 ---------------------------------------------------------------
+
+# Б-13: прямая запись в обход функций. Каждый запрос подставляет свои параметры из словаря.
+DIRECT_WRITES = {
+    "member_leave": "UPDATE couple_members SET active = false, left_at = now() WHERE user_id = :u",
+    "member_rejoin": "UPDATE couple_members SET active = true WHERE user_id = :u",
+    "dissolve": "UPDATE couples SET status = 'dissolved', dissolved_at = now() WHERE id = :c",
+    "invite_revoke": "UPDATE invites SET status = 'revoked' WHERE token_hash = :h",
+    "invite_insert": (
+        "INSERT INTO invites (token_hash, couple_id, created_by, expires_at) "
+        "VALUES (:n, :c, :u, now() + interval '1 day')"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(DIRECT_WRITES))
+async def test_direct_couple_writes_denied(
+    sessionmaker: SM, engine: AsyncEngine, name: str
+) -> None:
+    """Б-13 (АР-13): пара, участники и приглашения меняются только функциями — прямой
+    UPDATE/INSERT отклоняется правами (permission denied), состояние не меняется."""
+    uid, couple, token = await _pending(sessionmaker, engine)
+    params = {"u": uid, "c": couple, "h": token, "n": _token()}
+    with pytest.raises(DBAPIError) as ei:
+        await _call(sessionmaker, uid, DIRECT_WRITES[name] + " RETURNING 1", **params)
+    assert _sqlstate(ei.value) == "42501", ei.value
+    assert "permission denied" in str(ei.value)
+    c = await _row(engine, "SELECT status, dissolved_at FROM couples WHERE id = :c", c=couple)
+    assert c == {"status": "pending", "dissolved_at": None}
+    members = await _members(engine, couple)
+    assert [(m["active"], m["left_at"]) for m in members.values()] == [(True, None)]
+    inv = await _row(
+        engine,
+        "SELECT count(*) FILTER (WHERE status = 'active') AS active, count(*) AS n "
+        "FROM invites WHERE couple_id = :c",
+        c=couple,
+    )
+    assert inv == {"active": 1, "n": 1}
+
+
+async def test_couple_tables_read_only_for_app(engine: AsyncEngine) -> None:
+    """Б-13: у feelings_app на couples, couple_members, invites — только SELECT (ни на одну
+    колонку нет INSERT/UPDATE, нет DELETE); политики записи из 0001 удалены, чтения — на месте."""
+    async with engine.connect() as conn:
+        for table in ("couples", "couple_members", "invites"):
+            row = await conn.execute(
+                text(
+                    "SELECT has_table_privilege('feelings_app', :t, 'SELECT'), "
+                    "has_table_privilege('feelings_app', :t, 'DELETE'), "
+                    "has_any_column_privilege('feelings_app', :t, 'INSERT'), "
+                    "has_any_column_privilege('feelings_app', :t, 'UPDATE')"
+                ),
+                {"t": table},
+            )
+            assert tuple(row.one()) == (True, False, False, False), table
+        policies = await conn.execute(
+            text(
+                "SELECT policyname, cmd FROM pg_policies "
+                "WHERE tablename IN ('couples', 'couple_members', 'invites')"
+            )
+        )
+        assert sorted(map(tuple, policies)) == [
+            ("couples_select", "SELECT"),
+            ("invites_select", "SELECT"),
+            ("members_select", "SELECT"),
+        ]
+
+
+@pytest.mark.parametrize(
+    "missing", ["consent_terms_at", "consent_data_at", "consent_sensitive_at", "age_confirmed_at"]
+)
+async def test_issue_invite_requires_onboarding_fb008(
+    sessionmaker: SM, engine: AsyncEngine, missing: str
+) -> None:
+    """D-4 (0.7b-test): ТЗ §4.1 п.2, §9.3 — без любого из согласий или 18+ участник ожидающей
+    пары новую ссылку не получает (FB008); действующая ссылка не отзывается, новой не
+    появляется. Выйти из пары по-прежнему можно; после онбординга ссылка выдаётся."""
+    uid, couple, token = await _pending(sessionmaker, engine)
+    async with engine.begin() as conn:
+        await conn.execute(text(f"UPDATE users SET {missing} = NULL WHERE id = :u"), {"u": uid})
+    await _fails(sessionmaker, uid, "FB008", ISSUE, h=_token())
+    inv = await _row(
+        engine,
+        "SELECT count(*) AS n, bool_and(token_hash = :h AND status = 'active') AS same "
+        "FROM invites WHERE couple_id = :c",
+        c=couple,
+        h=token,
+    )
+    assert inv == {"n": 1, "same": True}
+    async with engine.begin() as conn:
+        await conn.execute(text(f"UPDATE users SET {missing} = now() WHERE id = :u"), {"u": uid})
+    assert isinstance(await _call(sessionmaker, uid, ISSUE, h=_token()), datetime)
+    async with engine.begin() as conn:
+        await conn.execute(text(f"UPDATE users SET {missing} = NULL WHERE id = :u"), {"u": uid})
+    assert await _call(sessionmaker, uid, LEAVE) == couple
+
+
+async def test_issue_invite_check_order(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Порядок проверок app_issue_invite (АР-13): 22023 → 42501 → FB008 → FB007."""
+    newbie = await _user(engine, "Новичок", onboarded=False)  # не в паре и без онбординга
+    await _fails(sessionmaker, newbie, "22023", ISSUE, h=b"short")
+    await _fails(sessionmaker, uuid.uuid4(), "22023", ISSUE, h=None)
+    await _fails(sessionmaker, uuid.uuid4(), "42501", ISSUE, h=_token())
+    await _fails(sessionmaker, newbie, "FB008", ISSUE, h=_token())
+    loner = await _user(engine, "Одиночка")
+    await _fails(sessionmaker, loner, "FB007", ISSUE, h=_token())
+
+
+async def test_migration_0004_reversible(engine: AsyncEngine, app_engine: AsyncEngine) -> None:
+    """0004 → 0003 → 0004: downgrade возвращает права и политики записи 0001 и
+    app_issue_invite без FB008; повторный upgrade снова их убирает."""
+
+    async def state() -> tuple[bool, int, bool]:
+        async with engine.connect() as conn:
+            row = await conn.execute(
+                text(
+                    "SELECT has_any_column_privilege('feelings_app', 'couples', 'UPDATE'), "
+                    "(SELECT count(*) FROM pg_policies "
+                    " WHERE tablename IN ('couples', 'couple_members', 'invites')), "
+                    "position('FB008' IN "
+                    "pg_get_functiondef('app_issue_invite(bytea)'::regprocedure)) > 0"
+                )
+            )
+            update, policies, fb008 = row.one()
+            return bool(update), int(policies), bool(fb008)
+
+    try:
+        assert await state() == (False, 3, True)
+        alembic("downgrade", "0003")
+        await engine.dispose()
+        assert await state() == (True, 7, False)
+    finally:
+        alembic("upgrade", "head")
+        await engine.dispose()
+        await app_engine.dispose()
+    assert await state() == (False, 3, True)

@@ -1,5 +1,27 @@
-# Локальная разработка: PostgreSQL 16 + pgvector и Redis.
-# Порты привязаны к 127.0.0.1 — БД и Redis не публикуются наружу (справка по инфраструктуре, раздел 5).
+# Локальная разработка: PostgreSQL 16 + pgvector и Redis; по профилю `workers` — миграции,
+# роли входа и фоновые воркеры памяти и базы знаний (Б-69). Продуктив — задача 4.7.
+# Порты привязаны к 127.0.0.1 — БД и Redis не публикуются наружу (справка по инфраструктуре, раздел 5);
+# у миграций, ролей и воркеров портов нет совсем.
+#
+#   make db-up     — только postgres и redis (как раньше);
+#   make dev-up    — всё, включая воркеры: postgres → migrate → db-roles → worker-memory, worker-kb.
+#
+# Значения ${…} подставляются из корневого .env (`--env-file .env` в Makefile); пароли ролей
+# входа — FEELINGS_*_DB_PASSWORD (см. .env.example, docs/ADMIN.md). Пустой пароль — db-roles
+# останавливается с ошибкой, воркеры не запускаются.
+x-backend: &backend
+  profiles: ["workers"]
+  build:
+    context: ..
+    dockerfile: infra/backend.Dockerfile
+  image: feelings-backend:dev
+  env_file:
+    - path: ../.env
+      required: false
+  # Ошибка конфигурации (нет ключей, OPENROUTER_API_KEY) повторяется при каждом старте — не
+  # больше 5 перезапусков, затем контейнер остаётся остановленным (docker compose logs worker-memory).
+  restart: "on-failure:5"
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -18,5 +40,56 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["127.0.0.1:6379:6379"]
+
+  # Схема БД под владельцем (локальная БД разработчика — АР-4). Создаёт и групповые роли feelings_*.
+  migrate:
+    <<: *backend
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      FEELINGS_ENV: dev
+      FEELINGS_MIGRATION_DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/feelings
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # Роли входа воркера, администратора и API (infra/db/roles.sql) — после миграций: групповые
+  # роли feelings_* создаёт миграция 0001. Повторный запуск безопасен (пароли обновляются).
+  db-roles:
+    profiles: ["workers"]
+    image: pgvector/pgvector:pg16
+    restart: "no"
+    entrypoint: ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "/db/roles.sql"]
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: feelings
+      FEELINGS_WORKER_DB_PASSWORD: ${FEELINGS_WORKER_DB_PASSWORD:-}
+      FEELINGS_ADMIN_DB_PASSWORD: ${FEELINGS_ADMIN_DB_PASSWORD:-}
+      FEELINGS_API_DB_PASSWORD: ${FEELINGS_API_DB_PASSWORD:-}
+    volumes:
+      - ./db:/db:ro
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  # Воркер памяти (2.4): обязателен вместе с DELETE /memory (Б-73, docs/ADMIN.md).
+  worker-memory:
+    <<: *backend
+    command: ["python", "-m", "app.workers.memory"]
+    environment: &worker-env
+      FEELINGS_ENV: dev
+      FEELINGS_WORKER_DATABASE_URL: postgresql+asyncpg://feelings_worker_login:${FEELINGS_WORKER_DB_PASSWORD:-}@postgres:5432/feelings
+      FEELINGS_REDIS_URL: redis://redis:6379/0
+    depends_on: &worker-deps
+      db-roles: { condition: service_completed_successfully }
+      redis: { condition: service_started }
+
+  # Воркер индексации базы знаний (2.6).
+  worker-kb:
+    <<: *backend
+    command: ["python", "-m", "app.workers.kb"]
+    environment: *worker-env
+    depends_on: *worker-deps
+
 volumes:
   pgdata:

@@ -4,9 +4,16 @@ info:
   version: 0.1.0
   description: |
     Контракт сервер ↔ клиент (задача 0.7, владелец A1). Изменяется только A1 через карточку.
-    Все эндпоинты, кроме входа, требуют `Authorization: Bearer <access_token>`, полученного
+    Все эндпоинты, кроме входа, `/health` и `/help/contacts`, требуют
+    `Authorization: Bearer <access_token>`, полученного
     в `POST /auth/telegram`. Тексты переписки в ответах есть только у их законных читателей
     (ТЗ §7 «Правила доступа»). Ссылки «ФТ-NN» — на `docs/TZ.md`, раздел 5.
+
+    Транзакция, отменённая из-за одновременного изменения тех же данных (40P01/40001), на любом
+    эндпоинте даёт 409 `conflict_retry` (АР-24; `components/responses/ConflictRetry`) — запрос
+    можно повторить. Явно ответ объявлен у эндпоинтов, чьи функции БД берут несколько
+    блокировок (пары, приглашения, отправка, удаление и выгрузка аккаунта); у эндпоинтов с
+    409 `Conflict` код `conflict_retry` входит в этот же ответ.
 servers:
   - url: /api/v1
 security:
@@ -84,10 +91,24 @@ paths:
     delete:
       tags: [profile]
       summary: Удалить аккаунт и все данные (ФТ-21)
-      description: Личные данные удаляются сразу из рабочей БД и из резервных копий в течение 30 дней (ТЗ §7).
+      description: |
+        Удаление полное и сразу (ТЗ §4.5 п.3, §9.1 п.6; АР-23): активная или ожидающая пара
+        распускается для обоих, как при выходе (`POST /couple/leave`); агент, диалоги, память,
+        черновики, приглашения, события безопасности и сообщения, которые написал пользователь,
+        удаляются из рабочей БД. Сообщения, которые партнёр написал удаляемому, остаются у
+        партнёра. Резервные копии очищаются по истечении срока хранения 30 дней (ТЗ §7);
+        повторное удаление после восстановления копии — BACKLOG Б-43 (задача 4.7).
+
+        Доступно после входа без завершённого онбординга (как выход из пары, АР-17): код
+        `onboarding_required` (403) этот эндпоинт не отдаёт.
+
+        После 204 сессия недействительна: любой запрос с тем же токеном, включая повтор
+        `DELETE /me`, — 401. Повторный вход тем же Telegram ID создаёт нового пользователя
+        без следов прежнего. Тело запроса не нужно; подтверждение действия — на клиенте.
       responses:
-        "204": { description: Удалено }
+        "204": { description: Аккаунт и данные удалены; сессия недействительна }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
 
   /me/onboarding:
     put:
@@ -123,24 +144,47 @@ paths:
     get:
       tags: [profile]
       summary: Выгрузка своих данных (ФТ-21)
-      description: Только данные владельца; память и личный чат партнёра не включаются.
+      description: |
+        Все данные владельца одним документом JSON, тексты расшифрованы (ТЗ §9.1 п.6, ФТ-21;
+        состав и толкования — АР-25). Только данные владельца: память, личный чат, профиль
+        агента и `tone_settings` партнёра, его id и Telegram ID не включаются; партнёр
+        представлен только именем, которым его назвал сам пользователь (`profile.partner_name`).
+        Сообщения пары, которые получатель не видел (`processing`, `withheld`), в его выгрузку
+        не входят.
+
+        Доступно после входа без завершённого онбординга (как выход из пары, АР-17): код
+        `onboarding_required` (403) этот эндпоинт не отдаёт.
+
+        Текст, который не удалось расшифровать, не роняет выгрузку: на его месте объект
+        `UnavailableText` с кодом причины (в журнал — только код причины и колонка, без текста
+        и id). Ответ не кэшируется (`Cache-Control: no-store`).
       responses:
         "200":
-          description: Архив данных
+          description: Выгрузка данных; версия формата — `export_version`
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/AccountExport" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
 
   /couple:
     get:
       tags: [couple]
       summary: Текущая пара и её статус
+      description: Только ожидающая или активная пара; после выхода — 404.
       responses:
         "200":
           description: OK
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Couple" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
         "404": { $ref: "#/components/responses/NotFound" }
     post:
       tags: [couple]
@@ -151,8 +195,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/InviteCreated" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/InvitesUnavailable" }
 
   /couple/invite:
     post:
@@ -164,16 +210,24 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/InviteCreated" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/InvitesUnavailable" }
 
   /couple/leave:
     post:
       tags: [couple]
       summary: Выйти из пары (ФТ-04)
-      description: Агенты и личная память сохраняются, обмен сообщениями прекращается (ТЗ §4.5 п.2).
+      description: >-
+        Агенты и личная память сохраняются, обмен сообщениями прекращается (ТЗ §4.5 п.2).
+        Доступно после входа без завершённого онбординга (DECISIONS.md, АР-17).
       responses:
         "204": { description: Пара расторгнута }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
 
   /invites/{token}:
     parameters:
@@ -181,6 +235,7 @@ paths:
     get:
       tags: [couple]
       summary: Проверить приглашение перед принятием
+      description: Доступно после входа, до онбординга; раскрывает только имя пригласившего и срок.
       responses:
         "200":
           description: Приглашение действительно
@@ -192,6 +247,7 @@ paths:
                 properties:
                   inviter_name: { type: [string, "null"] }
                   expires_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
   /invites/{token}/accept:
@@ -206,6 +262,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Couple" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/OnboardingRequired" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
@@ -215,32 +272,105 @@ paths:
     get:
       tags: [chat]
       summary: История личного чата с агентом (видит только владелец)
+      description: |
+        Реплики владельца (`author: owner`) и его агента (`author: agent`) из всех своих диалогов
+        одной лентой (деление на сессии — задача 2.4); партнёр и его агент эту ленту не видят
+        (ТЗ §2 п.4, §6). Сводка сжатия (`summary_enc`) не отдаётся; старые реплики после сжатия
+        в истории остаются. Кризисный ответ хранится и отдаётся как обычная реплика агента
+        (без контактов — они в `GET /help/contacts`).
+
+        **Порядок и курсор.** `items` — от новых к старым (`created_at DESC, id DESC`). Первая
+        страница (без `cursor`) — самые свежие `limit` реплик. `next_cursor` — непрозрачная
+        строка (сервер кодирует позицию последней реплики страницы, клиент её не разбирает
+        и не составляет сам); передаётся в `cursor` для следующей, более старой страницы;
+        `null` — старше реплик нет. Курсор, который сервер не выдавал (не разбирается), — 422
+        `validation_error`. Реплики, добавленные после выдачи курсора, на последующих
+        страницах не появляются и не сдвигают их — их даёт новая первая страница.
+
+        **Курсор после смены ключа сервера.** Курсор подписан ключом сессий сервера; после
+        его плановой смены (ротации) ранее выданные курсоры не принимаются — тот же 422
+        `validation_error`. Клиент на 422 по запросу с `cursor` начинает историю заново с
+        первой страницы (запрос без `cursor`) и не повторяет запрос с прежним курсором
+        (BACKLOG Б-62). Реплики при этом не теряются: новая первая страница и следующие
+        за ней отдают всю историю.
+
+        **Нерасшифровываемый текст** (повреждённая строка, неизвестный ключ; задача 4.2) не
+        роняет ответ и не пропускается: на месте `text` — объект `UnavailableText` с кодом
+        причины (в журнал — только код причины, без текста и id).
+
+        Требует завершённого онбординга (403 `onboarding_required`): личный чат — обработка
+        чувствительных данных по согласию (ФТ-02, ТЗ §4.1 п.2). Без онбординга свои реплики
+        доступны через `GET /me/export` (АР-25). Ответ не кэшируется (`Cache-Control: no-store`).
       parameters:
         - $ref: "#/components/parameters/Cursor"
         - $ref: "#/components/parameters/Limit"
       responses:
         "200":
-          description: OK
+          description: Страница истории (от новых к старым)
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [items, next_cursor]
                 properties:
                   items:
                     type: array
                     items: { $ref: "#/components/schemas/ChatMessage" }
-                  next_cursor: { type: [string, "null"] }
+                  next_cursor:
+                    type: [string, "null"]
+                    description: Курсор следующей (более старой) страницы; null — дальше реплик нет
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "422": { $ref: "#/components/responses/Validation" }
     post:
       tags: [chat]
       summary: Реплика владельца; ответ агента потоком (ФТ-05)
       description: |
-        Ответ — Server-Sent Events. События: `delta` {text}, `done` {message_id, suggest_draft: bool},
-        `crisis` {contacts} — кризисный протокол (ФТ-17), `error` {code, message} — отказ модели,
-        текст реплики не теряется (ТЗ §10). Первый символ — до 5 с в 95% случаев.
-        Порядок проверок: сначала классификатор безопасности, потом подписка и лимиты. При признаках
-        кризиса ответ с контактами помощи идёт всегда — 402 и 429 в этом случае не возвращаются
-        (ТЗ §9.3, §11 п.5).
+        **Обработка** (АР-30, АР-32). Проверки входа, онбординга и тела → реплика владельца
+        сохраняется (шифротекст) **до** любого вызова модели, поэтому при любом отказе дальше
+        она не теряется (ТЗ §10) → классификатор безопасности (вторая линия, ТЗ §9.3) по
+        контексту §6.1 → подписка и дневной лимит → поток ответа агента. Код ответа
+        выбирается до первого байта тела: 402/429 — после классификатора, но до потока.
+
+        **Кризис.** При признаках кризиса ответ по протоколу с контактами помощи идёт всегда —
+        402 и 429 в этом случае не возвращаются (ТЗ §9.3, §11 п.5); ни черновика, ни
+        смягчения.
+
+        **Ответы до потока** (тело JSON `Error`): 401; 403 `onboarding_required`; 422
+        `validation_error` (нет `text`, пустой или только из пробелов, длиннее 4000); 409
+        `conflict_retry` — только из транзакции сохранения реплики владельца, ничего не
+        сохранено, повтор безопасен (АР-24); 429 `rate_limited` — исчерпан дневной лимит
+        (ТЗ §10), реплика владельца **сохранена** и остаётся в истории без ответа агента, повтор
+        того же текста создаст новую реплику; 402 `subscription_required` — **не отдаётся до
+        этапа 4** (подписка, ТЗ §11), объявлен заранее.
+
+        **Поток** — ответ 200 `text/event-stream; charset=utf-8`, заголовки
+        `Cache-Control: no-store` и `X-Accel-Buffering: no`. Формат Server-Sent Events: каждое
+        событие — строка `event: <имя>`, строка `data: <JSON-объект в одну строку, UTF-8>` и
+        пустая строка. Имена и поля — схемы `ChatStreamDelta`, `ChatStreamDone`,
+        `ChatStreamCrisis`, `ChatStreamError` (имя события — `x-sse-event` схемы; в `data` оно
+        не повторяется). Строки-комментарии (начинаются с `:`) — поддержание соединения, клиент их
+        пропускает. Полей `id:` и `retry:` нет, возобновление потока (`Last-Event-ID`) не
+        поддерживается. Поток — ноль или больше `delta`, затем ровно одно завершающее событие
+        (`done`, `crisis` или `error`), после него соединение закрывается. Склейка всех `delta`
+        перед `done` — сохранённый текст реплики агента. Первый `delta` не ждёт полного ответа
+        модели; первый символ — до 5 с в 95% случаев (ТЗ §10).
+
+        **Отключение клиента.** Если клиент закрыл соединение до завершающего события, все
+        вызовы модели (агент и классификатор) отменяются и дожидаются (задача 2.1, правила
+        этапа 2); недописанный ответ агента не сохраняется, реплика владельца остаётся. Ответ,
+        сохранённый до отправки `done`/`crisis`, остаётся в истории, даже если событие не
+        дошло. После обрыва клиент перечитывает `GET /chat/messages`.
+
+        **Журналы.** Ни текст реплики владельца, ни куски и текст ответа агента не пишутся в
+        журналы, `audit_log` и `safety_events` (в `safety_events` — только тип события, ТЗ §7,
+        §9.3); в журнал запроса — имя завершающего события, код ошибки, длительности, модели и
+        расход.
       requestBody:
         required: true
         content:
@@ -248,15 +378,47 @@ paths:
             schema:
               type: object
               required: [text]
+              additionalProperties: false
               properties:
-                text: { type: string, minLength: 1, maxLength: 4000 }
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 4000
+                  description: Реплика владельца; только из пробелов — 422
       responses:
         "200":
-          description: Поток SSE
+          description: Поток SSE — события `delta`*, затем одно из `done`, `crisis`, `error`
+          headers:
+            Cache-Control:
+              description: Поток с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             text/event-stream:
-              schema: { type: string }
-        "402": { $ref: "#/components/responses/SubscriptionRequired" }
+              schema:
+                description: >-
+                  Последовательность событий SSE; `data` каждого события — JSON по схеме,
+                  которую выбирает имя события (`x-sse-event` схемы)
+                oneOf:
+                  - { $ref: "#/components/schemas/ChatStreamDelta" }
+                  - { $ref: "#/components/schemas/ChatStreamDone" }
+                  - { $ref: "#/components/schemas/ChatStreamCrisis" }
+                  - { $ref: "#/components/schemas/ChatStreamError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402":
+          description: >-
+            Код `subscription_required` (ТЗ §11). **Не отдаётся до этапа 4** (подписка и оплата):
+            до тех пор доступ ограничен только дневным лимитом (429). При кризисе не отдаётся
+            никогда (ТЗ §9.3, §11 п.5).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                subscription_required:
+                  value: { code: subscription_required, message: Подписка закончилась — продлите её, чтобы продолжить }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
+        "422": { $ref: "#/components/responses/Validation" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
   /chat/voice:
@@ -290,24 +452,58 @@ paths:
       tags: [drafts]
       summary: Сгенерировать черновик сообщения партнёру по текущему разговору (ФТ-07)
       description: |
-        Схема «чувство — ситуация — потребность — просьба» (ТЗ §4.3). Ничего не отправляется партнёру.
-        `reply_to_id` — ответ на конкретное входящее («Ответить с агентом», ТЗ §4.4 п.5, §8): после
-        отправки входящее получает статус `answered` (ФТ-11).
+        Агент пишет черновик по текущему разговору владельца по схеме «чувство — ситуация —
+        потребность — просьба» (ТЗ §4.3 п.1); контекст — только данные владельца и доставленные
+        ему сообщения текущей пары (ТЗ §6.1, §9.2). Ничего не отправляется партнёру: сообщение
+        появляется только по `POST /drafts/{draft_id}/send` (ФТ-08, ТЗ §2 п.2).
+
+        `reply_to_id` — ответ на конкретное входящее («Ответить с агентом», ТЗ §4.4 п.5, §8):
+        только доставленное владельцу сообщение текущей пары (иначе 422 `bad_reply_target`);
+        после отправки входящее получает статус `answered` (ФТ-11).
+
+        **Кризис** (ТЗ §9.3, ФТ-17): если в разговоре найдены признаки насилия, угроз или
+        кризиса, черновика нет — ответ **200** `DraftCrisis` (`kind: crisis`) с текстом протокола
+        и контактами помощи (те же, что `GET /help/contacts`). Это не ошибка: клиент всегда
+        показывает помощь, ничего не смягчается. Успех — **201** `Draft` (`kind: draft`).
+
+        Ошибки модели (АР-20, АР-27): 503 с понятным `message`; разговор не теряется, черновик не
+        записан, повтор безопасен. Ответ не кэшируется (`Cache-Control: no-store`). 402 до этапа 4
+        не отдаётся (АР-40).
       requestBody:
         required: false
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               properties:
                 reply_to_id: { type: [string, "null"], format: uuid }
       responses:
         "201":
-          description: Черновик
+          description: "Черновик (`kind: draft`, статус `draft`, версия 1)"
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Draft" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "200":
+          description: "Кризисный протокол вместо черновика (`kind: crisis`); черновик не создан"
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DraftCrisis" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "409": { $ref: "#/components/responses/DraftConflict" }
+        "422": { $ref: "#/components/responses/DraftInvalid" }
+        "503": { $ref: "#/components/responses/DraftModelError" }
 
   /drafts/{draft_id}:
     parameters:
@@ -315,31 +511,58 @@ paths:
     get:
       tags: [drafts]
       summary: Черновик (видит только автор)
+      description: |
+        Только свой черновик в любом статусе; чужой и несуществующий — одинаково 404. Ответ не
+        кэшируется (`Cache-Control: no-store`).
       responses:
         "200":
           description: OK
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Draft" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
         "404": { $ref: "#/components/responses/NotFound" }
     patch:
       tags: [drafts]
       summary: Правка текста автором (ФТ-07)
+      description: |
+        Только в статусе `draft` (иначе 409 `not_editable`; отправленный черновик неизменяем,
+        Б-38). `expected_version` — версия, которую автор правил: другая (идёт «другой вариант»
+        или правка из второй вкладки) — 409 `version_conflict`, ничего не изменено. Успех —
+        версия +1, текст автора как есть (агент его не переписывает, ТЗ §2 п.2).
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [text]
+              additionalProperties: false
+              required: [text, expected_version]
               properties:
                 text: { type: string, minLength: 1, maxLength: 4000 }
+                expected_version: { type: integer, minimum: 1 }
       responses:
         "200":
           description: OK
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Draft" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/DraftConflict" }
+        "422": { $ref: "#/components/responses/Validation" }
 
   /drafts/{draft_id}/regenerate:
     parameters:
@@ -347,12 +570,44 @@ paths:
     post:
       tags: [drafts]
       summary: «Другой вариант» (ФТ-07)
+      description: |
+        Новая версия того же черновика по текущему разговору; модели идут прежний текст и
+        пожелание `wish` (необязательно). Только в статусе `draft`; если автор правил текст, пока
+        шла модель, — 409 `not_editable`, его правка сохранена. Совпавший с прежним вариант —
+        422 `same_variant`.
+
+        Кризис (ТЗ §9.3) — как у `POST /drafts`: **200** `DraftCrisis`, прежний черновик не
+        меняется (`draft_id` в ответе — он). Успех — **200** `Draft` (версия +1). Различаются по
+        `kind`. Ошибки модели — 503, черновик прежний.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                wish:
+                  type: string
+                  maxLength: 500
+                  description: Пожелание к варианту («мягче», «короче»…) — только во вход модели, не хранится
       responses:
         "200":
-          description: Новая версия черновика
+          description: "Новая версия (`kind: draft`) или кризисный протокол (`kind: crisis`)"
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Draft" }
+              schema: { $ref: "#/components/schemas/DraftOutcome" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/DraftConflict" }
+        "422": { $ref: "#/components/responses/DraftInvalid" }
+        "503": { $ref: "#/components/responses/DraftModelError" }
 
   /drafts/{draft_id}/reject:
     parameters:
@@ -360,8 +615,15 @@ paths:
     post:
       tags: [drafts]
       summary: «Не отправлять» (ФТ-07)
+      description: |
+        Черновик `draft` → `rejected`; партнёру ничего не уходит. Повтор для уже отклонённого —
+        204, ничего не меняет; отправленный — 409 `not_editable`.
       responses:
         "204": { description: Черновик отклонён }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/DraftConflict" }
 
   /drafts/{draft_id}/send:
     parameters:
@@ -370,38 +632,71 @@ paths:
       tags: [drafts]
       summary: «Отправить» — единственный путь сообщения к партнёру (ФТ-08)
       description: |
-        Фиксирует оригинал (ТЗ §6.2 п.2) и запускает конвейер. `expected_version` защищает от
-        отправки не той версии, которую автор видел. При срабатывании проверки безопасности
-        сообщение не отправляется: 422 с кодом `blocked_by_safety` (ТЗ §9.3).
+        Явное подтверждение автора (ТЗ §2 п.2): `expected_version` — версия, которую автор видел
+        на экране; другая — 409 `version_conflict`, ничего не отправлено. Функция БД
+        `app_send_draft` (АР-11) фиксирует оригинал (ТЗ §6.2 п.2) — текст этой версии — и
+        создаёт сообщение пары; черновик → `sent` (неизменяем, Б-38).
+
+        **202**: сообщение принято со статусом `processing` — дальше конвейер получателя
+        (безопасность, тон, адаптация, контроль смысла, доставка; задача 3.2). До 3.2 сообщение
+        остаётся в `processing`: автор видит его в ленте, получатель — нет. Остановка проверкой
+        безопасности (`withheld`, ТЗ §9.3) происходит в конвейере после 202 и видна автору в
+        ленте статусом; 422 `blocked_by_safety` здесь отдаётся, только если черновик уже был
+        остановлен (`blocked`).
+
+        409: `version_conflict`; `couple_not_active` — нет активной пары или партнёр вышел/удалён;
+        `not_editable` — черновик не `draft`/`approved` (уже отправлен или отклонён);
+        `conflict_retry` (АР-24). 422 `bad_reply_target` — ответ не на своё входящее этой пары.
+        402 `subscription_required` — с этапа 4 (ТЗ §11), до него не отдаётся (АР-40).
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [expected_version]
               properties:
                 expected_version: { type: integer, minimum: 1 }
       responses:
         "202":
-          description: Принято в конвейер
+          description: "Принято в конвейер (`status = processing`)"
           content:
             application/json:
               schema: { $ref: "#/components/schemas/PartnerMessage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "402": { $ref: "#/components/responses/SubscriptionRequired" }
-        "409": { $ref: "#/components/responses/Conflict" }
-        "422": { $ref: "#/components/responses/Validation" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/DraftConflict" }
+        "422": { $ref: "#/components/responses/DraftInvalid" }
 
   /couple/messages:
     get:
       tags: [messages]
       summary: Лента сообщений пары со статусами (ФТ-11)
+      description: |
+        Только **текущая активная пара** (ТЗ §4.5 п.2 «обмен прекращается»): после выхода из пары
+        или её распада лента пуста (200, `items: []`); сообщения бывшей пары в выгрузке
+        (`GET /me/export`, АР-25). От новых к старым по `(sent_at, id)`; `next_cursor` — для
+        следующей страницы, `null` — дальше нет. Неверный курсор или `limit` — 422 (на 422 по
+        курсору клиент начинает с первой страницы).
+
+        Автору — его оригинал; получателю — версия для получателя (адаптированная или копия
+        оригинала), недоставленные (`processing`, `withheld`) получателю не видны (АР-11, АР-25).
+        Текст, который не удалось расшифровать, не скрывает сообщение: в `text` —
+        `UnavailableText`. Ответ не кэшируется (`Cache-Control: no-store`).
       parameters:
         - $ref: "#/components/parameters/Cursor"
         - $ref: "#/components/parameters/Limit"
       responses:
         "200":
           description: OK
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema:
@@ -412,6 +707,9 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/PartnerMessage" }
                   next_cursor: { type: [string, "null"] }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "422": { $ref: "#/components/responses/Validation" }
 
   /couple/messages/{message_id}/original:
     parameters:
@@ -419,18 +717,34 @@ paths:
     get:
       tags: [messages]
       summary: «Показать оригинал» — текст, одобренный автором (ФТ-10)
-      description: Просмотр фиксируется (`original_viewed_at`). Доступно получателю и автору.
+      description: |
+        Получателю доставленного сообщения — с фиксацией просмотра (`original_viewed_at`, первый
+        просмотр, ТЗ §7). Автору — его оригинал **без фиксации** (просмотр оригинала — факт для
+        получателя, автор свой текст видит в ленте). Только сообщения текущей активной пары;
+        бывшей пары, чужое, недоставленное получателю и несуществующее — одинаково 404.
+
+        Текст не расшифровался — 200 с `UnavailableText`, просмотр **не** фиксируется
+        (засчитывается только показанный текст). 409 `conflict_retry` — АР-24. Ответ не
+        кэшируется (`Cache-Control: no-store`).
       responses:
         "200":
           description: OK
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema:
                 type: object
                 required: [text]
                 properties:
-                  text: { type: string }
+                  text: { $ref: "#/components/schemas/ExportText" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
 
   /couple/messages/{message_id}/read:
     parameters:
@@ -438,13 +752,33 @@ paths:
     post:
       tags: [messages]
       summary: Отметить прочитанным (ФТ-11)
+      description: |
+        Только получатель доставленного сообщения текущей активной пары; повтор (уже прочитано
+        или отвечено) — 204 без изменений. Своё отправленное, чужое, недоставленное, бывшей пары
+        и несуществующее — 404.
       responses:
         "204": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /memory:
     get:
       tags: [memory]
       summary: «Что агент помнит» — записи по категориям (ФТ-13)
+      description: |
+        Только свои неудалённые записи (ТЗ §2 п.6, §6.3). Наблюдения агента отделены от слов
+        владельца: `type: observation`, `source: agent_inference`; записи из одобренных
+        сообщений партнёра — `type: from_partner`, `source: partner_message` (ФТ-14).
+
+        Доступно после входа без завершённого онбординга (принцип 6 «человек видит и удаляет
+        любую запись»; как выход из пары и выгрузка, АР-17, АР-25): код `onboarding_required`
+        (403) этот путь не отдаёт.
+
+        Запись, текст которой не удалось расшифровать, не скрывается и не роняет ответ: в
+        `text` — объект `UnavailableText` с кодом причины (в журнал — только код причины и
+        колонка, без текста и id); такую запись можно удалить. Неверный `type` — 422. Ответ не
+        кэшируется (`Cache-Control: no-store`).
       parameters:
         - name: type
           in: query
@@ -452,6 +786,11 @@ paths:
       responses:
         "200":
           description: OK
+          headers:
+            Cache-Control:
+              description: Ответ с личными данными не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema:
@@ -461,6 +800,8 @@ paths:
                   items:
                     type: array
                     items: { $ref: "#/components/schemas/MemoryItem" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Validation" }
   /memory/{memory_id}:
     parameters:
       - name: memory_id
@@ -470,9 +811,27 @@ paths:
     delete:
       tags: [memory]
       summary: Удалить запись — не восстанавливается и не извлекается повторно (ФТ-13, ТЗ §6.3)
+      description: |
+        Удаляет функция БД `app_delete_memory` (АР-36): текст, вектор и дата события стираются,
+        отпечаток записи остаётся — запись не возвращается ни повторным извлечением, ни
+        слиянием, ни сжатием. Удаляется и запись, текст которой не расшифровывается. Чужая,
+        уже удалённая и несуществующая запись — одинаково 404; повтор удаления — 404, ничего
+        не меняет.
+
+        Без требования онбординга (принцип 6, АР-17, АР-25): 403 не отдаётся. Ответ не
+        кэшируется (`Cache-Control: no-store`). 409 `conflict_retry` — одновременное изменение
+        (40P01/40001, АР-24), ничего не изменено, повтор безопасен.
       responses:
-        "204": { description: Удалено }
+        "204":
+          description: Удалено
+          headers:
+            Cache-Control:
+              description: Ответ не сохраняется ни клиентом, ни промежуточными узлами
+              required: true
+              schema: { type: string, const: no-store }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
 
   /subscription:
     get:
@@ -512,7 +871,15 @@ paths:
   /help/contacts:
     get:
       tags: [help]
-      summary: Контакты служб помощи — без подписки (ТЗ §9.3, §11 п.5)
+      summary: Контакты служб помощи — без входа и без подписки (ТЗ §9.3, §11 п.5)
+      description: |
+        Публичный путь (`security: []`, BACKLOG Б-58): помощь доступна «всегда» (ТЗ §9.3) —
+        и без сессии (истёк токен, вход не удался, аккаунт удалён), и без подписки (§11 п.5).
+        Ответ не содержит данных пользователя и одинаков для всех; источник списка — файл
+        конфигурации сервера (АР-33), тот же список, что в событии `crisis` (АР-32). Заголовок
+        `Authorization`, если передан, не проверяется и на ответ не влияет: ни 401, ни 403 этот
+        путь не отдаёт.
+      security: []
       responses:
         "200":
           description: OK
@@ -526,6 +893,9 @@ paths:
     get:
       tags: [admin]
       summary: Материалы базы знаний (ФТ-20)
+      description: |
+        Все материалы со статусом индексации; при `failed` — код причины `index_error` (без
+        текста). Исходный файл не отдаётся (хранится только до конца индексации, АР-39).
       security: [{ adminBearer: [] }]
       responses:
         "200":
@@ -535,9 +905,19 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/KbDocument" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
     post:
       tags: [admin]
       summary: Загрузить PDF, EPUB, DOCX, TXT (ФТ-15)
+      description: |
+        Загружаются только материалы с правами на использование (ТЗ §6.4): `rights_basis`
+        обязателен и не пустой. Файл — не больше **20 МиБ** (20 971 520 байт), форматы `pdf`,
+        `epub`, `docx`, `txt` (определяет сервер по содержимому и расширению). Тот же файл
+        (SHA-256 содержимого) повторно не загружается, пока прежний не в `failed`. Материал
+        принимается в статусе `uploaded`; индексация — фоновая (разбор, фрагменты, метки,
+        векторы), итог — `indexed` или `failed` с кодом причины. Запись в журнал действий — без
+        текстов (`kb.upload`, АР-24). Функция БД — `admin_kb_upload` (АР-39).
       security: [{ adminBearer: [] }]
       requestBody:
         required: true
@@ -547,17 +927,69 @@ paths:
               type: object
               required: [file, title, rights_basis]
               properties:
-                file: { type: string, format: binary }
-                title: { type: string }
-                author: { type: string }
-                approach: { type: string }
-                rights_basis: { type: string, description: "Основание прав на использование (ТЗ §6.4)" }
+                file: { type: string, format: binary, description: "До 20 МиБ" }
+                title: { type: string, minLength: 1, maxLength: 300 }
+                author: { type: string, maxLength: 200 }
+                approach:
+                  type: string
+                  maxLength: 100
+                  description: Подход (ненасильственное общение, ЭФТ, метод Готтмана, теория привязанности…) — метка от администратора
+                rights_basis:
+                  type: string
+                  minLength: 1
+                  description: "Основание прав на использование (ТЗ §6.4)"
       responses:
         "202":
-          description: Принято к индексации
+          description: Принято к индексации (`index_status = uploaded`)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/KbDocument" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "409":
+          description: Код `duplicate_document` — этот файл уже загружен (SHA-256 содержимого)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                duplicate_document:
+                  value: { code: duplicate_document, message: Этот файл уже загружен }
+        "413":
+          description: Код `file_too_large` — файл больше 20 МиБ
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                file_too_large:
+                  value: { code: file_too_large, message: Файл больше 20 МиБ }
+        "415":
+          description: Код `unsupported_format` — не PDF, EPUB, DOCX или TXT
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                unsupported_format:
+                  value: { code: unsupported_format, message: Поддерживаются PDF, EPUB, DOCX и TXT }
+        "422": { $ref: "#/components/responses/Validation" }
+  /admin/kb/documents/{document_id}:
+    parameters:
+      - name: document_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [admin]
+      summary: Удалить материал вместе с фрагментами (ФТ-15)
+      description: |
+        Материал, его фрагменты и векторы удаляются сразу (функция БД `admin_kb_delete`, АР-39);
+        идущая индексация прекращается. Журнал — `kb.delete`, без текстов. Несуществующий
+        материал и повтор — 404.
+      security: [{ adminBearer: [] }]
+      responses:
+        "204": { description: Удалено }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/AdminOnly" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /admin/prompts:
     get:
       tags: [admin]
@@ -599,13 +1031,27 @@ paths:
 components:
   securitySchemes:
     bearer: { type: http, scheme: bearer }
-    adminBearer: { type: http, scheme: bearer, description: Отдельная учётная запись администратора }
+    adminBearer:
+      type: http
+      scheme: bearer
+      description: |
+        Отдельная учётная запись администратора, не Telegram (АР-39). Токен — случайная строка не
+        короче 32 байт; сервер хранит только SHA-256 действующих токенов в окружении
+        (`FEELINGS_ADMIN_TOKEN_SHA256`, через запятую — для ротации) и сравнивает SHA-256
+        предъявленного за постоянное время. Нет заголовка или токен неизвестен — 401
+        `unauthorized`; предъявлена сессия пользователя Mini App — 403 `admin_only`. Запросы
+        администратора выполняются под ролью БД `feelings_admin` (справочные таблицы, без доступа
+        к личным данным, ТЗ §9.1 п.5).
 
   parameters:
     InviteToken:
       name: token
       in: path
       required: true
+      description: >-
+        Токен из ссылки `startapp` — 43 символа base64url (32 случайных байта). Любой неверный
+        формат (длина, алфавит, лишние символы) даёт 404 `not_found`, как несуществующий токен,
+        а не 422: по ответу не отличить «нет такого» от «неверного формата».
       schema: { type: string, minLength: 32, maxLength: 64 }
     DraftId:
       name: draft_id
@@ -641,14 +1087,122 @@ components:
             onboarding_required:
               value: { code: onboarding_required, message: Сначала завершите знакомство с сервисом }
     NotFound:
-      description: Не найдено или нет доступа (не различаются, чтобы не раскрывать чужие данные)
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      description: >-
+        Код `not_found`: не найдено или нет доступа (не различаются, чтобы не раскрывать чужие
+        данные). Для пары и приглашений: нет текущей пары (`GET /couple`), нет активного
+        членства (`POST /couple/invite`, `POST /couple/leave`), приглашение не найдено или
+        токен неверного формата (`/invites/{token}`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            not_found:
+              value: { code: not_found, message: Не найдено }
     Conflict:
-      description: Конфликт состояния (уже в паре, устаревшая версия, пара не активна)
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      description: >-
+        Конфликт состояния. Коды: `already_in_couple` — у пользователя уже есть пара
+        (создание пары, принятие приглашения; ФТ-04); `own_invite` — попытка принять своё
+        приглашение; `couple_not_pending` — пара уже не ожидает партнёра (выпуск ссылки в
+        активной паре, принятие приглашения в распавшуюся пару); `version_conflict` —
+        устаревшая версия черновика; `couple_not_active` — пара не активна. Тот же статус
+        с кодом `conflict_retry` — транзакция отменена из-за одновременного изменения
+        (40P01/40001, АР-24), ничего не изменено, запрос можно повторить (см. `ConflictRetry`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            already_in_couple:
+              value: { code: already_in_couple, message: У вас уже есть пара }
+            own_invite:
+              value: { code: own_invite, message: Это ваше приглашение — отправьте ссылку партнёру }
+            couple_not_pending:
+              value: { code: couple_not_pending, message: Пара уже не ожидает партнёра }
+    ConflictRetry:
+      description: >-
+        Код `conflict_retry`: транзакция отменена из-за одновременного изменения тех же данных
+        (взаимоблокировка 40P01 или конфликт сериализации 40001; АР-24). Ничего не изменено —
+        запрос можно повторить. Не 500.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            conflict_retry:
+              value: { code: conflict_retry, message: Не получилось с первого раза — повторите, пожалуйста }
     Gone:
-      description: Приглашение истекло или уже использовано
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      description: >-
+        Приглашение недействительно. Коды: `invite_expired` — срок 7 дней истёк;
+        `invite_used` — уже использовано или отозвано (выпущена новая ссылка, инициатор вышел).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            invite_expired:
+              value: { code: invite_expired, message: Срок приглашения истёк — попросите новую ссылку }
+            invite_used:
+              value: { code: invite_used, message: Приглашение уже использовано — попросите новую ссылку }
+    InvitesUnavailable:
+      description: >-
+        Код `service_unavailable`: выпуск ссылок временно недоступен — сервис не настроен
+        (нет имени бота `FEELINGS_BOT_USERNAME`); по образцу `POST /auth/telegram`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            service_unavailable:
+              value: { code: service_unavailable, message: Приглашения временно недоступны }
+    DraftConflict:
+      description: >-
+        Конфликт черновика: `couple_not_active` — нет активной пары (создание, отправка) или
+        партнёр вышел/удалён; `not_editable` — черновик не в статусе `draft` (правка, «другой
+        вариант», отказ) или не `draft`/`approved` (отправка), либо автор правил текст, пока шла
+        модель; `version_conflict` — `expected_version` не совпала с текущей версией;
+        `conflict_retry` — одновременное изменение (40P01/40001, АР-24), ничего не изменено.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            couple_not_active:
+              value: { code: couple_not_active, message: Пара не активна — отправить сообщение некому }
+            not_editable:
+              value: { code: not_editable, message: Этот черновик уже нельзя изменить }
+            version_conflict:
+              value: { code: version_conflict, message: Черновик изменился — проверьте текст ещё раз }
+    DraftInvalid:
+      description: >-
+        Черновик не получается: `no_turns` — в разговоре нет реплик владельца; `bad_reply_target`
+        — `reply_to_id` не доставленное владельцу сообщение текущей пары (или ответ не на своё
+        входящее при отправке); `draft_quote` — модель дважды вставила цитату из базы знаний
+        (ТЗ §6.4, Б-77); `same_variant` — «другой вариант» совпал с прежним; `blocked_by_safety`
+        — черновик остановлен проверкой безопасности (ТЗ §9.3); `validation_error` — тело запроса
+        неверно. Черновик не записан (или прежний не изменён), разговор цел.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            no_turns:
+              value: { code: no_turns, message: Сначала расскажите агенту, что хотите передать }
+            same_variant:
+              value: { code: same_variant, message: Другой вариант не получился — попробуйте уточнить пожелание }
+    DraftModelError:
+      description: >-
+        Модель не дала черновик (АР-20, АР-27): `llm_unavailable` — недоступна, перегружена,
+        исчерпан лимит поставщика, ответ испорчен или сервис не настроен; `llm_refusal` —
+        модель отказалась. `message` — понятный текст (`LLMError.user_message`). Черновик не
+        записан (прежний не изменён), разговор цел; повтор безопасен.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            llm_unavailable:
+              value: { code: llm_unavailable, message: Агент сейчас недоступен. Разговор сохранён — попробуйте чуть позже }
+    AdminOnly:
+      description: Код `admin_only` — путь только для администратора (предъявлена сессия пользователя)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            admin_only:
+              value: { code: admin_only, message: Доступно только администратору }
     Validation:
       description: Ошибка данных
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -656,8 +1210,24 @@ components:
       description: Подписка закончилась или исчерпан дневной лимит без подписки (ТЗ §11)
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     RateLimited:
-      description: Превышен дневной лимит запросов (ТЗ §10)
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      description: >-
+        Код `rate_limited`: исчерпан дневной лимит реплик в личном чате (ТЗ §10 «лимит запросов
+        на пользователя в сутки»). В лимит засчитываются реплики, принятые к ответу (200),
+        включая кризисные; реплика, получившая 429, не засчитывается. При кризисе 429 не
+        отдаётся (ТЗ §9.3, §11 п.5). Реплика владельца уже сохранена (см. `POST /chat/messages`).
+      headers:
+        Retry-After:
+          description: >-
+            Целое число секунд (не меньше 1) до начала следующего окна лимита, когда реплика
+            снова будет принята; окно и хранилище счётчика — решение A2 в отчёте задачи 2.1
+          required: true
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            rate_limited:
+              value: { code: rate_limited, message: На сегодня лимит сообщений агенту исчерпан — продолжим завтра }
 
   schemas:
     Error:
@@ -666,9 +1236,11 @@ components:
       properties:
         code:
           type: string
-          examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, underage, already_in_couple, invite_expired,
-                     invite_used, couple_not_active, version_conflict, blocked_by_safety,
-                     subscription_required, rate_limited, llm_unavailable]
+          examples: [invalid_init_data, unauthorized, account_deleted, validation_error, service_unavailable, onboarding_required, underage, not_found, already_in_couple, own_invite,
+                     couple_not_pending, invite_expired, invite_used, couple_not_active, version_conflict, blocked_by_safety,
+                     subscription_required, rate_limited, llm_unavailable, conflict_retry,
+                     admin_only, duplicate_document, file_too_large, unsupported_format,
+                     not_editable, no_turns, bad_reply_target, draft_quote, same_variant, llm_refusal]
         message: { type: string, description: Понятное пользователю сообщение на русском }
 
     Session:
@@ -731,33 +1303,171 @@ components:
 
     ChatMessage:
       type: object
+      description: Реплика личного чата (`conversation_messages`); видит только владелец
       required: [id, author, text, created_at]
+      additionalProperties: false
       properties:
         id: { type: string, format: uuid }
-        author: { type: string, enum: [owner, agent] }
-        text: { type: string }
+        author:
+          type: string
+          enum: [owner, agent]
+          description: "`owner` — реплика владельца, `agent` — ответ его агента (и кризисный ответ протокола)"
+        text:
+          description: Текст реплики или `UnavailableText`, если его не удалось расшифровать
+          $ref: "#/components/schemas/ExportText"
         created_at: { type: string, format: date-time }
+
+    ChatStreamDelta:
+      type: object
+      x-sse-event: delta
+      description: >-
+        Событие `delta` — очередной кусок ответа агента; клиент дописывает `text` к показанному.
+        Кусок не пустой; границы кусков произвольны (не по словам).
+      required: [text]
+      additionalProperties: false
+      properties:
+        text: { type: string, minLength: 1 }
+
+    ChatStreamDone:
+      type: object
+      x-sse-event: done
+      description: >-
+        Событие `done` — ответ агента завершён и сохранён; склейка всех `delta` — текст
+        сохранённой реплики.
+      required: [message_id, suggest_draft]
+      additionalProperties: false
+      properties:
+        message_id: { type: string, format: uuid, description: "id реплики агента (`ChatMessage.id`)" }
+        suggest_draft:
+          type: boolean
+          description: Агент готов предложить черновик сообщения партнёру; сам черновик — `POST /drafts` (задача 3.1)
+
+    ChatStreamCrisis:
+      type: object
+      x-sse-event: crisis
+      description: |
+        Событие `crisis` — кризисный протокол (ФТ-17, ТЗ §9.3): признаки найдены классификатором
+        безопасности или агентом. Идёт всегда, без 402/429; черновика нет (`suggest_draft` не
+        передаётся), ничего не смягчается.
+
+        `text` — итоговый ответ протокола (ответ агента, если был, и блоки шаблона
+        `prompts/crisis.v*.md`); он и сохраняется как реплика агента. `replace` — что делать
+        с уже показанными кусками `delta`: `true` — показанное заменяется на `text` целиком
+        (показанный текст — не начало `text`); `false` — `text` начинается с показанного
+        (без учёта пробелов по краям), клиент показывает `text` полностью. При порядке
+        «сначала классификатор» (АР-30) кризис от классификатора приходит до первого `delta`
+        и `replace` = false; `true` возможен, если кризис распознал сам агент и шаблон
+        протокола не начинается с его ответа, и при параллельном режиме (пересмотр АР-30).
+      required: [message_id, text, replace, contacts]
+      additionalProperties: false
+      properties:
+        message_id:
+          type: [string, "null"]
+          format: uuid
+          description: >-
+            id сохранённой реплики агента с `text`; null — сохранить не удалось (например,
+            аккаунт удалён во время ответа): событие с контактами отдаётся всё равно
+        text: { type: string, minLength: 1 }
+        replace: { type: boolean }
+        contacts:
+          type: array
+          minItems: 1
+          description: >-
+            Контакты служб помощи — те же записи и в том же порядке, что `GET /help/contacts`,
+            целиком в событии: показать помощь можно без второго запроса, даже если сеть или
+            сервер дальше недоступны. Не зависят от типа кризиса и не содержат данных пользователя.
+          items: { $ref: "#/components/schemas/HelpContact" }
+
+    ChatStreamError:
+      type: object
+      x-sse-event: error
+      description: |
+        Событие `error` — ответ агента не получен. **Реплика владельца сохранена** (ТЗ §10) и
+        есть в истории; повторить можно новой репликой. Куски `delta`, показанные до ошибки, не
+        сохранены — клиент помечает их как прерванный ответ или убирает. Резервная модель
+        пробуется только при недоступности основной до первого куска (АР-20); при отказе модели
+        резерва нет. Текст реплики и ответа в `error` и в журнал не попадает.
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code: { $ref: "#/components/schemas/ChatErrorCode" }
+        message: { type: string, minLength: 1, description: Понятное пользователю сообщение на русском }
+
+    ChatErrorCode:
+      type: string
+      description: |
+        Код события `error` (из `LLMError.kind` слоя модели, `app/ai/llm/errors.py`):
+        - `refusal` — модель отказалась отвечать на реплику;
+        - `unavailable` — модель недоступна (сеть, тайм-аут, перегрузка; резерв тоже не ответил
+          или куски уже шли);
+        - `quota` — исчерпан лимит/баланс поставщика модели (не дневной лимит пользователя —
+          он даёт 429 до потока);
+        - `bad_output` — ответ модели испорчен (не разбирается, обрезан);
+        - `internal` — всё остальное: ошибка кода, сервис не настроен или ключ отклонён
+          (`config`, `auth`, `bad_request`, `model_not_found`, `error`), сбой БД после начала
+          потока, в том числе не удалось сохранить ответ агента.
+        Новые коды добавляются в этот список; клиент любой незнакомый код показывает как `internal`.
+      enum: [refusal, unavailable, quota, bad_output, internal]
 
     Draft:
       type: object
-      required: [id, text, version, status]
+      description: |
+        Черновик (видит только автор). Части схемы «чувство — ситуация — потребность — просьба»
+        (ТЗ §4.3) отдельно не отдаются: это способ, которым агент пишет текст; после правки
+        автором текст — его, части устарели бы (АР-40). `version` растёт с каждой правкой и
+        «другим вариантом»; её передают в `PATCH` и `send` (`expected_version`).
+      required: [kind, id, text, version, status]
       properties:
+        kind: { type: string, const: draft }
         id: { type: string, format: uuid }
         text: { type: string }
         reply_to_id: { type: [string, "null"], format: uuid }
         version: { type: integer, minimum: 1 }
         status: { type: string, enum: [draft, approved, rejected, blocked, sent] }
 
+    DraftCrisis:
+      type: object
+      description: |
+        Кризисный протокол вместо черновика (ТЗ §9.3, ФТ-17): черновика нет, ничего не
+        смягчается; событие записывается в `safety_events` (только тип, без текста). `text` —
+        ответ владельцу по протоколу (шаблон `prompts/crisis.v*.md`), `contacts` — контакты
+        служб помощи, те же записи и в том же порядке, что `GET /help/contacts` (показать
+        помощь можно без второго запроса).
+      required: [kind, text, contacts]
+      additionalProperties: false
+      properties:
+        kind: { type: string, const: crisis }
+        text: { type: string, minLength: 1 }
+        draft_id:
+          type: [string, "null"]
+          format: uuid
+          description: "«Другой вариант»: прежний черновик (не изменён); `POST /drafts` — null"
+        contacts:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/HelpContact" }
+
+    DraftOutcome:
+      oneOf:
+        - { $ref: "#/components/schemas/Draft" }
+        - { $ref: "#/components/schemas/DraftCrisis" }
+      discriminator:
+        propertyName: kind
+        mapping:
+          draft: "#/components/schemas/Draft"
+          crisis: "#/components/schemas/DraftCrisis"
+
     PartnerMessage:
       type: object
       description: |
         Для получателя `text` — итоговая версия (адаптированная или оригинал), для автора —
-        его оригинал. Оригинал получателю — только через /original (ФТ-10).
+        его оригинал. Оригинал получателю — только через /original (ФТ-10). Текст, который не
+        удалось расшифровать, — `UnavailableText` (сообщение не скрывается).
       required: [id, direction, text, is_adapted, status, sent_at]
       properties:
         id: { type: string, format: uuid }
         direction: { type: string, enum: [outgoing, incoming] }
-        text: { type: string }
+        text: { $ref: "#/components/schemas/ExportText" }
         is_adapted: { type: boolean, description: "Пометка «адаптировано» (ФТ-09)" }
         harsh_tone_warning: { type: boolean, description: "ТЗ §6.2 п.6" }
         status: { type: string, enum: [processing, withheld, delivered, read, answered], description: "Получателю — только delivered/read/answered. processing и withheld (остановлено безопасностью, ТЗ §9.3) видит только автор" }
@@ -775,7 +1485,9 @@ components:
       properties:
         id: { type: string, format: uuid }
         type: { $ref: "#/components/schemas/MemoryType" }
-        text: { type: string }
+        text:
+          $ref: "#/components/schemas/ExportText"
+          description: Расшифрованный текст или `UnavailableText` (запись видна и удаляется)
         event_date: { type: [string, "null"], format: date }
         source: { type: string, enum: [owner_dialog, agent_inference, partner_message] }
         confidence: { type: number, minimum: 0, maximum: 1 }
@@ -801,7 +1513,7 @@ components:
 
     KbDocument:
       type: object
-      required: [id, title, rights_basis, index_status]
+      required: [id, title, rights_basis, index_status, created_at]
       properties:
         id: { type: string, format: uuid }
         title: { type: string }
@@ -809,6 +1521,18 @@ components:
         approach: { type: [string, "null"] }
         rights_basis: { type: string }
         index_status: { type: string, enum: [uploaded, indexing, indexed, failed] }
+        index_error:
+          type: [string, "null"]
+          pattern: "^[a-z][a-z0-9_]{0,31}$"
+          description: >-
+            Код причины сбоя при `failed` (без текста материала), например `too_large`,
+            `too_many_pages`, `zip_bomb`, `encrypted`, `corrupt`, `empty_text`,
+            `attempts_exhausted` — перечень ведёт воркер индексации (A3)
+        source_format: { type: [string, "null"], enum: [pdf, epub, docx, txt, null] }
+        source_size: { type: [integer, "null"], minimum: 1, maximum: 20971520 }
+        sha256: { type: [string, "null"], pattern: "^[0-9a-f]{64}$", description: SHA-256 исходного файла }
+        created_at: { type: string, format: date-time }
+        indexed_at: { type: [string, "null"], format: date-time }
 
     PromptVersion:
       type: object
@@ -830,3 +1554,268 @@ components:
         retention_30d: { type: number }
         heard_score_avg: { type: number }
         first_token_p95_ms: { type: integer }
+
+    UnavailableText:
+      type: object
+      description: >-
+        Текст не удалось расшифровать (повреждённая строка, неизвестный ключ и т. п.; задача 4.2).
+        Ни текста, ни шифротекста — только код причины `DecryptionError.reason`.
+      required: [unavailable, reason]
+      additionalProperties: false
+      properties:
+        unavailable: { type: boolean, const: true }
+        reason: { type: string, enum: [format, unknown_key, auth, encoding, context] }
+
+    ExportText:
+      description: >-
+        Расшифрованный текст или отметка о его недоступности (выгрузка ФТ-21, история
+        личного чата `GET /chat/messages`, память `GET /memory`, лента пары и оригинал
+        `/couple/messages*`)
+      oneOf:
+        - { type: string }
+        - { $ref: "#/components/schemas/UnavailableText" }
+
+    AccountExport:
+      type: object
+      description: |
+        Выгрузка своих данных (ФТ-21, ТЗ §9.1 п.6; АР-25). Только строки владельца: RLS и
+        функции БД, как в остальном API. Массивы упорядочены по времени (старые первыми).
+        Входит и `telegram_id` — он собран у пользователя (ТЗ §9.1 п.2). Не входят: служебные
+        и производные данные (векторы, отпечатки удалённых записей памяти, хеши приглашений,
+        версия промпта агента, оценка тона, `audit_log`) и данные партнёра (имя из его профиля,
+        id, Telegram ID, память, личный чат, агент и `tone_settings`).
+      required: [export_version, exported_at, profile, agent, conversations, memory, drafts,
+                 couple_messages, couples, subscriptions, safety_events]
+      additionalProperties: false
+      properties:
+        export_version:
+          type: integer
+          const: 1
+          description: Версия формата; меняется при несовместимом изменении состава или полей
+        exported_at: { type: string, format: date-time }
+        profile: { $ref: "#/components/schemas/ExportProfile" }
+        agent:
+          description: Свой агент; null — агент ещё не создан
+          oneOf:
+            - { type: "null" }
+            - { $ref: "#/components/schemas/ExportAgent" }
+        conversations:
+          type: array
+          items: { $ref: "#/components/schemas/ExportConversation" }
+        memory:
+          type: array
+          description: Действующие записи памяти своего агента; удалённые (ФТ-13) текста не имеют и не выгружаются
+          items: { $ref: "#/components/schemas/ExportMemoryItem" }
+        drafts:
+          type: array
+          description: Свои черновики во всех статусах
+          items: { $ref: "#/components/schemas/ExportDraft" }
+        couple_messages:
+          type: object
+          required: [sent, received]
+          additionalProperties: false
+          properties:
+            sent:
+              type: array
+              items: { $ref: "#/components/schemas/ExportSentMessage" }
+            received:
+              type: array
+              description: Только доставленные получателю (delivered, read, answered)
+              items: { $ref: "#/components/schemas/ExportReceivedMessage" }
+        couples:
+          type: array
+          description: Все пары, где пользователь был участником, включая распавшиеся
+          items: { $ref: "#/components/schemas/ExportCouple" }
+        subscriptions:
+          type: array
+          description: Подписки, где пользователь — плательщик, с их платежами
+          items: { $ref: "#/components/schemas/ExportSubscription" }
+        safety_events:
+          type: array
+          description: Срабатывания кризисного протокола — только тип и время (ТЗ §7, §9.3)
+          items: { $ref: "#/components/schemas/ExportSafetyEvent" }
+
+    ExportProfile:
+      type: object
+      required: [id, telegram_id, name, address_form, partner_name, timezone, created_at,
+                 consent_terms_at, consent_data_at, consent_sensitive_at, age_confirmed_at,
+                 onboarding_completed]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        telegram_id: { type: integer }
+        name: { type: [string, "null"] }
+        address_form: { type: [string, "null"] }
+        partner_name:
+          type: [string, "null"]
+          description: Имя партнёра, которое пользователь сам указал в онбординге (ФТ-02); единственное, что выгрузка говорит о партнёре
+        timezone: { type: string }
+        created_at: { type: string, format: date-time }
+        consent_terms_at: { type: [string, "null"], format: date-time }
+        consent_data_at: { type: [string, "null"], format: date-time }
+        consent_sensitive_at: { type: [string, "null"], format: date-time }
+        age_confirmed_at: { type: [string, "null"], format: date-time }
+        onboarding_completed: { type: boolean }
+
+    ExportAgent:
+      type: object
+      required: [created_at, profile_summary, tone_settings]
+      additionalProperties: false
+      properties:
+        created_at: { type: string, format: date-time }
+        profile_summary:
+          description: Сводка профиля владельца, которую ведёт агент; null — ещё не составлена
+          oneOf:
+            - { type: "null" }
+            - { $ref: "#/components/schemas/ExportText" }
+        tone_settings: { type: object, additionalProperties: true, description: "Свои настройки тона" }
+
+    ExportConversation:
+      type: object
+      required: [id, started_at, summary, messages]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        started_at: { type: string, format: date-time }
+        summary:
+          oneOf:
+            - { type: "null" }
+            - { $ref: "#/components/schemas/ExportText" }
+        messages:
+          type: array
+          items:
+            type: object
+            required: [id, author, text, created_at]
+            additionalProperties: false
+            properties:
+              id: { type: string, format: uuid }
+              author: { type: string, enum: [owner, agent] }
+              text: { $ref: "#/components/schemas/ExportText" }
+              created_at: { type: string, format: date-time }
+
+    ExportMemoryItem:
+      type: object
+      required: [id, type, text, event_date, source, source_message_id, confidence, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        type: { $ref: "#/components/schemas/MemoryType" }
+        text: { $ref: "#/components/schemas/ExportText" }
+        event_date: { type: [string, "null"], format: date }
+        source: { type: string, enum: [owner_dialog, agent_inference, partner_message] }
+        source_message_id:
+          type: [string, "null"]
+          format: uuid
+          description: Для `partner_message` — id сообщения из `couple_messages.received`
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: [string, "null"], format: date-time }
+
+    ExportDraft:
+      type: object
+      required: [id, text, reply_to_id, version, status, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        text: { $ref: "#/components/schemas/ExportText" }
+        reply_to_id: { type: [string, "null"], format: uuid }
+        version: { type: integer, minimum: 1 }
+        status: { type: string, enum: [draft, approved, rejected, blocked, sent] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: [string, "null"], format: date-time }
+
+    ExportSentMessage:
+      type: object
+      description: >-
+        Сообщение, которое написал пользователь: его оригинал (одобренный текст, ФТ-08) и статус.
+        Версия, которую агент получателя сделал для получателя (ФТ-09), не выгружается — её
+        автор не видит и в ленте (АР-25 п.3); выгружается только признак `is_adapted`.
+      required: [id, couple_id, reply_to_id, original, is_adapted, harsh_tone_warning, status,
+                 sent_at, delivered_at, read_at, answered_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        couple_id: { type: string, format: uuid }
+        reply_to_id: { type: [string, "null"], format: uuid }
+        original: { $ref: "#/components/schemas/ExportText" }
+        is_adapted: { type: boolean }
+        harsh_tone_warning: { type: boolean }
+        status: { type: string, enum: [processing, withheld, delivered, read, answered] }
+        sent_at: { type: string, format: date-time }
+        delivered_at: { type: [string, "null"], format: date-time }
+        read_at: { type: [string, "null"], format: date-time }
+        answered_at: { type: [string, "null"], format: date-time }
+
+    ExportReceivedMessage:
+      type: object
+      description: >-
+        Сообщение партнёра пользователю, доставленное ему. `text` — версия, показанная
+        получателю (адаптированная, если `is_adapted`, иначе оригинал), как в ленте.
+        `original` — текст, одобренный автором: выгрузка — запрос владельца, оригинал по
+        запросу (ТЗ §2 п.3, ФТ-10); выдача фиксируется как просмотр — `original_viewed_at`
+        в ответе уже учитывает эту выгрузку (ТЗ §7; АР-25 п.2).
+      required: [id, couple_id, reply_to_id, text, is_adapted, harsh_tone_warning, original,
+                 original_viewed_at, status, sent_at, read_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        couple_id: { type: string, format: uuid }
+        reply_to_id: { type: [string, "null"], format: uuid }
+        text: { $ref: "#/components/schemas/ExportText" }
+        is_adapted: { type: boolean, description: "Пометка «адаптировано» (ФТ-09)" }
+        harsh_tone_warning: { type: boolean, description: "ТЗ §6.2 п.6" }
+        original: { $ref: "#/components/schemas/ExportText" }
+        original_viewed_at: { type: string, format: date-time }
+        status: { type: string, enum: [delivered, read, answered] }
+        sent_at: { type: string, format: date-time }
+        read_at: { type: [string, "null"], format: date-time }
+
+    ExportCouple:
+      type: object
+      description: Своё участие в паре; о партнёре — ничего, кроме `profile.partner_name`
+      required: [id, status, role, created_at, activated_at, dissolved_at, joined_at, left_at]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, active, dissolved] }
+        role: { type: string, enum: [initiator, partner], description: "Своя роль в паре" }
+        created_at: { type: string, format: date-time }
+        activated_at: { type: [string, "null"], format: date-time }
+        dissolved_at: { type: [string, "null"], format: date-time }
+        joined_at: { type: string, format: date-time }
+        left_at: { type: [string, "null"], format: date-time }
+
+    ExportSubscription:
+      type: object
+      required: [id, couple_id, plan, status, period_start, period_end, created_at, payments]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        couple_id: { type: string, format: uuid }
+        plan: { type: string }
+        status: { type: string, enum: [trial, active, expired, canceled] }
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        payments:
+          type: array
+          items:
+            type: object
+            required: [id, amount, currency, provider, provider_charge_id, status, created_at]
+            additionalProperties: false
+            properties:
+              id: { type: string, format: uuid }
+              amount: { type: integer, minimum: 1, description: "В минимальных единицах валюты / Stars" }
+              currency: { type: string }
+              provider: { type: string }
+              provider_charge_id: { type: [string, "null"], description: "Идентификатор платежа у провайдера — для обращений о возврате" }
+              status: { type: string, enum: [pending, succeeded, failed, refunded] }
+              created_at: { type: string, format: date-time }
+
+    ExportSafetyEvent:
+      type: object
+      required: [type, created_at]
+      additionalProperties: false
+      properties:
+        type: { type: string, enum: [violence, threat_outgoing, self_harm, life_threat, underage] }
+        created_at: { type: string, format: date-time }

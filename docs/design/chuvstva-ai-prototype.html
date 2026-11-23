@@ -1,0 +1,1649 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Чувства AI — прототип</title>
+    <style>
+/* Прототип 0.6 — стиль по ТЗ §8.
+   Базовые токены совпадают с frontend/src/theme.css (check.mjs сверяет значения).
+   Красный --accent — только главное действие (MainButton) и знаки близости; не для ошибок. */
+
+/* --- Токены из src/theme.css (не менять без изменения исходника) --- */
+:root {
+  --bg: #ffffff;
+  --bg-secondary: #f5f3f1;
+  --text: #111111;
+  --accent: #e11d2e;
+  --radius: 16px;
+}
+:root[data-theme="dark"] { --bg: #000000; --bg-secondary: #1a1a1a; --text: #ffffff; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #000000; --bg-secondary: #1a1a1a; --text: #ffffff; }
+}
+
+/* --- Производные токены прототипа --- */
+:root {
+  --text-muted: #5f5a55;
+  --line: #e6e2de;
+  --own-bg: #111111;
+  --own-text: #ffffff;
+  --agent-bg: var(--bg-secondary);
+  --card-bg: #ffffff;
+  --on-accent: #ffffff;
+  --disabled-bg: #d9d5d1;
+  --disabled-text: #5f5a55;
+  --page-bg: #ece9e6;
+  --shadow: 0 1px 2px rgba(17, 17, 17, 0.06), 0 4px 16px rgba(17, 17, 17, 0.06);
+}
+:root[data-theme="dark"] {
+  --text-muted: #a8a29d;
+  --line: #2c2c2c;
+  --own-bg: #ffffff;
+  --own-text: #111111;
+  --card-bg: #111111;
+  --disabled-bg: #2c2c2c;
+  --disabled-text: #a8a29d;
+  --page-bg: #0d0d0d;
+  --shadow: none;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --text-muted: #a8a29d;
+    --line: #2c2c2c;
+    --own-bg: #ffffff;
+    --own-text: #111111;
+    --card-bg: #111111;
+    --disabled-bg: #2c2c2c;
+    --disabled-text: #a8a29d;
+    --page-bg: #0d0d0d;
+    --shadow: none;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--page-bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.45;
+  overflow-x: hidden;
+}
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+
+/* --- Панель прототипа (вне Mini App) --- */
+.proto-bar {
+  max-width: 430px;
+  margin: 0 auto;
+  padding: 8px 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.proto-bar__label { width: 100%; font-weight: 600; letter-spacing: .02em; }
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.seg button {
+  border: 0;
+  background: transparent;
+  padding: 6px 12px;
+  font-size: 13px;
+  color: var(--text);
+}
+.seg button[aria-pressed="true"] { background: var(--text); color: var(--bg); font-weight: 600; }
+.proto-bar select {
+  flex: 1 1 120px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  font-size: 13px;
+}
+
+/* --- «Телефон» --- */
+.phone {
+  position: relative;
+  max-width: 430px;
+  margin: 0 auto 24px;
+  background: var(--bg);
+  min-height: 720px;
+  height: calc(100vh - 96px);
+  max-height: 880px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 24px;
+  overflow: hidden;
+  box-shadow: var(--shadow);
+}
+@media (max-width: 480px) {
+  .phone { border-radius: 0; margin-bottom: 0; height: calc(100dvh - 76px); min-height: 560px; max-height: none; }
+}
+
+/* Имитация шапки Telegram с BackButton */
+.tg-header {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) 84px;
+  align-items: center;
+  height: 52px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.tg-back, .tg-close {
+  justify-self: start;
+  border: 0;
+  background: transparent;
+  padding: 8px;
+  font-size: 16px;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.tg-back[hidden], .tg-close[hidden] { display: none; }
+/* Значок «✕» — псевдоэлементом: доступное имя кнопки — aria-label «Закрыть» */
+.tg-close::before { content: "✕"; font-size: 18px; line-height: 1; }
+.tg-title { text-align: center; font-weight: 600; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tg-title small { display: block; font-weight: 400; font-size: 12px; color: var(--text-muted); }
+.tg-menu { justify-self: end; color: var(--text-muted); font-size: 20px; padding: 8px; }
+
+.content {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 24px 16px 24px;
+}
+.content--chat { display: flex; flex-direction: column; padding-bottom: 8px; }
+
+/* Имитация MainButton Telegram */
+.tg-main-wrap { flex: 0 0 auto; padding: 8px 16px 16px; background: var(--bg); border-top: 1px solid var(--line); }
+.tg-main-wrap[hidden] { display: none; }
+.tg-main {
+  width: 100%;
+  min-height: 52px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+  font-size: 17px;
+  transition: transform .08s ease;
+}
+.tg-main:disabled { background: var(--disabled-bg); color: var(--disabled-text); cursor: not-allowed; }
+.tg-main__hint { margin: 8px 0 0; text-align: center; font-size: 13px; color: var(--text-muted); }
+
+.haptic { animation: haptic .18s ease; }
+@keyframes haptic { 0%,100% { transform: translateX(0); } 30% { transform: translateX(-2px); } 70% { transform: translateX(2px); } }
+
+/* --- Типографика и блоки --- */
+h1 { font-size: 28px; line-height: 1.15; margin: 0 0 12px; letter-spacing: -.01em; }
+h2 { font-size: 20px; margin: 28px 0 10px; }
+h3 { font-size: 16px; margin: 0 0 4px; }
+p { margin: 0 0 12px; }
+.muted { color: var(--text-muted); }
+.small { font-size: 14px; }
+.tiny { font-size: 12px; }
+.lead { font-size: 18px; }
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 12px;
+}
+.card--soft { background: var(--bg-secondary); border-color: transparent; }
+.card--link { display: block; width: 100%; text-align: left; }
+.card--link:active { transform: scale(.99); }
+.row { display: flex; align-items: center; gap: 12px; }
+.row--between { justify-content: space-between; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.chev { color: var(--text-muted); font-size: 20px; }
+
+.note {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+.note__icon { flex: 0 0 auto; font-weight: 700; }
+.note--stub { border: 1px dashed var(--text-muted); background: transparent; }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg);
+  white-space: nowrap;
+}
+.badge--solid { background: var(--text); color: var(--bg); border-color: var(--text); }
+/* Метка «непрочитанное»: текст цветом --text (контраст), красные — только точка и рамка как знак близости */
+.badge--love { color: var(--text); border-color: var(--accent); }
+
+.heart { width: 14px; height: 14px; fill: var(--accent); vertical-align: -2px; flex: 0 0 auto; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; }
+
+/* Кнопки внутри экранов */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--text);
+  background: transparent;
+  color: var(--text);
+  font-weight: 600;
+  font-size: 15px;
+}
+.btn--block { width: 100%; }
+.btn--fill { background: var(--text); color: var(--bg); }
+.btn--ghost { border-color: var(--line); }
+.btn--text { border: 0; padding-left: 4px; padding-right: 4px; text-decoration: underline; text-underline-offset: 3px; font-weight: 500; }
+.btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.btn-row .btn { flex: 1 1 140px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.chip {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 14px;
+  text-align: left;
+  max-width: 100%;
+}
+
+/* --- Приветствие --- */
+.slide { padding-top: 24px; }
+.slide__art {
+  width: 96px; height: 96px; border-radius: 28px;
+  background: var(--bg-secondary);
+  display: grid; place-items: center;
+  margin-bottom: 28px;
+  font-size: 40px;
+}
+.slide__art svg { width: 44px; height: 44px; }
+.dots { display: flex; gap: 6px; align-items: center; margin-top: 28px; }
+.dots span { width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
+.dots span.on { background: var(--text); width: 24px; border-radius: 4px; }
+
+/* --- Формы --- */
+.field { margin-bottom: 16px; }
+.field label, .field .label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.input, .textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: var(--bg);
+  font-size: 16px;
+}
+.textarea { min-height: 260px; resize: vertical; line-height: 1.5; }
+.check { display: flex; gap: 12px; align-items: flex-start; padding: 10px 0; font-size: 15px; }
+.check input { width: 22px; height: 22px; margin: 1px 0 0; flex: 0 0 auto; accent-color: var(--text); }
+.radio-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.radio-row label { flex: 1 1 120px; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; display: flex; gap: 8px; align-items: center; font-weight: 500; font-size: 15px; margin: 0; }
+.radio-row input { accent-color: var(--text); }
+
+.link-box {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 12px 14px;
+  word-break: break-all;
+  margin-bottom: 12px;
+}
+.status { display: flex; gap: 10px; align-items: center; font-size: 15px; }
+.status__mark { flex: 0 0 auto; width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: var(--bg-secondary); font-size: 14px; }
+
+/* --- Чат --- */
+.chat { flex: 1 1 auto; display: flex; flex-direction: column; gap: 10px; }
+.msg { max-width: 86%; padding: 10px 14px; border-radius: 18px; font-size: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg--own { align-self: flex-end; background: var(--own-bg); color: var(--own-text); border-bottom-right-radius: 6px; }
+.msg--agent { align-self: flex-start; background: var(--agent-bg); color: var(--text); border-bottom-left-radius: 6px; }
+.msg__meta { display: block; font-size: 12px; opacity: .7; margin-top: 4px; }
+.msg--typing { color: var(--text-muted); font-style: italic; }
+.chat-day { align-self: center; font-size: 12px; color: var(--text-muted); }
+.composer {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  padding-top: 8px;
+}
+.composer textarea {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 44px;
+  max-height: 120px;
+  resize: none;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  padding: 10px 16px;
+  background: var(--bg);
+  font-size: 16px;
+  line-height: 1.4;
+}
+.icon-btn {
+  flex: 0 0 auto;
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  display: grid; place-items: center;
+  font-size: 18px;
+}
+.icon-btn--fill { background: var(--text); color: var(--bg); border-color: var(--text); }
+.icon-btn svg { width: 20px; height: 20px; fill: currentColor; }
+.recording { font-size: 14px; color: var(--text-muted); padding: 4px 0; }
+
+/* --- Черновик --- */
+.parts { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; font-size: 14px; margin: 12px 0 4px; }
+.parts dt { font-weight: 600; }
+.parts dd { margin: 0; color: var(--text-muted); }
+
+/* --- Лента пары --- */
+.feed { display: flex; flex-direction: column; gap: 14px; }
+.sent {
+  align-self: flex-end;
+  max-width: 92%;
+  background: var(--own-bg);
+  color: var(--own-text);
+  border-radius: 18px 18px 6px 18px;
+  padding: 12px 14px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.sent__status { display: block; font-size: 12px; margin-top: 6px; opacity: .8; }
+.partner-card {
+  background: var(--card-bg);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px var(--radius) var(--radius) 6px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+.partner-card__head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 13px; color: var(--text-muted); }
+.partner-card__text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 16px; margin-bottom: 10px; }
+.original {
+  border-top: 1px dashed var(--line);
+  margin-top: 8px;
+  padding-top: 10px;
+  font-size: 15px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.original__label { display: block; font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; }
+.empty { text-align: center; padding: 40px 12px; color: var(--text-muted); }
+
+/* --- Память --- */
+.mem-cat { margin-bottom: 20px; }
+.mem-cat h2 { margin-top: 8px; font-size: 15px; text-transform: none; color: var(--text-muted); font-weight: 600; }
+.mem-item { display: flex; gap: 12px; align-items: flex-start; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.mem-item:last-child { border-bottom: 0; }
+.mem-item__meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.mem-del { flex: 0 0 auto; border: 1px solid var(--line); background: transparent; border-radius: 10px; padding: 6px 10px; font-size: 13px; }
+.confirm { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.confirm .btn { min-height: 36px; padding: 6px 12px; font-size: 14px; }
+
+/* --- Профиль --- */
+.list { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; margin-bottom: 16px; }
+.list__row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); width: 100%; background: transparent; border-left: 0; border-right: 0; border-top: 0; text-align: left; font-size: 16px; }
+.list__row:last-child { border-bottom: 0; }
+.switch { display: inline-flex; align-items: center; gap: 8px; border: 0; background: transparent; padding: 0; font-size: 14px; }
+.switch__track { width: 44px; height: 26px; border-radius: 13px; background: var(--disabled-bg); position: relative; transition: background .15s; flex: 0 0 auto; }
+.switch__track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; transition: left .15s; }
+.switch[aria-checked="true"] .switch__track { background: var(--text); }
+.switch[aria-checked="true"] .switch__track::after { left: 21px; background: var(--bg); }
+.switch__text { min-width: 34px; text-align: right; }
+
+/* --- Подписка --- */
+.plan { display: flex; gap: 12px; align-items: center; border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 10px; width: 100%; background: var(--bg); text-align: left; }
+.plan[aria-checked="true"] { border: 2px solid var(--text); padding: 13px 15px; }
+.plan__price { font-weight: 700; white-space: nowrap; }
+
+/* --- Помощь --- */
+.contact { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.contact:last-child { border-bottom: 0; }
+.contact__phone { display: inline-block; font-weight: 700; font-size: 18px; color: var(--text); text-underline-offset: 3px; padding: 4px 0; }
+.contact__phone .small { font-weight: 400; color: var(--text-muted); }
+.chat-bottom { position: sticky; bottom: -8px; margin: 0 -16px -8px; padding: 4px 16px 8px; background: var(--bg); display: flex; flex-direction: column; z-index: 1; }
+.help-link { align-self: center; border: 0; background: transparent; font-size: 13px; color: var(--text-muted); text-decoration: underline; text-underline-offset: 3px; padding: 4px 8px; }
+
+/* --- Тост --- */
+.toast {
+  position: absolute;
+  left: 16px; right: 16px;
+  bottom: 96px;
+  background: var(--text);
+  color: var(--bg);
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 14px;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity .2s, transform .2s;
+  pointer-events: none;
+}
+.toast.show { opacity: 1; transform: none; }
+
+/* Затемнение — только под шапкой: «Назад» Telegram нативная и остаётся доступной */
+.sheet-backdrop { position: absolute; inset: 53px 0 0 0; background: rgba(0,0,0,.4); display: flex; align-items: flex-end; z-index: 5; }
+.sheet { background: var(--bg); width: 100%; border-radius: 20px 20px 0 0; padding: 20px 16px 24px; }
+
+/* Выделение фраз, изменённых агентом получателя (не красным) */
+mark.changed { background: var(--bg-secondary); color: inherit; text-decoration: underline dotted; text-underline-offset: 4px; border-radius: 4px; padding: 0 2px; }
+:root[data-theme="dark"] mark.changed { background: #2c2c2c; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) mark.changed { background: #2c2c2c; } }
+[data-what-changed] { margin: 0 0 10px; }
+[data-what-changed] ul { margin: 4px 0; padding-left: 18px; }
+
+</style>
+  </head>
+  <body>
+    <!-- Панель прототипа: её нет в настоящем Mini App -->
+    <div class="proto-bar" role="toolbar" aria-label="Панель прототипа">
+      <span class="proto-bar__label">Прототип 0.6 · данные выдуманные</span>
+      <div class="seg" role="group" aria-label="Чья сторона">
+        <button type="button" data-persona="anna" aria-pressed="true">Анна</button>
+        <button type="button" data-persona="igor" aria-pressed="false">Игорь</button>
+      </div>
+      <div class="seg" role="group" aria-label="Тема">
+        <button type="button" data-theme-set="auto" aria-pressed="true">Авто</button>
+        <button type="button" data-theme-set="light" aria-pressed="false">Светлая</button>
+        <button type="button" data-theme-set="dark" aria-pressed="false">Тёмная</button>
+      </div>
+      <select id="jump" aria-label="Перейти к экрану">
+        <option value="">Экран…</option>
+        <option value="welcome">Приветствие</option>
+        <option value="onboarding">Онбординг</option>
+        <option value="invite">Приглашение</option>
+        <option value="home">Главный</option>
+        <option value="chat">Чат с агентом</option>
+        <option value="draft">Черновик</option>
+        <option value="messages">Сообщения пары</option>
+        <option value="memory">Память</option>
+        <option value="profile">Профиль и пара</option>
+        <option value="subscription">Подписка</option>
+        <option value="help">Помощь</option>
+      </select>
+    </div>
+
+    <div class="phone" id="phone">
+      <header class="tg-header" id="tg-header">
+        <button type="button" class="tg-back" id="tg-back" aria-label="Назад" hidden>‹ Назад</button>
+        <button type="button" class="tg-close" id="tg-close" aria-label="Закрыть"></button>
+        <div class="tg-title" id="tg-title">Чувства AI</div>
+        <span class="tg-menu" aria-hidden="true">⋯</span>
+      </header>
+      <main class="content" id="content" tabindex="-1"></main>
+      <div class="tg-main-wrap" id="tg-main-wrap" hidden>
+        <button type="button" class="tg-main" id="tg-main"></button>
+        <p class="tg-main__hint" id="tg-main-hint" hidden></p>
+      </div>
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    </div>
+
+    <script>
+/* Прототип 0.6 «Чувства AI»: кликабельные экраны §8 ТЗ на выдуманных данных.
+   Без сборки и внешних зависимостей. Ничего не отправляет в сеть.
+   Главный инвариант (§2 п.2): сообщение партнёру появляется только в sendDraft(),
+   а sendDraft() вызывается только нажатием главной кнопки «Отправить …» на экране «Черновик». */
+(function () {
+  "use strict";
+
+  // ---------- Выдуманные персонажи ----------
+  const NAMES = {
+    anna: { name: "Анна", nom: "Аня", gen: "Ани", dat: "Ане", ins: "Аней", fem: true },
+    igor: { name: "Игорь", nom: "Игорь", gen: "Игоря", dat: "Игорю", ins: "Игорем", fem: false },
+  };
+  const other = (p) => (p === "anna" ? "igor" : "anna");
+
+  const TITLES = {
+    welcome: "Чувства AI",
+    onboarding: "Знакомство",
+    invite: "Приглашение",
+    home: "Чувства AI",
+    chat: "Твой агент",
+    draft: "Черновик",
+    messages: "Сообщения пары",
+    memory: "Что агент помнит",
+    profile: "Профиль и пара",
+    subscription: "Подписка",
+    help: "Помощь",
+  };
+
+  const MEMORY_CATS = [
+    ["fact", "Факты"],
+    ["date", "Важные даты"],
+    ["pref", "Предпочтения"],
+    ["sensitive", "Чувствительные темы"],
+    ["observation", "Наблюдения агента"],
+    ["partner", "Из сообщений партнёра"],
+  ];
+
+  const INITIAL_MEMORY = {
+    anna: [
+      { cat: "fact", text: "Работает дизайнером, по вторникам часто задерживается", src: "твои слова · 2 ноября" },
+      { cat: "fact", text: "Живёт с Игорем третий год", src: "твои слова · 2 ноября" },
+      { cat: "date", text: "Годовщина знакомства — 14 июня", src: "твои слова · 5 ноября" },
+      { cat: "pref", text: "Не любит, когда планы меняются в последний момент", src: "твои слова · 12 ноября" },
+      { cat: "sensitive", text: "Тяжело переживает ощущение, что она не на первом месте", src: "твои слова · 12 ноября" },
+      { cat: "observation", text: "Чаще пишет поздно вечером", src: "вывод агента · уверенность средняя" },
+    ],
+    igor: [
+      { cat: "fact", text: "Работает посменно, в конце месяца — авралы", src: "твои слова · 4 ноября" },
+      { cat: "date", text: "День рождения Ани — 3 марта", src: "твои слова · 4 ноября" },
+      { cat: "pref", text: "Не любит, когда решают за него", src: "твои слова · 9 ноября" },
+      { cat: "sensitive", text: "Болезненно реагирует на тему денег", src: "твои слова · 9 ноября" },
+      { cat: "observation", text: "После ночных смен отвечает коротко", src: "вывод агента · уверенность низкая" },
+    ],
+  };
+
+  // Черновики по схеме «чувство — ситуация — потребность — просьба» (§4.3, §6.2).
+  // recap — как агент ПОЛУЧАТЕЛЯ пересказывает этот текст: только слова из самого текста (§6.2, §9.2 п.2).
+  // memory — запись в памяти получателя из одобренного текста (§6.3): без домыслов, с верным родом автора.
+  // Варианты Игоря строятся только из того, что Аня отправила, — без её личного чата и памяти (§2 п.4, §6.3).
+  const DRAFTS = {
+    anna: {
+      main: [
+        {
+          text:
+            "Игорь, мне грустно, когда наши планы отменяются в последний момент — в этом месяце так было уже три раза. " +
+            "Мне важно проводить с тобой время и чувствовать, что оно важно и тебе. " +
+            "Давай договоримся: если что-то меняется, ты предупреждаешь заранее. И выберем вечер на этой неделе, который точно будет нашим?",
+          parts: [
+            ["Чувство", "мне грустно"],
+            ["Ситуация", "планы отменяются в последний момент, три раза за месяц"],
+            ["Потребность", "проводить время вместе и чувствовать, что оно важно обоим"],
+            ["Просьба", "предупреждать заранее и выбрать вечер на этой неделе"],
+          ],
+          recap:
+            "Она пишет, что ей грустно, когда ваши планы отменяются в последний момент, — в этом месяце так было три раза. " +
+            "Ей важно проводить с тобой время. Она просит предупреждать заранее, если что-то меняется, и выбрать вечер на этой неделе.",
+          memory: "Аня просит предупреждать заранее, если планы меняются, и выбрать вечер на этой неделе",
+        },
+        {
+          text:
+            "Игорь, сегодня мне стало одиноко, когда наш вечер снова сорвался. " +
+            "Я скучаю по нашему времени вдвоём. " +
+            "Можешь предупреждать об изменениях заранее? И давай вместе выберем вечер на выходных.",
+          parts: [
+            ["Чувство", "мне одиноко"],
+            ["Ситуация", "вечер снова сорвался"],
+            ["Потребность", "время вдвоём"],
+            ["Просьба", "предупреждать заранее, выбрать вечер на выходных"],
+          ],
+          recap:
+            "Она пишет, что ей стало одиноко, когда ваш вечер снова сорвался, и что она скучает по вашему времени вдвоём. " +
+            "Она просит предупреждать об изменениях заранее и вместе выбрать вечер на выходных.",
+          memory: "Аня просит предупреждать об изменениях заранее и выбрать вечер на выходных",
+        },
+      ],
+    },
+    igor: {
+      // Ответ на известный вариант Ани: оба её варианта — об отменённых вечерах и просьбе предупреждать заранее
+      reply: [
+        {
+          text:
+            "Аня, мне жаль, что наши вечера срывались. " +
+            "Наше время мне тоже важно — я не думал, что это происходит так часто. " +
+            "Давай в субботу поужинаем вдвоём, а если что-то поменяется, я скажу заранее.",
+          parts: [
+            ["Чувство", "мне жаль"],
+            ["Ситуация", "вечера срывались"],
+            ["Потребность", "наше время важно и мне"],
+            ["Просьба", "ужин вдвоём в субботу"],
+          ],
+          recap:
+            "Он пишет, что ему жаль, что ваши вечера срывались, и что ваше время ему тоже важно. " +
+            "Он предлагает поужинать вдвоём в субботу и обещает сказать заранее, если что-то поменяется.",
+          memory: "Игорь обещал сказать заранее, если планы поменяются, и предложил поужинать вдвоём в субботу",
+        },
+        {
+          text:
+            "Аня, я прочитал твоё сообщение, и мне стало не по себе. Мне тоже важно наше время вдвоём. " +
+            "Можем сегодня вечером спокойно поговорить об этом?",
+          parts: [
+            ["Чувство", "мне не по себе"],
+            ["Ситуация", "твоё сообщение"],
+            ["Потребность", "наше время вдвоём"],
+            ["Просьба", "поговорить сегодня вечером"],
+          ],
+          recap: "Он пишет, что ему стало не по себе от твоего сообщения и что ваше время вдвоём ему тоже важно. Он предлагает спокойно поговорить сегодня вечером.",
+          memory: "Игорь предложил спокойно поговорить сегодня вечером",
+        },
+      ],
+      // Входящего нет или текст Ани неизвестен — ничего ей не приписываем
+      neutral: [
+        {
+          text: "Аня, мне важно спокойно поговорить с тобой, без спешки. Давай сегодня вечером?",
+          parts: [
+            ["Чувство", "мне важно"],
+            ["Ситуация", "хочется поговорить без спешки"],
+            ["Потребность", "спокойный разговор"],
+            ["Просьба", "поговорить сегодня вечером"],
+          ],
+          recap: "Он пишет, что ему важно спокойно поговорить с тобой, без спешки, и предлагает сегодня вечером.",
+          memory: "Игорь предложил спокойно поговорить сегодня вечером",
+        },
+        {
+          text: "Аня, я хочу лучше понимать, что для тебя важно. Расскажешь, когда будет удобно?",
+          parts: [
+            ["Чувство", "хочу понимать тебя"],
+            ["Ситуация", "наш разговор"],
+            ["Потребность", "понимать, что для тебя важно"],
+            ["Просьба", "рассказать, когда будет удобно"],
+          ],
+          recap: "Он пишет, что хочет лучше понимать, что для тебя важно, и просит рассказать, когда тебе будет удобно.",
+          memory: "Игорь попросил рассказать, что для Ани важно, когда ей будет удобно",
+        },
+      ],
+    },
+  };
+  const EXAMPLE_EDIT = "Ты вечно всё отменяешь в последний момент.";
+
+  // Смягчение — только заранее заданные фразы целиком (это прототип, не модель; §2 п.3, §6.2 п.5).
+  // Остальной текст передаётся как есть: факты, просьбы и чувства не трогаются; замены без родовых окончаний.
+  const SOFTEN = [
+    {
+      from: "Ты вечно всё отменяешь в последний момент",
+      to: "Мне кажется, отмены в последний момент стали повторяться слишком часто",
+      word: "вечно",
+      why: "обобщение заменено наблюдением автора; факт — отмены в последний момент — сохранён",
+      recap: (a) => "Ещё " + (a.fem ? "она пишет, что, как ей кажется," : "он пишет, что, как ему кажется,") + " отмены в последний момент стали повторяться слишком часто.",
+    },
+    {
+      from: "Ты опять меня не слышишь",
+      to: "Мне кажется, сейчас ты меня не слышишь",
+      word: "опять",
+      why: "упрёк заменён тем, как это ощущает автор; суть — «ты меня не слышишь» — сохранена",
+      recap: (a) => "Ещё " + (a.fem ? "она пишет, что, как ей кажется, сейчас ты её не слышишь." : "он пишет, что, как ему кажется, сейчас ты его не слышишь."),
+    },
+  ];
+
+  // Тексты агента: сначала отражает чувство, потом уточняет, потом предлагает (§2, §4.2)
+  const SCRIPT = {
+    anna: {
+      greeting: "Привет, Аня. Я здесь, чтобы выслушать. Что у тебя на душе?",
+      suggest: [
+        "Ему вообще плевать на меня",
+        "Он третий раз за месяц отменяет наш вечер. Сегодня написал за час до встречи.",
+      ],
+      replies: [
+        "Звучит так, будто тебе сейчас очень обидно — как будто тебя не замечают. Это тяжёлое чувство, и хорошо, что ты о нём говоришь.\n\nРасскажешь, что случилось? Что задело сильнее всего?",
+        "Понимаю. Ты ждала этот вечер, а он снова сорвался — и уже не в первый раз.\n\nФакт — три отмены за месяц. А «плевать» — это то, как это ощущается изнутри, и это ощущение важно. Похоже, за обидой стоит желание чувствовать, что ваше время ценно и для него. Так?\n\nЧто тебе сейчас ближе: просто выговориться, получить совет или подготовить сообщение Игорю?",
+      ],
+      options: true,
+    },
+    igor: {
+      greeting: "Привет, Игорь. Как ты? Можно рассказать что угодно — это видишь только ты.",
+      suggest: ["Я не думал, что для неё это так важно. Мне правда важно время с ней."],
+      replies: [
+        "Похоже, ты не ожидал, что для неё это так важно, и тебе сейчас немного не по себе. Это понятно — и то, что тебе важно ваше время, хорошо слышно.\n\nМожно ответить коротко, а самое важное обсудить вживую — например, за ужином. Подготовить ответ Ане?",
+      ],
+      options: false,
+    },
+  };
+  const GENERIC_REPLY = "Слышу тебя. Расскажи ещё, если хочется, — я не тороплю.";
+
+  // ---------- Состояние ----------
+  function freshUser(id) {
+    const n = NAMES[id];
+    const p = NAMES[other(id)];
+    return {
+      stack: id === "anna" ? ["welcome"] : ["invite"],
+      slide: 0,
+      onboarded: false,
+      form: { name: n.name, call: n.nom, partner: p.name, rules: false, data: false, sensitive: false, age: false },
+      chat: [{ from: "agent", text: SCRIPT[id].greeting }],
+      stage: 0,
+      input: "",
+      inputVoice: false,
+      typing: false,
+      recording: false,
+      draft: null,
+      memory: INITIAL_MEMORY[id].map((m, i) => Object.assign({ id: id + "-m" + i }, m)),
+      pendingDelete: null,
+      notify: { messages: true, billing: true },
+      inviteSent: false,
+      showOriginal: {},
+      replyContext: false,
+      plan: "month",
+      sheet: null,
+    };
+  }
+
+  const S = {
+    persona: "anna",
+    theme: "auto",
+    pairActive: false,
+    messages: [],
+    subscription: { status: "trial", paidBy: null },
+    users: { anna: freshUser("anna"), igor: freshUser("igor") },
+  };
+  let memSeq = 0;
+
+  const me = () => S.users[S.persona];
+  const N = () => NAMES[S.persona];
+  const P = () => NAMES[other(S.persona)];
+  const current = () => me().stack[me().stack.length - 1];
+
+  // ---------- Утилиты ----------
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  }
+  const HEART = '<svg class="heart" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-10-9.3C.4 8.4 2.3 4 6.4 4c2.3 0 3.8 1.3 5.6 3.3C13.8 5.3 15.3 4 17.6 4c4.1 0 6 4.4 4.4 7.7C19.5 16.4 12 21 12 21z"/></svg>';
+  const MIC = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-2.1A7 7 0 0 0 19 12h-2z"/></svg>';
+  const SEND = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20.5 21 12 3 3.5 3 10l12 2-12 2z"/></svg>';
+
+  function haptic(el) {
+    try { if (navigator.vibrate) navigator.vibrate(10); } catch (e) { /* нет вибрации */ }
+    if (!el) return;
+    el.classList.remove("haptic");
+    void el.offsetWidth;
+    el.classList.add("haptic");
+  }
+
+  let toastTimer = null;
+  function toast(text) {
+    const t = document.getElementById("toast");
+    t.textContent = text;
+    t.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
+  }
+
+  // Имитация адаптации агентом получателя (§4.4, §6.2): меняются только фразы из SOFTEN.
+  // segs — куски текста; у изменённых есть from (как было), чтобы подсветить разницу.
+  function adaptText(text) {
+    const segs = [];
+    const changes = [];
+    let i = 0;
+    for (;;) {
+      let best = null;
+      for (const r of SOFTEN) {
+        const k = text.indexOf(r.from, i);
+        if (k !== -1 && (!best || k < best.k)) best = { k, r };
+      }
+      if (!best) { if (i < text.length) segs.push({ t: text.slice(i) }); break; }
+      if (best.k > i) segs.push({ t: text.slice(i, best.k) });
+      segs.push({ t: best.r.to, from: best.r.from });
+      changes.push(best.r);
+      i = best.k + best.r.from.length;
+    }
+    return { text: segs.map((x) => x.t).join(""), adapted: changes.length > 0, segs, changes };
+  }
+  const softenable = (text) => SOFTEN.filter((r) => text.indexOf(r.from) !== -1);
+
+  // Какой заготовленный вариант отправлен. Только точное совпадение (N-1): допускаются лишь дописанные
+  // фразы из SOFTEN — их смысл агент получателя знает и пересказывает отдельно. Любая другая правка —
+  // и агент получателя уже не пересказывает заготовку, а предлагает прочитать сообщение.
+  const norm = (t) => t.replace(/\s+/g, " ").trim();
+  function findVariant(author, original) {
+    let core = original;
+    for (const r of SOFTEN) core = core.split(r.from + ".").join(" ").split(r.from).join(" ");
+    core = norm(core);
+    const sets = DRAFTS[author];
+    for (const name of Object.keys(sets)) {
+      const idx = sets[name].findIndex((v) => norm(v.text) === core);
+      if (idx !== -1) return { set: name, idx };
+    }
+    return null;
+  }
+  const variantOf = (author, ref) => (ref ? DRAFTS[author][ref.set][ref.idx] : null);
+
+  function draftSetFor(persona) {
+    if (persona === "anna") return "main";
+    const last = S.messages.filter((m) => m.to === "igor").slice(-1)[0];
+    return last && last.variant ? "reply" : "neutral";
+  }
+
+  // Запись в памяти получателя — только из одобренного текста (§6.3, ФТ-14)
+  // Для неизвестного текста — дословная цитата отправленного, без пересказа
+  function partnerMemoryFrom(author, ref, original) {
+    const v = variantOf(author, ref);
+    if (v) return v.memory;
+    const a = NAMES[author];
+    return a.nom + (a.fem ? " написала" : " написал") + " (дословно): «" + original + "»";
+  }
+
+  // Пересказ входящего агентом получателя — только из того, что автор отправил (§6.2, §9.2 п.2)
+  function recapFor(m, viewer) {
+    const a = NAMES[m.from];
+    const v = variantOf(m.from, m.variant);
+    const head = a.nom + (a.fem ? " прислала" : " прислал") + " тебе сообщение.";
+    const ask = viewer === "igor"
+      ? "Как ты это воспринял? Что первым пришло в голову?"
+      : "Как тебе этот ответ? Что хочется сказать — или, может, лучше обсудить это вживую?";
+    if (!v) {
+      return head + " Пересказывать его своими словами не буду — лучше прочитай " + (a.fem ? "её" : "его") +
+        " слова. Если хочешь, вместе разберёмся, что для " + (a.fem ? "неё" : "него") + " важно и что ответить.\n\n" + ask;
+    }
+    const extra = (m.changes || []).map((r) => " " + r.recap(a)).join("");
+    return head + " " + v.recap + extra + "\n\n" + ask;
+  }
+
+  // ---------- Навигация ----------
+  function go(screen) {
+    const u = me();
+    if (current() !== screen) u.stack.push(screen);
+    u.sheet = null;
+    render(true);
+  }
+  function resetTo(screen) {
+    me().stack = [screen];
+    me().sheet = null;
+    render(true);
+  }
+  function back() {
+    const u = me();
+    if (current() === "welcome" && u.slide > 0) { u.slide -= 1; render(true); return; }
+    if (u.sheet) { u.sheet = null; render(); return; }
+    if (u.stack.length > 1) { u.stack.pop(); render(true); }
+  }
+  function canGoBack() {
+    const u = me();
+    return u.stack.length > 1 || (current() === "welcome" && u.slide > 0);
+  }
+
+  // ---------- Действия ----------
+  function sendToAgent(textArg) {
+    const u = me();
+    const text = (textArg != null ? textArg : u.input).trim();
+    if (!text || u.typing) return;
+    u.chat.push({ from: "own", text, voice: textArg == null && u.inputVoice });
+    u.input = "";
+    u.inputVoice = false;
+    u.typing = true;
+    const persona = S.persona;
+    render();
+    setTimeout(() => {
+      const uu = S.users[persona];
+      const sc = SCRIPT[persona];
+      let reply;
+      if (persona === "igor" && !uu.replyContext) reply = GENERIC_REPLY;
+      else reply = sc.replies[uu.stage] || GENERIC_REPLY;
+      uu.stage += 1;
+      uu.typing = false;
+      uu.chat.push({ from: "agent", text: reply, options: sc.options && uu.stage === sc.replies.length });
+      if (S.persona === persona) render();
+    }, 650);
+  }
+
+  function chooseOption(kind) {
+    const u = me();
+    const map = {
+      vent: ["Просто выговориться", "Хорошо, я просто побуду рядом и послушаю. Пиши как есть, не подбирая слов — здесь это видишь только ты."],
+      advice: ["Получить совет", "Можно начать не с упрёка, а с чувства: не «ты опять», а «мне грустно, когда…». И выбрать спокойный момент, а не сразу после отмены.\n\nЕсли захочешь, вместе подготовим сообщение — отправишь его, только когда сама решишь."],
+    };
+    if (kind === "draft") { openDraft(); return; }
+    const [q, a] = map[kind];
+    u.chat.push({ from: "own", text: q });
+    u.chat.push({ from: "agent", text: a });
+    render();
+  }
+
+  function ensureDraft() {
+    const u = me();
+    if (!u.draft) {
+      const set = draftSetFor(S.persona);
+      u.draft = { set, idx: 0, text: DRAFTS[S.persona][set][0].text, edited: false, confirmVariant: false };
+    }
+    return u.draft;
+  }
+  const draftVariants = () => DRAFTS[S.persona][me().draft.set];
+
+  function nextVariant() {
+    const u = me();
+    const list = draftVariants();
+    const idx = (u.draft.idx + 1) % list.length;
+    u.draft = { set: u.draft.set, idx, text: list[idx].text, edited: false, confirmVariant: false };
+    toast("Агент предложил другой вариант");
+    render();
+  }
+
+  function openDraft() {
+    ensureDraft();
+    go("draft");
+  }
+
+  function sendDraft() {
+    const u = me();
+    if (!S.pairActive || !u.draft) return;
+    const original = u.draft.text.trim();
+    if (!original) return;
+    const to = other(S.persona);
+    const ad = adaptText(original);
+    const variant = findVariant(S.persona, original);
+    // Ответ на последнее входящее отмечаем «отвечено»
+    S.messages.forEach((m) => { if (m.to === S.persona && m.from === to) m.status = "replied"; });
+    S.messages.push({
+      id: "msg" + (S.messages.length + 1),
+      from: S.persona,
+      to,
+      original,
+      delivered: ad.text,
+      adapted: ad.adapted,
+      segs: ad.segs,
+      changes: ad.changes,
+      variant,
+      status: "delivered",
+      time: S.messages.length ? "20:15" : "19:42",
+      originalViewed: false,
+    });
+    S.users[to].memory.push({
+      id: "pm" + ++memSeq,
+      cat: "partner",
+      text: partnerMemoryFrom(S.persona, variant, original),
+      src: "одобренное сообщение " + NAMES[S.persona].gen + " · сегодня",
+    });
+    u.draft = null;
+    u.chat.push({
+      from: "agent",
+      text:
+        "Сообщение у " + P().gen + ". Ты " + (N().fem ? "сказала" : "сказал") + " о важном — это непросто.\n\n" +
+        "Когда " + P().nom + " ответит, я помогу разобраться. А если захочется поговорить вживую — помогу подготовиться.",
+    });
+    u.stack = u.stack.filter((s) => s !== "draft");
+    toast("Отправлено. " + P().nom + " получит уведомление без текста сообщения.");
+    go("messages");
+  }
+
+  function replyWithAgent() {
+    const u = me();
+    if (!u.replyContext) {
+      u.replyContext = true;
+      if (S.persona === "igor") u.stage = 0;
+      else u.stage = SCRIPT.anna.replies.length + 1;
+      const incoming = S.messages.filter((m) => m.to === S.persona).slice(-1)[0];
+      if (incoming) u.chat.push({ from: "agent", text: recapFor(incoming, S.persona) });
+    }
+    go("chat");
+  }
+
+  function finishOnboarding() {
+    const u = me();
+    u.onboarded = true;
+    if (S.persona === "anna") {
+      resetTo("invite");
+    } else {
+      S.pairActive = true;
+      toast("Пара создана. Вы с Аней на связи");
+      resetTo("home");
+    }
+  }
+
+  function onboardingValid() {
+    const f = me().form;
+    return !!(f.name.trim() && f.call.trim() && f.partner.trim() && f.rules && f.data && f.sensitive && f.age);
+  }
+
+  // ---------- Экраны ----------
+  const screens = {
+    welcome() {
+      const u = me();
+      const slides = [
+        {
+          art: HEART.replace('class="heart"', 'class="heart" style="width:44px;height:44px"'),
+          h: "Твой личный агент",
+          p: "Он выслушает без осуждения и поможет сказать партнёру о том, что беспокоит, — на языке чувств, а не упрёков.",
+        },
+        {
+          art: "🔒",
+          h: "Что приватно",
+          p: "Разговор с агентом видишь только ты. Партнёр и его агент получат только те сообщения, которые ты отправишь кнопкой «Отправить».",
+        },
+        {
+          art: "🤝",
+          h: "Чем мы не являемся",
+          p: "«Чувства AI» не заменяет психолога и не оказывает психологических и медицинских услуг. Если тебе или кому-то рядом угрожает опасность — в разделе «Помощь» есть контакты служб поддержки.",
+        },
+      ];
+      const s = slides[u.slide];
+      return {
+        html:
+          '<section class="slide" data-screen="welcome" data-slide="' + (u.slide + 1) + '">' +
+          '<div class="slide__art" aria-hidden="true">' + s.art + "</div>" +
+          "<h1>" + esc(s.h) + "</h1>" +
+          '<p class="lead">' + esc(s.p) + "</p>" +
+          '<div class="dots" aria-hidden="true">' + slides.map((_, i) => '<span class="' + (i === u.slide ? "on" : "") + '"></span>').join("") + "</div>" +
+          '<p class="small muted" style="margin-top:8px">Слайд ' + (u.slide + 1) + " из 3</p>" +
+          "</section>",
+        main: {
+          text: u.slide < 2 ? "Далее" : "Начать",
+          action: () => { if (u.slide < 2) { u.slide += 1; render(true); } else go("onboarding"); },
+        },
+      };
+    },
+
+    onboarding() {
+      const f = me().form;
+      const n = N();
+      const chk = (key, label) =>
+        '<label class="check"><input type="checkbox" data-model="form.' + key + '"' + (f[key] ? " checked" : "") + "><span>" + label + "</span></label>";
+      return {
+        html:
+          '<section data-screen="onboarding">' +
+          "<h1>Давай познакомимся</h1>" +
+          '<p class="muted">Это нужно агенту, чтобы говорить с тобой по-человечески. Номер телефона не нужен.</p>' +
+          '<div class="field"><label for="f-name">Твоё имя</label><input class="input" id="f-name" data-model="form.name" value="' + esc(f.name) + '" autocomplete="off"></div>' +
+          '<div class="field"><label for="f-call">Как к тебе обращаться</label><input class="input" id="f-call" data-model="form.call" value="' + esc(f.call) + '" autocomplete="off"></div>' +
+          '<div class="field"><label for="f-partner">Имя партнёра</label><input class="input" id="f-partner" data-model="form.partner" value="' + esc(f.partner) + '" autocomplete="off"' + (S.persona === "igor" ? " readonly" : "") + "></div>" +
+          '<div class="field"><span class="label">Согласия</span>' +
+          chk("rules", 'Принимаю <u>правила сервиса</u>') +
+          chk("data", "Даю согласие на обработку персональных данных") +
+          chk("sensitive", "Даю отдельное согласие на обработку сведений о чувствах и отношениях") +
+          chk("age", "Мне исполнилось 18 лет") +
+          "</div>" +
+          '<div class="note"><span class="note__icon">i</span><span>Сервис не оказывает психологических и медицинских услуг. Тексты документов готовит юрист — здесь заглушки.</span></div>' +
+          (S.persona === "igor" ? '<p class="small muted">' + esc(n.nom) + ", после этого шага пара с Аней будет создана.</p>" : "") +
+          "</section>",
+        main: {
+          text: "Продолжить",
+          disabled: !onboardingValid(),
+          hint: onboardingValid() ? "" : "Чтобы продолжить, заполни поля и отметь все четыре пункта",
+          action: finishOnboarding,
+        },
+      };
+    },
+
+    invite() {
+      const u = me();
+      if (S.persona === "anna") {
+        let status;
+        if (S.pairActive) status = '<div class="status" data-status="active"><span class="status__mark">' + HEART + '</span><span><b>Игорь принял приглашение.</b> Вы пара.</span></div>';
+        else if (u.inviteSent) status = '<div class="status" data-status="waiting"><span class="status__mark">…</span><span><b>Ждём Игоря.</b> Ссылка отправлена, он ещё не принял приглашение.</span></div>';
+        else status = '<div class="status" data-status="ready"><span class="status__mark">○</span><span><b>Ссылка готова.</b> Ещё не отправлена.</span></div>';
+        return {
+          html:
+            '<section data-screen="invite">' +
+            "<h1>Пригласи Игоря</h1>" +
+            '<p class="muted">У Игоря будет свой агент. Ваши личные разговоры с агентами друг другу не видны.</p>' +
+            '<div class="link-box" aria-label="Ссылка-приглашение">t.me/chuvstva_ai_bot?start=inv_7Kq2xP</div>' +
+            '<p class="small muted">Ссылка одноразовая и действует 7 дней — до 28 ноября.</p>' +
+            '<div class="card card--soft">' + status + "</div>" +
+            '<p class="small">Пока Игорь не принял приглашение, можно говорить со своим агентом. Отправлять сообщения партнёру можно будет после того, как пара создана.</p>' +
+            '<button type="button" class="btn btn--block btn--ghost" data-action="to-home">' + (S.pairActive ? "На главный" : "Пока поговорить с агентом") + "</button>" +
+            "</section>",
+          main: S.pairActive
+            ? { text: "На главный", action: () => resetTo("home") }
+            : {
+                text: u.inviteSent ? "Отправить ещё раз в Telegram" : "Отправить в Telegram",
+                action: () => { u.inviteSent = true; toast("Открылся выбор чата Telegram (имитация). Ссылка отправлена"); render(); },
+              },
+        };
+      }
+      // Сторона Игоря: входящее приглашение
+      const annaReady = S.users.anna.onboarded;
+      if (S.pairActive) {
+        return {
+          html: '<section data-screen="invite"><h1>Вы пара</h1><div class="card card--soft"><div class="status" data-status="active"><span class="status__mark">' + HEART + "</span><span>Приглашение Ани принято.</span></div></div></section>",
+          main: { text: "На главный", action: () => resetTo("home") },
+        };
+      }
+      return {
+        html:
+          '<section data-screen="invite">' +
+          (annaReady
+            ? "<h1>Аня приглашает тебя</h1>" +
+              '<p class="lead">Аня пользуется «Чувствами AI» и хочет, чтобы вам было проще говорить о важном.</p>' +
+              '<div class="card card--soft"><p><b>Как это устроено</b></p><p class="small">У тебя будет свой агент. Он не видит разговоров Ани, а она — твоих. Между вами передаются только сообщения, которые каждый сам нажал «Отправить».</p></div>' +
+              '<p class="small muted">Приглашение действует до 28 ноября.</p>'
+            : "<h1>Приглашения пока нет</h1>" +
+              '<div class="card card--soft"><div class="status" data-status="none"><span class="status__mark">○</span><span>Аня ещё не прошла знакомство и не отправила ссылку. В прототипе переключись на «Анна» вверху.</span></div></div>') +
+          "</section>",
+        main: annaReady ? { text: "Принять приглашение", action: () => go("onboarding") } : null,
+      };
+    },
+
+    home() {
+      const u = me();
+      const p = P();
+      const incoming = S.messages.filter((m) => m.to === S.persona);
+      const unread = incoming.filter((m) => m.status === "delivered").length;
+      const pairCard = S.pairActive
+        ? '<div class="card card--soft" data-pair="active"><div class="row">' + HEART + '<div class="grow"><b>Вы в паре с ' + esc(p.ins) + "</b>" +
+          '<div class="small muted">Подписка: ' + (S.subscription.status === "paid" ? "активна" : "пробный период, 7 дней") + "</div></div></div></div>"
+        : '<button type="button" class="card card--soft card--link" data-action="go" data-to="invite" data-pair="pending"><div class="row"><span class="status__mark">…</span>' +
+          '<div class="grow"><b>Ждём, когда ' + esc(p.nom) + " примет приглашение</b>" +
+          '<div class="small muted">Пока можно говорить с агентом. Отправка сообщений откроется после создания пары.</div></div><span class="chev">›</span></div></button>';
+      const bot = unread && u.notify.messages
+        ? '<div class="note" data-bot-notice><span class="note__icon">✉</span><span><b>Из бота:</b> «' + esc(p.nom) + (p.fem ? " отправила" : " отправил") + " тебе сообщение. Открой приложение, чтобы прочитать». <span class=\"muted\">Текста в уведомлении нет.</span></span></div>"
+        : "";
+      const unreadBadge = unread
+        ? '<span class="badge badge--love" data-unread="' + unread + '"><span class="dot"></span> ' + unread + " " + (unread === 1 ? "непрочитанное" : "непрочитанных") + "</span>"
+        : '<span class="badge">нет новых</span>';
+      return {
+        html:
+          '<section data-screen="home">' +
+          "<h1>Привет, " + esc(u.form.call || N().nom) + "</h1>" +
+          pairCard + bot +
+          '<button type="button" class="card card--link" data-action="go" data-to="chat"><div class="row"><div class="grow"><h3>Поговорить с агентом</h3>' +
+          '<div class="small muted">Выговориться, разобраться в чувствах, подготовить сообщение. Это видишь только ты.</div></div><span class="chev">›</span></div></button>' +
+          '<button type="button" class="card card--link" data-action="go" data-to="messages"><div class="row"><div class="grow"><h3>Сообщения с ' + esc(p.ins) + "</h3>" +
+          '<div style="margin-top:6px">' + unreadBadge + '</div></div><span class="chev">›</span></div></button>' +
+          '<div class="list" style="margin-top:20px">' +
+          '<button type="button" class="list__row" data-action="go" data-to="memory"><span>Что агент помнит</span><span class="chev">›</span></button>' +
+          '<button type="button" class="list__row" data-action="go" data-to="profile"><span>Профиль и пара</span><span class="chev">›</span></button>' +
+          '<button type="button" class="list__row" data-action="go" data-to="subscription"><span>Подписка</span><span class="small muted">' + (S.subscription.status === "paid" ? "активна" : S.pairActive ? "пробный период" : "начнётся с пары") + "</span></button>" +
+          '<button type="button" class="list__row" data-action="go" data-to="help"><span>Помощь</span><span class="chev">›</span></button>' +
+          "</div></section>",
+        main: { text: "Поговорить с агентом", action: () => go("chat") },
+      };
+    },
+
+    chat() {
+      const u = me();
+      const sc = SCRIPT[S.persona];
+      const p = P();
+      let suggest = [];
+      if (S.persona === "anna" && u.stage < sc.suggest.length) suggest = [sc.suggest[u.stage]];
+      if (S.persona === "igor" && u.replyContext && u.stage < sc.suggest.length) suggest = [sc.suggest[u.stage]];
+      const last = u.chat[u.chat.length - 1];
+      const msgs = u.chat
+        .map((m) =>
+          '<div class="msg msg--' + (m.from === "own" ? "own" : "agent") + '" data-from="' + m.from + '">' + esc(m.text) +
+          (m.voice ? '<span class="msg__meta">голосовое · расшифровано</span>' : "") + "</div>")
+        .join("");
+      const options =
+        last && last.options && !u.typing
+          ? '<div class="chips" data-options>' +
+            '<button type="button" class="chip" data-action="opt" data-kind="vent">Просто выговориться</button>' +
+            '<button type="button" class="chip" data-action="opt" data-kind="advice">Получить совет</button>' +
+            '<button type="button" class="chip" data-action="opt" data-kind="draft">Подготовить сообщение</button></div>'
+          : "";
+      const hasOwn = u.chat.some((m) => m.from === "own");
+      return {
+        chat: true,
+        html:
+          '<section class="chat" data-screen="chat" aria-live="polite">' +
+          '<div class="chat-day">Сегодня · этот разговор видишь только ты</div>' +
+          msgs +
+          (u.typing ? '<div class="msg msg--agent msg--typing" data-typing>Агент печатает…</div>' : "") + options +
+          "</section>" +
+          // Низ чата закреплён: вход в «Помощь» виден всегда, при любой длине ленты (§9.3, N-3)
+          '<div class="chat-bottom">' +
+          '<button type="button" class="help-link" data-action="go" data-to="help">Если тебе сейчас опасно или очень тяжело — Помощь</button>' +
+          (suggest.length && !u.typing
+            ? '<div class="chips" data-suggest><span class="tiny muted" style="width:100%">Подсказка прототипа — нажми, чтобы вставить:</span>' +
+              suggest.map((s) => '<button type="button" class="chip" data-action="suggest" data-text="' + esc(s) + '">' + esc(s) + "</button>").join("") + "</div>"
+            : "") +
+          (u.recording ? '<div class="recording" data-recording>● Идёт запись (имитация). Нажми на микрофон ещё раз, чтобы закончить.</div>' : "") +
+          '<div class="composer">' +
+          '<button type="button" class="icon-btn" data-action="mic" aria-label="' + (u.recording ? "Закончить запись" : "Записать голосовое") + '" aria-pressed="' + u.recording + '">' + MIC + "</button>" +
+          '<textarea id="chat-input" rows="1" data-model="input" placeholder="Что тебя беспокоит?" aria-label="Сообщение агенту">' + esc(u.input) + "</textarea>" +
+          '<button type="button" class="icon-btn icon-btn--fill" data-action="send-agent" aria-label="Отправить агенту">' + SEND + "</button>" +
+          "</div></div>",
+        main: hasOwn || u.replyContext ? { text: S.persona === "anna" ? "Подготовить сообщение " + p.dat : "Подготовить ответ " + p.dat, action: openDraft } : null,
+      };
+    },
+
+    draft() {
+      const u = me();
+      const p = P();
+      const d = ensureDraft();
+      const v = draftVariants()[d.idx];
+      return {
+        html:
+          '<section data-screen="draft">' +
+          '<div class="note"><span class="note__icon">i</span><span>Черновик видишь только ты. Пока ты не нажмёшь «Отправить», ' + esc(p.nom) + " ничего не получит.</span></div>" +
+          '<div class="field"><label for="draft-text">Сообщение для ' + esc(p.gen) + "</label>" +
+          '<textarea class="textarea" id="draft-text" data-model="draft.text">' + esc(d.text) + "</textarea></div>" +
+          '<p class="small muted" id="draft-meta">' + draftMeta() + "</p>" +
+          '<div id="draft-hint">' + draftHint() + "</div>" +
+          (S.persona === "anna"
+            ? '<div class="chips"><span class="tiny muted" style="width:100%">Подсказка прототипа — пример правки Ани:</span><button type="button" class="chip" data-action="example-edit">Добавить «' + esc(EXAMPLE_EDIT) + "»</button></div>"
+            : "") +
+          '<dl class="parts" aria-label="Из чего состоит черновик">' + v.parts.map(([k, val]) => "<dt>" + k + "</dt><dd>" + esc(val) + "</dd>").join("") + "</dl>" +
+          '<p class="tiny muted">Схема: чувство — ситуация — потребность — просьба' + (d.edited ? " (по исходному варианту агента)" : "") + "</p>" +
+          '<div class="btn-row">' +
+          '<button type="button" class="btn" data-action="edit">Править</button>' +
+          '<button type="button" class="btn" data-action="variant">Другой вариант</button>' +
+          "</div>" +
+          (d.confirmVariant
+            ? '<div class="confirm" data-confirm-variant role="group" aria-label="Заменить твой текст?"><span class="small">Твоя правка пропадёт, а агент подставит новый вариант. Заменить?</span>' +
+              '<button type="button" class="btn btn--fill" data-action="variant-confirm">Заменить</button>' +
+              '<button type="button" class="btn btn--ghost" data-action="variant-cancel">Оставить мой текст</button></div>'
+            : "") +
+          '<div class="btn-row"><button type="button" class="btn btn--text" data-action="discard">Не отправлять</button></div>' +
+          "</section>",
+        main: {
+          text: "Отправить " + p.dat,
+          disabled: !S.pairActive || !d.text.trim(),
+          hint: !S.pairActive ? "Отправка откроется, когда " + p.nom + " примет приглашение" : !d.text.trim() ? "Текст пустой — нечего отправлять" : "",
+          action: sendDraft,
+          guard: true,
+          id: "send",
+        },
+      };
+    },
+
+    messages() {
+      const p = P();
+      const list = S.messages.filter((m) => m.from === S.persona || m.to === S.persona);
+      // Открытие экрана = прочтение входящих
+      list.forEach((m) => { if (m.to === S.persona && m.status === "delivered") m.status = "read"; });
+      const STATUS = { delivered: "✓ доставлено", read: "✓✓ прочитано", replied: "↩ отвечено" };
+      const items = list
+        .map((m) => {
+          if (m.from === S.persona) {
+            return '<div class="sent" data-msg="sent" data-id="' + m.id + '">' + esc(m.original) +
+              '<span class="sent__status" data-status="' + m.status + '">Ты · ' + m.time + " · " + STATUS[m.status] + "</span></div>";
+          }
+          const shown = me().showOriginal[m.id];
+          const author = NAMES[m.from];
+          return (
+            '<article class="partner-card" data-msg="incoming" data-id="' + m.id + '">' +
+            '<div class="partner-card__head"><span>От ' + esc(author.gen) + " · " + m.time + "</span>" +
+            (m.adapted ? '<span class="badge" data-adapted>✎ адаптировано</span>' : '<span class="badge">без изменений</span>') + "</div>" +
+            '<div class="partner-card__text" data-delivered>' + segsHtml(m, "to") + "</div>" +
+            (m.adapted
+              ? '<div class="small muted" data-what-changed><b>Что изменил твой агент</b> (выделено) — фраз: ' + m.changes.length + ".<ul>" +
+                m.changes.map((r) => "<li>" + esc(r.why) + "</li>").join("") + "</ul>Остальное — слово в слово, как " + (author.fem ? "написала " : "написал ") + esc(author.nom) + ".</div>"
+              : '<p class="small muted">Передано так, как ' + (author.fem ? "написала" : "написал") + " " + esc(author.nom) + ".</p>") +
+            (shown ? '<div class="original" data-original><span class="original__label">Оригинал — как ' + (author.fem ? "написала и одобрила " : "написал и одобрил ") + esc(author.nom) + " (отличия выделены)</span>" + segsHtml(m, "from") + "</div>" : "") +
+            '<div class="btn-row">' +
+            (m.adapted ? '<button type="button" class="btn btn--ghost" data-action="toggle-original" data-id="' + m.id + '">' + (shown ? "Скрыть оригинал" : "Показать оригинал") + "</button>" : "") +
+            '<button type="button" class="btn btn--fill" data-action="reply">Ответить с агентом</button>' +
+            "</div></article>"
+          );
+        })
+        .join("");
+      return {
+        html:
+          '<section data-screen="messages">' +
+          '<p class="small muted">Здесь только то, что вы с ' + esc(p.ins) + " отправили друг другу кнопкой «Отправить». Разговоры с агентами сюда не попадают.</p>" +
+          (items ? '<div class="feed">' + items + "</div>" : '<div class="empty" data-empty><p><b>Пока сообщений нет</b></p><p class="small">Когда кто-то из вас отправит сообщение, оно появится здесь.</p></div>') +
+          "</section>",
+        main: null,
+      };
+    },
+
+    memory() {
+      const u = me();
+      const cats = MEMORY_CATS.map(([key, label]) => {
+        const items = u.memory.filter((m) => m.cat === key);
+        const body = items.length
+          ? items
+              .map((m) =>
+                '<div class="mem-item" data-mem="' + m.id + '"><div class="grow"><div>' + esc(m.text) +
+                (key === "observation" ? ' <span class="badge">наблюдение, не твои слова</span>' : "") + "</div>" +
+                '<div class="mem-item__meta">Источник: ' + esc(m.src) + "</div>" +
+                (u.pendingDelete === m.id
+                  ? '<div class="confirm"><span class="small">Удалить навсегда? Агент больше не вспомнит это.</span>' +
+                    '<button type="button" class="btn btn--fill" data-action="mem-confirm" data-id="' + m.id + '">Удалить</button>' +
+                    '<button type="button" class="btn btn--ghost" data-action="mem-cancel">Оставить</button></div>'
+                  : "") +
+                "</div>" +
+                (u.pendingDelete === m.id ? "" : '<button type="button" class="mem-del" data-action="mem-del" data-id="' + m.id + '" aria-label="Удалить запись: ' + esc(m.text) + '">Удалить</button>') +
+                "</div>")
+              .join("")
+          : '<p class="small muted">Пока пусто</p>';
+        return '<div class="mem-cat"><h2>' + label + "</h2>" + body + "</div>";
+      }).join("");
+      return {
+        html:
+          '<section data-screen="memory">' +
+          '<div class="note" data-private-note><span class="note__icon">🔒</span><span><b>Партнёр этого не видит.</b> Эти записи видишь только ты и твой агент. Любую можно удалить.</span></div>' +
+          cats +
+          "</section>",
+        main: null,
+      };
+    },
+
+    profile() {
+      const u = me();
+      const p = P();
+      const sw = (key, label) =>
+        '<div class="list__row"><span>' + label + '</span><button type="button" class="switch" role="switch" aria-label="' + label + '" aria-checked="' + u.notify[key] + '" data-action="toggle-notify" data-key="' + key + '">' +
+        '<span class="switch__text">' + (u.notify[key] ? "вкл" : "выкл") + '</span><span class="switch__track" aria-hidden="true"></span></button></div>';
+      const sheet = u.sheet
+        ? '<div class="sheet-backdrop" data-sheet="' + u.sheet + '"><div class="sheet" role="dialog" aria-modal="true">' +
+          (u.sheet === "leave"
+            ? "<h2 style=\"margin-top:0\">Выйти из пары?</h2><p>Обмен сообщениями с " + esc(p.ins) + " прекратится. Твой агент и твоя память останутся. " + esc(p.nom) + " увидит, что пары больше нет.</p>"
+            : "<h2 style=\"margin-top:0\">Удалить аккаунт?</h2><p>Будут удалены профиль, разговоры с агентом, память и черновики — в течение 30 дней, включая резервные копии. Вернуть их будет нельзя.</p>") +
+          '<div class="btn-row"><button type="button" class="btn btn--fill" data-action="sheet-confirm">' + (u.sheet === "leave" ? "Выйти из пары" : "Удалить аккаунт") + "</button>" +
+          '<button type="button" class="btn" data-action="sheet-cancel">Отмена</button></div></div></div>'
+        : "";
+      return {
+        html:
+          '<section data-screen="profile">' +
+          "<h2 style=\"margin-top:0\">Профиль</h2>" +
+          '<div class="list">' +
+          '<div class="list__row"><span>Имя</span><span class="muted">' + esc(u.form.name) + "</span></div>" +
+          '<div class="list__row"><span>Как обращаться</span><span class="muted">' + esc(u.form.call) + "</span></div>" +
+          "</div>" +
+          "<h2>Пара</h2>" +
+          '<div class="list">' +
+          '<div class="list__row"><span>Партнёр</span><span class="muted">' + esc(p.name) + " · " + (S.pairActive ? "в паре" : "ждём ответа") + "</span></div>" +
+          '<button type="button" class="list__row" data-action="sheet" data-sheet="leave"><span>Выйти из пары</span><span class="chev">›</span></button>' +
+          "</div>" +
+          "<h2>Уведомления в Telegram</h2>" +
+          '<div class="list">' + sw("messages", "Новые сообщения от партнёра") + sw("billing", "Статус подписки") + "</div>" +
+          '<p class="tiny muted">В уведомлениях нет текста сообщений.</p>' +
+          "<h2>Мои данные</h2>" +
+          '<div class="list">' +
+          '<button type="button" class="list__row" data-action="export"><span>Выгрузить мои данные</span><span class="chev">›</span></button>' +
+          '<button type="button" class="list__row" data-action="sheet" data-sheet="delete"><span>Удалить аккаунт и все данные</span><span class="chev">›</span></button>' +
+          "</div>" +
+          "</section>" + sheet,
+        main: null,
+      };
+    },
+
+    subscription() {
+      const u = me();
+      const sub = S.subscription;
+      const paid = sub.status === "paid";
+      const before = !S.pairActive && !paid; // §11 п.2–3: до создания пары пробный период не идёт, оплатить нечего
+      const plans = [
+        ["month", "Месяц", "390 ⭐"],
+        ["year", "Год", "3 290 ⭐"],
+      ];
+      return {
+        html:
+          '<section data-screen="subscription">' +
+          "<h1>Подписка на пару</h1>" +
+          '<p class="muted">Платит один — доступ получают оба. Статус видите вы оба.</p>' +
+          '<div class="card card--soft" data-sub="' + sub.status + '"><div class="row row--between"><b>Статус</b>' +
+          (paid ? '<span class="badge badge--solid">активна</span>' : before ? '<span class="badge">ещё не начался</span>' : '<span class="badge">пробный период</span>') + "</div>" +
+          '<p class="small" style="margin:8px 0 0">' +
+          (paid
+            ? "Активна до 21 декабря. " + (sub.paidBy === S.persona ? "Оплачено тобой." : "Оплатил" + (NAMES[sub.paidBy].fem ? "а " : " ") + NAMES[sub.paidBy].nom + ".")
+            : before
+              ? "Пробный период — 7 дней — начнётся, когда пара будет создана. Пока разговоры с агентом бесплатны в пределах дневного лимита."
+              : "Пробный период: осталось 7 дней — до 28 ноября. Отсчёт идёт с момента создания пары.") +
+          "</p></div>" +
+          (paid || before
+            ? ""
+            : "<h2>Тариф</h2>" +
+              plans.map(([id, name, price]) =>
+                '<button type="button" class="plan" role="radio" aria-checked="' + (u.plan === id) + '" data-action="plan" data-plan="' + id + '">' +
+                '<span class="grow"><b>' + name + "</b>" + (id === "year" ? '<span class="small muted"> · выгоднее</span>' : "") + "</span>" +
+                '<span class="plan__price">' + price + "</span>" + (u.plan === id ? '<span class="tiny">выбран</span>' : "") + "</button>").join("") +
+              '<p class="tiny muted">Цены — пример для макета; окончательные задаются в настройках (ТЗ §11, [уточняется]). Оплата — Telegram Stars.</p>') +
+          "<h2>Что входит</h2>" +
+          '<ul class="small" style="padding-left:20px;margin:0 0 12px"><li>Разговоры с агентом — с увеличенным дневным лимитом [уточняется]</li><li>Сообщения партнёру с адаптацией</li><li>Память агента</li></ul>' +
+          '<div class="note"><span class="note__icon">i</span><span>Контакты помощи и кризисная поддержка работают без подписки. Когда подписка закончится, история и память сохранятся.</span></div>' +
+          "</section>",
+        main: paid || before
+          ? null
+          : {
+              guard: true,
+              text: "Оплатить " + (u.plan === "year" ? "3 290 ⭐" : "390 ⭐") + " · Telegram Stars",
+              action: () => { sub.status = "paid"; sub.paidBy = S.persona; toast("Окно оплаты Telegram Stars (имитация): оплачено. Подписка активна у вас обоих"); render(); },
+            },
+      };
+    },
+
+    help() {
+      const contacts = [
+        ["Экстренные службы", "000", "tel:000", "если есть угроза жизни — звони сразу"],
+        ["Круглосуточная психологическая помощь", "8 800 000-00-00", "tel:+78000000000", "анонимно, бесплатно"],
+        ["Помощь при домашнем насилии", "8 800 000-00-01", "tel:+78000000001", "консультация и убежище"],
+      ];
+      return {
+        html:
+          '<section data-screen="help">' +
+          '<div class="card card--soft" data-disclaimer><b>«Чувства AI» не заменяет психолога.</b><p class="small" style="margin:6px 0 0">Сервис не оказывает психологических и медицинских услуг и не ставит диагнозов. Если тяжело справляться — обратись к специалисту.</p></div>' +
+          "<h2>Если тебе или кому-то рядом опасно</h2>" +
+          '<div class="note note--stub" data-stub><span class="note__icon">!</span><span><b>Заглушка.</b> Номера ниже выдуманы. Настоящий список служб по странам проверяется перед запуском (ТЗ §9.3, [уточняется]).</span></div>' +
+          contacts.map(([n, ph, tel, d]) => '<div class="contact"><div>' + n + '</div><a class="contact__phone" href="' + tel + '">' + ph + ' <span class="small">(заглушка)</span></a><div class="small muted">' + d + "</div></div>").join("") +
+          '<p class="small muted">Контакты помощи доступны всегда, даже без подписки.</p>' +
+          "<h2>Правила</h2>" +
+          '<ul class="small" style="padding-left:20px;margin:0 0 12px">' +
+          "<li>Агент помогает сказать о чувствах — он не адвокат и не судья.</li>" +
+          "<li>Ничего не уходит партнёру без твоего «Отправить».</li>" +
+          "<li>Агент партнёра может смягчить форму, но не смысл; оригинал виден по запросу.</li>" +
+          "<li>Твой разговор с агентом не видят ни партнёр, ни его агент.</li>" +
+          "<li>При угрозах и насилии агент ничего не смягчает и подскажет, куда обратиться.</li></ul>" +
+          "<h2>Документы</h2>" +
+          '<div class="list">' +
+          '<button type="button" class="list__row" data-action="doc"><span>Пользовательское соглашение</span><span class="chev">›</span></button>' +
+          '<button type="button" class="list__row" data-action="doc"><span>Политика обработки данных</span><span class="chev">›</span></button>' +
+          '<button type="button" class="list__row" data-action="doc"><span>Согласие на обработку чувствительных сведений</span><span class="chev">›</span></button>' +
+          "</div>" +
+          "</section>",
+        main: null,
+      };
+    },
+  };
+
+  // Текст сообщения с выделением изменённых фраз: "to" — доставленная версия, "from" — оригинал
+  function segsHtml(m, side) {
+    if (!m.segs) return esc(side === "to" ? m.delivered : m.original);
+    return m.segs.map((x) => (x.from ? '<mark class="changed">' + esc(side === "to" ? x.t : x.from) + "</mark>" : esc(x.t))).join("");
+  }
+
+  function draftMeta() {
+    const d = me().draft;
+    if (!d) return "";
+    return "Вариант " + (d.idx + 1) + " из " + draftVariants().length + (d.edited ? " · изменено тобой" : " · от агента");
+  }
+  // Подсказка — только для фраз, которые агент получателя действительно умеет смягчить (SOFTEN)
+  function draftHint() {
+    const d = me().draft;
+    if (!d) return "";
+    const found = softenable(d.text);
+    if (!found.length) return "";
+    return found.map((r) => '<div class="note" data-harsh-hint><span class="note__icon">i</span><span>В тексте есть «' + esc(r.word) + "». Фразу «" + esc(r.from) + "» агент " + esc(P().gen) +
+      " смягчит: «" + esc(r.to) + "». Остальной текст дойдёт слово в слово, а твой оригинал " + esc(P().nom) + " сможет открыть.</span></div>").join("");
+  }
+
+  // ---------- Отрисовка ----------
+  // Защита от двойного касания (§2 п.2). Если нажатие MainButton само привело к необратимому действию
+  // (main.guard: «Отправить», «Оплатить»), кнопка первые GUARD_MS не принимает нажатий: второе касание
+  // «Подготовить сообщение» не превратится в «Отправить». Кнопка при этом выглядит и остаётся доступной (без мигания серым).
+  const GUARD_MS = 600;
+  let mainAction = null;
+  let mainKey = null;
+  let guardUntil = 0;
+  let guardKey = null; // защита действует только для того действия, на котором включилась
+  let guardTimer = null;
+  let viaMain = false; // идёт обработка нажатия MainButton
+  function applyMain(def) {
+    const wrap = document.getElementById("tg-main-wrap");
+    const btn = document.getElementById("tg-main");
+    const hint = document.getElementById("tg-main-hint");
+    const key = def.main ? current() + "|" + def.main.text : "none";
+    if (key !== mainKey && viaMain && def.main && def.main.guard) {
+      guardUntil = Date.now() + GUARD_MS;
+      guardKey = key;
+      btn.setAttribute("data-guard", "");
+      clearTimeout(guardTimer);
+      guardTimer = setTimeout(() => btn.removeAttribute("data-guard"), GUARD_MS + 10);
+    } else if (key !== mainKey) {
+      btn.removeAttribute("data-guard");
+    }
+    mainKey = key;
+    if (!def.main) { wrap.hidden = true; mainAction = null; return; }
+    wrap.hidden = false;
+    btn.textContent = def.main.text;
+    btn.disabled = !!def.main.disabled;
+    btn.setAttribute("aria-disabled", String(!!def.main.disabled));
+    mainAction = def.main.action;
+    if (def.main.hint) { hint.hidden = false; hint.textContent = def.main.hint; } else { hint.hidden = true; hint.textContent = ""; }
+  }
+
+  function render(scrollTop) {
+    const scr = current();
+    const def = screens[scr]();
+    const content = document.getElementById("content");
+    content.className = "content" + (def.chat ? " content--chat" : "");
+    content.dataset.current = scr;
+    content.innerHTML = def.html;
+    document.getElementById("tg-title").innerHTML = esc(TITLES[scr]) + '<small>' + esc(N().name) + " · прототип</small>";
+    const backBtn = document.getElementById("tg-back");
+    const closeBtn = document.getElementById("tg-close");
+    backBtn.hidden = !canGoBack();
+    closeBtn.hidden = canGoBack();
+    applyMain(def);
+    document.querySelectorAll("[data-persona]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.persona === S.persona)));
+    document.getElementById("jump").value = "";
+    if (def.chat) content.scrollTop = content.scrollHeight;
+    else if (scrollTop) content.scrollTop = 0;
+  }
+
+  function setTheme(t) {
+    S.theme = t;
+    if (t === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", t);
+    document.querySelectorAll("[data-theme-set]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.themeSet === t)));
+    try { localStorage.setItem("proto-theme", t); } catch (e) { /* хранилище недоступно */ }
+  }
+
+  // ---------- События ----------
+  document.addEventListener("click", (e) => {
+    const t = e.target.closest("button, [data-action]");
+    if (!t) return;
+    if (t.id === "tg-back") { haptic(t); back(); return; }
+    if (t.id === "tg-close") { toast("В Telegram это закрыло бы Mini App"); return; }
+    if (t.id === "tg-main") { if (!t.disabled && mainAction && !(mainKey === guardKey && Date.now() < guardUntil)) { haptic(t); viaMain = true; try { mainAction(); } finally { viaMain = false; } } return; }
+    if (t.dataset.persona) { S.persona = t.dataset.persona; document.getElementById("toast").classList.remove("show"); render(true); return; }
+    if (t.dataset.themeSet) { setTheme(t.dataset.themeSet); return; }
+    const u = me();
+    switch (t.dataset.action) {
+      case "go": go(t.dataset.to); break;
+      case "to-home": resetTo("home"); break;
+      case "suggest": u.input = t.dataset.text; u.inputVoice = false; render(); document.getElementById("chat-input").focus(); break;
+      case "send-agent": sendToAgent(); break;
+      case "mic":
+        haptic(t);
+        if (!u.recording) { u.recording = true; render(); }
+        else {
+          u.recording = false;
+          const sc = SCRIPT[S.persona];
+          u.input = sc.suggest[Math.min(u.stage, sc.suggest.length - 1)];
+          u.inputVoice = true;
+          toast("Голосовое расшифровано — проверь текст перед отправкой агенту");
+          render();
+        }
+        break;
+      case "opt": chooseOption(t.dataset.kind); break;
+      case "edit": { const ta = document.getElementById("draft-text"); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); break; }
+      case "example-edit":
+        if (u.draft && u.draft.text.indexOf(EXAMPLE_EDIT) === -1) { u.draft.text = u.draft.text.trim() + " " + EXAMPLE_EDIT; u.draft.edited = true; }
+        render();
+        break;
+      case "variant":
+        // Правку автора молча не стираем (§2 п.2): сначала спрашиваем
+        if (u.draft.edited) { u.draft.confirmVariant = true; render(); }
+        else nextVariant();
+        break;
+      case "variant-confirm": nextVariant(); break;
+      case "variant-cancel": u.draft.confirmVariant = false; render(); break;
+      case "discard":
+        u.draft = null;
+        u.chat.push({ from: "agent", text: "Хорошо, ничего не отправляю — черновик удалён. Иногда важно просто проговорить. Я рядом, если захочешь вернуться к этому." });
+        u.stack = u.stack.filter((s) => s !== "draft");
+        if (current() !== "chat") u.stack.push("chat");
+        toast("Не отправлено. Черновик удалён");
+        render(true);
+        break;
+      case "toggle-original": {
+        const id = t.dataset.id;
+        u.showOriginal[id] = !u.showOriginal[id];
+        const m = S.messages.find((x) => x.id === id);
+        if (m && u.showOriginal[id]) m.originalViewed = true;
+        render();
+        break;
+      }
+      case "reply": replyWithAgent(); break;
+      case "mem-del": u.pendingDelete = t.dataset.id; render(); break;
+      case "mem-cancel": u.pendingDelete = null; render(); break;
+      case "mem-confirm":
+        u.memory = u.memory.filter((m) => m.id !== t.dataset.id);
+        u.pendingDelete = null;
+        haptic(t);
+        toast("Запись удалена. Агент её больше не вспомнит");
+        render();
+        break;
+      case "toggle-notify": u.notify[t.dataset.key] = !u.notify[t.dataset.key]; render(); break;
+      case "sheet": u.sheet = t.dataset.sheet; render(); break;
+      case "sheet-cancel": u.sheet = null; render(); break;
+      case "sheet-confirm": u.sheet = null; toast("В прототипе это действие не выполняется"); render(); break;
+      case "export": toast("Файл с твоими данными придёт в чат с ботом (имитация)"); break;
+      case "plan": u.plan = t.dataset.plan; render(); break;
+      case "doc": toast("Текст документа готовит юрист — пока заглушка"); break;
+      default: break;
+    }
+  });
+
+  document.addEventListener("input", (e) => {
+    const el = e.target;
+    const model = el.dataset && el.dataset.model;
+    if (!model) return;
+    const u = me();
+    const val = el.type === "checkbox" ? el.checked : el.value;
+    if (model.startsWith("form.")) {
+      u.form[model.slice(5)] = val;
+      applyMain(screens.onboarding());
+    } else if (model === "input") {
+      u.input = val;
+      u.inputVoice = false;
+    } else if (model === "draft.text" && u.draft) {
+      u.draft.text = val;
+      u.draft.edited = true;
+      document.getElementById("draft-meta").textContent = draftMeta();
+      document.getElementById("draft-hint").innerHTML = draftHint();
+      applyMain(screens.draft());
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.target.id === "chat-input" && e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendToAgent(); }
+  });
+
+  document.getElementById("jump").addEventListener("change", (e) => {
+    const v = e.target.value;
+    if (!v) return;
+    if (v === "draft") { openDraft(); return; }
+    if (v === "welcome") me().slide = 0;
+    go(v);
+  });
+
+  // Хук только для check.mjs: чистая функция адаптации, состояние наружу не отдаётся
+  window.ChuvstvaProto = Object.freeze({
+    adaptText: (t) => { const r = adaptText(String(t)); return { text: r.text, adapted: r.adapted }; },
+  });
+
+  // ---------- Старт ----------
+  let saved = "auto";
+  try { saved = localStorage.getItem("proto-theme") || "auto"; } catch (e) { /* хранилище недоступно */ }
+  setTheme(saved);
+  render(true);
+})();
+
+</script>
+  </body>
+</html>

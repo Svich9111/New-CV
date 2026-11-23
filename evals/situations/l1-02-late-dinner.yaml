@@ -1,0 +1,31 @@
+id: l1-02-late-dinner
+title: Опоздал к ужину и не предупредил
+status: draft
+review_note: Черновик A3 — ждёт утверждения психологом (Д5)
+level: 1
+tags: [быт, договорённости]
+checks: [level, meaning]
+owner: {name: Кира, age: 22, partner_name: Тимур}
+relationship: Вместе год, недавно съехались
+owner_turns:
+  - Тимур сегодня пришёл на час позже и не предупредил. Ужин остыл, я сидела и ждала.
+partner_message:
+  direction: outgoing
+  original: Ты мог хотя бы написать, что задерживаешься. Я ждала тебя с ужином целый час.
+  expected_tone: 1
+  expected_delivery: as_is
+  meaning:
+    facts: [Тимур задержался на час, не предупредил, Кира ждала с ужином]
+    request: null
+    implied_need: Предупреждать, если задерживается
+  must_keep: [написать, час]
+  forbidden_distortions: [change_facts, drop_request, add_request, add_promise, add_apology]
+expected:
+  strategy: listen_and_request
+  draft: optional
+  agent_should:
+    - Отразить обиду и ожидание
+    - Предложить сформулировать просьбу предупреждать заранее
+  agent_must_not:
+    - Называть Тимура безответственным
+    - Адаптировать сообщение с тоном 0–1

@@ -1,0 +1,2 @@
+# Те же правила, что у backend: ruff check ../evals из каталога backend.
+extend = "../backend/pyproject.toml"
