@@ -164,7 +164,7 @@ def snapshot() -> str:
         "      ORDER BY 1), "
         "ARRAY(SELECT u.rolname || ':' || m.inherit_option || m.set_option || m.admin_option "
         "      FROM pg_auth_members m JOIN pg_roles u ON u.oid = m.member WHERE m.roleid = r.oid "
-        "      AND u.rolname NOT LIKE 't\\_%' AND u.rolname NOT LIKE 'a8r\\_%' ORDER BY 1)), "
+        "      AND u.rolname NOT LIKE 't\\_%' AND u.rolname NOT LIKE 'a8r\\_%' AND u.rolname NOT LIKE 'a8o\\_%' ORDER BY 1)), "
         "E'\\n' ORDER BY r.rolname) "
         "FROM pg_roles r JOIN pg_authid a ON a.oid = r.oid "
         "WHERE r.rolname LIKE 'feelings\\_%' OR r.rolname = 'postgres'"

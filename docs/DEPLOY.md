@@ -229,7 +229,7 @@ curl -fsS https://стенд.домен/api/v1/health
 - **Код, без изменений схемы.** В `.env` верните прежнюю метку `FEELINGS_IMAGE_TAG`, выполните
   `git checkout <прежний коммит>` и `dc up -d`. Образы с прежней меткой уже есть локально.
 - **Схема менялась — только по подтверждению оператора.**
-  1. `dc stop api worker-memory worker-kb`.
+  1. `dc stop api worker-memory worker-kb worker-pipeline`.
   2. `infra/deploy/backup.sh`.
   3. `dc --profile ops run --rm migrate alembic downgrade <ревизия>` (под `feelings_owner`;
      образ — ещё новый: в нём есть шаги отката новых миграций).
@@ -342,7 +342,7 @@ cd /opt/feelings/app
 git checkout <коммит, с которого снята копия>   # версия схемы копии = версии кода (alembic_version)
 # в .env — метка образов этого коммита (FEELINGS_IMAGE_TAG); при необходимости dc build
 DUMP=/opt/feelings/backups/feelings-<дата>.dump
-dc stop caddy api worker-memory worker-kb
+dc stop caddy api worker-memory worker-kb worker-pipeline
 infra/deploy/backup.sh                      # копия текущего состояния — на случай ошибки
 dc exec -T postgres psql -X -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'DROP DATABASE feelings WITH (FORCE)' -c 'CREATE DATABASE feelings'
