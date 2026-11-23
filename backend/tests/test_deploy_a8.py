@@ -770,6 +770,112 @@ def test_restore_check_detects_rls_and_grant_weakening(
     assert r.returncode != 0, r.stdout
 
 
+# Раунд 3 (перепроверка D2): каждое ослабление — отдельно, при прочих таблицах «как надо»
+# (у couples — RLS и политика), и отказ называет именно ослабленный объект.
+_COUPLES_OK = (
+    "CREATE TABLE couples (id int PRIMARY KEY); ALTER TABLE couples ENABLE ROW LEVEL SECURITY;"
+    " CREATE POLICY couples_self ON couples FOR SELECT TO feelings_app USING (id = 1);"
+    " GRANT SELECT ON couples TO feelings_app;"
+)
+PRECISE_WEAKENINGS = {
+    "rls_off_users_only": ("ALTER TABLE users DISABLE ROW LEVEL SECURITY;", "users"),
+    "policy_dropped_users_only": ("DROP POLICY users_self ON users;", "users"),
+    "new_table_without_rls": ("CREATE TABLE a8_notes (id int);", "a8_notes"),
+    "table_grant_to_public": ("GRANT SELECT ON users TO PUBLIC;", "users → PUBLIC"),
+    "table_grant_to_api": ("GRANT SELECT ON couples TO feelings_api;", "couples → feelings_api"),
+    "column_grant_to_api": ("GRANT SELECT (name) ON users TO feelings_api;", "users.name"),
+    "sequence_grant_to_api": (
+        "CREATE SEQUENCE a8_seq; GRANT USAGE ON SEQUENCE a8_seq TO feelings_api;",
+        "a8_seq → feelings_api",
+    ),
+    "function_execute_by_public": (
+        "CREATE FUNCTION a8_fn() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'select 1';",
+        "a8_fn() → PUBLIC",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(PRECISE_WEAKENINGS))
+def test_restore_check_names_each_weakened_object(
+    tmp_path: Path, owner_env: OwnerEnv, cluster: Cluster, case: str
+) -> None:
+    """D2 (раунд 3): ослабление одной таблицы/объекта при остальных в порядке — отказ, в
+    сообщении назван ослабленный объект; временная база удалена."""
+    before = _restore_dbs(cluster)
+    sql, named = PRECISE_WEAKENINGS[case]
+    src = _good_source(cluster, owner_env.role)
+    cluster.psql(src, f"SET ROLE {owner_env.role}; {_COUPLES_OK} {sql}")
+    dump = _dump(cluster, src, tmp_path / f"{case}.dump")
+    r = _run(owner_env.script, owner_env.env, str(dump))
+    assert r.returncode != 0, r.stdout
+    assert named in r.stderr, r.stderr
+    assert "восстановление проверено" not in r.stdout
+    assert _restore_dbs(cluster) == before
+
+
+def test_restore_check_accepts_reference_tables_and_revoked_functions(
+    tmp_path: Path, owner_env: OwnerEnv, cluster: Cluster
+) -> None:
+    """D2 (раунд 3), отсутствие ложной тревоги: справочные таблицы без RLS (kb_documents,
+    prompt_versions), функция SECURITY DEFINER с ``REVOKE … FROM PUBLIC`` и ``GRANT EXECUTE`` группе
+    feelings_app (как в миграциях), права групповых ролей на таблицы — проверка проходит."""
+    src = _good_source(cluster, owner_env.role)
+    cluster.psql(src, f"""
+        SET ROLE {owner_env.role};
+        {_COUPLES_OK}
+        CREATE TABLE kb_documents (id int PRIMARY KEY); GRANT SELECT ON kb_documents TO feelings_app;
+        CREATE TABLE prompt_versions (id int PRIMARY KEY);
+        CREATE FUNCTION app_fn() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'select 1';
+        REVOKE ALL ON FUNCTION app_fn() FROM PUBLIC;
+        GRANT EXECUTE ON FUNCTION app_fn() TO feelings_app, feelings_worker;
+    """)  # fmt: skip
+    dump = _dump(cluster, src, tmp_path / "reference.dump")
+    r = _run(owner_env.script, owner_env.env, str(dump))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "восстановление проверено" in r.stdout
+
+
+def test_worker_restart_policy_survives_transient_start_failures(compose: dict) -> None:
+    """D3 (раунд 3): все долгоживущие воркеры стенда — ``unless-stopped`` через общий якорь
+    ``x-worker-restart`` (не ``on-failure:N``): после серии быстрых неудач при старте (сеть/DNS
+    до OpenRouter) Docker продолжает перезапуски с растущей паузой."""
+    assert compose["x-worker-restart"] == "unless-stopped"
+    raw = COMPOSE_FILE.read_text(encoding="utf-8")
+    assert "on-failure" not in raw.split("services:", 1)[1]
+    for name in ("worker-memory", "worker-kb", "worker-pipeline", "worker-notify"):
+        assert compose["services"][name]["restart"] == "unless-stopped", name
+        block = raw.split(f"  {name}:", 1)[1].split("\n\n", 1)[0]
+        assert "restart: *worker-restart" in block, name
+
+
+@pytest.mark.skipif(DOCKER is None, reason="нет docker CLI — проверка только статически")
+def test_worker_restart_policy_resolved_by_compose(tmp_path: Path) -> None:
+    """D3 (раунд 3): ``docker compose config`` раскрывает якорь — у воркеров ``unless-stopped``."""
+    _gen(tmp_path)
+    env_file = tmp_path / ".env"
+    _set_env(env_file, MANUAL | {"FEELINGS_SECRETS_DIR": str(tmp_path / "secrets")})
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FEELINGS_", "OPENROUTER"))}
+    r = subprocess.run(
+        [DOCKER or "docker", "compose", "-p", "a8static", "-f", str(COMPOSE_FILE), "--env-file",
+         str(env_file), "config", "--format", "json"],
+        env=env, capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    svcs = json.loads(r.stdout)["services"]
+    for name in ("worker-memory", "worker-kb", "worker-pipeline", "worker-notify"):
+        assert svcs[name]["restart"] == "unless-stopped", name
+
+
+def test_deploy_doc_lists_worker_notify_and_restart_check() -> None:
+    """D1/D3 (раунд 3): DEPLOY §4/§6/§10 — worker-notify в списках остановки; после выкладки и
+    перезагрузки — проверка ``dc ps`` на Restarting/Exited."""
+    doc = (ROOT / "docs" / "DEPLOY.md").read_text(encoding="utf-8")
+    assert "dc stop api worker-memory worker-kb worker-pipeline worker-notify" in doc
+    assert "dc stop caddy api worker-memory worker-kb worker-pipeline worker-notify" in doc
+    assert "Restarting" in doc and "unless-stopped" in doc
+    assert "on-failure:5" not in doc
+
+
 def test_restore_check_db_mode_fails_on_weak_database_rights(
     owner_env: OwnerEnv, cluster: Cluster
 ) -> None:
