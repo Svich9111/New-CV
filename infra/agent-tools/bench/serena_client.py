@@ -14,9 +14,15 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 REPO = str(__import__("pathlib").Path(__file__).resolve().parents[3])
-_cfg = json.load(open(f"{REPO}/.mcp.json"))["mcpServers"]["serena"]
-SERVER = StdioServerParameters(command=_cfg["command"], args=_cfg["args"], cwd=REPO,
-                               env={**__import__("os").environ, **_cfg.get("env", {})})
+# Та же команда, что регистрирует install.sh (claude mcp add --scope user serena ...).
+SERVER = StdioServerParameters(
+    command="uvx",
+    args=["-q", "-p", "3.13", "--from", "serena-agent==2.1.0", "serena", "start-mcp-server",
+          "--context", "claude-code", "--project-from-cwd", "--agent-interface", "tools",
+          "--enable-web-dashboard", "false"],
+    cwd=REPO,
+    env={**__import__("os").environ, "SERENA_USAGE_REPORTING": "false"},
+)
 
 
 def text_of(result) -> str:

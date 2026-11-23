@@ -1,11 +1,12 @@
 # Экономия токенов агентов: RTK и Serena
 
-Решение — `DECISIONS.md`, АР-15. Установка — `infra/agent-tools/install.sh` (идемпотентно).
+Решение — `DECISIONS.md`, АР-15. Установка **глобальная — на все проекты пользователя**:
+`infra/agent-tools/install.sh` (компьютер) и `infra/agent-tools/cloud-setup.sh` (облачные окружения).
 
 | Средство | Что делает | Как подключено |
 | --- | --- | --- |
-| [RTK](https://github.com/rtk-ai/rtk) v1.2.1 | Сжимает вывод команд (git, pytest, ls, find…) до того, как его прочитает агент | Хук `PreToolUse` в `.claude/settings.json` переписывает `git status` → `rtk git status` и т. п. |
-| [Serena](https://github.com/oraios/serena) 2.1.0 | MCP-сервер: поиск функций, классов и ссылок по символам вместо чтения целых файлов | `.mcp.json` + `.serena/project.yml` (Python и TypeScript) |
+| [RTK](https://github.com/rtk-ai/rtk) v1.2.1 | Сжимает вывод команд (git, pytest, ls, find…) до того, как его прочитает агент | Хук `PreToolUse` в `~/.claude/settings.json` переписывает `git status` → `rtk git status` и т. п. |
+| [Serena](https://github.com/oraios/serena) 2.1.0 | MCP-сервер: поиск функций, классов и ссылок по символам вместо чтения целых файлов | Сервер уровня пользователя в `~/.claude.json`; проект определяется по текущему каталогу |
 
 Оба работают локально, код открыт. Внешние обращения отключены: телеметрия RTK — `enabled = false`;
 у Serena — `SERENA_USAGE_REPORTING=false` (иначе при запуске уходит ОС/версия на oraios-software.de)
@@ -13,13 +14,18 @@
 
 ## Установка
 
-```bash
-bash infra/agent-tools/install.sh
-```
+| Где | Как |
+| --- | --- |
+| Свой компьютер (Linux, macOS) | `bash infra/agent-tools/install.sh`, затем перезапустить Claude Code |
+| Облачное окружение | Содержимое `infra/agent-tools/cloud-setup.sh` — в конец Setup script окружения. Уже добавлено в окружение New-CV |
 
-Без установленного `rtk` хук ничего не делает: команды идут как есть. Сервер Serena из `.mcp.json`
-Claude Code при первом открытии проекта попросит одобрить — это защитная мера, обойти её из
-репозитория нельзя. Проверка: `/mcp` в сессии или `claude mcp list`.
+Скрипт ставит RTK, пишет его настройки, добавляет хук в `~/.claude/settings.json` (остальные
+настройки не трогает), регистрирует Serena на уровне пользователя (одобрять не нужно) и добавляет
+`.serena/` в глобальный gitignore — Serena создаёт этот каталог в каждом проекте. Повторный запуск
+дублей не создаёт. Проверка: `/mcp` в сессии или `claude mcp list` в любом проекте.
+
+Serena сама определяет язык проекта, но берёт **один**. Для проекта на нескольких языках список
+задаётся в его `.serena/project.yml` (`language_servers: [python, typescript]`), как в New-CV.
 
 ## Исключения RTK
 
