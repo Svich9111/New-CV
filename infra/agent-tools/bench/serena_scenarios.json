@@ -1,0 +1,9 @@
+[
+ {"id":"A1 complete_onboarding тело","tool":"find_symbol","args":{"name_path_pattern":"complete_onboarding","include_body":true}},
+ {"id":"A2 кто вызывает","tool":"find_referencing_symbols","args":{"name_path":"complete_onboarding","relative_path":"backend/app/repositories/users.py"}},
+ {"id":"B обзор tables.py","tool":"get_symbols_overview","args":{"relative_path":"backend/app/models/tables.py"}},
+ {"id":"C класс PartnerMessage","tool":"find_symbol","args":{"name_path_pattern":"PartnerMessage","relative_path":"backend/app/models/tables.py","include_body":true}},
+ {"id":"D тест в 1274 строках","tool":"find_symbol","args":{"name_path_pattern":"test_dedicated_login_role_cannot_escape_to_superuser","include_body":true}},
+ {"id":"E где используется User","tool":"find_referencing_symbols","args":{"name_path":"User","relative_path":"backend/app/models/tables.py"}},
+ {"id":"F TS: компонент App","tool":"find_symbol","args":{"name_path_pattern":"App","relative_path":"frontend/src/App.tsx","include_body":true}}
+]
