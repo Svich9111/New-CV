@@ -31,6 +31,7 @@ make install      # зависимости backend + frontend
 make lint         # ruff + mypy + eslint + tsc
 make test         # pytest (нужен PostgreSQL с pgvector, см. ниже) + vitest
 make db-up        # PostgreSQL и Redis в Docker для локальной разработки
+bash infra/agent-tools/install.sh   # RTK + Serena: экономия токенов агентов (docs/AGENT_TOOLS.md)
 ```
 
 Тесты backend берут адрес БД из `TEST_DATABASE_URL`
