@@ -1,18 +1,24 @@
-# Тестовый стенд «Чувства AI» (задача 0.8). Один сервер в РФ (152-ФЗ, Д1), Docker Compose.
-# Порядок и команды — docs/DEPLOY.md. Значения — из infra/deploy/.env (шаблон .env.prod.example;
-# compose читает его сам, потому что он лежит рядом с этим файлом).
+# Тестовый стенд «Чувства AI» (задача 0.8; НЕ production, FEELINGS_ENV=staging). Один сервер
+# в РФ (152-ФЗ, Д1), Docker Compose. Порядок и команды — docs/DEPLOY.md.
 #
-# Наружу — только Caddy: 80 (сертификат, переадресация) и 443 (HTTPS, HTTP/3).
-# БД и Redis — только во внутренней сети `data` без выхода наружу; портов у них нет.
+# Секреты:
+#   - infra/deploy/.env (600) — секреты приложения и пароли ролей входа; compose читает его сам
+#     (лежит рядом) и раздаёт каждому сервису только нужные ему значения;
+#   - infra/deploy/secrets/postgres_superuser_password (600) — пароль суперпользователя БД,
+#     отдельно от .env: нужен только при первом создании тома (postgres) и для db-init; в
+#     контейнеры приложения не попадает (docker secret, файл /run/secrets/…).
+# В этом файле нет ни одного значения секрета: обязательные переменные — `:?`.
 #
-#   docker compose -f infra/deploy/docker-compose.prod.yml up -d --build      — сервисы
-#   docker compose -f infra/deploy/docker-compose.prod.yml --profile ops run --rm migrate
-#       — миграции: ТОЛЬКО после подтверждения оператора (RoadMap §4, АР-4)
-#   docker compose -f infra/deploy/docker-compose.prod.yml --profile ops run --rm db-roles
-#       — роли входа (infra/db/roles.sql), после миграций
+# Наружу — только Caddy: 80 (сертификат, переадресация) и 443 (HTTPS, HTTP/3). БД и Redis —
+# только во внутренней сети `data` без выхода наружу; портов у них нет.
 #
-# Внимание: `docker compose config` и `docker inspect` показывают значения из .env, включая
-# пароли и ключи — вывод не прикладывать к тикетам и чатам.
+#   dc = docker compose -f infra/deploy/docker-compose.prod.yml
+#   dc --profile ops run --rm db-init     — однократно: владелец схемы и расширение vector
+#   dc --profile ops run --rm migrate     — миграции под feelings_owner (ТОЛЬКО по подтверждению, RoadMap §4)
+#   dc --profile ops run --rm db-roles    — роли входа (infra/db/roles.sql) под feelings_owner
+#   dc up -d                              — сервисы
+#
+# `dc config` и `docker inspect` показывают значения из .env — вывод не прикладывать к тикетам.
 name: feelings
 
 x-logging: &logging
@@ -26,7 +32,7 @@ x-hardening: &hardening
 # Образ сервера (API, воркеры, миграции): непривилегированный пользователь `feelings` (uid 10001).
 x-backend: &backend
   <<: *hardening
-  image: feelings-backend:${FEELINGS_IMAGE_TAG:-staging}
+  image: feelings-backend:${FEELINGS_IMAGE_TAG:?задайте FEELINGS_IMAGE_TAG}
   build:
     context: ../..
     dockerfile: infra/backend.Dockerfile
@@ -35,16 +41,35 @@ x-backend: &backend
   cap_drop: ["ALL"]
   restart: unless-stopped
 
+# Живость воркера: процесс жив (PID 1 контейнера) и его роль входа подключается к БД. Зависание
+# цикла без выхода так не видно — для этого нужен файл-пульс в самом воркере (предложение A3).
+x-worker-health: &worker-health
+  test:
+    - CMD
+    - python
+    - -c
+    - "import asyncio,os,asyncpg\nasync def main():\n    url = os.environ['FEELINGS_WORKER_DATABASE_URL'].replace('+asyncpg', '', 1)\n    conn = await asyncio.wait_for(asyncpg.connect(url), 5)\n    await conn.fetchval('SELECT 1')\n    await conn.close()\nasyncio.run(main())"
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 20s
+
 # Подключения собираются здесь из паролей ролей (адреса — внутренняя сеть compose).
 x-urls:
   api-db: &api-db postgresql+asyncpg://feelings_api:${FEELINGS_API_DB_PASSWORD:?задайте FEELINGS_API_DB_PASSWORD}@postgres:5432/feelings
   worker-db: &worker-db postgresql+asyncpg://feelings_worker_login:${FEELINGS_WORKER_DB_PASSWORD:?задайте FEELINGS_WORKER_DB_PASSWORD}@postgres:5432/feelings
   admin-db: &admin-db postgresql+asyncpg://feelings_admin_login:${FEELINGS_ADMIN_DB_PASSWORD:?задайте FEELINGS_ADMIN_DB_PASSWORD}@postgres:5432/feelings
+  owner-db: &owner-db postgresql+asyncpg://feelings_owner:${FEELINGS_OWNER_DB_PASSWORD:?задайте FEELINGS_OWNER_DB_PASSWORD}@postgres:5432/feelings
+
+secrets:
+  postgres_superuser_password:
+    # Каталог можно переопределить (локальная проверка во временном каталоге).
+    file: ${FEELINGS_SECRETS_DIR:-./secrets}/postgres_superuser_password
 
 services:
   caddy:
     <<: *hardening
-    image: feelings-caddy:${FEELINGS_IMAGE_TAG:-staging}
+    image: feelings-caddy:${FEELINGS_IMAGE_TAG}
     build:
       context: ../..
       dockerfile: infra/deploy/caddy.Dockerfile
@@ -55,13 +80,20 @@ services:
       - "443:443/udp"
     environment:
       FEELINGS_DOMAIN: ${FEELINGS_DOMAIN:?задайте FEELINGS_DOMAIN}
-      FEELINGS_ACME_EMAIL: ${FEELINGS_ACME_EMAIL:?задайте FEELINGS_ACME_EMAIL}
+      # Почта для Let's Encrypt; `internal` — собственный центр Caddy (только локальная проверка).
+      FEELINGS_TLS: ${FEELINGS_TLS:?задайте FEELINGS_TLS (почта для Let's Encrypt)}
       FEELINGS_PROXY_MAX_BODY: ${FEELINGS_PROXY_MAX_BODY:-2MiB}
     cap_drop: ["ALL"]
     cap_add: ["NET_BIND_SERVICE"]
     volumes:
       - caddy_data:/data
       - caddy_config:/config
+    healthcheck:
+      # Админ-интерфейс Caddy слушает только 127.0.0.1:2019 внутри контейнера.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
     networks: [edge]
     depends_on:
       api: { condition: service_healthy }
@@ -112,7 +144,7 @@ services:
     networks: [data, edge]
     depends_on:
       postgres: { condition: service_healthy }
-      redis: { condition: service_started }
+      redis: { condition: service_healthy }
 
   # Воркер памяти (2.4) — обязателен вместе с API (docs/ADMIN.md §5).
   worker-memory:
@@ -130,6 +162,7 @@ services:
       FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
       FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    healthcheck: *worker-health
     networks: [data, egress]
     depends_on:
       postgres: { condition: service_healthy }
@@ -145,6 +178,7 @@ services:
       FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
       FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    healthcheck: *worker-health
     networks: [data, egress]
     depends_on:
       postgres: { condition: service_healthy }
@@ -156,13 +190,16 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD}
+      # Только при первом создании тома; дальше пароль суперпользователя нужен лишь db-init.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_superuser_password
       POSTGRES_DB: feelings
+    secrets: [postgres_superuser_password]
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d feelings"]
       interval: 5s
+      timeout: 5s
       retries: 20
     networks: [data]
 
@@ -173,10 +210,39 @@ services:
     restart: unless-stopped
     # Только счётчики лимитов: без записи на диск.
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks: [data]
 
   # --- Разовые операции (профиль ops), только по команде оператора ----------------------
-  # Миграции под владельцем схемы. Запуск — ТОЛЬКО после подтверждения оператора (RoadMap §4).
+  # Однократно, суперпользователем: владелец схемы feelings_owner и расширение vector
+  # (infra/db/init-owner.sql). Повторный запуск безопасен (смена пароля владельца).
+  db-init:
+    image: pgvector/pgvector:0.8.0-pg16
+    profiles: ["ops"]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    restart: "no"
+    entrypoint:
+      - sh
+      - -c
+      - 'PGPASSWORD="$$(cat /run/secrets/postgres_superuser_password)" exec psql -X -v ON_ERROR_STOP=1 -f /db/init-owner.sql'
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGDATABASE: feelings
+      FEELINGS_OWNER_DB_PASSWORD: ${FEELINGS_OWNER_DB_PASSWORD:?задайте FEELINGS_OWNER_DB_PASSWORD}
+    secrets: [postgres_superuser_password]
+    volumes:
+      - ../db:/db:ro
+    networks: [data]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # Миграции под владельцем схемы (не суперпользователем). ТОЛЬКО по подтверждению оператора.
   migrate:
     <<: *backend
     profiles: ["ops"]
@@ -184,12 +250,13 @@ services:
     command: ["alembic", "upgrade", "head"]
     environment:
       FEELINGS_ENV: ${FEELINGS_ENV}
-      FEELINGS_MIGRATION_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/feelings
+      FEELINGS_MIGRATION_DATABASE_URL: *owner-db
     networks: [data]
     depends_on:
       postgres: { condition: service_healthy }
 
-  # Роли входа (infra/db/roles.sql) — после миграций; повторный запуск = смена паролей.
+  # Роли входа (infra/db/roles.sql) — после миграций, под feelings_owner (CREATEROLE и ADMIN на
+  # созданные им групповые роли); повторный запуск = смена паролей.
   db-roles:
     image: pgvector/pgvector:0.8.0-pg16
     profiles: ["ops"]
@@ -199,8 +266,8 @@ services:
     entrypoint: ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "/db/roles.sql"]
     environment:
       PGHOST: postgres
-      PGUSER: postgres
-      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGUSER: feelings_owner
+      PGPASSWORD: ${FEELINGS_OWNER_DB_PASSWORD}
       PGDATABASE: feelings
       FEELINGS_WORKER_DB_PASSWORD: ${FEELINGS_WORKER_DB_PASSWORD}
       FEELINGS_ADMIN_DB_PASSWORD: ${FEELINGS_ADMIN_DB_PASSWORD}

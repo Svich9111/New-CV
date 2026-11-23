@@ -55,13 +55,13 @@
 \set dry_run 0
 \endif
 
-BEGIN;
 
 -- Пароли не должны попасть в журнал сервера и статистику запросов: ни сам запрос
 -- (log_statement, log_min_duration_statement), ни текст запроса при ошибке
 -- (log_min_error_statement), ни текст служебной команды в pg_stat_statements (track_utility).
 -- Под суперпользователем скрипт отключает это сам. Без суперпользователя менять эти настройки
--- нельзя: если запросы журналируются (log_statement = ddl/all, log_min_duration_statement ≠ -1)
+-- нельзя: если запросы журналируются (log_statement = ddl/mod/all, log_min_duration_statement ≠ -1,
+-- выборочно: log_min_duration_sample ≠ -1, log_transaction_sample_rate > 0)
 -- или pg_stat_statements записывает служебные команды, скрипт останавливается — разве что
 -- передано явное согласие -v allow_logged=1 (тогда пароли сменить сразу после, docs/ADMIN.md).
 \if :{?allow_logged}
@@ -79,15 +79,19 @@ FROM pg_roles WHERE rolname = current_user \gset
 \set super_attrs ''
 \endif
 \if :is_super
-SET LOCAL log_statement = 'none';
-SET LOCAL log_min_duration_statement = -1;
-SET LOCAL log_min_error_statement = 'panic';
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_duration_sample = -1;
+SET log_transaction_sample_rate = 0;
+SET log_min_error_statement = 'panic';
 \if :has_pgss
-SET LOCAL pg_stat_statements.track_utility = off;
+SET pg_stat_statements.track_utility = off;
 \endif
 \else
-SELECT current_setting('log_statement') IN ('ddl', 'all')
+SELECT current_setting('log_statement') IN ('ddl', 'mod', 'all')
        OR current_setting('log_min_duration_statement') <> '-1'
+       OR current_setting('log_min_duration_sample') <> '-1'
+       OR current_setting('log_transaction_sample_rate')::float8 > 0
        OR coalesce(current_setting('pg_stat_statements.track_utility', true), 'off') = 'on'
        AS logged \gset
 \if :logged
@@ -102,6 +106,9 @@ END $log$;
 \echo 'ВНИМАНИЕ: не суперпользователь — при ошибке запроса текст с паролем может попасть в журнал (log_min_error_statement).'
 \endif
 \endif
+-- Транзакция — после настроек журнала: выборка log_transaction_sample_rate решается в начале
+-- транзакции, поэтому отключать её нужно до BEGIN (на весь сеанс psql).
+BEGIN;
 SET LOCAL password_encryption = 'scram-sha-256';
 
 -- Пустая переменная окружения = не задана (запросы с паролями — только после отключения журнала).
@@ -127,7 +134,8 @@ SELECT set_config('feelings_roles.worker_login', :'worker_login', true),
        set_config('feelings_roles.admin_login', :'admin_login', true),
        set_config('feelings_roles.do_worker', CASE WHEN :'do_worker'::boolean THEN '1' ELSE '' END, true),
        set_config('feelings_roles.do_admin', CASE WHEN :'do_admin'::boolean THEN '1' ELSE '' END, true),
-       set_config('feelings_roles.do_api', CASE WHEN :'do_api'::boolean THEN '1' ELSE '' END, true)
+       set_config('feelings_roles.do_api', CASE WHEN :'do_api'::boolean THEN '1' ELSE '' END, true),
+       set_config('feelings_roles.is_super', CASE WHEN :'is_super'::boolean THEN '1' ELSE '' END, true)
 \gset
 
 -- Пароль: не короче 32 символов A-Z a-z 0-9 _ - (результат проверки — без самого пароля).
@@ -180,6 +188,27 @@ BEGIN
             RAISE EXCEPTION 'роль «%» уже существует и имеет особые права — скрипт её не трогает', v_name;
         END IF;
     END LOOP;
+    -- Без суперпользователя: права проверяются ДО запросов с паролем, чтобы предсказуемая ошибка
+    -- ALTER ROLE / GRANT не вывела текст запроса с паролем в журнал (log_min_error_statement).
+    IF current_setting('feelings_roles.is_super') = '' THEN
+        IF NOT (SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user) THEN
+            RAISE EXCEPTION 'нужен суперпользователь или роль с CREATEROLE';
+        END IF;
+        FOR v_name IN
+            SELECT r FROM (VALUES
+                (v_worker, current_setting('feelings_roles.do_worker')),
+                ('feelings_worker', current_setting('feelings_roles.do_worker')),
+                ('feelings_app', current_setting('feelings_roles.do_worker')),
+                (v_admin, current_setting('feelings_roles.do_admin')),
+                ('feelings_admin', current_setting('feelings_roles.do_admin')),
+                ('feelings_api', current_setting('feelings_roles.do_api'))) AS t(r, needed)
+            WHERE needed <> '' AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r)
+        LOOP
+            IF NOT pg_has_role(current_user, v_name, 'MEMBER WITH ADMIN OPTION') THEN
+                RAISE EXCEPTION 'у «%» нет ADMIN OPTION на роль «%» — запустите под суперпользователем или владельцем схемы', current_user, v_name;
+            END IF;
+        END LOOP;
+    END IF;
 END $chk$;
 
 \if :do_worker
@@ -242,6 +271,19 @@ BEGIN
         WHERE r.rolname <> v_login AND pg_has_role(v_login, r.oid, 'USAGE');
         IF v_usage IS NOT NULL THEN
             RAISE EXCEPTION 'роль «%» наследует права: % (нужен INHERIT FALSE)', v_login, v_usage;
+        END IF;
+        -- Члены самой роли входа получили бы её доступ (SET ROLE через неё). Допустимо только
+        -- членство без SET и INHERIT — так PG16 записывает создателя роли (ADMIN OPTION).
+        SELECT string_agg(m.rolname, ', ' ORDER BY m.rolname) INTO v_extra
+        FROM pg_auth_members am JOIN pg_roles m ON m.oid = am.member
+        WHERE am.roleid = v_role.oid AND (am.set_option OR am.inherit_option);
+        IF v_extra IS NOT NULL THEN
+            RAISE EXCEPTION 'у роли «%» есть члены: % — скрипт такую роль не принимает', v_login, v_extra;
+        END IF;
+        -- Собственные права или объекты (GRANT … TO роль, владение): NOINHERIT от них не защищает.
+        IF EXISTS (SELECT 1 FROM pg_shdepend
+                   WHERE refclassid = 'pg_authid'::regclass AND refobjid = v_role.oid) THEN
+            RAISE EXCEPTION 'у роли «%» есть собственные права или объекты — скрипт такую роль не принимает', v_login;
         END IF;
         IF EXISTS (SELECT 1 FROM unnest(v_allowed) a WHERE NOT pg_has_role(v_login, a, 'SET')) THEN
             RAISE EXCEPTION 'роль «%» не может SET ROLE в одну из: %', v_login, array_to_string(v_allowed, ', ');

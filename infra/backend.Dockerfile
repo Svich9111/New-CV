@@ -6,7 +6,12 @@
 # backend.Dockerfile.dockerignore (в том числе .env: секреты в образ не кладутся).
 FROM python:3.12-slim
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.32 /uv /usr/local/bin/uv
+# Необязательный корневой сертификат для сборки за прокси с подменой TLS (только сборка:
+# BuildKit-секрет `build_ca`, в образ не попадает). На сервере стенда не нужен.
+# uv — из PyPI (тот же реестр, что и зависимости; ghcr.io не нужен), версия закреплена.
+RUN --mount=type=secret,id=build_ca,required=false \
+    if [ -s /run/secrets/build_ca ]; then export PIP_CERT=/run/secrets/build_ca; fi; \
+    pip install --no-cache-dir uv==0.11.32
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -17,7 +22,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /srv/backend
 # Зависимости — отдельным слоем, строго по uv.lock, без инструментов разработки.
 COPY backend/pyproject.toml backend/uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project
+RUN --mount=type=secret,id=build_ca,required=false \
+    if [ -s /run/secrets/build_ca ]; then export SSL_CERT_FILE=/run/secrets/build_ca; fi; \
+    uv sync --locked --no-dev --no-install-project
 
 # Код и промпты: app.ai.prompts ищет каталог prompts/ рядом с backend/ (/srv/prompts).
 COPY backend/alembic.ini ./

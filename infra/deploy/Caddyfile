@@ -1,13 +1,13 @@
 # Caddy тестового стенда (задача 0.8): HTTPS по домену (Let's Encrypt, автоматически),
 # статический Mini App и обратный прокси на API. Наружу — только 80/443 (80 — выдача
 # сертификата и переадресация на HTTPS).
-{
-	email {$FEELINGS_ACME_EMAIL}
-	# Журнал доступа Caddy не ведётся: в пути может быть токен приглашения (/invites/<токен>),
-	# журнал доступа API (uvicorn) его маскирует (app.core.logging).
-}
+# Журнал доступа Caddy не ведётся: в пути может быть токен приглашения (/invites/<токен>),
+# журнал доступа API (uvicorn) его маскирует (app.core.logging).
 
 {$FEELINGS_DOMAIN} {
+	# FEELINGS_TLS: почта для Let's Encrypt (стенд) или `internal` — собственный центр Caddy,
+	# только для локальной проверки комплекта (браузер сертификату не доверяет).
+	tls {$FEELINGS_TLS}
 	encode zstd gzip
 
 	header {

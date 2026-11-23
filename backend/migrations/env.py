@@ -19,6 +19,8 @@ db_url = (
     context.get_x_argument(as_dictionary=True).get("db_url")
     or get_settings().migration_database_url
 )
+if not db_url:
+    raise RuntimeError("FEELINGS_MIGRATION_DATABASE_URL is empty (or pass -x db_url=...)")
 config.set_main_option("sqlalchemy.url", db_url)
 target_metadata = Base.metadata
 

@@ -18,7 +18,8 @@ class Settings(BaseSettings):
     # Приложение — только под ролью входа feelings_api (АР-10); пароль задаётся окружением.
     database_url: str = "postgresql+asyncpg://feelings_api@localhost:5432/feelings"
     # Владелец схемы для Alembic; приложение под ним не работает.
-    migration_database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/feelings"
+    # Без значения по умолчанию (0.8): адрес владельца схемы с паролем — только из окружения.
+    migration_database_url: str = ""
     redis_url: str = "redis://localhost:6379/0"
     telegram_bot_token: SecretStr = SecretStr("")
     # Максимальный возраст initData, секунд (ФТ-01)
