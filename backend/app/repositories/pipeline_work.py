@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -32,6 +33,8 @@ from app.repositories import texts
 from app.repositories.chat import SAFETY_EVENT_TYPES
 from app.repositories.memory_work import worker_scope
 
+logger = logging.getLogger(__name__)
+
 WithholdReason = Literal["safety", "model_refusal", "pipeline_error"]
 DeliverResult = Literal["delivered", "couple_ended", "lost"]
 
@@ -44,9 +47,14 @@ _DELIVER = (
     "SELECT pipeline_deliver_leased(:m, :t, :b, :ad, CAST(:tone AS smallint), :h, "
     "CAST(CAST(:ev AS text[]) AS safety_event_type[]))"
 )
+# 0014: 5 аргументов — тип кризиса для автора (``safety`` требует его, прочие причины — NULL).
 _WITHHOLD = (
-    "SELECT pipeline_withhold_leased(:m, :t, :r, CAST(CAST(:ev AS text[]) AS safety_event_type[]))"
+    "SELECT pipeline_withhold_leased(:m, :t, :r, "
+    "CAST(CAST(:ev AS text[]) AS safety_event_type[]), "
+    "CAST(CAST(:cr AS text) AS safety_event_type))"
 )
+_RELEASE = "SELECT pipeline_release(:m, :t, CAST(CAST(:after AS text) AS interval), :count)"
+MAX_RETRY_AFTER = timedelta(days=1)  # предел pipeline_release (22023 больше)
 
 
 @dataclass(frozen=True)
@@ -64,15 +72,41 @@ def _interval(value: timedelta) -> str:
     return f"{value.total_seconds():.3f} seconds"
 
 
+_DB_EVENT_TYPES = frozenset(SAFETY_EVENT_TYPES.values())
+
+
+def _db_type(e: str | None) -> str | None:
+    """Тип ``crisis`` или уже значение перечисления → значение ``safety_event_type``."""
+    if e in SAFETY_EVENT_TYPES:
+        return SAFETY_EVENT_TYPES[e]
+    return e if e in _DB_EVENT_TYPES else None
+
+
 def event_types(events: Iterable[str]) -> list[str]:
     """Типы ``crisis`` → значения ``safety_event_type`` (``outgoing_threat`` →
-    ``threat_outgoing``). Неизвестный тип — ``ValueError``: завершение не пишет мусор."""
+    ``threat_outgoing``). Неизвестный тип отбрасывается с предупреждением (только код типа, без
+    текста): остановка по безопасности не должна срываться из-за события (ревью 3.2 MINOR-6)."""
     out = []
     for e in events:
-        if e not in SAFETY_EVENT_TYPES:
-            raise ValueError("неизвестный тип события безопасности")
-        out.append(SAFETY_EVENT_TYPES[e])
+        db = _db_type(e)
+        if db is not None:
+            out.append(db)
+        else:
+            logger.warning("pipeline: unknown safety event type dropped")
     return out
+
+
+def crisis_type(primary: str | None, events: Iterable[str]) -> str:
+    """Тип кризиса для автора (АР-45 п.3; шаблон отправителя при ``threat_outgoing``, §9.3):
+    главный тип, иначе первый известный не-``underage`` из событий. Неизвестно ничего —
+    ``life_threat`` с предупреждением: самый осторожный протокол (экстренные службы), остановка
+    не срывается (MINOR-6; при ``MESSAGE_CRISIS`` ⊂ ``SAFETY_EVENT_TYPES`` недостижимо)."""
+    for e in (primary, *events):
+        db = _db_type(e)
+        if db is not None and db != "underage":
+            return db
+    logger.warning("pipeline: crisis type unknown, cautious protocol used")
+    return "life_threat"
 
 
 async def claim(
@@ -135,8 +169,15 @@ async def withhold(
     c: PipelineClaim,
     reason: WithholdReason,
     events: Sequence[str] = (),
+    crisis: str | None = None,
 ) -> bool:
-    """Остановка по токену с причиной (видна автору в ленте); ``False`` — как ``lost``."""
+    """Остановка по токену с причиной (видна автору в ленте); ``False`` — как ``lost`` (аренду
+    перехватили, сообщения нет или исход уже записан — запись по токену идемпотентна, 0014).
+    ``crisis`` — тип кризиса (crisis-тип или значение перечисления) только при ``safety``; не
+    задан — по событиям (``crisis_type``)."""
+    if reason != "safety" and crisis is not None:
+        raise ValueError("тип кризиса — только у остановки безопасностью")
+    cr = crisis_type(crisis, events) if reason == "safety" else None
     async with worker_scope(sm) as s:
         value = (
             await s.execute(
@@ -146,6 +187,34 @@ async def withhold(
                     "t": c.token,
                     "r": reason,
                     "ev": event_types(events) or None,
+                    "cr": cr,
+                },
+            )
+        ).scalar_one()
+    return bool(value)
+
+
+async def release(
+    sm: async_sessionmaker[AsyncSession],
+    c: PipelineClaim,
+    *,
+    retry_after: timedelta,
+    count_attempt: bool,
+) -> bool:
+    """Досрочное снятие аренды (0014, АР-45): сообщение снова выдаётся захватом не раньше чем
+    через ``retry_after``; ``count_attempt=False`` — попытка не расходуется (пауза при ошибке
+    настройки модели; предел ожидания — 24 ч от отправки, ставит БД). ``False`` — аренда не
+    своя или сообщение уже не в конвейере."""
+    after = min(max(retry_after, timedelta(0)), MAX_RETRY_AFTER)
+    async with worker_scope(sm) as s:
+        value = (
+            await s.execute(
+                text(_RELEASE),
+                {
+                    "m": c.message_id,
+                    "t": c.token,
+                    "after": _interval(after),
+                    "count": count_attempt,
                 },
             )
         ).scalar_one()

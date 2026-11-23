@@ -211,6 +211,8 @@ services:
       FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
       FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?задайте OPENROUTER_API_KEY}
+      # Набор промптов конвейера (АР-26, АР-45): v0 — только staging; без значения не стартует.
+      FEELINGS_PIPELINE_PROMPT_SET: ${FEELINGS_PIPELINE_PROMPT_SET:?задайте FEELINGS_PIPELINE_PROMPT_SET (АР-45)}
     healthcheck: *worker-health
     networks: [data, egress]
     depends_on:

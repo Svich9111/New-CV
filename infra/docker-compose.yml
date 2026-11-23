@@ -97,7 +97,10 @@ services:
   worker-pipeline:
     <<: *backend
     command: ["python", "-m", "app.workers.pipeline"]
-    environment: *worker-env
+    environment:
+      <<: *worker-env
+      # Набор промптов (АР-45): локально — прототип v0; в production — только прогнанный набор.
+      FEELINGS_PIPELINE_PROMPT_SET: ${FEELINGS_PIPELINE_PROMPT_SET:-v0}
     depends_on: *worker-deps
 
 volumes:

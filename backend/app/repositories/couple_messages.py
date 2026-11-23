@@ -7,7 +7,9 @@
   ``(sent_at DESC, id DESC)``, курсор — ключ последней показанной строки; автору — его оригинал,
   получателю — версия для получателя; ``processing``/``withheld`` получателю не видны. После
   выхода из пары или её распада лента пуста (ТЗ §4.5 п.2). Предел функции — 100 строк: при
-  ``limit = 100`` полная страница даёт курсор, следующая может оказаться пустой (Б-80);
+  ``limit = 100`` полная страница даёт курсор, следующая может оказаться пустой (Б-80). Автору у
+  остановленного (``withheld``) — причина ``withheld_reason`` и тип кризиса ``withheld_crisis``
+  (0013/0014, АР-44, АР-45; получателю функция отдаёт NULL);
 - ``app_read_original`` — оригинал: получателю доставленного — с фиксацией просмотра
   ``original_viewed_at``, автору — без неё; сообщение должно быть из текущей пары (иначе ``Gone``
   — 404, как в ленте). Не расшифровался — транзакция откатывается вместе с отметкой (просмотр
@@ -39,7 +41,8 @@ DELIVERED = ("delivered", "read", "answered")
 
 _FEED_PAGE = (
     "SELECT id, couple_id, outgoing, text_enc, is_adapted, harsh_tone_warning, "
-    "status::text AS status, reply_to_id, draft_id, sent_at, read_at "
+    "status::text AS status, reply_to_id, draft_id, sent_at, read_at, "
+    "withheld_reason, withheld_crisis::text AS withheld_crisis "
     "FROM app_couple_feed_page(:l, :ba, :bi)"
 )
 _CURRENT_COUPLE = (
@@ -70,6 +73,10 @@ class FeedItem:
     sent_at: datetime
     read_at: datetime | None
     unavailable: str | None = None
+    # Только автору и только у ``withheld`` (0013/0014: функция отдаёт их лишь автору; АР-44,
+    # АР-45): причина остановки и тип кризиса — какой протокол помощи показать (§9.3).
+    withheld_reason: str | None = None
+    withheld_crisis: str | None = None
 
 
 class Gone(Exception):
@@ -95,6 +102,18 @@ def _open(keys: Keyring, r: Any) -> tuple[str | None, str | None]:
         return open_row(keys, crypto.MESSAGE_ADAPTED, msg_id, m["text_enc"])
     draft = None if m["draft_id"] is None else _uuid(m["draft_id"])
     return open_row(keys, crypto.MESSAGE_ORIGINAL, draft, m["text_enc"])
+
+
+def _withheld(r: Any) -> dict[str, str | None]:
+    """Причина и тип кризиса — только своему ``withheld`` (функция уже обнуляет их получателю;
+    здесь — вторая граница: у входящих и не остановленных полей нет)."""
+    if not r.outgoing or r.status != "withheld":
+        return {"withheld_reason": None, "withheld_crisis": None}
+    reason = r.withheld_reason
+    return {
+        "withheld_reason": reason,
+        "withheld_crisis": r.withheld_crisis if reason == "safety" else None,
+    }
 
 
 async def read_page(
@@ -138,6 +157,7 @@ async def read_page(
                 sent_at=r.sent_at,
                 read_at=r.read_at,
                 unavailable=reason,
+                **_withheld(r),
             )
         )
     # Предел функции — 100: при limit = 100 полная страница означает «возможно, есть ещё»

@@ -47,6 +47,7 @@ from app.ai.llm import (
     Usage,
 )
 from app.ai.models import AgentModels
+from app.ai.prompts import V0
 from app.core import crypto
 from app.core.crypto import Keyring, generate_key_entry, parse_keyring
 from app.db import make_sessionmaker, user_scope
@@ -179,6 +180,7 @@ def make_worker(engine: AsyncEngine, stub: Stub, **cfg: Any) -> PipelineWorker:
         worker_sm=make_sessionmaker(engine),
         keys=KEYS,
         models=AgentModels.single(stub),  # type: ignore[arg-type]
+        prompt_set=V0,  # АР-45: набор промптов — явно, значения по умолчанию нет
         settings=PipelineSettings(**({"lease": LEASE, "batch": 20} | cfg)),
     )
 
@@ -311,6 +313,19 @@ async def expire(engine: AsyncEngine, mid: uuid.UUID) -> None:
             text(
                 "UPDATE partner_messages SET work_lease_until = now() - interval '1 second' "
                 "WHERE id = :m AND work_lease_token IS NOT NULL"
+            ),
+            {"m": mid},
+        )
+
+
+async def due(engine: AsyncEngine, mid: uuid.UUID) -> None:
+    """Срок повтора (``pipeline_release``, 0014) или аренды наступил — для сообщения в
+    конвейере (правка A3, раунд 1: после досрочного снятия аренды токена нет)."""
+    async with engine.begin() as c:
+        await c.execute(
+            text(
+                "UPDATE partner_messages SET work_lease_until = now() - interval '1 second' "
+                "WHERE id = :m AND status = 'processing'"
             ),
             {"m": mid},
         )
@@ -529,16 +544,26 @@ async def test_model_refusal_withheld_and_never_retried(
     assert await events(engine, duo.anna.user_id) == []
 
 
+# АР-45 п.2 (ревью 3.2 MAJOR-2, раунд 1, правка A3): ``pipeline_error`` — только ``bad_request``
+# (ошибка в коде); ошибки, которые лечит оператор (лимит, ключ, настройка, модель не найдена), —
+# пауза воркера без закрытия сообщения: ``test_operator_fixable_error_pauses_not_closes``.
+OPERATOR_FIXABLE = [
+    ("safety", LLMQuotaError("q")),
+    ("safety", LLMConfigError("c")),
+    ("tone", LLMAuthError("a")),
+    ("safety", LLMModelNotFound("m")),
+    ("adapt", LLMConfigError("c")),
+    ("meaning", LLMQuotaError("q")),
+]
+
+
 @pytest.mark.parametrize(
     ("step", "exc"),
     [
-        ("safety", LLMQuotaError("q")),
-        ("safety", LLMConfigError("c")),
-        ("tone", LLMAuthError("a")),
-        ("safety", LLMModelNotFound("m")),
         ("tone", LLMRequestError("r")),
-        ("adapt", LLMConfigError("c")),
-        ("meaning", LLMQuotaError("q")),
+        ("safety", LLMRequestError("r")),
+        ("adapt", LLMRequestError("r")),
+        ("meaning", LLMRequestError("r")),
     ],
 )
 async def test_unrecoverable_error_pipeline_error(
@@ -557,6 +582,27 @@ async def test_unrecoverable_error_pipeline_error(
     assert mid not in await feed(sessionmaker, duo.igor.user_id)
     await expire(engine, mid)
     assert await make_worker(engine, stub).run_once() == []
+
+
+@pytest.mark.parametrize(("step", "exc"), OPERATOR_FIXABLE)
+async def test_operator_fixable_error_pauses_not_closes(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo, step: str, exc: BaseException
+) -> None:
+    """АР-45 п.2: лимит, ключ, настройка, модель не найдена — сообщение не закрывается и попытка
+    не расходуется; воркер на паузе; получатель ничего не видит; после исправления — доставка."""
+    mid, _ = await send(sessionmaker, duo.anna, HARSH)
+    stub = Stub(fail={step: [exc]})
+    w = make_worker(engine, stub)
+    out = await w.run_once()
+    assert [(o.status, o.reason) for o in out] == [("paused", getattr(exc, "kind", None))]
+    assert (await author_view(sessionmaker, duo.anna.user_id))[mid] == ("processing", None)
+    r = await row(engine, mid)
+    assert r is not None and r["work_attempts"] == 0 and r["work_lease_token"] is None
+    assert mid not in await feed(sessionmaker, duo.igor.user_id)
+    assert await w.run_once() == []  # пауза
+    await due(engine, mid)
+    out = await make_worker(engine, stub).run_once()
+    assert [(o.status, o.attempts) for o in out] == [("delivered", 1)]
 
 
 async def test_undecryptable_original_pipeline_error_without_model(
@@ -589,19 +635,20 @@ async def test_undecryptable_original_pipeline_error_without_model(
 async def test_unavailable_retry_after_lease_then_delivered(
     sessionmaker: SM, engine: AsyncEngine, duo: Duo, step: str, errs: list[BaseException]
 ) -> None:
-    """§10, АР-27, Б-48: недоступность/испорченный ответ на безопасности или тоне — ничего не
-    записано, одобрение не израсходовано; до истечения аренды не повторяется, после — повтор и
-    доставка; получатель до доставки ничего не видит."""
+    """§10, АР-27, Б-48: недоступность/испорченный ответ на безопасности или тоне — исход не
+    записан, одобрение не израсходовано; до срока повтора не повторяется, после — повтор и
+    доставка; получатель до доставки ничего не видит. (АР-45, MINOR-1, правка A3: аренда
+    снимается досрочно ``pipeline_release`` со сроком повтора 5 с · 2^попытка.)"""
     mid, _ = await send(sessionmaker, duo.anna, HARSH)
     stub = Stub(fail={step: errs})
     out = await make_worker(engine, stub).run_once()
     assert [(o.status, o.attempts) for o in out] == [("retry", 1)]
     r = await row(engine, mid)
-    assert r is not None and r["status"] == "processing" and r["work_lease_token"] is not None
+    assert r is not None and r["status"] == "processing" and r["work_lease_token"] is None
     assert (await author_view(sessionmaker, duo.anna.user_id))[mid] == ("processing", None)
     assert mid not in await feed(sessionmaker, duo.igor.user_id)
-    assert await make_worker(engine, stub).run_once() == []  # аренда держится
-    await expire(engine, mid)
+    assert await make_worker(engine, stub).run_once() == []  # срок повтора не наступил
+    await due(engine, mid)
     out = await make_worker(engine, stub).run_once()
     assert [(o.status, o.attempts) for o in out] == [("delivered", 2)]
     assert (await feed(sessionmaker, duo.igor.user_id))[mid].text == HARSH_ADAPTED
@@ -624,7 +671,7 @@ async def test_attempts_exhausted_author_sees_reason(
     stub = Stub(fail={"safety": [LLMUnavailable("x")] * 10})
     for _ in range(2):
         assert statuses(await make_worker(engine, stub, max_attempts=2).run_once()) == ["retry"]
-        await expire(engine, mid)
+        await due(engine, mid)  # АР-45: срок повтора, а не аренда (правка A3)
     n = len(stub.calls)
     assert await make_worker(engine, stub, max_attempts=2).run_once() == []
     assert len(stub.calls) == n == 2
@@ -1448,11 +1495,6 @@ async def test_max_length_message_processed(
     assert (await feed(sessionmaker, duo.igor.user_id))[mid].is_adapted is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-3.2-D1: отказ модели расходует одобрение только в памяти процесса — сбой БД при "
-    "записи model_refusal ведёт к повторной обработке и доставке после аренды (Б-48)",
-)
 async def test_refusal_not_turned_into_delivery_after_db_failure(
     sessionmaker: SM, engine: AsyncEngine, duo: Duo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1478,11 +1520,6 @@ async def test_refusal_not_turned_into_delivery_after_db_failure(
     assert mid not in await feed(sessionmaker, duo.igor.user_id)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-3.2-D2 / Б-84: причина остановки (withheld_reason) не отдаётся автору ни слоем "
-    "ленты, ни API — клиент не отличит кризис (помощь, §9.3) от сбоя или распада пары",
-)
 def test_author_feed_exposes_withheld_reason() -> None:
     """§9.3, АР-28, критерий карточки 3.2: автору — «не отправлено» и помощь. Контракт
     ``PartnerMessage.withheld_reason`` объявлен (0013), слой ленты и ответ API его не несут."""

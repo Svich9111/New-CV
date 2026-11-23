@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     pipeline_max_attempts: int = Field(default=5, ge=1, le=100)
     pipeline_poll_s: float = Field(default=1.0, gt=0, le=60)
     pipeline_batch: int = Field(default=5, ge=1, le=100)
+    # Набор промптов конвейера — обязателен, без значения по умолчанию (АР-26, АР-45): v0 —
+    # прототип без прогона (только staging и разработка), в production — только прогнанный набор.
+    pipeline_prompt_set: str = ""
+    # Пауза воркера при ошибке настройки модели (лимит, ключ, модель не найдена), секунд (АР-45).
+    pipeline_pause_s: int = Field(default=300, ge=5, le=24 * 60 * 60)
     session_ttl_s: int = 3600
     # Имя бота без «@» для ссылки-приглашения https://t.me/<бот>?startapp=<токен> (ФТ-03).
     # Не секрет; правила имени Telegram — 5–32 символа, латиница, цифры, «_».

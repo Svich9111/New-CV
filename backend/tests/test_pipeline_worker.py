@@ -27,22 +27,32 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.ai import pipeline
 from app.ai.llm import (
     ChatMessage,
+    LLMAuthError,
     LLMBadOutput,
+    LLMConfigError,
     LLMError,
+    LLMModelNotFound,
     LLMQuotaError,
     LLMRefusal,
+    LLMRequestError,
     LLMUnavailable,
     StructuredResult,
 )
 from app.ai.models import AgentModels
 from app.ai.prompts import V0, system_prompt
 from app.ai.stub import ScriptedProvider, role_of
+from app.config import ConfigError, Settings
 from app.core import crypto
 from app.core.crypto import Keyring, generate_key_entry, parse_keyring
 from app.db import make_sessionmaker, user_scope
 from app.repositories import chat, couple_messages, texts
 from app.repositories import pipeline_work as pw
-from app.workers.pipeline import PipelineOutcome, PipelineSettings, PipelineWorker
+from app.workers.pipeline import (
+    PipelineOutcome,
+    PipelineSettings,
+    PipelineWorker,
+    resolve_prompt_set,
+)
 from tests.conftest import TEST_FP
 from tests.test_couple_functions import LEAVE, SM, _call
 from tests.test_pipeline_db import P, _events, _expire, _msg, _pair, _park
@@ -57,6 +67,10 @@ HARSH_ADAPTED = "Ты опять опоздал. Третий раз за нед
 HINT = "Похоже, автору важна пунктуальность. Можно начать с признания."
 CRISIS_SELF = "Я больше не хочу жить, всё бессмысленно."
 CRISIS_THREAT = "Ещё раз так сделаешь — пожалеешь, мало не покажется."
+CRISIS_VIOLENCE = "Вчера он снова меня ударил, мне страшно."
+CRISIS_LIFE = "Я сейчас стою на крыше и сейчас прыгну."
+UNDERAGE = "Мне 15 лет, и ты опять опоздал!"
+SLOW = "Медленное сообщение"
 
 Hook = Callable[[str, dict[str, Any]], Awaitable[None]]
 
@@ -69,6 +83,12 @@ def honest(role: str, payload: dict[str, Any]) -> dict[str, Any]:
             return {"category": "self_harm", "secondary": []}
         if "пожалеешь" in low:
             return {"category": "threat_or_insult", "secondary": []}
+        if "ударил" in low:
+            return {"category": "violence", "secondary": []}
+        if "прыгну" in low:
+            return {"category": "life_threat", "secondary": ["self_harm"]}
+        if "мне 15 лет" in low:
+            return {"category": "underage", "secondary": []}
         return {"category": "none", "secondary": []}
     if role == "tone":
         harsh = "!" in payload["original"]
@@ -129,6 +149,7 @@ def worker(engine: AsyncEngine, model: Model, **cfg: Any) -> PipelineWorker:
         worker_sm=make_sessionmaker(engine),
         keys=KEYS,
         models=AgentModels.single(model),
+        prompt_set=V0,  # набор — явно (АР-45: значения по умолчанию нет)
         settings=settings,
     )
 
@@ -139,12 +160,29 @@ async def send(sm: SM, who: P, body: str) -> uuid.UUID:
     return await texts.send_draft(sm, who.user_id, did, 1)
 
 
+async def _due_in(engine: AsyncEngine, mid: uuid.UUID) -> float:
+    """Через сколько секунд захват снова выдаст сообщение (``work_lease_until − now()``)."""
+    async with engine.connect() as c:
+        value = (
+            await c.execute(
+                text(
+                    "SELECT EXTRACT(EPOCH FROM work_lease_until - now()) FROM partner_messages "
+                    "WHERE id = :m"
+                ),
+                {"m": mid},
+            )
+        ).scalar_one()
+    return float(value)
+
+
 async def author_view(sm: SM, uid: uuid.UUID) -> dict[uuid.UUID, Any]:
-    """Лента автора с причиной остановки (``app_couple_feed_page``, 0013; поле API — Б-84)."""
+    """Лента автора с причиной остановки и типом кризиса (``app_couple_feed_page``, 0013/0014;
+    поля API — Б-84, A2)."""
     async with user_scope(sm, uid) as s:
         rows = await s.execute(
             text(
-                "SELECT id, status::text AS status, withheld_reason "
+                "SELECT id, status::text AS status, withheld_reason, "
+                "withheld_crisis::text AS withheld_crisis "
                 "FROM app_couple_feed_page(100, NULL, NULL)"
             )
         )
@@ -242,6 +280,11 @@ async def test_crisis_withheld_author_sees_not_sent(
         assert (view[m].status, view[m].withheld_reason) == ("withheld", "safety")
         row = await _msg(engine, m)
         assert row is not None and row["adapted_enc"] is None
+    # MAJOR-3: тип кризиса — автору, для протокола §9.3 (шаблон отправителя при угрозе).
+    assert view[self_harm].withheld_crisis == "self_harm"
+    assert view[threat].withheld_crisis == "threat_outgoing"
+    # Получатель типа не видит (сообщения в его ленте нет вовсе).
+    assert self_harm not in await author_view(sessionmaker, igor.user_id)
     assert await _events(engine, anna.user_id) == ["self_harm", "threat_outgoing"]
     assert await _events(engine, igor.user_id) == []
 
@@ -270,12 +313,13 @@ async def test_model_refusal_consumes_approval(
 
 @pytest.mark.parametrize("exc", [LLMUnavailable("нет связи"), LLMBadOutput("мусор")])
 @pytest.mark.parametrize("step", ["safety", "tone"])
-async def test_unavailable_retries_after_lease_then_exhausted(
+async def test_unavailable_retries_after_short_delay_then_exhausted(
     sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID], exc: LLMError, step: str
 ) -> None:
-    """Недоступность модели (и испорченный ответ) на безопасности/тоне — ничего не
-    вызывается: сообщение под арендой, до её истечения не повторяется; после — повтор (попытка
-    2); предел попыток — ``withheld/attempts_exhausted`` ставит БД, автору видно."""
+    """MINOR-1, АР-45: недоступность модели (и испорченный ответ) на безопасности/тоне — аренда
+    снимается досрочно (``pipeline_release``, задержка 5 с · 2^попытка, попытка засчитана); до
+    срока не повторяется, после — повтор (попытка 2); предел попыток —
+    ``withheld/attempts_exhausted`` ставит БД, автору видно."""
     anna, igor, _ = pair
     mid = await send(sessionmaker, anna, HARSH)
     model = Model(fail={step: [exc] * 4})  # испорченный ответ ``complete`` повторяет сам
@@ -284,8 +328,10 @@ async def test_unavailable_retries_after_lease_then_exhausted(
         ("retry", exc.kind, 1)
     ]
     row = await _msg(engine, mid)
-    assert row is not None and row["status"] == "processing" and row["work_lease_token"]
-    assert await w.run_once() == []  # аренда ещё действует
+    assert row is not None and row["status"] == "processing"
+    assert row["work_lease_token"] is None and row["work_attempts"] == 1
+    assert await _due_in(engine, mid) == pytest.approx(10, abs=3)  # 5 с · 2^1
+    assert await w.run_once() == []  # срок повтора ещё не наступил
     await _expire(engine, mid)
     assert [(o.status, o.attempts) for o in await w.run_once()] == [("retry", 2)]
     await _expire(engine, mid)
@@ -298,7 +344,7 @@ async def test_unavailable_retries_after_lease_then_exhausted(
 async def test_unavailable_then_recovered_delivers_once(
     sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID]
 ) -> None:
-    """Сбой не расходует одобрение (Б-48): после аренды — доставка, ровно одна."""
+    """Сбой не расходует одобрение (Б-48): после задержки — доставка, ровно одна."""
     anna, igor, _ = pair
     mid = await send(sessionmaker, anna, HARSH)
     model = Model(fail={"safety": [LLMUnavailable("нет связи")]})
@@ -329,16 +375,68 @@ async def test_degraded_adaptation_delivers_original_with_warning(
     assert (item.text, item.is_adapted, item.harsh_tone_warning) == (HARSH, False, True)
 
 
-@pytest.mark.parametrize("step", ["safety", "adapt"])
-async def test_config_error_is_pipeline_error(
-    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID], step: str
+@pytest.mark.parametrize(
+    "exc",
+    [
+        LLMQuotaError("402"),
+        LLMAuthError("401"),
+        LLMConfigError("нет ключа"),
+        LLMModelNotFound("404"),
+    ],
+)
+@pytest.mark.parametrize("step", ["safety", "tone", "adapt", "meaning"])
+async def test_config_error_pauses_worker_without_spending_attempt(
+    sessionmaker: SM,
+    engine: AsyncEngine,
+    pair: tuple[P, P, uuid.UUID],
+    caplog: pytest.LogCaptureFixture,
+    step: str,
+    exc: LLMError,
 ) -> None:
-    """АР-27: ошибка настройки (ключ, лимит, модель не найдена) — не деградация:
-    ``withheld/pipeline_error``, без автоповтора."""
+    """MAJOR-2, АР-45 п.2: лимит, ключ, настройка, модель не найдена — «сервис не настроен», а не
+    свойство сообщения: сообщение не закрывается и попытка не расходуется
+    (``pipeline_release(…, пауза, false)``); воркер на паузе — новых не захватывает; ERROR в
+    журнале без текстов. После паузы (исправил оператор) — доставка."""
+    anna, igor, _ = pair
+    mid = await send(sessionmaker, anna, HARSH)
+    caplog.set_level(logging.INFO)
+    model = Model(fail={step: [exc]})
+    w = worker(engine, model, pause=timedelta(minutes=5))
+    assert [(o.status, o.reason, o.attempts) for o in await w.run_once()] == [
+        ("paused", exc.kind, 1)
+    ]
+    assert w.paused
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == [
+        f"pipeline paused: model {exc.kind}, resume in 300s"
+    ]
+    row = await _msg(engine, mid)
+    assert row is not None
+    assert (row["status"], row["work_lease_token"], row["work_attempts"]) == ("processing", None, 0)
+    assert await _due_in(engine, mid) == pytest.approx(300, abs=5)
+    other = await send(sessionmaker, anna, CALM)
+    calls = len(model.requests)
+    assert await w.run_once() == []  # на паузе — ничего не захватывает
+    assert len(model.requests) == calls
+    assert (await author_view(sessionmaker, anna.user_id))[mid].status == "processing"
+    # Оператор исправил настройку, пауза кончилась (новая копия) — сообщение доставляется.
+    await _expire(engine, mid)
+    out = await worker(engine, Model()).run_once()
+    assert sorted((o.status, o.attempts) for o in out) == [("delivered", 1), ("delivered", 1)]
+    feed = await recipient_feed(sessionmaker, igor.user_id)
+    assert feed[mid].text == HARSH_ADAPTED and feed[other].text == CALM
+
+
+async def test_bad_request_is_pipeline_error(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID]
+) -> None:
+    """АР-45: ``bad_request`` — ошибка в коде, детерминирована для запроса: ``pipeline_error``."""
     anna, _igor, _ = pair
     mid = await send(sessionmaker, anna, HARSH)
-    out = await worker(engine, Model(fail={step: [LLMQuotaError("402")]})).run_once()
+    w = worker(engine, Model(fail={"safety": [LLMRequestError("400")]}))
+    out = await w.run_once()
     assert [(o.status, o.reason) for o in out] == [("withheld", "pipeline_error")]
+    assert not w.paused
     view = await author_view(sessionmaker, anna.user_id)
     assert view[mid].withheld_reason == "pipeline_error"
 
@@ -355,6 +453,7 @@ async def test_undecryptable_original_is_pipeline_error(
         worker_sm=make_sessionmaker(engine),
         keys=other,
         models=AgentModels.single(model),
+        prompt_set=V0,
         settings=PipelineSettings(lease=LEASE),
     )
     assert [(o.status, o.reason) for o in await w.run_once()] == [("withheld", "pipeline_error")]
@@ -634,7 +733,7 @@ async def test_logs_have_no_texts_or_ids(
     assert sorted(o.status for o in out) == [
         "delivered",
         "delivered",
-        "error",
+        "retry",
         "retry",
         "withheld",
         "withheld",
@@ -697,5 +796,233 @@ async def test_settings_and_event_mapping() -> None:
         "underage",
         "self_harm",
     ]
-    with pytest.raises(ValueError):
-        pw.event_types(["threat_or_insult"])
+    assert cfg.retry_delay(1) == timedelta(seconds=10)
+    assert cfg.retry_delay(3) == timedelta(seconds=40)
+    assert cfg.retry_delay(30) == timedelta(hours=1)
+
+
+# --------------------------------------------------------------------------- раунд 1 (ревью 3.2)
+
+
+@pytest.mark.parametrize(
+    ("body", "crisis", "events"),
+    [
+        (CRISIS_VIOLENCE, "violence", ["violence"]),
+        (CRISIS_LIFE, "life_threat", ["life_threat"]),  # главный тип (вторичные — в протоколе)
+    ],
+)
+async def test_crisis_violence_and_life_threat(
+    sessionmaker: SM,
+    engine: AsyncEngine,
+    pair: tuple[P, P, uuid.UUID],
+    body: str,
+    crisis: str,
+    events: list[str],
+) -> None:
+    """MINOR-5, АР-28, АР-45 п.3: насилие и угроза жизни — не доставляются, тип кризиса у
+    сообщения (для автора), все события — типом от имени автора."""
+    anna, igor, _ = pair
+    mid = await send(sessionmaker, anna, body)
+    out = await worker(engine, Model()).run_once()
+    assert [(o.status, o.reason) for o in out] == [("withheld", "safety")]
+    view = await author_view(sessionmaker, anna.user_id)
+    assert (view[mid].withheld_reason, view[mid].withheld_crisis) == ("safety", crisis)
+    assert await _events(engine, anna.user_id) == sorted(events)
+    assert mid not in await recipient_feed(sessionmaker, igor.user_id)
+
+
+async def test_underage_in_delivered_message_event_from_author(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID]
+) -> None:
+    """MINOR-5, §9.3: «младше 18» по тексту сообщения не останавливает доставку; событие
+    ``underage`` — от имени автора, у получателя событий нет."""
+    anna, igor, _ = pair
+    mid = await send(sessionmaker, anna, UNDERAGE)
+    out = await worker(engine, Model()).run_once()
+    assert [(o.status, o.adapted) for o in out] == [("delivered", True)]
+    assert await _events(engine, anna.user_id) == ["underage"]
+    assert await _events(engine, igor.user_id) == []
+    assert (await recipient_feed(sessionmaker, igor.user_id))[mid].is_adapted
+    row = await _msg(engine, mid)
+    assert row is not None and row["withheld_reason"] is None
+
+
+@pytest.mark.parametrize("body", ["   \n\t ", "я" * 4001])
+async def test_text_rejected_by_approve_is_pipeline_error(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID], body: str
+) -> None:
+    """MINOR-5: текст не проходит ``approve`` (пустой после ``strip``, длиннее 4000) —
+    ``pipeline_error`` без вызова модели."""
+    anna, _igor, _ = pair
+    mid = await send(sessionmaker, anna, body)
+    model = Model()
+    out = await worker(engine, model).run_once()
+    assert [(o.status, o.reason) for o in out] == [("withheld", "pipeline_error")]
+    assert model.requests == []
+    assert (await author_view(sessionmaker, anna.user_id))[mid].withheld_reason == "pipeline_error"
+
+
+async def test_timeout_releases_for_short_retry(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID]
+) -> None:
+    """MINOR-5, MINOR-1: превышение времени конвейера — аренда снята досрочно, повтор через
+    5 с · 2^попытка (попытка засчитана), не доставка и не остановка."""
+    anna, igor, _ = pair
+    mid = await send(sessionmaker, anna, HARSH)
+    out = await worker(engine, Model(delay_s=0.3), process_timeout_s=0.1).run_once()
+    assert [(o.status, o.reason, o.attempts) for o in out] == [("retry", "timeout", 1)]
+    row = await _msg(engine, mid)
+    assert row is not None
+    assert (row["status"], row["work_lease_token"], row["work_attempts"]) == ("processing", None, 1)
+    assert await _due_in(engine, mid) == pytest.approx(10, abs=3)
+    await _expire(engine, mid)
+    assert [o.status for o in await worker(engine, Model()).run_once()] == ["delivered"]
+    assert (await recipient_feed(sessionmaker, igor.user_id))[mid].text == HARSH_ADAPTED
+
+
+@pytest.mark.parametrize("fails", [1, 3])
+async def test_refusal_write_retried_with_same_token(
+    sessionmaker: SM,
+    engine: AsyncEngine,
+    pair: tuple[P, P, uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
+    fails: int,
+) -> None:
+    """D1: сбой соединения при записи ``model_refusal`` — та же запись с тем же токеном
+    повторяется (с паузой) до успеха; проход — ``error`` с ``recorded = withheld``; после
+    истечения аренды отказ не превращается в доставку, событий и вторых записей нет."""
+    anna, igor, _ = pair
+    mid = await send(sessionmaker, anna, HARSH)
+    real = pw.withhold
+    tokens: list[uuid.UUID] = []
+
+    async def flaky(sm: Any, c: pw.PipelineClaim, *a: Any, **kw: Any) -> bool:
+        tokens.append(c.token)
+        if len(tokens) <= fails:
+            raise ConnectionError("db down")
+        return await real(sm, c, *a, **kw)
+
+    monkeypatch.setattr(pw, "withhold", flaky)
+    model = Model(fail={"safety": [LLMRefusal("отказ")]})
+    out = await worker(engine, model, write_retry_pause_s=0.01).run_once()
+    assert [(o.status, o.reason, o.recorded) for o in out] == [
+        ("error", "ConnectionError", "withheld")
+    ]
+    assert len(tokens) == fails + 1 and len(set(tokens)) == 1
+    await _expire(engine, mid)
+    assert await worker(engine, Model()).run_once() == []
+    view = await author_view(sessionmaker, anna.user_id)
+    assert (view[mid].status, view[mid].withheld_reason) == ("withheld", "model_refusal")
+    assert mid not in await recipient_feed(sessionmaker, igor.user_id)
+
+
+async def test_write_retries_exhausted_keeps_lease(
+    sessionmaker: SM,
+    engine: AsyncEngine,
+    pair: tuple[P, P, uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D1: запись так и не прошла (повторы исчерпаны) — ``error``; аренда для отказа не
+    снимается досрочно: до её истечения сообщение никому не выдаётся."""
+    anna, _igor, _ = pair
+    mid = await send(sessionmaker, anna, HARSH)
+
+    async def down(*_a: Any, **_kw: Any) -> bool:
+        raise ConnectionError("db down")
+
+    monkeypatch.setattr(pw, "withhold", down)
+    model = Model(fail={"safety": [LLMRefusal("отказ")]})
+    w = worker(engine, model, write_retries=2, write_retry_pause_s=0.01)
+    assert [(o.status, o.recorded) for o in await w.run_once()] == [("error", None)]
+    row = await _msg(engine, mid)
+    assert row is not None and row["status"] == "processing" and row["work_lease_token"]
+    assert await worker(engine, Model()).run_once() == []
+
+
+async def test_unknown_event_type_dropped_safety_kept(
+    sessionmaker: SM,
+    engine: AsyncEngine,
+    pair: tuple[P, P, uuid.UUID],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MINOR-6: неизвестный тип события отбрасывается с предупреждением (без текста), остановка
+    безопасностью не срывается; неизвестный главный тип — осторожный протокол."""
+    anna, _igor, _ = pair
+    mid = await send(sessionmaker, anna, CALM)
+    caplog.set_level(logging.WARNING)
+    [c] = await pw.claim(make_sessionmaker(engine), lease=LEASE, max_attempts=5, limit=10)
+    assert c.message_id == mid
+    sm = make_sessionmaker(engine)
+    ok = await pw.withhold(
+        sm, c, "safety", ("нечто", "self_harm"), pw.crisis_type("нечто", ("нечто", "self_harm"))
+    )
+    assert ok is True
+    assert (await author_view(sessionmaker, anna.user_id))[mid].withheld_crisis == "self_harm"
+    assert await _events(engine, anna.user_id) == ["self_harm"]
+    assert "pipeline: unknown safety event type dropped" in caplog.text
+    assert "нечто" not in caplog.text
+    assert pw.crisis_type("нечто", ("underage",)) == "life_threat"
+    assert pw.crisis_type("outgoing_threat", ()) == "threat_outgoing"
+    assert pw.event_types(["threat_or_insult", "underage"]) == ["underage"]
+
+
+@pytest.mark.parametrize(
+    ("name", "env", "ok"),
+    [
+        ("v0", "staging", True),
+        ("V0", "dev", True),
+        ("v0", "production", False),
+        ("v1", "staging", False),
+        ("v2", "production", False),
+        ("", "staging", False),
+        ("v9", "staging", False),
+        ("v0", "prod", False),
+    ],
+)
+def test_prompt_set_is_required_setting(name: str, env: str, ok: bool) -> None:
+    """MAJOR-1, АР-26, АР-45 п.1: набор промптов — обязательная настройка без значения по
+    умолчанию; v0 — только стенд и разработка; в production — только прогнанный набор (пока
+    нет ни одного), черновые V1/V2 — нигде."""
+    if ok:
+        assert resolve_prompt_set(name, env) is V0
+    else:
+        with pytest.raises(ConfigError):
+            resolve_prompt_set(name, env)
+    assert Settings().pipeline_prompt_set == ""
+
+
+async def test_continuous_loop_slow_message_does_not_block_new(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID]
+) -> None:
+    """MINOR-2: непрерывный цикл с ограничением одновременных — медленное сообщение не
+    задерживает новые: свободный слот сразу занимается захватом."""
+    anna, igor, _ = pair
+    release = asyncio.Event()
+
+    async def hook(role: str, payload: dict[str, Any]) -> None:
+        if role == "safety" and payload["text"] == SLOW:
+            await release.wait()
+
+    w = worker(engine, Model(hook=hook), batch=2)
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run_forever(poll_s=0.05, stop=stop))
+    try:
+        slow = await send(sessionmaker, anna, SLOW)
+        await asyncio.sleep(0.2)
+        fast = [await send(sessionmaker, anna, f"{CALM} {n}") for n in range(3)]
+        t0 = time.monotonic()
+        while True:
+            feed = await recipient_feed(sessionmaker, igor.user_id)
+            if all(m in feed for m in fast):
+                break
+            assert time.monotonic() - t0 < 10
+            await asyncio.sleep(0.05)
+        assert slow not in feed  # медленное ещё в работе
+        release.set()
+        while slow not in await recipient_feed(sessionmaker, igor.user_id):
+            assert time.monotonic() - t0 < 10
+            await asyncio.sleep(0.05)
+    finally:
+        release.set()
+        stop.set()
+        await task

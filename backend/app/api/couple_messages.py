@@ -10,6 +10,8 @@
 Лента — от новых к старым, курсор непрозрачный (позиция + HMAC, привязан к владельцу; чужой или
 испорченный — 422). Автору — его оригинал (версию для получателя автор не видит, АР-25 п.3),
 получателю — версия для получателя с пометкой `is_adapted`; недоставленное получателю не видно.
+Автору у остановленного — причина `withheld_reason` и тип кризиса `withheld_crisis` (какой
+протокол помощи показать, ТЗ §9.3; АР-44, АР-45); получателю и в других статусах — null.
 Нерасшифрованный текст не скрывается: в `text` — `UnavailableText` с кодом причины (контракт —
 `ExportText`, АР-40); в журнал — код причины и колонка.
 
@@ -44,6 +46,12 @@ logger = logging.getLogger(__name__)
 CURSOR_DOMAIN = b"feelings/couple-feed-cursor/v1\x00"
 
 
+WithheldReason = Literal[
+    "safety", "model_refusal", "pipeline_error", "attempts_exhausted", "couple_ended"
+]
+WithheldCrisis = Literal["violence", "threat_outgoing", "self_harm", "life_threat"]
+
+
 class PartnerMessage(BaseModel):
     id: uuid.UUID
     direction: Literal["outgoing", "incoming"]
@@ -51,6 +59,10 @@ class PartnerMessage(BaseModel):
     is_adapted: bool
     harsh_tone_warning: bool
     status: Literal["processing", "withheld", "delivered", "read", "answered"]
+    # Только автору и только при ``withheld`` (АР-44, АР-45); получателю и в остальных
+    # статусах — null.
+    withheld_reason: WithheldReason | None = None
+    withheld_crisis: WithheldCrisis | None = None
     reply_to_id: uuid.UUID | None
     sent_at: datetime
     read_at: datetime | None
@@ -140,6 +152,8 @@ async def feed(
                 reply_to_id=r.reply_to_id,
                 sent_at=r.sent_at,
                 read_at=r.read_at,
+                withheld_reason=r.withheld_reason,
+                withheld_crisis=r.withheld_crisis,
             )
             for r in rows
         ],

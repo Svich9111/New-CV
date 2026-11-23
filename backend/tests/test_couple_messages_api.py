@@ -457,3 +457,176 @@ async def test_logs_have_no_texts_or_ids(env: Env, caplog: pytest.LogCaptureFixt
     for label in env.marks:
         assert label not in logged and label.split("-")[-1] not in logged
     assert str(sc.anna.id) not in logged and str(sc.igor.id) not in logged
+
+
+# --------------------------------------------------------------------------- причина остановки
+# 3.2 (A2), Б-84 / A8-3.2-D2: автору у `withheld` — `withheld_reason` и `withheld_crisis`
+# (контракт `PartnerMessage`, АР-44, АР-45); получателю остановленное не видно и полей нет.
+
+CRISES = ("violence", "threat_outgoing", "self_harm", "life_threat")
+NO_WITHHELD = (None, None)
+
+
+async def withhold_leased(env: Env, msg: uuid.UUID, reason: str, crisis: str | None = None) -> None:
+    """Остановка, как у воркера: аренда (выдана «захватом» — здесь проставлена напрямую, чтобы
+    не забирать чужие сообщения общей тестовой БД) → ``pipeline_withhold_leased`` (0014)."""
+    token = uuid.uuid4()
+    async with env.engine.connect() as conn, conn.begin():
+        await conn.execute(
+            text(
+                "UPDATE partner_messages SET work_lease_token = :t, "
+                "work_lease_until = now() + interval '1 minute' WHERE id = :m"
+            ),
+            {"m": msg, "t": token},
+        )
+        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
+        ok = (
+            await conn.execute(
+                text(
+                    "SELECT pipeline_withhold_leased(:m, :t, CAST(:r AS varchar), "
+                    "CAST(:ev AS safety_event_type[]), CAST(:c AS safety_event_type))"
+                ),
+                {"m": msg, "t": token, "r": reason, "ev": [crisis] if crisis else [], "c": crisis},
+            )
+        ).scalar_one()
+    assert ok is True
+
+
+async def exhaust(env: Env, msg: uuid.UUID) -> None:
+    """``attempts_exhausted`` ставит сам ``pipeline_claim`` (без модели); общий захват забрал
+    бы сообщения других тестов — исход проставлен напрямую, как его пишет функция."""
+    async with env.engine.connect() as conn, conn.begin():
+        await conn.execute(
+            text(
+                "UPDATE partner_messages SET status = 'withheld', "
+                "withheld_reason = 'attempts_exhausted' WHERE id = :m AND status = 'processing'"
+            ),
+            {"m": msg},
+        )
+
+
+def _withheld(item: dict[str, Any]) -> tuple[Any, Any]:
+    return item.get("withheld_reason"), item.get("withheld_crisis")
+
+
+async def reasons_scene(env: Env) -> tuple[Scene, dict[str, tuple[str | None, str | None]]]:
+    """К сцене (доставленные, ``processing``, остановленное прежней функцией — ``safety`` без
+    типа) — остановки Анны по каждой причине и каждому типу кризиса и остановка Игоря."""
+    sc = await scene(env)
+    want: dict[str, tuple[str | None, str | None]] = {
+        "adapted": NO_WITHHELD,
+        "plain": NO_WITHHELD,
+        "processing": NO_WITHHELD,
+        "withheld": ("safety", None),  # до 0014: тип неизвестен — общий протокол
+    }
+    cases = [("safety", c) for c in CRISES] + [
+        ("model_refusal", None),
+        ("pipeline_error", None),
+    ]
+    for reason, crisis in cases:
+        kind = f"{reason}-{crisis}"
+        sc.texts[kind] = env.mark(f"orig-{kind}")
+        sc.ids[kind] = await send(env, sc.anna, sc.texts[kind])
+        await withhold_leased(env, sc.ids[kind], reason, crisis)
+        want[kind] = (reason, crisis)
+    sc.texts["exhausted"] = env.mark("orig-exhausted")
+    sc.ids["exhausted"] = await send(env, sc.anna, sc.texts["exhausted"])
+    await exhaust(env, sc.ids["exhausted"])
+    want["exhausted"] = ("attempts_exhausted", None)
+    sc.texts["igor"] = env.mark("orig-igor")
+    sc.ids["igor"] = await send(env, sc.igor, sc.texts["igor"])
+    await withhold_leased(env, sc.ids["igor"], "safety", "threat_outgoing")
+    return sc, want
+
+
+async def test_feed_author_sees_withheld_reason_and_crisis(env: Env) -> None:
+    """§9.3, АР-28, АР-44, АР-45: автору у остановленного — причина и тип кризиса (какой
+    протокол помощи показать); у доставленных и ``processing`` — null. Ответ — по схеме
+    контракта (``feed`` сверяет каждый элемент)."""
+    sc, want = await reasons_scene(env)
+    mine = {i["id"]: i for i in (await feed(env, sc.anna))["items"]}
+    anna_ids = {k: v for k, v in sc.ids.items() if k != "igor"}
+    assert set(mine) == {str(v) for v in anna_ids.values()}
+    for kind, msg in anna_ids.items():
+        item = mine[str(msg)]
+        assert _withheld(item) == want[kind], kind
+        assert item["status"] == ("withheld" if want[kind][0] else item["status"])
+        assert item["text"] == sc.texts[kind]  # текст сохранён у автора
+    # Остановленное Игоря: Игорю — своё, с типом; Анне (получателю) — не видно.
+    igor_item = {i["id"]: i for i in (await feed(env, sc.igor))["items"]}[str(sc.ids["igor"])]
+    assert _withheld(igor_item) == ("safety", "threat_outgoing")
+
+
+async def test_feed_recipient_sees_no_withheld_nor_reason_fields(env: Env) -> None:
+    """Получателю остановленное и ``processing`` не видны; у видимых (входящих) причины и типа
+    нет — ни у одного элемента ленты получателя (АР-11, АР-25, АР-44)."""
+    sc, want = await reasons_scene(env)
+    got = (await feed(env, sc.igor))["items"]
+    delivered = {str(sc.ids["adapted"]), str(sc.ids["plain"])}
+    incoming = [i for i in got if i["direction"] == "incoming"]
+    assert {i["id"] for i in incoming} == delivered
+    for item in incoming:
+        assert _withheld(item) == NO_WITHHELD
+        assert item["status"] in ("delivered", "read", "answered")
+    anna_feed = (await feed(env, sc.anna))["items"]
+    assert str(sc.ids["igor"]) not in {i["id"] for i in anna_feed}
+    assert all(_withheld(i) == NO_WITHHELD for i in anna_feed if i["direction"] == "incoming")
+    hidden = [t for k, t in sc.texts.items() if want.get(k, NO_WITHHELD)[0] and k != "igor"]
+    assert all(t not in i["text"] for i in got for t in hidden)
+
+
+def test_repository_drops_withheld_fields_outside_own_withheld() -> None:
+    """Вторая граница слоя доступа: даже если строка (подделка, ошибка функции) несёт причину у
+    входящего или не остановленного сообщения, в ``FeedItem`` её нет; тип кризиса — только при
+    ``safety``."""
+    from types import SimpleNamespace
+
+    from app.repositories.couple_messages import _withheld as pick
+
+    def row(outgoing: bool, status: str, reason: str | None, crisis: str | None) -> Any:
+        return SimpleNamespace(
+            outgoing=outgoing, status=status, withheld_reason=reason, withheld_crisis=crisis
+        )
+
+    none = {"withheld_reason": None, "withheld_crisis": None}
+    assert pick(row(False, "withheld", "safety", "violence")) == none
+    assert pick(row(False, "delivered", "safety", "violence")) == none
+    assert pick(row(True, "processing", "model_refusal", None)) == none
+    assert pick(row(True, "withheld", "model_refusal", "violence")) == {
+        "withheld_reason": "model_refusal",
+        "withheld_crisis": None,
+    }
+    assert pick(row(True, "withheld", "safety", "self_harm")) == {
+        "withheld_reason": "safety",
+        "withheld_crisis": "self_harm",
+    }
+
+
+async def test_send_202_has_null_withheld_fields(env: Env) -> None:
+    """202 ``POST /drafts/{id}/send``: сообщение в ``processing`` — причины ещё нет (null), ответ
+    по схеме контракта ``PartnerMessage``."""
+    anna, igor = await _person(env, "Анна", "Игорь"), await _person(env, "Игорь", "Анна")
+    await _pair(env, anna, igor)
+    assert anna.agent_id is not None
+    body = env.mark("send-202")
+    draft = await texts.create_draft(env.sm, env.keys, anna.id, anna.agent_id, body, None)
+    resp = await env.client.post(
+        f"/api/v1/drafts/{draft}/send", headers=anna.headers, json={"expected_version": 1}
+    )
+    assert resp.status_code == 202, resp.text
+    out = resp.json()
+    assert_matches(out, "PartnerMessage")
+    assert out["status"] == "processing" and out["text"] == body
+    assert _withheld(out) == NO_WITHHELD
+    assert out["withheld_reason"] is None and out["withheld_crisis"] is None
+
+
+async def test_withheld_feed_logs_have_no_texts(env: Env, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    sc, _ = await reasons_scene(env)
+    await feed(env, sc.anna)
+    await feed(env, sc.igor)
+    logged = "\n".join(f"{r.getMessage()} {r.args!r}" for r in caplog.records)
+    for label in env.marks:
+        assert label not in logged and label.split("-")[-1] not in logged
+    assert str(sc.anna.id) not in logged and str(sc.igor.id) not in logged
