@@ -1515,8 +1515,16 @@ async def test_refusal_not_turned_into_delivery_after_db_failure(
     stub = Stub(fail={"safety": [LLMRefusal("no")]})
     out = await make_worker(engine, stub).run_once()
     assert [o.status for o in out] == ["error"]
+    # Раунд 2 (A8): отказ записан повтором записи; модель не вызывается снова.
+    assert out[0].recorded == "withheld"
+    assert (await author_view(sessionmaker, duo.anna.user_id))[mid] == (
+        "withheld",
+        "model_refusal",
+    )
+    n = len(stub.calls)
     await expire(engine, mid)
-    await make_worker(engine, stub).run_once()
+    assert await make_worker(engine, stub).run_once() == []
+    assert len(stub.calls) == n
     assert mid not in await feed(sessionmaker, duo.igor.user_id)
 
 
@@ -1527,3 +1535,447 @@ def test_author_feed_exposes_withheld_reason() -> None:
 
     assert "withheld_reason" in couple_messages.FeedItem.__dataclass_fields__
     assert "withheld_reason" in PartnerMessage.model_fields
+    # Раунд 2 (A8): и тип кризиса — какой протокол помощи показать (АР-45 п.3); поведение —
+    # test_r2_crisis_type_in_author_feed_only.
+    assert "withheld_crisis" in couple_messages.FeedItem.__dataclass_fields__
+    assert "withheld_crisis" in PartnerMessage.model_fields
+
+
+# =========================================================================== раунд 2 (АР-45, 0014)
+#
+# Независимая проверка исправлений раунда 1 (коммиты 0bf0f83, d80ebd4): выключатель, быстрый
+# повтор, тип кризиса в ленте автора, повтор записи исхода, непрерывный цикл, обязательный набор
+# промптов. Хелперы — свои (кроме общих для файла).
+
+
+def r2_worker(engine: AsyncEngine, stub: Stub, **cfg: Any) -> PipelineWorker:
+    return make_worker(engine, stub, **cfg)
+
+
+async def lease_left_s(engine: AsyncEngine, mid: uuid.UUID) -> float | None:
+    async with engine.connect() as c:
+        v = (
+            await c.execute(
+                text(
+                    "SELECT EXTRACT(EPOCH FROM work_lease_until - now()) FROM partner_messages "
+                    "WHERE id = :m"
+                ),
+                {"m": mid},
+            )
+        ).scalar_one()
+    return None if v is None else float(v)
+
+
+async def test_r2_pause_claims_nothing_and_resumes(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo, caplog: pytest.LogCaptureFixture
+) -> None:
+    """АР-45 п.2: ошибка настройки модели — пауза: пока она идёт, копия ничего не захватывает
+    (даже наступившие сообщения), попытка не расходуется, ERROR один раз и без текстов/id;
+    после паузы — обычная обработка."""
+    m1, _ = await send(sessionmaker, duo.anna, HARSH)
+    m2, _ = await send(sessionmaker, duo.anna, CALM)
+    stub = Stub(fail={"safety": [LLMQuotaError("лимит " + HARSH)]})
+    w = r2_worker(engine, stub, batch=1, pause=timedelta(seconds=1))
+    caplog.set_level(logging.DEBUG, logger="app")
+    out = await w.run_once()
+    assert [(o.status, o.reason) for o in out] == [("paused", "quota")]
+    assert w.paused
+    r1 = await row(engine, m1)
+    assert r1 is not None and (r1["work_attempts"], r1["work_lease_token"]) == (0, None)
+    left = await lease_left_s(engine, m1)
+    assert left is not None and 0 < left <= 1.5  # срок «не раньше» = пауза
+    n = len(stub.calls)
+    await due(engine, m1)
+    for _ in range(3):
+        assert await w.run_once() == []  # на паузе — ни m1 (наступило), ни m2
+    assert len(stub.calls) == n
+    r2 = await row(engine, m2)
+    assert r2 is not None and (r2["work_attempts"], r2["work_lease_token"]) == (0, None)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1 and "quota" in errors[0].getMessage()
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    for secret in (HARSH, CALM, str(m1), str(m2), str(duo.anna.user_id)):
+        assert secret not in logged
+    await asyncio.sleep(1.1)
+    assert not w.paused
+    done: list[PipelineOutcome] = []
+    for _ in range(3):
+        done += await w.run_once()
+    assert sorted(o.status for o in done) == ["delivered", "delivered"]
+    rec = await feed(sessionmaker, duo.igor.user_id)
+    assert {m1, m2} <= set(rec)
+
+
+async def test_r2_repeated_pause_never_exhausts_attempts(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo
+) -> None:
+    """Пауза — не попытка: 6 пауз подряд при пределе 2 попытки сообщение не закрывают."""
+    mid, _ = await send(sessionmaker, duo.anna, HARSH)
+    stub = Stub(fail={"tone": [LLMAuthError("a")] * 6})
+    for _ in range(6):
+        w = r2_worker(engine, stub, max_attempts=2, pause=timedelta(seconds=5))
+        assert [o.status for o in await w.run_once()] == ["paused"]
+        await due(engine, mid)
+    r = await row(engine, mid)
+    assert r is not None and (r["status"], r["work_attempts"]) == ("processing", 0)
+    out = await r2_worker(engine, stub, max_attempts=2).run_once()
+    assert [(o.status, o.attempts) for o in out] == [("delivered", 1)]
+
+
+@pytest.mark.parametrize(
+    ("age", "exhausted"), [("24 hours 1 minute", True), ("23 hours 50 minutes", False)]
+)
+async def test_r2_wait_limit_24h(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo, age: str, exhausted: bool
+) -> None:
+    """АР-45: дольше 24 ч от отправки — ``attempts_exhausted`` без вызова модели; раньше — работа."""
+    mid, _ = await send(sessionmaker, duo.anna, HARSH)
+    async with engine.begin() as c:
+        await c.execute(
+            text(f"UPDATE partner_messages SET sent_at = now() - interval '{age}' WHERE id = :m"),
+            {"m": mid},
+        )
+    stub = Stub()
+    out = await r2_worker(engine, stub).run_once()
+    if exhausted:
+        assert out == [] and stub.calls == []
+        assert (await author_view(sessionmaker, duo.anna.user_id))[mid] == (
+            "withheld",
+            "attempts_exhausted",
+        )
+        assert mid not in await feed(sessionmaker, duo.igor.user_id)
+    else:
+        assert [o.status for o in out] == ["delivered"]
+
+
+async def test_r2_retry_delay_grows_and_fits_budget(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo
+) -> None:
+    """MINOR-1 / §10: повтор после недоступности — 5 с · 2^попытка (10, 20, 40 с), не аренда;
+    потолок — 1 ч; пятая попытка — ``attempts_exhausted``."""
+    mid, _ = await send(sessionmaker, duo.anna, HARSH)
+    stub = Stub(fail={"safety": [LLMUnavailable("x")] * 10})
+    seen = []
+    for expected in (10, 20, 40, 80, 160):
+        out = await r2_worker(engine, stub).run_once()
+        assert [o.status for o in out] == ["retry"]
+        left = await lease_left_s(engine, mid)
+        assert left is not None
+        seen.append(left)
+        assert expected - 2 <= left <= expected + 0.5, (expected, left)
+        await due(engine, mid)
+    assert await r2_worker(engine, stub).run_once() == []
+    assert (await author_view(sessionmaker, duo.anna.user_id))[mid] == (
+        "withheld",
+        "attempts_exhausted",
+    )
+    s = PipelineSettings()
+    assert s.retry_delay(1) == timedelta(seconds=10)
+    assert s.retry_delay(30) == timedelta(hours=1)
+
+
+CRISIS_TEXT = {
+    "threat_outgoing": ("Ещё раз так сделаешь — пожалеешь.", "threat_or_insult"),
+    "violence": ("Он снова поднял на меня руку.", "violence"),
+    "self_harm": ("Я больше не хочу жить.", "self_harm"),
+    "life_threat": ("Я стою на крыше и сейчас прыгну.", "life_threat"),
+}
+
+
+def crisis_decider(role: str, p: dict[str, Any]) -> dict[str, Any]:
+    if role == "safety":
+        for _, (body, cat) in CRISIS_TEXT.items():
+            if body in p["text"]:
+                sec = ["underage"] if "Мне 15 лет" in p["text"] else []
+                return {"category": cat, "secondary": sec}
+    return honest(role, p)
+
+
+@pytest.mark.parametrize("underage", [False, True])
+@pytest.mark.parametrize("crisis", sorted(CRISIS_TEXT))
+async def test_r2_crisis_type_in_author_feed_only(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo, crisis: str, underage: bool
+) -> None:
+    """АР-45 п.3, §9.3: тип кризиса — у сообщения, видит только автор (лента: причина и тип);
+    «младше 18» не подменяет тип; получатель не видит ни сообщения, ни полей; у не-кризисных
+    остановок и у доставленных полей нет."""
+    body = CRISIS_TEXT[crisis][0] + (" Мне 15 лет." if underage else "")
+    mid, _ = await send(sessionmaker, duo.anna, body)
+    ok, _ = await send(sessionmaker, duo.anna, CALM)
+    out = await r2_worker(engine, Stub(crisis_decider)).run_once()
+    assert sorted(o.status for o in out) == ["delivered", "withheld"]
+    mine = await feed(sessionmaker, duo.anna.user_id)
+    assert (mine[mid].status, mine[mid].withheld_reason, mine[mid].withheld_crisis) == (
+        "withheld",
+        "safety",
+        crisis,
+    )
+    assert (mine[ok].withheld_reason, mine[ok].withheld_crisis) == (None, None)
+    rec = await feed(sessionmaker, duo.igor.user_id)
+    assert mid not in rec
+    assert all(i.withheld_reason is None and i.withheld_crisis is None for i in rec.values())
+    # Сырой выход функции получателю — тоже без полей (вторая граница — функция БД).
+    async with user_scope(sessionmaker, duo.igor.user_id) as s:
+        rows = (
+            await s.execute(
+                text(
+                    "SELECT withheld_reason, withheld_crisis FROM app_couple_feed_page(100, NULL, NULL)"
+                )
+            )
+        ).all()
+    assert all(r == (None, None) for r in rows)
+    expected_events = sorted([crisis, *(["underage"] if underage else [])])
+    assert await events(engine, duo.anna.user_id) == expected_events
+
+
+async def test_r2_refusal_withheld_has_no_crisis_type(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo
+) -> None:
+    mid, _ = await send(sessionmaker, duo.anna, HARSH)
+    await r2_worker(engine, Stub(fail={"safety": [LLMRefusal("no")]})).run_once()
+    mine = await feed(sessionmaker, duo.anna.user_id)
+    assert (mine[mid].withheld_reason, mine[mid].withheld_crisis) == ("model_refusal", None)
+
+
+# --- повтор записи исхода (D1)
+
+
+def flaky_after_commit(
+    monkeypatch: pytest.MonkeyPatch, name: str, times: int = 1
+) -> dict[str, int]:
+    """Запись проходит и фиксируется, но ответ «теряется» (обрыв соединения после COMMIT)."""
+    real = getattr(pw, name)
+    st = {"n": 0}
+
+    async def wrapper(*a: Any, **kw: Any) -> Any:
+        res = await real(*a, **kw)
+        if st["n"] < times:
+            st["n"] += 1
+            raise ConnectionError("ответ потерян")
+        return res
+
+    monkeypatch.setattr(pw, name, wrapper)
+    return st
+
+
+def flaky_before(monkeypatch: pytest.MonkeyPatch, name: str, times: int) -> dict[str, int]:
+    """Запись не прошла ``times`` раз подряд (соединения нет)."""
+    real = getattr(pw, name)
+    st = {"n": 0}
+
+    async def wrapper(*a: Any, **kw: Any) -> Any:
+        if st["n"] < times:
+            st["n"] += 1
+            raise ConnectionError("db down")
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(pw, name, wrapper)
+    return st
+
+
+async def notify_ids(engine: AsyncEngine) -> list[uuid.UUID]:
+    async with worker_tx(engine) as c:
+        q = await c.execute(
+            text("SELECT message_id FROM pipeline_claim_notify(interval '1 minute', 5, 100)")
+        )
+        return [r.message_id for r in q]
+
+
+async def test_r2_deliver_committed_then_lost_answer_no_duplicates(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Доставка зафиксирована, ответ потерян — повтор записи не дублирует событий, доставку и
+    уведомление; повторной обработки нет."""
+    mid, _ = await send(sessionmaker, duo.anna, UNDERAGE)
+    flaky_after_commit(monkeypatch, "deliver")
+    stub = Stub()
+    out = await r2_worker(engine, stub, write_retry_pause_s=0.01).run_once()
+    assert [o.status for o in out] == ["error"]
+    assert await events(engine, duo.anna.user_id) == ["underage"]
+    assert (await feed(sessionmaker, duo.igor.user_id))[mid].text == UNDERAGE
+    assert await notify_ids(engine) == [mid]
+    n = len(stub.calls)
+    await expire(engine, mid)
+    assert await r2_worker(engine, stub).run_once() == []
+    assert len(stub.calls) == n
+
+
+async def test_r2_crisis_withhold_committed_then_lost_answer_single_event(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mid, _ = await send(sessionmaker, duo.anna, THREAT)
+    flaky_after_commit(monkeypatch, "withhold", times=2)
+    out = await r2_worker(engine, Stub(), write_retry_pause_s=0.01).run_once()
+    assert [o.status for o in out] == ["error"]
+    assert await events(engine, duo.anna.user_id) == ["threat_outgoing"]
+    mine = await feed(sessionmaker, duo.anna.user_id)
+    assert (mine[mid].withheld_reason, mine[mid].withheld_crisis) == ("safety", "threat_outgoing")
+
+
+@pytest.mark.parametrize("fails", [1, 3, 5])
+async def test_r2_refusal_write_retried_until_recorded(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo, monkeypatch: pytest.MonkeyPatch, fails: int
+) -> None:
+    """D1: запись отказа повторяется (до ``write_retries``) — отказ записан, доставки нет."""
+    mid, _ = await send(sessionmaker, duo.anna, HARSH)
+    flaky_before(monkeypatch, "withhold", fails)
+    stub = Stub(fail={"safety": [LLMRefusal("no")]})
+    out = await r2_worker(engine, stub, write_retry_pause_s=0.01).run_once()
+    assert [(o.status, o.recorded) for o in out] == [("error", "withheld")]
+    await expire(engine, mid)
+    assert await r2_worker(engine, stub).run_once() == []
+    assert (await author_view(sessionmaker, duo.anna.user_id))[mid] == (
+        "withheld",
+        "model_refusal",
+    )
+    assert mid not in await feed(sessionmaker, duo.igor.user_id)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="A8-3.2-R2-D1 (MINOR): повтор записи исхода ограничен ~3 с (5 повторов по 0,2·n с); "
+    "сбой БД дольше — отказ не записан, аренда истекает, сообщение обрабатывается заново и "
+    "может быть доставлено без нового «Отправить» (Б-48)",
+)
+async def test_r2_refusal_not_delivered_after_long_db_outage(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mid, _ = await send(sessionmaker, duo.anna, HARSH)
+    flaky_before(monkeypatch, "withhold", 6)  # все 1 + 5 повторов
+    stub = Stub(fail={"safety": [LLMRefusal("no")]})
+    out = await r2_worker(engine, stub, write_retry_pause_s=0.01).run_once()
+    assert [o.status for o in out] == ["error"]
+    await expire(engine, mid)  # аренда истекла (БД снова доступна)
+    await r2_worker(engine, stub).run_once()
+    assert mid not in await feed(sessionmaker, duo.igor.user_id)
+
+
+async def test_r2_release_write_retried(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Снятие аренды при повторе тоже повторяется: попытка учтена один раз, срок повтора задан."""
+    mid, _ = await send(sessionmaker, duo.anna, HARSH)
+    flaky_before(monkeypatch, "release", 2)
+    out = await r2_worker(
+        engine, Stub(fail={"safety": [LLMUnavailable("x")]}), write_retry_pause_s=0.01
+    ).run_once()
+    assert [(o.status, o.recorded) for o in out] == [("error", "retry")]
+    r = await row(engine, mid)
+    assert r is not None and (r["work_lease_token"], r["work_attempts"]) == (None, 1)
+    left = await lease_left_s(engine, mid)
+    assert left is not None and 5 < left <= 10.5
+
+
+# --- непрерывный цикл
+
+
+async def test_r2_slow_message_does_not_hold_others(
+    sessionmaker: SM, engine: AsyncEngine, duo: Duo
+) -> None:
+    """MINOR-2, §10: медленное сообщение занимает один слот — остальные доставляются, пока оно
+    ждёт модель; после него — тоже доставлено; остановка дожидается начатых."""
+    gate = asyncio.Event()
+    slow_text = "МЕДЛЕННОЕ: ты опять забыл позвонить!"
+
+    async def hook(role: str, p: dict[str, Any]) -> None:
+        if role == "safety" and p["text"] == slow_text:
+            await gate.wait()
+
+    slow, _ = await send(sessionmaker, duo.anna, slow_text)
+    fast = [(await send(sessionmaker, duo.anna, f"{CALM} №{i}"))[0] for i in range(4)]
+    stop = asyncio.Event()
+    w = r2_worker(engine, Stub(hook=hook), batch=2)
+    task = asyncio.create_task(w.run_forever(poll_s=0.05, stop=stop))
+    try:
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            rec = await feed(sessionmaker, duo.igor.user_id)
+            if all(m in rec for m in fast):
+                break
+            await asyncio.sleep(0.05)
+        assert all(m in rec for m in fast)
+        assert slow not in rec
+        gate.set()
+        end = time.monotonic() + 10
+        while slow not in await feed(sessionmaker, duo.igor.user_id):
+            assert time.monotonic() < end
+            await asyncio.sleep(0.05)
+    finally:
+        gate.set()
+        stop.set()
+        await asyncio.wait_for(task, 10)
+
+
+# --- набор промптов (АР-45 п.1)
+
+
+@pytest.mark.parametrize(
+    ("value", "env", "ok"),
+    [
+        ("", "staging", False),
+        ("   ", "staging", False),
+        ("v9", "staging", False),
+        ("v1", "staging", False),
+        ("v2", "staging", False),
+        ("v0", "production", False),
+        ("v1", "production", False),
+        ("v0", "Production", False),
+        ("v0", "prod", False),
+        ("v0", "staging", True),
+        ("v0", "dev", True),
+    ],
+)
+def test_r2_prompt_set_resolution(value: str, env: str, ok: bool) -> None:
+    from app.config import ConfigError
+    from app.workers.pipeline import resolve_prompt_set
+
+    if ok:
+        assert resolve_prompt_set(value, env) is V0
+    else:
+        with pytest.raises(ConfigError):
+            resolve_prompt_set(value, env)
+
+
+@pytest.mark.parametrize(
+    ("value", "env"), [("", "staging"), ("v1", "staging"), ("v0", "production")]
+)
+def test_r2_worker_process_refuses_to_start(value: str, env: str) -> None:
+    """Процесс воркера (``python -m app.workers.pipeline``) не стартует: отказ до подключения к
+    модели и БД (сети нет)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("FEELINGS_", "OPENROUTER"))}
+    env_vars = base | {
+        "FEELINGS_ENV": env,
+        "FEELINGS_PIPELINE_PROMPT_SET": value,
+        "FEELINGS_WORKER_DATABASE_URL": "postgresql+asyncpg://nobody:x@127.0.0.1:1/none",
+        "FEELINGS_ENCRYPTION_KEYS": "t1:" + "A" * 43,
+        "FEELINGS_ENCRYPTION_KEY_ID": "t1",
+        "HTTPS_PROXY": "http://127.0.0.1:9",
+        "https_proxy": "http://127.0.0.1:9",
+    }
+    r = subprocess.run(
+        [sys.executable, "-m", "app.workers.pipeline"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env_vars,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert r.returncode != 0
+    assert "ConfigError" in r.stderr
+    assert "openrouter" not in r.stderr.lower() or "ConfigError" in r.stderr.splitlines()[-1]
+
+
+def test_r2_compose_requires_prompt_set() -> None:
+    """АР-45 п.1: на стенде compose без набора промптов не запускает worker-pipeline."""
+    from pathlib import Path
+
+    compose = (
+        Path(__file__).resolve().parents[2] / "infra/deploy/docker-compose.prod.yml"
+    ).read_text(encoding="utf-8")
+    assert "FEELINGS_PIPELINE_PROMPT_SET: ${FEELINGS_PIPELINE_PROMPT_SET:?" in compose
