@@ -928,6 +928,9 @@ PIPELINE_FUNCS = [
     "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[])",  # 0013
     "pipeline_claim_notify(interval, integer, integer)",  # 0013: очередь уведомлений (Б-47)
     "pipeline_notify_done(uuid, uuid)",  # 0013
+    "pipeline_release(uuid, uuid, interval, boolean)",  # 0014, раунд 1 задачи 3.2 (АР-45)
+    "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[], "
+    "safety_event_type)",  # 0014: с типом кризиса
 ]
 # 0011, задача 2.6: функции администратора (feelings_admin) — загрузка и удаление материала.
 ADMIN_FUNCS = [

@@ -458,9 +458,10 @@ async def test_claim_argument_checks_and_limit(sessionmaker: SM, engine: AsyncEn
             assert _sqlstate(ei.value) == "22023", (fn, lease, n)
     anna, _igor, _ = await _pair(sessionmaker, engine)
     mids = [(await _send(sessionmaker, engine, anna, b"m%d" % i))[0] for i in range(3)]
-    async with engine.begin() as c:  # одинаковое время — порядок по id
+    async with engine.begin() as c:  # одинаковое время (моложе 24 ч, АР-45) — порядок по id
         await c.execute(
-            text("UPDATE partner_messages SET sent_at = '2026-11-01 00:00:00+00' "
+            text("UPDATE partner_messages "
+                 "SET sent_at = date_trunc('minute', now()) - interval '1 hour' "
                  "WHERE id = ANY(:ids)"),
             {"ids": mids},
         )  # fmt: skip
@@ -763,3 +764,290 @@ async def test_downgrade_0012_upgrade_backfill_check(
     row = await _msg(engine, done)
     assert row is not None and row["notify_done_at"] == row["delivered_at"]
     assert (await _feed(sessionmaker, anna.user_id))[held].withheld_reason == "safety"
+
+
+# --------------------------------------------------------------------------- 0014 (раунд 1, АР-45)
+
+RELEASE = "SELECT pipeline_release(:m, :t, CAST(CAST(:r AS text) AS interval), CAST(:c AS boolean))"
+WITHHOLD5 = (
+    "SELECT pipeline_withhold_leased(:m, :t, :r, CAST(CAST(:ev AS text[]) AS safety_event_type[]), "
+    "CAST(CAST(:cr AS text) AS safety_event_type))"
+)
+
+
+async def _released(engine: AsyncEngine, m: uuid.UUID) -> tuple[Any, Any, Any]:
+    row = await _msg(engine, m)
+    assert row is not None
+    return row["work_lease_token"], row["work_lease_until"], row["work_attempts"]
+
+
+async def test_release_retry_after_and_attempt_not_counted(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """АР-45 п.2: досрочное снятие аренды по своему токену; попытка не расходуется при
+    `p_count_attempt = false`; `p_retry_after` — не выдавать раньше срока; старый токен — `lost`."""
+    await _park(engine)
+    anna, _igor, _ = await _pair(sessionmaker, engine)
+    mid, _ = await _send(sessionmaker, engine, anna, b"orig")
+    first = (await _claim(engine))[mid]
+    assert await _w1(engine, RELEASE, m=mid, t=uuid.uuid4(), r=None, c=True) is False
+    assert await _w1(engine, RELEASE, m=mid, t=first.token, r=None, c=False) is True
+    assert await _released(engine, mid) == (None, None, 0)
+    assert await _w1(engine, RELEASE, m=mid, t=first.token, r=None, c=False) is False
+    assert await _deliver(engine, mid, first.token) == "lost"
+    second = (await _claim(engine))[mid]  # сразу снова в очереди, попытка — снова первая
+    assert second.attempts == 1 and second.token != first.token
+    assert await _w1(engine, RELEASE, m=mid, t=second.token, r="1 hour", c=True) is True
+    token, until, attempts = await _released(engine, mid)
+    assert token is None and until is not None and attempts == 1
+    assert await _claim(engine) == {}  # «не раньше» срока
+    await _expire(engine, mid)
+    third = (await _claim(engine))[mid]
+    assert third.attempts == 2
+    assert await _deliver(engine, mid, third.token) == "delivered"
+    assert (
+        await _w1(engine, RELEASE, m=mid, t=third.token, r=None, c=True) is False
+    )  # не processing
+    for r, c in (("-1 second", True), ("2 days", True), (None, None)):
+        with pytest.raises(DBAPIError) as ei:
+            await _w(engine, RELEASE, m=mid, t=third.token, r=r, c=c)
+        assert _sqlstate(ei.value) == "22023", (r, c)
+
+
+async def test_release_does_not_wait_for_couple_or_user_locks(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Снятие аренды меняет одну строку сообщения: удаление/выход, держащие пару и пользователя
+    FOR UPDATE, его не задерживают (АР-13)."""
+    await _park(engine)
+    anna, _igor, couple = await _pair(sessionmaker, engine)
+    mid, _ = await _send(sessionmaker, engine, anna, b"orig")
+    tok = (await _claim(engine))[mid].token
+    async with engine.connect() as holder, holder.begin():
+        await holder.execute(text("SELECT 1 FROM couples WHERE id = :c FOR UPDATE"), {"c": couple})
+        await holder.execute(
+            text("SELECT 1 FROM users WHERE id = :u FOR UPDATE"), {"u": anna.user_id}
+        )
+        async with _worker_tx(engine) as w:
+            await w.execute(text("SET LOCAL lock_timeout = '1s'"))
+            res = await w.execute(text(RELEASE), {"m": mid, "t": tok, "r": "5 seconds", "c": False})
+            assert res.scalar_one() is True
+
+
+async def test_wait_limit_24h_from_sent(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """АР-45: сообщение ждёт дольше 24 ч от отправки (пауза воркера) — при захвате
+    `attempts_exhausted` без модели, даже если попытки не расходовались."""
+    await _park(engine)
+    anna, _igor, _ = await _pair(sessionmaker, engine)
+    old, _ = await _send(sessionmaker, engine, anna, b"old")
+    fresh, _ = await _send(sessionmaker, engine, anna, b"fresh")
+    async with engine.begin() as c:
+        await c.execute(
+            text(
+                "UPDATE partner_messages SET sent_at = now() - interval '24 hours 1 minute' "
+                "WHERE id = :m"
+            ),
+            {"m": old},
+        )
+    assert set(await _claim(engine, n=100)) == {fresh}
+    row = await _msg(engine, old)
+    assert row is not None
+    assert (row["status"], row["withheld_reason"], row["work_attempts"]) == (
+        "withheld",
+        "attempts_exhausted",
+        0,
+    )
+
+
+async def test_crisis_type_kept_for_author_only(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """АР-45 п.3 (ревью MAJOR-3): тип кризиса хранится у сообщения и отдаётся только автору —
+    экран выберет протокол (шаблон отправителя при `threat_outgoing`, §9.3, АР-28)."""
+    await _park(engine)
+    anna, igor, _ = await _pair(sessionmaker, engine)
+    threat, _ = await _send(sessionmaker, engine, anna, b"threat")
+    harm, _ = await _send(sessionmaker, engine, anna, b"harm")
+    refused, _ = await _send(sessionmaker, engine, anna, b"refused")
+    got = await _claim(engine)
+    bad = (
+        ("safety", None),
+        ("safety", "underage"),
+        ("model_refusal", "violence"),
+        ("pipeline_error", "self_harm"),
+    )
+    for reason, crisis in bad:
+        with pytest.raises(DBAPIError) as ei:
+            await _w(engine, WITHHOLD5, m=threat, t=got[threat].token, r=reason, ev=None, cr=crisis)
+        assert _sqlstate(ei.value) == "22023", (reason, crisis)
+    assert (
+        await _w1(
+            engine,
+            WITHHOLD5,
+            m=threat,
+            t=got[threat].token,
+            r="safety",
+            ev=["threat_outgoing"],
+            cr="threat_outgoing",
+        )
+        is True
+    )
+    # Прежняя сигнатура (обёртка): главный тип — первый не-«младше 18» из событий.
+    assert (
+        await _w1(
+            engine, WITHHOLD, m=harm, t=got[harm].token, r="safety", ev=["underage", "self_harm"]
+        )
+        is True
+    )
+    assert (
+        await _w1(engine, WITHHOLD, m=refused, t=got[refused].token, r="model_refusal", ev=None)
+        is True
+    )
+    feed = await _feed(sessionmaker, anna.user_id)
+    assert (feed[threat].withheld_reason, feed[threat].withheld_crisis) == (
+        "safety",
+        "threat_outgoing",
+    )
+    assert (feed[harm].withheld_reason, feed[harm].withheld_crisis) == ("safety", "self_harm")
+    assert (feed[refused].withheld_reason, feed[refused].withheld_crisis) == (
+        "model_refusal",
+        None,
+    )
+    igor_feed = await _feed(sessionmaker, igor.user_id)
+    assert not {threat, harm, refused} & set(igor_feed)
+    assert all(r.withheld_crisis is None and r.withheld_reason is None for r in igor_feed.values())
+    assert await _events(engine, anna.user_id) == ["self_harm", "threat_outgoing", "underage"]
+    for sql in (
+        "UPDATE partner_messages SET withheld_crisis = 'violence' WHERE id = :m",  # не safety
+        "UPDATE partner_messages SET withheld_reason = 'safety', withheld_crisis = 'underage' "
+        "WHERE id = :m",
+    ):
+        with pytest.raises(DBAPIError) as ei:
+            async with engine.begin() as c:
+                await c.execute(text(sql), {"m": refused})
+        assert _sqlstate(ei.value) == "23514", sql
+
+
+async def test_crisis_after_couple_ended_stays_safety(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """О-3: кризис, остановленный после распада пары, — `safety` с типом (помощь автору важнее),
+    не `couple_ended`; событие — от автора."""
+    await _park(engine)
+    anna, igor, _ = await _pair(sessionmaker, engine)
+    mid, _ = await _send(sessionmaker, engine, anna, b"crisis")
+    tok = (await _claim(engine))[mid].token
+    await _call(sessionmaker, igor.user_id, LEAVE)
+    assert (
+        await _w1(engine, WITHHOLD5, m=mid, t=tok, r="safety", ev=["life_threat"], cr="life_threat")
+        is True
+    )
+    row = await _msg(engine, mid)
+    assert row is not None
+    assert (row["status"], row["withheld_reason"]) == ("withheld", "safety")
+    async with engine.connect() as c:
+        crisis = await c.execute(
+            text("SELECT withheld_crisis::text FROM partner_messages WHERE id = :m"), {"m": mid}
+        )
+        assert crisis.scalar_one() == "life_threat"
+    assert await _events(engine, anna.user_id) == ["life_threat"]
+
+
+async def test_finish_retry_after_failed_write_is_idempotent(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """D1 (на уровне БД): запись исхода, которая не зафиксировалась (обрыв), повторяется тем же
+    токеном и проходит; повтор после успешной — `false` без изменений и без вторых событий.
+    Пока аренда не истекла, сообщение никому не выдаётся; истёкшая, но не перехваченная —
+    повтор записи всё равно проходит."""
+    await _park(engine)
+    anna, _igor, _ = await _pair(sessionmaker, engine)
+    mid, _ = await _send(sessionmaker, engine, anna, b"refused")
+    tok = (await _claim(engine))[mid].token
+    async with engine.connect() as conn:
+        tx = await conn.begin()
+        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
+        res = await conn.execute(
+            text(WITHHOLD5), {"m": mid, "t": tok, "r": "model_refusal", "ev": None, "cr": None}
+        )
+        assert res.scalar_one() is True
+        await tx.rollback()  # «соединение оборвалось до фиксации»
+    assert await _claim(engine) == {}  # аренда жива — не выдаётся
+    await _expire(engine, mid)
+    assert (
+        await _w1(engine, WITHHOLD5, m=mid, t=tok, r="model_refusal", ev=["underage"], cr=None)
+        is True
+    )
+    assert (
+        await _w1(engine, WITHHOLD5, m=mid, t=tok, r="model_refusal", ev=["underage"], cr=None)
+        is False
+    )
+    row = await _msg(engine, mid)
+    assert row is not None and (row["status"], row["withheld_reason"]) == (
+        "withheld",
+        "model_refusal",
+    )
+    assert await _events(engine, anna.user_id) == ["underage"]
+    assert await _claim(engine) == {}
+
+
+async def test_old_functions_do_not_touch_leased_messages(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """MINOR-8, Б-83: `pipeline_original`/`pipeline_deliver`/`pipeline_withhold` без аренды не
+    читают и не завершают сообщение, которое держит воркер."""
+    await _park(engine)
+    anna, _igor, _ = await _pair(sessionmaker, engine)
+    mid, _ = await _send(sessionmaker, engine, anna, b"orig")
+    tok = (await _claim(engine))[mid].token
+    assert await _w1(engine, "SELECT pipeline_original(:m)", m=mid) is None
+    assert (
+        await _w1(engine, "SELECT pipeline_deliver(:m, 'x', false, 0::smallint, false)", m=mid)
+        is False
+    )
+    assert await _w1(engine, "SELECT pipeline_withhold(:m)", m=mid) is False
+    assert (await _msg(engine, mid) or {})["status"] == "processing"
+    assert await _deliver(engine, mid, tok) == "delivered"
+
+
+async def test_downgrade_0013_upgrade_check(
+    sessionmaker: SM, engine: AsyncEngine, app_engine: AsyncEngine
+) -> None:
+    """0014 → 0013 → head: отложенный срок без токена сбрасывается (CHECK 0013 «токен ⇔ срок»),
+    тип кризиса и функции 0014 удаляются, тела 0013 возвращаются; `alembic check` чист."""
+    await _park(engine)
+    anna, _igor, _ = await _pair(sessionmaker, engine)
+    mid, _ = await _send(sessionmaker, engine, anna, b"orig")
+    held, _ = await _send(sessionmaker, engine, anna, b"held")
+    got = await _claim(engine)
+    assert await _w1(engine, RELEASE, m=mid, t=got[mid].token, r="1 hour", c=False) is True
+    assert await _w1(
+        engine, WITHHOLD5, m=held, t=got[held].token, r="safety", ev=None, cr="violence"
+    )
+    alembic("downgrade", "0013")
+    await engine.dispose()
+    await app_engine.dispose()
+    try:
+        async with engine.connect() as conn:
+            n = await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_proc WHERE proname = 'pipeline_release' "
+                    "OR (proname = 'pipeline_withhold_leased' AND pronargs = 5)"
+                )
+            )
+            assert n.scalar_one() == 0
+            col = await conn.execute(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_name = 'partner_messages' AND column_name = 'withheld_crisis'"
+                )
+            )
+            assert col.scalar_one() == 0
+            body = await conn.execute(
+                text("SELECT pg_get_functiondef('pipeline_original(uuid)'::regprocedure)")
+            )
+            assert "work_lease_token" not in body.scalar_one()
+        assert await _released(engine, mid) == (None, None, 0)
+    finally:
+        alembic("upgrade", "head")
+        await engine.dispose()
+        await app_engine.dispose()
+    alembic("check")

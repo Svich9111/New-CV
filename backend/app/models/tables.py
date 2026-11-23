@@ -377,8 +377,15 @@ class PartnerMessage(Base):
         CheckConstraint(
             "withheld_reason IS NULL OR status = 'withheld'", name="withheld_reason_status"
         ),
+        # 0014 (АР-45): срок без токена — «не захватывать раньше» (pipeline_release).
         CheckConstraint(
-            "(work_lease_token IS NULL) = (work_lease_until IS NULL)", name="work_lease_whole"
+            "work_lease_token IS NULL OR work_lease_until IS NOT NULL", name="work_lease_has_until"
+        ),
+        # 0014 (АР-45): тип кризиса — только у остановленного безопасностью, не «младше 18».
+        CheckConstraint(
+            "withheld_crisis IS NULL OR (withheld_reason = 'safety' "
+            "AND withheld_crisis <> 'underage')",
+            name="withheld_crisis_safety",
         ),
         CheckConstraint("work_attempts >= 0", name="work_attempts_nonnegative"),
         # 0013: очередь конвейера (processing) и очередь уведомлений получателю (Б-47).
@@ -438,6 +445,8 @@ class PartnerMessage(Base):
     # автору; аренда сообщения воркером (processing — конвейер, delivered — уведомление);
     # notify_done_at — уведомление получателю отправлено или не нужно. Меняют только функции.
     withheld_reason: Mapped[str | None] = mapped_column(String(32))
+    # 0014: главный тип кризиса при withheld_reason = safety — протокол автору (§9.3).
+    withheld_crisis: Mapped[str | None] = mapped_column(SafetyEventType)
     work_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     work_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     work_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sa_text("0"))
