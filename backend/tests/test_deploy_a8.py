@@ -56,7 +56,10 @@ RESTORE = DEPLOY / "restore-check.sh"
 INIT_OWNER = ROOT / "infra" / "db" / "init-owner.sql"
 EXAMPLE = DEPLOY / ".env.prod.example"
 
-LONG_LIVED = ("caddy", "api", "worker-memory", "worker-kb", "worker-pipeline", "postgres", "redis")
+LONG_LIVED = (
+    "caddy", "api", "worker-memory", "worker-kb", "worker-pipeline", "worker-notify", "postgres",
+    "redis",
+)  # fmt: skip
 SECRET_VARS = (
     "FEELINGS_OWNER_DB_PASSWORD",
     "FEELINGS_API_DB_PASSWORD",
@@ -169,7 +172,7 @@ def test_migrations_under_owner_app_under_api_role(compose: dict) -> None:
     assert "feelings_owner:" in svcs["migrate"]["environment"]["FEELINGS_MIGRATION_DATABASE_URL"]
     assert "//feelings_api:" in svcs["api"]["environment"]["FEELINGS_DATABASE_URL"]
     assert "//feelings_admin_login:" in svcs["api"]["environment"]["FEELINGS_ADMIN_DATABASE_URL"]
-    for w in ("worker-memory", "worker-kb", "worker-pipeline"):
+    for w in ("worker-memory", "worker-kb", "worker-pipeline", "worker-notify"):
         assert "//feelings_worker_login:" in svcs[w]["environment"]["FEELINGS_WORKER_DATABASE_URL"]
     assert svcs["db-roles"]["environment"]["PGUSER"] == "feelings_owner"
     for name, svc in svcs.items():
@@ -217,7 +220,14 @@ def test_entrypoint_env_guard(compose: dict, env: str, ok: bool) -> None:
 
 
 def test_all_backend_services_use_guarded_entrypoint(compose: dict) -> None:
-    for name in ("api", "worker-memory", "worker-kb", "worker-pipeline", "migrate"):
+    for name in (
+        "api",
+        "worker-memory",
+        "worker-kb",
+        "worker-pipeline",
+        "worker-notify",
+        "migrate",
+    ):
         svc = compose["services"][name]
         assert svc["entrypoint"] == compose["x-backend"]["entrypoint"], name
         assert svc.get("read_only") is True and svc.get("cap_drop") == ["ALL"], name
@@ -750,12 +760,6 @@ def test_restore_check_fails_on_weakened_copy(
 
 
 @pytest.mark.parametrize("case", sorted(UNDETECTED))
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-0.8-D2 (MINOR): restore-check.sh проверяет RLS только «хотя бы у одной таблицы» и "
-    "не проверяет прямые права таблиц — копия без RLS/политик у users или с правами роли входа "
-    "проходит проверку",
-)
 def test_restore_check_detects_rls_and_grant_weakening(
     tmp_path: Path, owner_env: OwnerEnv, cluster: Cluster, case: str
 ) -> None:

@@ -55,6 +55,15 @@ x-backend: &backend
   cap_drop: ["ALL"]
   restart: unless-stopped
 
+# Перезапуск воркеров (тест 0.8, A8-0.8-D3): unless-stopped, а не on-failure:5. Воркер при старте
+# обращается к OpenRouter (цены моделей); кратковременный сбой сети/DNS при загрузке сервера после
+# пяти быстрых перезапусков оставлял контейнер остановленным — конвейер входящего и память стояли
+# до ручного `dc up`. Docker сам увеличивает паузу между перезапусками (до 1 минуты), так что
+# постоянная ошибка настройки (нет ключа, неверный набор промптов) не крутится вхолостую, а видна
+# в `dc ps` как Restarting и в `dc logs <воркер>` — DEPLOY §4. Отличать ошибку настройки от
+# временной недоступности по коду выхода — в коде воркеров (предложение A3, тест 0.8 D3).
+x-worker-restart: &worker-restart unless-stopped
+
 # Живость воркера: процесс жив (PID 1 контейнера) и его роль входа подключается к БД. Зависание
 # цикла без выхода так не видно — для этого нужен файл-пульс в самом воркере (предложение A3).
 x-worker-health: &worker-health
@@ -165,8 +174,7 @@ services:
   worker-memory:
     <<: *backend
     command: ["python", "-m", "app.workers.memory"]
-    # Ошибка конфигурации (нет ключа OpenRouter, ключей) повторяется — не перезапускать бесконечно.
-    restart: "on-failure:5"
+    restart: *worker-restart
     environment:
       FEELINGS_ENV: ${FEELINGS_ENV}
       FEELINGS_WORKER_DATABASE_URL: *worker-db
@@ -186,7 +194,7 @@ services:
   worker-kb:
     <<: *backend
     command: ["python", "-m", "app.workers.kb"]
-    restart: "on-failure:5"
+    restart: *worker-restart
     environment:
       FEELINGS_ENV: ${FEELINGS_ENV}
       FEELINGS_WORKER_DATABASE_URL: *worker-db
@@ -202,7 +210,7 @@ services:
   worker-pipeline:
     <<: *backend
     command: ["python", "-m", "app.workers.pipeline"]
-    restart: "on-failure:5"
+    restart: *worker-restart
     environment:
       FEELINGS_ENV: ${FEELINGS_ENV}
       FEELINGS_WORKER_DATABASE_URL: *worker-db
@@ -213,6 +221,22 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?задайте OPENROUTER_API_KEY}
       # Набор промптов конвейера (АР-26, АР-45): v0 — только staging; без значения не стартует.
       FEELINGS_PIPELINE_PROMPT_SET: ${FEELINGS_PIPELINE_PROMPT_SET:?задайте FEELINGS_PIPELINE_PROMPT_SET (АР-45)}
+    healthcheck: *worker-health
+    networks: [data, egress]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # Воркер уведомлений (3.5): доставленные сообщения → уведомление получателю через бота (без
+  # текста сообщения). Только токен бота и роль воркера: ключей шифрования и OpenRouter нет.
+  worker-notify:
+    <<: *backend
+    command: ["python", "-m", "app.workers.notify"]
+    restart: *worker-restart
+    environment:
+      FEELINGS_ENV: ${FEELINGS_ENV}
+      FEELINGS_WORKER_DATABASE_URL: *worker-db
+      FEELINGS_TELEGRAM_BOT_TOKEN: ${FEELINGS_TELEGRAM_BOT_TOKEN:?задайте FEELINGS_TELEGRAM_BOT_TOKEN}
+      FEELINGS_WEBAPP_URL: https://${FEELINGS_DOMAIN}/
     healthcheck: *worker-health
     networks: [data, egress]
     depends_on:

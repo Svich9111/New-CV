@@ -159,7 +159,7 @@ dc --profile ops run --rm migrate
 # роли входа feelings_api, feelings_worker_login, feelings_admin_login — под feelings_owner
 dc --profile ops run --rm db-roles
 
-dc up -d                                   # caddy, api, worker-memory, worker-kb, worker-pipeline
+dc up -d                                   # caddy, api, worker-memory, worker-kb, worker-pipeline, worker-notify
 dc ps                                      # все — healthy
 curl -fsS https://стенд.домен/api/v1/health    # {"status":"ok"}
 ```
@@ -193,7 +193,13 @@ postgres при каждом старте), — оставьте пустую з
   `strict-transport-security`, `content-security-policy` и `x-content-type-options`.
 - **Причины сбоев:**
   - API не стартует — контакты помощи (шаг 0) или пустой секрет (в журнале имя переменной);
-  - воркер памяти остановился после пяти попыток — `OPENROUTER_API_KEY` (`dc logs worker-memory`).
+  - воркер в состоянии `Restarting` — `dc logs worker-memory` (`worker-pipeline`, `worker-kb`).
+    Воркеры перезапускаются всегда (`unless-stopped`, пауза растёт до 1 минуты): кратковременная
+    недоступность OpenRouter при старте проходит сама. Постоянная причина — ошибка настройки
+    (`OPENROUTER_API_KEY`, `FEELINGS_PIPELINE_PROMPT_SET`, ключи) — видна как бесконечный
+    `Restarting` и не исправится без правки `.env`.
+  - **После каждой выкладки и перезагрузки сервера** — `dc ps`: все сервисы `healthy`, ни одного
+    `Restarting`/`Exited`. Иначе отправленные сообщения остаются «в обработке» (`worker-pipeline`).
 
 ## 5. Вебхук бота — по подтверждению оператора
 
@@ -229,7 +235,7 @@ curl -fsS https://стенд.домен/api/v1/health
 - **Код, без изменений схемы.** В `.env` верните прежнюю метку `FEELINGS_IMAGE_TAG`, выполните
   `git checkout <прежний коммит>` и `dc up -d`. Образы с прежней меткой уже есть локально.
 - **Схема менялась — только по подтверждению оператора.**
-  1. `dc stop api worker-memory worker-kb worker-pipeline`.
+  1. `dc stop api worker-memory worker-kb worker-pipeline worker-notify`.
   2. `infra/deploy/backup.sh`.
   3. `dc --profile ops run --rm migrate alembic downgrade <ревизия>` (под `feelings_owner`;
      образ — ещё новый: в нём есть шаги отката новых миграций).
@@ -342,7 +348,7 @@ cd /opt/feelings/app
 git checkout <коммит, с которого снята копия>   # версия схемы копии = версии кода (alembic_version)
 # в .env — метка образов этого коммита (FEELINGS_IMAGE_TAG); при необходимости dc build
 DUMP=/opt/feelings/backups/feelings-<дата>.dump
-dc stop caddy api worker-memory worker-kb worker-pipeline
+dc stop caddy api worker-memory worker-kb worker-pipeline worker-notify
 infra/deploy/backup.sh                      # копия текущего состояния — на случай ошибки
 dc exec -T postgres psql -X -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'DROP DATABASE feelings WITH (FORCE)' -c 'CREATE DATABASE feelings'

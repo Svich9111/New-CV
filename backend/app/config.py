@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     pipeline_prompt_set: str = ""
     # Пауза воркера при ошибке настройки модели (лимит, ключ, модель не найдена), секунд (АР-45).
     pipeline_pause_s: int = Field(default=300, ge=5, le=24 * 60 * 60)
+    # Воркер уведомлений (3.5, Б-47): аренда уведомления (повтор после сетевого сбоя — внутри
+    # аренды, после падения — по её истечении), предел попыток, опрос очереди (§10 — до 30 с).
+    notify_lease_s: int = Field(default=120, ge=60, le=24 * 60 * 60)
+    notify_max_attempts: int = Field(default=5, ge=1, le=100)
+    notify_poll_s: float = Field(default=1.0, gt=0, le=60)
+    notify_batch: int = Field(default=10, ge=1, le=100)
     session_ttl_s: int = 3600
     # Имя бота без «@» для ссылки-приглашения https://t.me/<бот>?startapp=<токен> (ФТ-03).
     # Не секрет; правила имени Telegram — 5–32 символа, латиница, цифры, «_».
@@ -125,6 +131,16 @@ def check_bot_config(settings: Settings) -> None:
             "FEELINGS_TELEGRAM_WEBHOOK_SECRET must be 32-256 characters of A-Z a-z 0-9 _ -"
         )
     _check_webapp_url(settings)
+
+
+def check_notify_config(settings: Settings) -> None:
+    """Воркер уведомлений (3.5): токен бота и роль входа воркера обязательны; адрес Mini App —
+    по желанию (без него уведомление уходит без кнопки), но если задан — только https."""
+    _check_bot_token(settings)
+    if not settings.worker_database_url:
+        raise ConfigError("FEELINGS_WORKER_DATABASE_URL is empty (worker login role, Б-69)")
+    if settings.webapp_url:
+        _check_webapp_url(settings)
 
 
 def check_bot_token_config(settings: Settings) -> None:

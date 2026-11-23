@@ -1,11 +1,11 @@
 # Локальная разработка: PostgreSQL 16 + pgvector и Redis; по профилю `workers` — миграции,
-# роли входа и фоновые воркеры памяти, базы знаний и конвейера (Б-69). Продуктив — задача 4.7.
+# роли входа и фоновые воркеры памяти, базы знаний, конвейера и уведомлений (Б-69). Продуктив — задача 4.7.
 # Порты привязаны к 127.0.0.1 — БД и Redis не публикуются наружу (справка по инфраструктуре, раздел 5);
 # у миграций, ролей и воркеров портов нет совсем.
 #
 #   make db-up     — только postgres и redis (как раньше);
 #   make dev-up    — всё, включая воркеры: postgres → migrate → db-roles → worker-memory, worker-kb,
-#                    worker-pipeline.
+#                    worker-pipeline, worker-notify.
 #
 # Значения ${…} подставляются из корневого .env (`--env-file .env` в Makefile); пароли ролей
 # входа — FEELINGS_*_DB_PASSWORD (см. .env.example, docs/ADMIN.md). Пустой пароль — db-roles
@@ -101,6 +101,26 @@ services:
       <<: *worker-env
       # Набор промптов (АР-45): локально — прототип v0; в production — только прогнанный набор.
       FEELINGS_PIPELINE_PROMPT_SET: ${FEELINGS_PIPELINE_PROMPT_SET:-v0}
+    depends_on: *worker-deps
+
+  # Воркер уведомлений (3.5): доставленные сообщения → уведомление получателю в Telegram без
+  # текста сообщения. Нужен FEELINGS_TELEGRAM_BOT_TOKEN из .env (без него не стартует);
+  # FEELINGS_WEBAPP_URL (https) — кнопка «Открыть» Mini App, без него уведомление без кнопки.
+  worker-notify:
+    <<: *backend
+    command: ["python", "-m", "app.workers.notify"]
+    environment: *worker-env
+    # Живость: процесс жив и роль входа воркера подключается к БД (как на стенде).
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import asyncio,os,asyncpg\nasync def main():\n    url = os.environ['FEELINGS_WORKER_DATABASE_URL'].replace('+asyncpg', '', 1)\n    conn = await asyncio.wait_for(asyncpg.connect(url), 5)\n    await conn.fetchval('SELECT 1')\n    await conn.close()\nasyncio.run(main())"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     depends_on: *worker-deps
 
 volumes:

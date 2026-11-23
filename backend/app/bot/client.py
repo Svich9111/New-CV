@@ -9,7 +9,9 @@
 
 Повтор — только на 429 с `retry_after` (не дольше `max_retry_after` секунд, не больше
 `max_retries` раз). Тайм-ауты и сетевые сбои не повторяются: повторная отправка могла бы
-продублировать сообщение; повтор обеспечивает повторная доставка вебхука."""
+продублировать сообщение; повтор обеспечивает повторная доставка вебхука. Признак `maybe_sent`
+у ошибки различает «запрос мог быть выполнен» (тайм-аут чтения, обрыв) и «точно не выполнен»
+(соединение не установлено) — по нему воркер уведомлений (3.5) решает, повторять ли."""
 
 import asyncio
 from collections.abc import Awaitable, Callable
@@ -36,6 +38,7 @@ class BotApiError(Exception):
         transient: bool = False,
         retry_after: int | None = None,
         description: str | None = None,
+        maybe_sent: bool = False,
     ) -> None:
         super().__init__(f"Bot API {method}: {reason}")
         # Описание от Telegram — отдельным полем, не в str(): его показывает только утилита
@@ -45,6 +48,10 @@ class BotApiError(Exception):
         self.error_code = error_code
         self.transient = transient
         self.retry_after = retry_after
+        # Запрос мог дойти до Telegram и быть выполнен (тайм-аут чтения, обрыв после отправки):
+        # повтор мог бы продублировать сообщение. ``False`` — точно не выполнен (соединение не
+        # установлено) или Telegram ответил ошибкой.
+        self.maybe_sent = maybe_sent
 
 
 class BotApi:
@@ -99,10 +106,15 @@ class BotApi:
         url = f"{self._base}/bot{self._token.get_secret_value()}/{method}"
         try:
             resp = await self._http.post(url, json=payload, timeout=http_timeout or self.timeout)
-        except httpx.TimeoutException:
+        except (httpx.ConnectTimeout, httpx.PoolTimeout):
+            # Соединение не установлено — запрос до Telegram не дошёл.
             raise BotApiError(method, "timeout", transient=True) from None
-        except httpx.HTTPError:
+        except httpx.TimeoutException:
+            raise BotApiError(method, "timeout", transient=True, maybe_sent=True) from None
+        except (httpx.ConnectError, httpx.ProxyError, httpx.UnsupportedProtocol):
             raise BotApiError(method, "network error", transient=True) from None
+        except httpx.HTTPError:
+            raise BotApiError(method, "network error", transient=True, maybe_sent=True) from None
         try:
             body = resp.json()
         except ValueError:

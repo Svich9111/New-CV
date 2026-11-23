@@ -2,7 +2,11 @@
 
 Уведомление не раскрывает текст сообщения (ТЗ §4.4 п.3): функция принимает только вид
 уведомления, текст берётся из фиксированных шаблонов. Передать сюда текст сообщения пары
-нельзя по сигнатуре; не добавляйте параметров со свободным текстом."""
+нельзя по сигнатуре; не добавляйте параметров со свободным текстом.
+
+Текст «новое сообщение» (3.5) — без имени автора: у пары один партнёр, «партнёр» однозначен, а имя
+на экране блокировки раскрывало бы, с кем человек в паре (ТЗ §2 п.4, §9.1); без id сообщения и
+времени. Подробности — только в Mini App после входа."""
 
 import uuid
 from enum import StrEnum
@@ -27,7 +31,9 @@ _BUTTON = "Открыть"
 
 
 async def notify(api: BotApi, chat_id: int, kind: NotificationKind, webapp_url: str) -> None:
-    await api.send_message(chat_id, _TEXTS[kind], webapp_keyboard(_BUTTON, webapp_url))
+    """Пустой ``webapp_url`` — без кнопки (адрес Mini App не настроен): текст тот же."""
+    keyboard = webapp_keyboard(_BUTTON, webapp_url) if webapp_url else None
+    await api.send_message(chat_id, _TEXTS[kind], keyboard)
 
 
 async def notify_user(

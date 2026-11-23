@@ -10,7 +10,10 @@
 #                                                 восстановления и удаления
 # Проверки:
 #   - pg_restore без ошибок; версия схемы (alembic_version) есть; таблицы на месте, число строк
-#     читается; расширение vector и политики RLS восстановлены;
+#     читается; расширение vector восстановлено; у КАЖДОЙ таблицы public, кроме alembic_version
+#     и справочных kb_documents / kb_chunks / prompt_versions, включён RLS и есть политики;
+#   - нет прямых прав PUBLIC и ролей входа (feelings_api, *_login) на таблицы, колонки,
+#     последовательности и функции public — доступ только через SET ROLE (АР-10);
 #   - права уровня базы (АР-10, миграция 0001; ревью 0.8 MAJOR-1): ни PUBLIC, ни feelings_app /
 #     feelings_api / feelings_worker / feelings_admin не могут создавать временные таблицы и
 #     схемы — pg_dump без --create прав базы не переносит, их возвращает init-owner.sql;
@@ -47,6 +50,44 @@ BEGIN
     IF (SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace
         AND relkind = 'r' AND relrowsecurity) = 0 THEN
         RAISE EXCEPTION 'не восстановлены политики RLS';
+    END IF;
+    -- RLS по каждой таблице (тест 0.8, A8-0.8-D2): все таблицы public — с личными данными и под
+    -- RLS с политиками (0001: PERSONAL_TABLES), кроме служебной alembic_version и справочных
+    -- без личных данных (0001: REFERENCE_TABLES). Новая таблица без RLS — тоже отказ: список
+    -- исключений пополняется только вместе с миграцией (ТЗ §7, АР-7).
+    SELECT string_agg(c.relname, ', ' ORDER BY c.relname) INTO v_bad
+    FROM pg_class c
+    WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p')
+      AND c.relname NOT IN ('alembic_version', 'kb_documents', 'kb_chunks', 'prompt_versions')
+      AND (NOT c.relrowsecurity
+           OR NOT EXISTS (SELECT 1 FROM pg_policy pl WHERE pl.polrelid = c.oid));
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'таблицы с личными данными без RLS или без политик: %', v_bad;
+    END IF;
+    -- Прямые права в обход SET ROLE (АР-10): ни у одной роли входа (feelings_api, *_login, кроме
+    -- владельца объекта и суперпользователей) и ни у PUBLIC нет прав на таблицы, колонки и
+    -- последовательности public; функции public PUBLIC не исполняет (0001: REVOKE … FROM PUBLIC).
+    SELECT string_agg(DISTINCT x, ', ') INTO v_bad FROM (
+        SELECT format('%s → %s', c.relname, CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END) AS x
+        FROM pg_class c, aclexplode(c.relacl) a
+        WHERE c.relnamespace = 'public'::regnamespace AND a.grantee <> c.relowner
+          AND (a.grantee = 0 OR EXISTS (SELECT 1 FROM pg_roles r WHERE r.oid = a.grantee
+                                        AND r.rolcanlogin AND NOT r.rolsuper))
+        UNION ALL
+        SELECT format('%s.%s → %s', c.relname, at.attname, CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END)
+        FROM pg_attribute at JOIN pg_class c ON c.oid = at.attrelid, aclexplode(at.attacl) a
+        WHERE c.relnamespace = 'public'::regnamespace AND a.grantee <> c.relowner
+          AND (a.grantee = 0 OR EXISTS (SELECT 1 FROM pg_roles r WHERE r.oid = a.grantee
+                                        AND r.rolcanlogin AND NOT r.rolsuper))
+        UNION ALL
+        SELECT format('%s → %s', p.oid::regprocedure, CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END)
+        FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+        WHERE p.pronamespace = 'public'::regnamespace AND a.grantee <> p.proowner
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')
+          AND (a.grantee = 0 OR EXISTS (SELECT 1 FROM pg_roles r WHERE r.oid = a.grantee
+                                        AND r.rolcanlogin AND NOT r.rolsuper))) s;
+    IF v_bad IS NOT NULL THEN
+        RAISE EXCEPTION 'прямые права PUBLIC или ролей входа в обход SET ROLE (АР-10): %', v_bad;
     END IF;
     IF (SELECT datdba::regrole::text FROM pg_database WHERE datname = v_db) <> 'feelings_owner' THEN
         RAISE EXCEPTION 'база % не во владении feelings_owner', v_db;
