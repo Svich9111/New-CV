@@ -78,7 +78,7 @@ from app.ai import pipeline
 from app.ai.llm import LLMError, LLMRefusal
 from app.ai.models import AgentModels
 from app.ai.prompts import V0, V1, V2, PromptSet
-from app.config import ConfigError
+from app.config import ConfigError, Settings
 from app.core.crypto import DecryptionError, Keyring
 from app.db import sqlstate
 from app.repositories import pipeline_work as pw
@@ -441,15 +441,28 @@ class PipelineWorker:
 
 
 async def _main() -> None:  # pragma: no cover — запуск процесса (нужны роль входа и ключи)
-    from app.ai.models import openrouter_models_async
     from app.config import get_settings
-    from app.core.crypto import load_keyring
-    from app.db import make_engine, make_sessionmaker
+    from app.workers.signals import stop_on_signals
 
     settings = get_settings()
     if not settings.worker_database_url:
         raise ConfigError("FEELINGS_WORKER_DATABASE_URL не задан (роль входа воркера, Б-69)")
     prompt_set = resolve_prompt_set(settings.pipeline_prompt_set, settings.env)
+    # SIGTERM/SIGINT (docker stop, выкладка) — штатная остановка: новые сообщения не
+    # захватываются, начатые дорабатываются (``run_forever``); второй сигнал — сразу.
+    stop = asyncio.Event()
+    with stop_on_signals(stop, name="pipeline worker"):
+        await _run(settings, prompt_set, stop)
+    logger.info("pipeline worker stopped")
+
+
+async def _run(  # pragma: no cover — запуск процесса
+    settings: Settings, prompt_set: PromptSet, stop: asyncio.Event
+) -> None:
+    from app.ai.models import openrouter_models_async
+    from app.core.crypto import load_keyring
+    from app.db import make_engine, make_sessionmaker
+
     worker = PipelineWorker(
         worker_sm=make_sessionmaker(make_engine(settings.worker_database_url)),
         keys=load_keyring(settings),  # Б-42: ключи шифрования воркера — из окружения
@@ -464,7 +477,7 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
             pause=timedelta(seconds=settings.pipeline_pause_s),
         ),
     )
-    await worker.run_forever(poll_s=settings.pipeline_poll_s)
+    await worker.run_forever(poll_s=settings.pipeline_poll_s, stop=stop)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -128,25 +128,37 @@ FEELINGS_WORKER_DB_PASSWORD=... FEELINGS_ADMIN_DB_PASSWORD=... FEELINGS_API_DB_P
 
 ```bash
 cd backend
-uv run python -m app.workers.memory   # воркер памяти (2.4)
-uv run python -m app.workers.kb       # воркер индексации базы знаний (2.6)
+uv run python -m app.workers.memory     # воркер памяти (2.4)
+uv run python -m app.workers.kb         # воркер индексации базы знаний (2.6)
+uv run python -m app.workers.pipeline   # конвейер входящего: безопасность, тон, доставка (3.2)
+uv run python -m app.workers.notify     # уведомления в Telegram без текста сообщения (3.5)
 ```
 
-Обоим нужен `FEELINGS_WORKER_DATABASE_URL`; без него процесс останавливается с ошибкой
+Всем нужен `FEELINGS_WORKER_DATABASE_URL`; без него процесс останавливается с ошибкой
 конфигурации. Воркер памяти дополнительно требует ключи шифрования, ключ отпечатков и
-`OPENROUTER_API_KEY`.
+`OPENROUTER_API_KEY`; воркер конвейера — ключи шифрования, `OPENROUTER_API_KEY` и набор промптов
+`FEELINGS_PIPELINE_PROMPT_SET` (локально `v0`, АР-45); воркер уведомлений — только
+`FEELINGS_TELEGRAM_BOT_TOKEN` (`FEELINGS_WEBAPP_URL` по https — кнопка «Открыть» Mini App, без
+него уведомление без кнопки). Отправленные сообщения доходят до партнёра только при запущенном
+`worker-pipeline`, уведомления о них — при запущенном `worker-notify`.
+
+Воркеры конвейера и уведомлений останавливаются штатно по SIGTERM/SIGINT (Ctrl+C, `docker stop`):
+новое не захватывается, начатое дорабатывается; повторный сигнал — остановка сразу. Неверный
+токен бота — строки ERROR `notify message: status=paused reason=http_401` в журнале
+`worker-notify`.
 
 **Локальная разработка (Docker Compose):**
 
 ```bash
 cp .env.example .env    # заполнить ключи, FEELINGS_*_DB_PASSWORD и те же пароли в *_DATABASE_URL
-make dev-up             # postgres, redis → migrate → db-roles → worker-memory, worker-kb
+make dev-up             # postgres, redis → migrate → db-roles → воркеры (memory, kb, pipeline, notify)
 make db-roles           # только миграции и роли входа (повторно — смена паролей)
 make dev-down
 make db-up              # как раньше: только postgres и redis
 ```
 
-Сервисы `migrate`, `db-roles`, `worker-memory`, `worker-kb` — в профиле `workers`
+Сервисы `migrate`, `db-roles`, `worker-memory`, `worker-kb`, `worker-pipeline`, `worker-notify` —
+в профиле `workers`
 (`infra/docker-compose.yml`), образ `infra/backend.Dockerfile` (только для разработки; продуктив
 — задача 4.7). Портов у них нет. Сервиса API в compose нет: сервер API запускается локально
 (`uv run uvicorn app.main:app`) с адресами `localhost`.

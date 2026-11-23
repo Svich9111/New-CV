@@ -6,7 +6,7 @@
    сообщение без отметки, id получателя, токен аренды. ``SKIP LOCKED`` — две копии воркера не
    берут одно сообщение; брошенное (воркер упал, аренда истекла) выдаётся снова. Пара распалась,
    получатель удалён, попытки исчерпаны — отметку без выдачи ставит БД.
-2. **Отправка** — ``notify_user``: чат Telegram ищется в момент отправки, в области самого
+2. **Отправка** (``_attempt``): чат Telegram ищется в момент отправки, в области самого
    получателя (``user_scope``, RLS); удалён — ничего не отправляется (Б-47). Текст — фиксированный
    шаблон ``NotificationKind.NEW_MESSAGE`` («Партнёр прислал вам сообщение…»): ни текста
    сообщения, ни имени автора, ни id (ТЗ §4.4 п.3); кнопка «Открыть» — Mini App
@@ -17,12 +17,13 @@
 Ошибки Telegram (``BotApiError``):
 
 - **429** — пауза всего воркера на ``retry_after`` (лимит общий на бота): новые не захватываются,
-  начатые ждут и повторяют отправку в пределах своей аренды; не успели — аренда истечёт, повтор
-  при следующем захвате (попытка засчитана БД);
+  начатые ждут и повторяют отправку в пределах своей аренды; пауза дольше окна — аренда снимается
+  досрочно с отсрочкой до конца паузы, попытка не расходуется (``pipeline_notify_release``, 0015);
 - **403** (бот заблокирован, пользователь деактивирован) и **400** (чат не найден и т. п.) —
   отметка без повторов: повтор ничего не изменит. 403 — штатный исход (INFO);
-- **401/404** (токен бота неверен) — ошибка настройки: пауза воркера, отметки нет (повтор после
-  аренды и паузы);
+- **401/404** (токен бота неверен) — ошибка настройки: пауза воркера, отметки нет; аренда снимается
+  с отсрочкой на паузу без расхода попытки — уведомления ждут исправления токена, а не
+  помечаются сделанными через ``max_attempts`` пауз (ревью 3.5 р.1 MINOR-1);
 - **сеть, 5xx** — повтор с растущей паузой в пределах аренды, затем — после её истечения. Только
   если запрос точно не дошёл до Telegram (соединение не установлено) или Telegram ответил
   ошибкой. Тайм-аут чтения или обрыв после отправки (``maybe_sent``) — уведомление могло уйти:
@@ -30,12 +31,16 @@
   нет ключа идемпотентности, и дубль здесь хуже пропуска — сообщение и так видно в ленте Mini App.
 
 Предел попыток — в БД (``pipeline_claim_notify``: ``work_attempts ≥ p_max_attempts`` — отметка без
-выдачи). Досрочного снятия аренды уведомления в БД нет (``pipeline_release`` — только фаза
-``processing``), поэтому повтор после 429 сверх аренды и после ошибки настройки расходует
-попытку (предложение A1 — ``pipeline_notify_release``).
+выдачи). Попытку расходуют только сбои самого уведомления (сеть, 5xx, падение процесса); 429
+дольше окна и ошибка настройки бота — снятие аренды без расхода (``nw.release``).
 
-Остаточный риск «ровно одного»: процесс убит (или БД недоступна дольше аренды) между успешной
-отправкой и отметкой — после истечения аренды уведомление уйдёт ещё раз.
+Остановка процесса (SIGTERM/SIGINT — ``docker stop``, выкладка; ``app.workers.signals``): новые
+уведомления не захватываются, повторы и ожидание паузы не начинаются (аренда истечёт — повтор
+другим процессом), начатый запрос к Telegram дорабатывается и отмечается. Время на это —
+``stop_grace_period`` сервиса в compose (не меньше тайм-аута запроса Bot API и отметки).
+
+Остаточный риск «ровно одного»: процесс убит SIGKILL (или БД недоступна дольше аренды) между
+успешной отправкой и отметкой — после истечения аренды уведомление уйдёт ещё раз.
 
 Журнал — только исход, вид ошибки (код HTTP или класс исключения) и номер попытки: ни текстов, ни
 токена бота, ни chat_id, ни id пользователей и сообщений (ТЗ §9.1 п.5); описание ошибки от
@@ -60,10 +65,12 @@ from typing import Literal
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot.client import BotApi, BotApiError
-from app.bot.notifications import NotificationKind, notify_user
+from app.bot.notifications import NotificationKind, notify
 from app.repositories import notify_work as nw
+from app.repositories import users
 from app.repositories.notify_work import NotifyClaim
 from app.workers.pipeline import transient_db_error
+from app.workers.signals import stop_on_signals
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +81,7 @@ Status = Literal[
     "rejected",  # 400 и прочие постоянные ошибки Telegram — отмечено без повторов
     "unknown",  # запрос мог дойти (тайм-аут чтения, обрыв) — отмечено без повтора
     "retry",  # временный сбой — повтор после истечения аренды
-    "paused",  # ошибка настройки бота (401/404) — пауза воркера, повтор после аренды
+    "paused",  # ошибка настройки бота (401/404) — пауза, отсрочка без расхода попытки
     "lost",  # отметка не своя: аренду перехватили или отметка уже стоит
     "error",  # сбой БД / непредвиденная ошибка — повтор после истечения аренды
 ]
@@ -133,11 +140,16 @@ class _Sent(Exception):
 
 
 class _Leave(Exception):
-    """Внутренний сигнал: не отмечать — повтор после истечения аренды."""
+    """Внутренний сигнал: не отмечать — повтор после истечения аренды. ``release_after`` —
+    снять аренду досрочно с отсрочкой (секунды) без расхода попытки: причина не в уведомлении
+    (429 дольше окна, ошибка настройки бота)."""
 
-    def __init__(self, status: Status, reason: str | None) -> None:
+    def __init__(
+        self, status: Status, reason: str | None, *, release_after: float | None = None
+    ) -> None:
         self.status = status
         self.reason = reason
+        self.release_after = release_after
 
 
 class NotifyWorker:
@@ -160,6 +172,7 @@ class NotifyWorker:
         self.settings = settings or NotifySettings()
         self._sleep = sleep
         self._paused_until = 0.0  # time.monotonic()
+        self._stop: asyncio.Event | None = None  # остановка процесса (``run_forever``)
 
     # ----------------------------------------------------------------- пауза (429, настройка)
 
@@ -169,6 +182,26 @@ class NotifyWorker:
 
     def _pause_for(self, seconds: float) -> None:
         self._paused_until = max(self._paused_until, time.monotonic() + seconds)
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop is not None and self._stop.is_set()
+
+    async def _nap(self, seconds: float) -> None:
+        """Пауза перед повтором; остановка процесса её прерывает."""
+        stop = self._stop
+        if stop is None:
+            await self._sleep(seconds)
+            return
+        if stop.is_set():
+            return
+        nap = asyncio.ensure_future(self._sleep(seconds))
+        waiter = asyncio.ensure_future(stop.wait())
+        try:
+            await asyncio.wait({nap, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (nap, waiter):
+                t.cancel()
 
     # ----------------------------------------------------------------- проход
 
@@ -209,53 +242,76 @@ class NotifyWorker:
         except _Sent as fin:
             return await self._mark(c, fin.status, fin.reason, t0 + cfg.mark_window_s)
         except _Leave as leave:
+            if leave.release_after is not None:
+                await self._release(c, leave.release_after)
             return NotifyOutcome(leave.status, leave.reason, c.attempts)
         raise AssertionError("unreachable")  # pragma: no cover
 
     async def _send(self, c: NotifyClaim, deadline: float) -> None:
         """Отправка с повторами в пределах аренды. Исход — исключением: ``_Sent`` (отметить)
-        или ``_Leave`` (не отмечать — повтор после истечения аренды)."""
+        или ``_Leave`` (не отмечать — повтор после истечения аренды). После остановки процесса
+        (``stop``) повторы и ожидание паузы не начинаются: начатый запрос дорабатывается."""
         cfg = self.settings
         pause = cfg.retry_pause_s
         last: str | None = None
-        for _ in range(cfg.max_sends):
+        for n in range(cfg.max_sends):
+            if n and self.stopping:
+                raise _Leave("retry", last or "stopping")
             wait = self._paused_until - time.monotonic()
             if wait > 0:
                 if time.monotonic() + wait >= deadline:
-                    raise _Leave("retry", last or "paused")
-                await self._sleep(wait)
-            left = deadline - time.monotonic()
-            if left <= 0:
+                    # 429 или ошибка настройки дольше окна: отсрочка до конца паузы без расхода
+                    # попытки (иначе через max_attempts пауз уведомление помечалось бы без
+                    # отправки, MINOR-1).
+                    raise _Leave("retry", last or "paused", release_after=wait)
+                await self._nap(wait)
+                if self.stopping:
+                    raise _Leave("retry", last or "stopping")
+            if deadline - time.monotonic() <= 0:
                 raise _Leave("retry", last or "deadline")
-            limit = asyncio.timeout(left)
-            try:
-                async with limit:
-                    sent = await notify_user(
-                        self.api, self.sm, c.recipient_id, NotificationKind.NEW_MESSAGE,
-                        self.webapp_url,
-                    )  # fmt: skip
-            except TimeoutError:
-                if not limit.expired():  # тайм-аут соединения с БД при поиске чата — повтор
-                    last = "TimeoutError"
-                else:
-                    # Срок отправки вышел посреди запроса — он мог дойти: не повторять.
-                    raise _Sent("unknown", "deadline") from None
-            except BotApiError as err:
-                last = self._classify(err)
-            except Exception as exc:
-                if not transient_db_error(exc):  # поиск чата: детерминированная ошибка БД
-                    raise
-                last = type(exc).__name__
-            else:
-                raise _Sent("sent" if sent else "no_chat")
+            last = await self._attempt(c, deadline)
             # Временный сбой: повтор с паузой (429 — пауза уже выставлена).
             if last != "http_429":
                 left = deadline - time.monotonic()
                 if left <= pause:
                     raise _Leave("retry", last)
-                await self._sleep(pause)
+                await self._nap(pause)
                 pause = min(pause * 2, cfg.retry_max_pause_s)
         raise _Leave("retry", last)
+
+    async def _attempt(self, c: NotifyClaim, deadline: float) -> str:
+        """Одна попытка: поиск чата получателя, затем ``sendMessage``. Известный исход —
+        исключением (``_Sent``/``_Leave``); временный сбой — его вид (для повтора).
+
+        Срок — отдельно для каждой фазы (MINOR-2): вышел при поиске чата — запрос к Telegram
+        ещё не отправлялся, это «не отправлено» (повтор после аренды); вышел посреди
+        ``sendMessage`` — запрос мог дойти, отметка без повтора (``unknown``)."""
+        lookup = asyncio.timeout(deadline - time.monotonic())
+        try:
+            async with lookup:
+                chat_id = await users.notification_chat_id(self.sm, c.recipient_id)
+        except TimeoutError:
+            if lookup.expired():
+                raise _Leave("retry", "deadline") from None
+            return "TimeoutError"  # тайм-аут соединения с БД — повтор
+        except Exception as exc:
+            if not transient_db_error(exc):  # детерминированная ошибка БД
+                raise
+            return type(exc).__name__
+        if chat_id is None:  # получатель удалён к моменту отправки (Б-47)
+            raise _Sent("no_chat")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _Leave("retry", "deadline")
+        try:
+            async with asyncio.timeout(left):
+                await notify(self.api, chat_id, NotificationKind.NEW_MESSAGE, self.webapp_url)
+        except TimeoutError:
+            # Срок отправки вышел посреди запроса — он мог дойти: не повторять.
+            raise _Sent("unknown", "deadline") from None
+        except BotApiError as err:
+            return self._classify(err)
+        raise _Sent("sent")
 
     def _classify(self, err: BotApiError) -> str:
         """Ошибка Bot API → вид для повтора; постоянные исходы — исключением."""
@@ -268,7 +324,7 @@ class NotifyWorker:
             return reason
         if code in CONFIG_ERROR_CODES:
             self._pause_for(cfg.pause.total_seconds())
-            raise _Leave("paused", reason)
+            raise _Leave("paused", reason, release_after=cfg.pause.total_seconds())
         if code in UNREACHABLE_CODES:
             raise _Sent("blocked", reason)
         if err.maybe_sent:
@@ -276,6 +332,16 @@ class NotifyWorker:
         if err.transient:
             return reason
         raise _Sent("rejected", reason)
+
+    async def _release(self, c: NotifyClaim, after_s: float) -> None:
+        """Досрочное снятие аренды без расхода попытки (``pipeline_notify_release``, 0015).
+        Сбой БД — не страшно: аренда истечёт сама (попытка тогда засчитается)."""
+        try:
+            await nw.release(
+                self.sm, c, retry_after=timedelta(seconds=after_s), count_attempt=False
+            )
+        except Exception as exc:
+            logger.warning("notify release failed: %s", type(exc).__name__)
 
     async def _mark(
         self, c: NotifyClaim, status: Status, reason: str | None, deadline: float
@@ -303,8 +369,10 @@ class NotifyWorker:
     async def run_forever(self, *, poll_s: float = 1.0, stop: asyncio.Event | None = None) -> None:
         """Непрерывный цикл: до ``batch`` уведомлений одновременно; освободился слот — сразу
         новый захват. Нечего захватывать или пауза — ждём ``poll_s``, конца любой задачи или
-        остановки. При остановке — дожидаемся начатых."""
+        остановки. При остановке — новые не захватываются, повторы не начинаются; начатые
+        запросы дорабатываются и отмечаются (дожидаемся их)."""
         stop = stop or asyncio.Event()
+        self._stop = stop
         running: set[asyncio.Task[NotifyOutcome]] = set()
         stopper = asyncio.create_task(stop.wait())
         cfg = self.settings
@@ -360,10 +428,13 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
             batch=settings.notify_batch,
         ),
     )
+    stop = asyncio.Event()
     try:
-        await worker.run_forever(poll_s=settings.notify_poll_s)
+        with stop_on_signals(stop, name="notify worker"):
+            await worker.run_forever(poll_s=settings.notify_poll_s, stop=stop)
     finally:
         await api.aclose()
+    logger.info("notify worker stopped")
 
 
 if __name__ == "__main__":  # pragma: no cover

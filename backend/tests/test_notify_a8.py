@@ -470,12 +470,7 @@ def test_process_survives_db_outage_without_leaking_secrets(tmp_path: Path) -> N
         assert s not in out, s
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-3.5-D1 (MINOR): SIGTERM (docker stop при выкладке, DEPLOY §6/§10) не останавливает "
-    "run_forever штатно — у _main нет обработчика сигнала, процесс обрывается посреди отправки; "
-    "отправленное, но не отмеченное уведомление после аренды уйдёт повторно",
-)
+# A8-3.5-D1 исправлен (3.5, раунд 1): обработчик SIGTERM/SIGINT — app.workers.signals.
 def test_process_stops_gracefully_on_sigterm(tmp_path: Path) -> None:
     proc = _start_worker(tmp_path)
     try:

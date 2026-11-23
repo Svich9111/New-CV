@@ -193,11 +193,22 @@ postgres при каждом старте), — оставьте пустую з
   `strict-transport-security`, `content-security-policy` и `x-content-type-options`.
 - **Причины сбоев:**
   - API не стартует — контакты помощи (шаг 0) или пустой секрет (в журнале имя переменной);
-  - воркер в состоянии `Restarting` — `dc logs worker-memory` (`worker-pipeline`, `worker-kb`).
+  - воркер в состоянии `Restarting` — `dc logs worker-memory` (`worker-pipeline`, `worker-kb`,
+    `worker-notify`).
     Воркеры перезапускаются всегда (`unless-stopped`, пауза растёт до 1 минуты): кратковременная
     недоступность OpenRouter при старте проходит сама. Постоянная причина — ошибка настройки
     (`OPENROUTER_API_KEY`, `FEELINGS_PIPELINE_PROMPT_SET`, ключи) — видна как бесконечный
     `Restarting` и не исправится без правки `.env`.
+  - уведомления в Telegram не приходят, а `worker-notify` `healthy` — `dc logs worker-notify`.
+    Ошибка настройки бота (неверный или отозванный `FEELINGS_TELEGRAM_BOT_TOKEN`) видна как
+    строки уровня ERROR `notify message: status=paused reason=http_401` (или `http_404`): воркер
+    встаёт на паузу на 5 минут и повторяет; уведомления ждут (попытки не расходуются) и уйдут
+    после исправления. Health check (подключение к БД) паузу не показывает.
+    Исправить токен в `.env`, затем `dc up -d worker-notify`. Прочие исходы в журнале — без текстов
+    и адресатов: `status=blocked` (бот заблокирован получателем — штатно), `status=retry` (сеть,
+    5xx, 429 — повтор). Остановка (`dc stop`, выкладка) штатная: начатая отправка дорабатывается
+    и отмечается (`stop_grace_period: 30s`), в журнале — `SIGTERM received` и
+    `notify worker stopped`.
   - **После каждой выкладки и перезагрузки сервера** — `dc ps`: все сервисы `healthy`, ни одного
     `Restarting`/`Exited`. Иначе отправленные сообщения остаются «в обработке» (`worker-pipeline`).
 

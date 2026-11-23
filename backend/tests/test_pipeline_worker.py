@@ -1093,3 +1093,60 @@ async def test_write_committed_answer_lost_logged_without_error(
     ]
     assert "status=error" not in "\n".join(lines)
     assert (await recipient_feed(sessionmaker, igor.user_id))[mid].text == HARSH_ADAPTED
+
+
+# Процесс воркера как ``python -m app.workers.pipeline`` (настоящий ``_main`` с обработчиком
+# сигналов); каталог OpenRouter подменён (сети нет), БД недоступна — воркер крутит захват.
+_PIPELINE_LAUNCH = (
+    "import asyncio, logging\n"
+    "import app.ai.models as m\n"
+    "async def _models(*a, **k):\n"
+    "    return None\n"
+    "m.openrouter_models_async = _models\n"
+    "import app.workers.pipeline as p\n"
+    "logging.basicConfig(level=logging.INFO)\n"
+    "asyncio.run(p._main())\n"
+)
+
+
+def test_pipeline_process_stops_gracefully_on_sigterm() -> None:
+    """3.5 MAJOR-1 (то же у конвейера): настоящий процесс и ``os.kill(SIGTERM)`` (``docker
+    stop``) — штатная остановка ``run_forever``, код выхода 0, а не гибель от сигнала."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    backend = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FEELINGS_", "OPENROUTER"))}
+    env |= {
+        "FEELINGS_ENV": "dev",
+        "FEELINGS_PIPELINE_PROMPT_SET": "v0",
+        "FEELINGS_WORKER_DATABASE_URL": "postgresql+asyncpg://nobody:x@127.0.0.1:1/none",
+        "FEELINGS_ENCRYPTION_KEYS": "t1:" + "A" * 43,
+        "FEELINGS_ENCRYPTION_KEY_ID": "t1",
+        "FEELINGS_PIPELINE_POLL_S": "0.2",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": str(backend),
+    }
+    proc = subprocess.Popen(  # noqa: S603 — свой интерпретатор и свой код запуска
+        [sys.executable, "-c", _PIPELINE_LAUNCH], cwd=backend, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )  # fmt: skip
+    try:
+        assert proc.stdout is not None
+        deadline = time.monotonic() + 30
+        for line in proc.stdout:  # воркер в цикле: захват уже пробовался
+            if "pipeline worker claim failed" in line:
+                break
+            assert time.monotonic() < deadline
+        assert proc.poll() is None
+        os.kill(proc.pid, signal.SIGTERM)
+        code = proc.wait(timeout=15)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        out = proc.communicate(timeout=10)[0]
+    assert code == 0, out[-2000:]
+    assert "SIGTERM received" in out and "pipeline worker stopped" in out

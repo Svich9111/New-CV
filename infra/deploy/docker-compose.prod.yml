@@ -232,6 +232,10 @@ services:
     <<: *backend
     command: ["python", "-m", "app.workers.notify"]
     restart: *worker-restart
+    # SIGTERM → начатый запрос к Bot API (тайм-аут клиента до 10 с + соединение 5 с) дорабатывается
+    # и отмечается; по умолчанию Docker ждёт 10 с и убивает — отправленное, но не отмеченное
+    # уведомление ушло бы повторно (3.5, MAJOR-1).
+    stop_grace_period: 30s
     environment:
       FEELINGS_ENV: ${FEELINGS_ENV}
       FEELINGS_WORKER_DATABASE_URL: *worker-db

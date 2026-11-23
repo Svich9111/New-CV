@@ -9,11 +9,13 @@
   истекла) выдаётся снова. Пара распалась, получатель удалён или помечен удалённым, попытки
   исчерпаны — отметку ставит сама БД, без выдачи;
 - **отметка** — ``pipeline_notify_done`` по своему токену (снимает аренду). ``False`` — аренду
-  перехватили или отметка уже стоит (повтор той же записи после потерянного ответа).
+  перехватили или отметка уже стоит (повтор той же записи после потерянного ответа);
+- **снятие аренды** — ``pipeline_notify_release`` (0015) по своему токену, с отсрочкой и, по выбору,
+  без расхода попытки: 429 дольше окна аренды и ошибка настройки бота (401/404) — уведомление ждёт,
+  а не помечается сделанным через ``max_attempts`` пауз (ревью 3.5 р.1 MINOR-1).
 
-Чат Telegram получателя здесь не читается: его ищет ``notify_user`` в момент отправки, в области
-самого получателя (``user_scope``, RLS). Досрочного снятия аренды уведомления в БД нет
-(``pipeline_release`` — только фаза ``processing``): повтор после падения — по истечении аренды."""
+Чат Telegram получателя здесь не читается: воркер ищет его в момент отправки, в области самого
+получателя (``user_scope``, RLS). Повтор после падения процесса — по истечении аренды."""
 
 from __future__ import annotations
 
@@ -32,6 +34,9 @@ _CLAIM = (
     "FROM pipeline_claim_notify(CAST(CAST(:l AS text) AS interval), :n, :lim)"
 )
 _DONE = "SELECT pipeline_notify_done(:m, :t)"
+# 0015: снятие аренды уведомления с отсрочкой (ревью 3.5 р.1 MINOR-1).
+_RELEASE = "SELECT pipeline_notify_release(:m, :t, CAST(CAST(:after AS text) AS interval), :count)"
+MAX_RETRY_AFTER = timedelta(days=1)  # предел pipeline_notify_release (22023 больше)
 
 
 @dataclass(frozen=True)
@@ -70,4 +75,32 @@ async def done(sm: async_sessionmaker[AsyncSession], c: NotifyClaim) -> bool:
     отмечено (ничего не изменено)."""
     async with worker_scope(sm) as s:
         value = (await s.execute(text(_DONE), {"m": c.message_id, "t": c.token})).scalar_one()
+    return bool(value)
+
+
+async def release(
+    sm: async_sessionmaker[AsyncSession],
+    c: NotifyClaim,
+    *,
+    retry_after: timedelta,
+    count_attempt: bool,
+) -> bool:
+    """Досрочное снятие аренды уведомления по своему токену (0015, ``pipeline_notify_release``):
+    захват выдаёт сообщение снова не раньше чем через ``retry_after`` (обрезается до [0, 1 день]);
+    ``count_attempt=False`` — попытка не расходуется (401/404 настройки бота, 429 дольше окна
+    аренды: уведомления ждут исправления, а не помечаются сделанными). ``False`` — аренда не
+    своя, отметка уже стоит или сообщение удалено (ничего не изменено)."""
+    after = min(max(retry_after, timedelta(0)), MAX_RETRY_AFTER)
+    async with worker_scope(sm) as s:
+        value = (
+            await s.execute(
+                text(_RELEASE),
+                {
+                    "m": c.message_id,
+                    "t": c.token,
+                    "after": f"{after.total_seconds():.3f} seconds",
+                    "count": count_attempt,
+                },
+            )
+        ).scalar_one()
     return bool(value)

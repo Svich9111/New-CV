@@ -110,6 +110,8 @@ services:
     <<: *backend
     command: ["python", "-m", "app.workers.notify"]
     environment: *worker-env
+    # SIGTERM → начатый запрос к Bot API дорабатывается и отмечается (как на стенде, MAJOR-1).
+    stop_grace_period: 30s
     # Живость: процесс жив и роль входа воркера подключается к БД (как на стенде).
     healthcheck:
       test:
