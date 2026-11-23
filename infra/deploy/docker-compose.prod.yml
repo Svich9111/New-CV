@@ -1,0 +1,224 @@
+# Тестовый стенд «Чувства AI» (задача 0.8). Один сервер в РФ (152-ФЗ, Д1), Docker Compose.
+# Порядок и команды — docs/DEPLOY.md. Значения — из infra/deploy/.env (шаблон .env.prod.example;
+# compose читает его сам, потому что он лежит рядом с этим файлом).
+#
+# Наружу — только Caddy: 80 (сертификат, переадресация) и 443 (HTTPS, HTTP/3).
+# БД и Redis — только во внутренней сети `data` без выхода наружу; портов у них нет.
+#
+#   docker compose -f infra/deploy/docker-compose.prod.yml up -d --build      — сервисы
+#   docker compose -f infra/deploy/docker-compose.prod.yml --profile ops run --rm migrate
+#       — миграции: ТОЛЬКО после подтверждения оператора (RoadMap §4, АР-4)
+#   docker compose -f infra/deploy/docker-compose.prod.yml --profile ops run --rm db-roles
+#       — роли входа (infra/db/roles.sql), после миграций
+#
+# Внимание: `docker compose config` и `docker inspect` показывают значения из .env, включая
+# пароли и ключи — вывод не прикладывать к тикетам и чатам.
+name: feelings
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  logging: *logging
+
+# Образ сервера (API, воркеры, миграции): непривилегированный пользователь `feelings` (uid 10001).
+x-backend: &backend
+  <<: *hardening
+  image: feelings-backend:${FEELINGS_IMAGE_TAG:-staging}
+  build:
+    context: ../..
+    dockerfile: infra/backend.Dockerfile
+  read_only: true
+  tmpfs: ["/tmp"]
+  cap_drop: ["ALL"]
+  restart: unless-stopped
+
+# Подключения собираются здесь из паролей ролей (адреса — внутренняя сеть compose).
+x-urls:
+  api-db: &api-db postgresql+asyncpg://feelings_api:${FEELINGS_API_DB_PASSWORD:?задайте FEELINGS_API_DB_PASSWORD}@postgres:5432/feelings
+  worker-db: &worker-db postgresql+asyncpg://feelings_worker_login:${FEELINGS_WORKER_DB_PASSWORD:?задайте FEELINGS_WORKER_DB_PASSWORD}@postgres:5432/feelings
+  admin-db: &admin-db postgresql+asyncpg://feelings_admin_login:${FEELINGS_ADMIN_DB_PASSWORD:?задайте FEELINGS_ADMIN_DB_PASSWORD}@postgres:5432/feelings
+
+services:
+  caddy:
+    <<: *hardening
+    image: feelings-caddy:${FEELINGS_IMAGE_TAG:-staging}
+    build:
+      context: ../..
+      dockerfile: infra/deploy/caddy.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      FEELINGS_DOMAIN: ${FEELINGS_DOMAIN:?задайте FEELINGS_DOMAIN}
+      FEELINGS_ACME_EMAIL: ${FEELINGS_ACME_EMAIL:?задайте FEELINGS_ACME_EMAIL}
+      FEELINGS_PROXY_MAX_BODY: ${FEELINGS_PROXY_MAX_BODY:-2MiB}
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [edge]
+    depends_on:
+      api: { condition: service_healthy }
+
+  # Один процесс uvicorn: защита от повторной доставки обновлений бота (update_id) и фоновые
+  # задачи чата/памяти живут в памяти процесса — несколько процессов API пока не поддержаны.
+  api:
+    <<: *backend
+    command:
+      - uvicorn
+      - app.main:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --proxy-headers
+      # Порт API не опубликован: доверять заголовкам X-Forwarded-* можно (до API доходит только Caddy).
+      - --forwarded-allow-ips=*
+      - --no-server-header
+      - --timeout-graceful-shutdown=20
+    environment:
+      FEELINGS_ENV: ${FEELINGS_ENV:?задайте FEELINGS_ENV}
+      FEELINGS_DATABASE_URL: *api-db
+      FEELINGS_ADMIN_DATABASE_URL: *admin-db
+      FEELINGS_REDIS_URL: redis://redis:6379/0
+      FEELINGS_TELEGRAM_BOT_TOKEN: ${FEELINGS_TELEGRAM_BOT_TOKEN:?задайте FEELINGS_TELEGRAM_BOT_TOKEN}
+      FEELINGS_SESSION_SECRET: ${FEELINGS_SESSION_SECRET:?задайте FEELINGS_SESSION_SECRET}
+      FEELINGS_BOT_USERNAME: ${FEELINGS_BOT_USERNAME:?задайте FEELINGS_BOT_USERNAME}
+      FEELINGS_TELEGRAM_WEBHOOK_SECRET: ${FEELINGS_TELEGRAM_WEBHOOK_SECRET:?задайте FEELINGS_TELEGRAM_WEBHOOK_SECRET}
+      FEELINGS_WEBAPP_URL: https://${FEELINGS_DOMAIN}/
+      FEELINGS_ENCRYPTION_KEYS: ${FEELINGS_ENCRYPTION_KEYS:?задайте FEELINGS_ENCRYPTION_KEYS}
+      FEELINGS_ENCRYPTION_KEY_ID: ${FEELINGS_ENCRYPTION_KEY_ID:?задайте FEELINGS_ENCRYPTION_KEY_ID}
+      FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
+      FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      FEELINGS_ADMIN_TOKEN_SHA256: ${FEELINGS_ADMIN_TOKEN_SHA256:-}
+      FEELINGS_CHAT_DAILY_LIMIT: ${FEELINGS_CHAT_DAILY_LIMIT:-100}
+      FEELINGS_MAX_REQUEST_BODY_BYTES: ${FEELINGS_MAX_REQUEST_BODY_BYTES:-1048576}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    # data — БД и Redis; edge — Caddy и выход наружу (Telegram Bot API, OpenRouter).
+    networks: [data, edge]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  # Воркер памяти (2.4) — обязателен вместе с API (docs/ADMIN.md §5).
+  worker-memory:
+    <<: *backend
+    command: ["python", "-m", "app.workers.memory"]
+    # Ошибка конфигурации (нет ключа OpenRouter, ключей) повторяется — не перезапускать бесконечно.
+    restart: "on-failure:5"
+    environment:
+      FEELINGS_ENV: ${FEELINGS_ENV}
+      FEELINGS_WORKER_DATABASE_URL: *worker-db
+      FEELINGS_ENCRYPTION_KEYS: ${FEELINGS_ENCRYPTION_KEYS}
+      FEELINGS_ENCRYPTION_KEY_ID: ${FEELINGS_ENCRYPTION_KEY_ID}
+      FEELINGS_MEMORY_FINGERPRINT_KEY: ${FEELINGS_MEMORY_FINGERPRINT_KEY:?задайте FEELINGS_MEMORY_FINGERPRINT_KEY}
+      FEELINGS_MEMORY_FINGERPRINT_KEYS_OLD: ${FEELINGS_MEMORY_FINGERPRINT_KEYS_OLD:-}
+      FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
+      FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    networks: [data, egress]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # Воркер индексации базы знаний (2.6).
+  worker-kb:
+    <<: *backend
+    command: ["python", "-m", "app.workers.kb"]
+    restart: "on-failure:5"
+    environment:
+      FEELINGS_ENV: ${FEELINGS_ENV}
+      FEELINGS_WORKER_DATABASE_URL: *worker-db
+      FEELINGS_LLM_WRITER_MODEL: ${FEELINGS_LLM_WRITER_MODEL:-anthropic/claude-sonnet-5.5}
+      FEELINGS_LLM_CLASSIFIER_MODEL: ${FEELINGS_LLM_CLASSIFIER_MODEL:-anthropic/claude-haiku-5.5}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    networks: [data, egress]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  postgres:
+    image: pgvector/pgvector:0.8.0-pg16
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD}
+      POSTGRES_DB: feelings
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d feelings"]
+      interval: 5s
+      retries: 20
+    networks: [data]
+
+  redis:
+    image: redis:7.4-alpine
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    restart: unless-stopped
+    # Только счётчики лимитов: без записи на диск.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [data]
+
+  # --- Разовые операции (профиль ops), только по команде оператора ----------------------
+  # Миграции под владельцем схемы. Запуск — ТОЛЬКО после подтверждения оператора (RoadMap §4).
+  migrate:
+    <<: *backend
+    profiles: ["ops"]
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      FEELINGS_ENV: ${FEELINGS_ENV}
+      FEELINGS_MIGRATION_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/feelings
+    networks: [data]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # Роли входа (infra/db/roles.sql) — после миграций; повторный запуск = смена паролей.
+  db-roles:
+    image: pgvector/pgvector:0.8.0-pg16
+    profiles: ["ops"]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    restart: "no"
+    entrypoint: ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-f", "/db/roles.sql"]
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: feelings
+      FEELINGS_WORKER_DB_PASSWORD: ${FEELINGS_WORKER_DB_PASSWORD}
+      FEELINGS_ADMIN_DB_PASSWORD: ${FEELINGS_ADMIN_DB_PASSWORD}
+      FEELINGS_API_DB_PASSWORD: ${FEELINGS_API_DB_PASSWORD}
+    volumes:
+      - ../db:/db:ro
+    networks: [data]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+networks:
+  # Внутренняя: без выхода наружу и без опубликованных портов.
+  data:
+    internal: true
+  edge: {}
+  egress: {}
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

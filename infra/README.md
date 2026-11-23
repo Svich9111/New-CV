@@ -4,7 +4,8 @@
 | --- | --- |
 | `docker-compose.yml` | Локальная разработка: PostgreSQL+pgvector и Redis (`make db-up`); профиль `workers` — миграции, роли входа и воркеры памяти и базы знаний (`make dev-up`) |
 | `db/roles.sql` | Роли входа воркера, администратора и API с паролями из окружения (Б-69, Б-75, АР-10); запускается после `alembic upgrade head` |
-| `backend.Dockerfile` (+ `.dockerignore`) | Образ сервера для локальной разработки (воркеры, миграции) |
+| `backend.Dockerfile` (+ `.dockerignore`) | Образ сервера: API, воркеры, миграции (локально и на стенде) |
+| `deploy/` | Тестовый стенд (0.8): `docker-compose.prod.yml`, `Caddyfile`, `caddy.Dockerfile`, `bootstrap.sh`, `.env.prod.example`, `gen_secrets.py` — инструкция `docs/DEPLOY.md` |
 | `initdb/` | Первичная инициализация локального кластера (БД `feelings_test`) |
 
-Инструкция администратора — `docs/ADMIN.md`. Тестовый стенд и продуктив — задачи 0.8, 4.7.
+Инструкция администратора — `docs/ADMIN.md`, выкладка стенда — `docs/DEPLOY.md`. Продуктив — задача 4.7.
