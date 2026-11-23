@@ -16,6 +16,7 @@ feelings_app; сообщения пары, пары, подписки меняю
 import asyncio
 import hashlib
 import itertools
+import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1138,12 +1139,17 @@ async def test_dedicated_login_role_cannot_escape_to_superuser(engine: AsyncEngi
     """Любая отдельная LOGIN-роль, которая входит только в feelings_app, не может стать
     суперпользователем. Роль своя, временная: общую feelings_api тест не трогает."""
     login = f"a8_login_{uuid.uuid4().hex[:8]}"
+    # 0.8 (A0): пароль — чтобы тест работал и на кластере с проверкой паролей (CI: scram-sha-256),
+    # а не только с trust. Пароль случайный, только из [0-9a-f] — безопасен как литерал DDL.
+    password = secrets.token_hex(24)
     async with engine.connect() as conn:
-        await conn.execute(text(f"CREATE ROLE {login} LOGIN NOINHERIT IN ROLE feelings_app"))
+        await conn.execute(
+            text(f"CREATE ROLE {login} LOGIN NOINHERIT PASSWORD '{password}' IN ROLE feelings_app")
+        )
         await conn.commit()
     parts = urlsplit(TEST_DATABASE_URL)
     host = parts.netloc.split("@")[-1]
-    url = urlunsplit(parts._replace(netloc=f"{login}@{host}"))
+    url = urlunsplit(parts._replace(netloc=f"{login}:{password}@{host}"))
     eng = create_async_engine(url)
     try:
         async with eng.connect() as conn:
