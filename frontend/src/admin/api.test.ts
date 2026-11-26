@@ -1,8 +1,11 @@
+/// <reference types="node" />
 /**
  * Клиент админ-панели: только `/api/v1/admin/*`, токен — только заголовком, без cookie; строгая проверка
  * `KbDocument`; коды ответа — по контракту, при теле не-JSON — по статусу; 204/404 удаления.
  */
-import { AdminApi, AdminApiError, adminPath, toKbDocument } from "./api";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { AdminApi, AdminApiError, MAX_FIELD_BYTES, adminPath, toKbDocument } from "./api";
 import { ADMIN_TOKEN, FakeAdminApi, json, makeDoc } from "./test/fakeAdminApi";
 
 const make = (fake = new FakeAdminApi(), timeouts?: { default?: number; upload?: number }) => ({
@@ -128,4 +131,20 @@ test("загрузка: multipart с полями контракта; тольк
   expect(fake.log[0]).toMatchObject({ method: "POST", path: "/api/v1/admin/kb/documents", body: { title: "Т", rights_basis: "Лицензия", file: { name: "a.txt" } } });
   fake.inject("POST", "/admin/kb/documents", { status: 201, body: makeDoc() });
   expect(await code(api.uploadDocument({ file: new File(["x"], "a.txt"), title: "Т", rights_basis: "Л" }))).toEqual([201, "bad_response"]);
+});
+
+/**
+ * Предел текстового поля формы клиента = серверный `max_part_size` (ревью A6 р.2, MINOR-2): значение берётся из
+ * исходника сервера (`backend/app/api/admin_kb.py`), а не из клиентской константы, — как в тестах A8 `serverParity`.
+ */
+test("MAX_FIELD_BYTES = max_part_size сервера (admin_kb.py), 65 536 байт", () => {
+  const py = readFileSync(join(__dirname, "..", "..", "..", "backend/app/api/admin_kb.py"), "utf8");
+  const name = /request\.form\([^)]*\bmax_part_size=([A-Z_][A-Z0-9_]*)/s.exec(py)?.[1];
+  expect(name, "max_part_size в request.form(...)").toBeTruthy();
+  const expr = new RegExp(`^${name} = ([^#\\n]+)`, "m").exec(py)?.[1].trim() ?? "";
+  // только произведение целых — иначе тест надо обновить вместе с сервером
+  expect(expr).toMatch(/^\d[\d_]*( \* \d[\d_]*)*$/);
+  const server = expr.split("*").reduce((a, f) => a * Number(f.trim().replace(/_/g, "")), 1);
+  expect(server).toBe(65_536);
+  expect(MAX_FIELD_BYTES).toBe(server);
 });

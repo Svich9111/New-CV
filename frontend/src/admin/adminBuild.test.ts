@@ -1,102 +1,193 @@
 // @vitest-environment node
 /// <reference types="node" />
 /**
- * Сборка (карточка 2.8; критерий RoadMap п.2; АР-52): два входа — Mini App (`index.html`) и админ-панель
+ * Сборка (карточка 2.8; критерий RoadMap п.2; ТЗ §9.1 п.5; АР-52): два входа — Mini App (`index.html`) и админ-панель
  * (`admin.html`). Собирается как `npm run build` (`NODE_ENV=production`; под vitest он `test`, и JSX собирался бы в
- * отладочном виде с путями файлов — проверялась бы не та сборка). Граф чанков — по манифесту Vite, от входа
- * `admin.html`, включая динамические импорты (ленивые экраны в HTML не попадают): в **каждом** достижимом чанке
- * строки-пути — только из перечня разрешённого (`/admin/…`, `/api/v1`), нет SDK Telegram; модули — только свои,
- * `src/ui/Notice` и React. Mini App не тянет ни одного модуля панели ни сразу, ни лениво.
+ * отладочном виде с путями файлов — проверялась бы не та сборка), результат берётся из памяти (`RollupOutput`,
+ * `write: false`).
+ * - Граф чанков — от входа `admin.html` по `imports` и `dynamicImports` (ленивые экраны в HTML не попадают).
+ * - Состав **каждого** достижимого чанка, общего с Mini App тоже, — по `chunk.moduleIds` (ревью A6 р.2, MAJOR-1):
+ *   только `admin.html`, `src/admin/**` (без тестов и `src/admin/test/`), `src/ui/Notice.tsx`, общие стили, React
+ *   (`react`, `react-dom`, `scheduler`) и служебные модули Vite. Модуль Mini App, подключённый переэкспортом через
+ *   разрешённый модуль или файл `.js`, попадает в состав чанка — страж падает.
+ * - В каждом достижимом чанке строки-пути — только из перечня разрешённого (`/admin/…`, `/api/v1`), нет SDK Telegram,
+ *   хранилищ, отладочной сборки и путей файлов.
+ * - Mini App не тянет ни одного модуля панели ни сразу, ни лениво.
+ * Каждое правило состава проверено мутацией сборки через плагин (`transform`/`resolveId`/`load`), настоящие файлы не
+ * меняются: см. «страж падает» в конце файла.
  */
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { build } from "vite";
+import { build, type Plugin, type Rollup } from "vite";
 
 const root = resolve(__dirname, "../..");
+const ADMIN_HTML = join(root, "admin.html");
+const INDEX_HTML = join(root, "index.html");
 const ALLOWED_PATH = /^\/(admin\/[a-z0-9/_{}-]*|api\/v1)$/;
-/** Модули, из которых может состоять сборка панели (ключи/`src` манифеста). */
-const ALLOWED_MODULE = (src: string) =>
-  src === "admin.html" ||
-  src.startsWith("src/admin/") ||
-  src === "src/ui/Notice.tsx" ||
-  /^src\/(theme|app)\.css$/.test(src) ||
-  /(^|\/)node_modules\/(react|react-dom|scheduler)\//.test(src) ||
-  src.startsWith("_"); // общий чанк без своего исходника (`_app-….js`) — его содержимое проверяется ниже
 
-interface ManifestChunk {
-  file: string;
-  src?: string;
-  imports?: string[];
-  dynamicImports?: string[];
-  css?: string[];
+/** Служебные модули сборщика (виртуальные, `\0…`), без кода приложения. */
+const VIRTUAL = new Set(["vite/modulepreload-polyfill.js", "vite/preload-helper.js", "commonjsHelpers.js"]);
+
+/** Модуль, из которого может состоять сборка панели (id модуля Rollup: абсолютный путь или `\0…` с `?commonjs-…`). */
+function allowedModule(id: string): boolean {
+  const virtual = id.startsWith("\0");
+  const path = (virtual ? id.slice(1) : id).replace(/\?.*$/, "");
+  if (virtual && VIRTUAL.has(path)) return true;
+  if (/\/node_modules\/(react|react-dom|scheduler)\/[^?]*$/.test(path)) return true;
+  if (virtual) return false;
+  if (path === ADMIN_HTML) return true;
+  if (path === join(root, "src/ui/Notice.tsx")) return true;
+  if (path === join(root, "src/theme.css") || path === join(root, "src/app.css")) return true;
+  const admin = join(root, "src/admin") + "/";
+  return path.startsWith(admin) && !path.startsWith(join(admin, "test") + "/") && !/\.test\.[a-z]+$/.test(path) && /\.(ts|tsx|css)$/.test(path);
 }
 
-function reach(manifest: Record<string, ManifestChunk>, entry: string): Set<string> {
-  const seen = new Set<string>();
-  const walk = (k: string) => {
-    if (seen.has(k) || !manifest[k]) return;
-    seen.add(k);
-    for (const i of [...(manifest[k].imports ?? []), ...(manifest[k].dynamicImports ?? [])]) walk(i);
+type Chunk = Rollup.OutputChunk;
+type Output = (Rollup.OutputChunk | Rollup.OutputAsset)[];
+
+function reach(chunks: Map<string, Chunk>, entry: Chunk): Chunk[] {
+  const seen = new Map<string, Chunk>();
+  const walk = (c: Chunk | undefined) => {
+    if (!c || seen.has(c.fileName)) return;
+    seen.set(c.fileName, c);
+    for (const f of [...c.imports, ...c.dynamicImports]) walk(chunks.get(f));
   };
   walk(entry);
-  return seen;
+  return [...seen.values()];
 }
 
-test("vite build (production): все чанки панели по манифесту — только /admin/*; Mini App без кода панели", async () => {
+async function buildAll(plugins: Plugin[] = []): Promise<Output> {
   const outDir = mkdtempSync(join(tmpdir(), "feelings-admin-"));
   const env = process.env.NODE_ENV;
   process.env.NODE_ENV = "production";
   try {
-    await build({
+    const res = await build({
       root,
       mode: "production",
       configFile: join(root, "vite.config.ts"),
       logLevel: "silent",
-      build: { outDir, emptyOutDir: true, write: true, manifest: "manifest.json" },
+      plugins,
+      build: { outDir, emptyOutDir: true, write: false },
     });
-    const manifest = JSON.parse(readFileSync(join(outDir, "manifest.json"), "utf8")) as Record<string, ManifestChunk>;
-    expect(Object.keys(manifest)).toEqual(expect.arrayContaining(["admin.html", "index.html"]));
-
-    // Страница панели: без SDK Telegram, без встроенных скриптов и комментариев (A6 р.1, MINOR-6).
-    const page = readFileSync(join(outDir, "admin.html"), "utf8");
-    expect(page).not.toMatch(/telegram\.org|telegram-web-app|sdk-state/);
-    expect(page).not.toMatch(/<!--/);
-    for (const m of page.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)) {
-      expect(m[1]).toMatch(/\ssrc="/);
-      expect(m[2].trim()).toBe("");
-    }
-
-    const adminKeys = reach(manifest, "admin.html");
-    for (const k of adminKeys) expect(ALLOWED_MODULE(manifest[k].src ?? k), `модуль панели: ${k}`).toBe(true);
-    const adminJs = [...adminKeys].map((k) => manifest[k].file).filter((f) => f.endsWith(".js"));
-    expect(adminJs.length).toBeGreaterThan(0);
-    let sawAdminPath = false;
-    for (const f of adminJs) {
-      const js = readFileSync(join(outDir, f), "utf8");
-      expect(js, `${f}: отладочная сборка`).not.toContain("jsxDEV");
-      expect(js, `${f}: пути файлов`).not.toContain(root);
-      for (const m of js.matchAll(/["'`](\/[a-z][a-z0-9_/{}.-]*)/gi)) expect(m[1], `${f}: «${m[1]}»`).toMatch(ALLOWED_PATH);
-      for (const m of js.matchAll(/\/api\/v1\/[a-z]+/g)) expect(m[0], `${f}`).toBe("/api/v1/admin");
-      expect(js, f).not.toMatch(/telegram-web-app|initData|Telegram\.WebApp|localStorage|sessionStorage/);
-      if (js.includes('"/admin/kb/documents')) sawAdminPath = true;
-    }
-    expect(sawAdminPath, "путь /admin/kb/documents найден в чанках панели (проверка не пустая)").toBe(true);
-
-    // Mini App: ни одного модуля src/admin (ни общим чанком, ни лениво) и ни одного пути панели.
-    const appKeys = reach(manifest, "index.html");
-    expect([...appKeys].map((k) => manifest[k].src ?? k).filter((s) => s.includes("src/admin/"))).toEqual([]);
-    for (const k of appKeys) {
-      const f = manifest[k].file;
-      if (f.endsWith(".js")) expect(readFileSync(join(outDir, f), "utf8"), f).not.toContain("/admin/kb/documents");
-    }
+    const outs = (Array.isArray(res) ? res : [res]) as Rollup.RollupOutput[];
+    return outs.flatMap((o) => o.output);
   } finally {
     process.env.NODE_ENV = env;
     rmSync(outDir, { recursive: true, force: true });
   }
+}
+
+/** Нарушения в собранном выводе; пустой список — сборка чистая. */
+function findings(output: Output): string[] {
+  const out: string[] = [];
+  const chunks = new Map(output.filter((o): o is Chunk => o.type === "chunk").map((c) => [c.fileName, c]));
+  const entry = (html: string) => [...chunks.values()].find((c) => c.isEntry && c.facadeModuleId === html);
+  const admin = entry(ADMIN_HTML);
+  const app = entry(INDEX_HTML);
+  if (!admin || !app) return ["нет входа admin.html или index.html"];
+
+  // Страница панели: без SDK Telegram, без встроенных скриптов и комментариев (A6 р.1, MINOR-6).
+  const pageAsset = output.find((o) => o.type === "asset" && o.fileName === "admin.html") as Rollup.OutputAsset | undefined;
+  const page = pageAsset ? String(pageAsset.source) : "";
+  if (!page) out.push("нет admin.html в выводе");
+  if (/telegram\.org|telegram-web-app|sdk-state/.test(page)) out.push("admin.html: Telegram SDK");
+  if (/<!--/.test(page)) out.push("admin.html: комментарий");
+  for (const m of page.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g))
+    if (!/\ssrc="/.test(m[1]) || m[2].trim() !== "") out.push("admin.html: встроенный скрипт");
+
+  let sawAdminPath = false;
+  let sawAdminModule = false;
+  for (const c of reach(chunks, admin)) {
+    for (const id of c.moduleIds) {
+      if (!allowedModule(id)) out.push(`${c.fileName}: модуль ${id.replace("\0", "\\0").replace(root + "/", "")}`);
+      if (id === join(root, "src/admin/main.tsx")) sawAdminModule = true;
+    }
+    const js = c.code;
+    if (js.includes("jsxDEV")) out.push(`${c.fileName}: отладочная сборка`);
+    if (js.includes(root)) out.push(`${c.fileName}: пути файлов`);
+    for (const m of js.matchAll(/["'`](\/[a-z][a-z0-9_/{}.-]*)/gi)) if (!ALLOWED_PATH.test(m[1])) out.push(`${c.fileName}: «${m[1]}»`);
+    for (const m of js.matchAll(/\/api\/v1\/[a-z]+/g)) if (m[0] !== "/api/v1/admin") out.push(`${c.fileName}: «${m[0]}»`);
+    const bad = js.match(/telegram-web-app|initData|Telegram\.WebApp|localStorage|sessionStorage/);
+    if (bad) out.push(`${c.fileName}: «${bad[0]}»`);
+    if (js.includes('"/admin/kb/documents')) sawAdminPath = true;
+  }
+  if (!sawAdminModule) out.push("src/admin/main.tsx не найден в чанках панели (проверка пустая)");
+  if (!sawAdminPath) out.push("путь /admin/kb/documents не найден в чанках панели (проверка пустая)");
+
+  // Mini App: ни одного модуля src/admin (ни общим чанком, ни лениво) и ни одного пути панели.
+  for (const c of reach(chunks, app)) {
+    for (const id of c.moduleIds) if (id.includes("/src/admin/")) out.push(`Mini App ${c.fileName}: модуль панели ${id}`);
+    if (c.code.includes("/admin/kb/documents")) out.push(`Mini App ${c.fileName}: путь панели`);
+  }
+  return out;
+}
+
+test("vite build (production): состав и содержимое каждого чанка панели — только разрешённое; Mini App без кода панели", async () => {
+  expect(findings(await buildAll())).toEqual([]);
 }, 120_000);
 
 test("перечень разрешённых путей сборки — не пустой страж", () => {
   for (const ok of ["/admin/", "/admin/kb/documents", "/api/v1"]) expect(ok).toMatch(ALLOWED_PATH);
   for (const bad of ["/api/v1/", "/api/v1/memory", "/memory", "/chat/messages", "/auth/telegram", "/admin"]) expect(bad).not.toMatch(ALLOWED_PATH);
+});
+
+test("перечень модулей сборки — не пустой страж", () => {
+  for (const ok of ["src/admin/api.ts", "src/admin/admin.css", "src/ui/Notice.tsx", "src/theme.css", "admin.html"]) expect(allowedModule(join(root, ok)), ok).toBe(true);
+  for (const ok of ["\0vite/preload-helper.js", "\0/x/node_modules/react/index.js?commonjs-module", "/x/node_modules/scheduler/index.js"])
+    expect(allowedModule(ok), ok).toBe(true);
+  for (const bad of ["src/api/chat.ts", "src/api/client.ts", "src/ui/format.ts", "src/admin/zzz.js", "src/admin/test/fakeAdminApi.ts", "src/admin/api.test.ts", "src/main.tsx"])
+    expect(allowedModule(join(root, bad)), bad).toBe(false);
+  for (const bad of ["\0/x/src/api/chat.ts?commonjs-proxy", "/x/node_modules/@telegram-apps/sdk/index.js", "\0other-virtual.js"]) expect(allowedModule(bad), bad).toBe(false);
+});
+
+/**
+ * Мутации сборки (ревью A6 р.2, MAJOR-1: m10, m11, m6): плагин дописывает код в модуль при сборке или подставляет
+ * несуществующий файл — настоящие исходники не меняются.
+ */
+const MAIN = join(root, "src/admin/main.tsx");
+const NOTICE = join(root, "src/ui/Notice.tsx");
+const append = (file: string, code: string): Plugin => ({
+  name: `mut-append-${file}`,
+  enforce: "pre",
+  transform: (src, id) => (id === file ? { code: `${src}\n${code}\n`, map: null } : null),
+});
+/** Виртуальный файл `src/admin/<name>` (например `.js`), подключённый из `main.tsx`. */
+const virtualAdminFile = (name: string, code: string): Plugin => {
+  const id = join(root, "src/admin", name);
+  return {
+    name: `mut-file-${name}`,
+    enforce: "pre",
+    resolveId: (spec, importer) => (spec === `./${name}` && importer === MAIN ? id : null),
+    load: (i) => (i === id ? code : null),
+  };
+};
+const LEAK = 'if (location.hash === "#x") (window as unknown as { a: unknown }).a';
+
+describe("страж сборки падает (ревью A6 р.2, MAJOR-1)", () => {
+  test.each<[string, Plugin[], RegExp]>([
+    [
+      "m10: модуль Mini App переэкспортом через Notice (статический импорт)",
+      [append(NOTICE, 'export { SseParser, parseEvent } from "../api/chat";'), append(MAIN, `import { parseEvent } from "../ui/Notice";\n${LEAK} = parseEvent;`)],
+      /модуль src\/api\/chat\.ts/,
+    ],
+    [
+      "m11: то же лениво — import(\"../ui/Notice\")",
+      [append(NOTICE, 'export { SseParser, parseEvent } from "../api/chat";'), append(MAIN, `if (location.hash === "#x") void import("../ui/Notice").then((m) => ((window as unknown as { a: unknown }).a = m.parseEvent));`)],
+      /модуль src\/api\/chat\.ts/,
+    ],
+    [
+      "m6: файл .js в src/admin переэкспортирует модуль Mini App",
+      [virtualAdminFile("zzz.js", 'export { SseParser } from "../api/chat.ts";'), append(MAIN, `import { SseParser } from "./zzz.js";\n${LEAK} = new SseParser();`)],
+      /модуль src\/api\/chat\.ts/,
+    ],
+    [
+      "общий модуль ui вне перечня (src/ui/format.ts через Notice)",
+      [append(NOTICE, 'export * as fmt from "./format";'), append(MAIN, `import { fmt } from "../ui/Notice";\n${LEAK} = fmt;`)],
+      /модуль src\/ui\/format\.ts/,
+    ],
+  ])("%s", async (_name, plugins, expected) => {
+    const found = findings(await buildAll(plugins));
+    expect(found.join("\n")).toMatch(expected);
+  }, 120_000);
 });
