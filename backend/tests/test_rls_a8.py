@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.db import user_scope
+from tests import _pipeline_helpers as pipeline
 from tests.conftest import TEST_DATABASE_URL
 
 _tg = itertools.count(5_000_000)
@@ -326,6 +327,14 @@ async def _set_user(s: AsyncSession, uid: uuid.UUID) -> None:
     await s.execute(text("SELECT set_config('app.user_id', :u, true)"), {"u": str(uid)})
 
 
+# Конвейер по аренде (0013/0014): оригинал по токену (нет строки — NULL) и доставка по токену.
+READ = "SELECT (SELECT original_enc FROM pipeline_read(:m, :t))"
+DELIVER = (
+    "SELECT pipeline_deliver_leased(:m, :t, :b, true, 2::smallint, false, "
+    "NULL::safety_event_type[])"
+)
+
+
 async def _worker(engine: AsyncEngine, sql: str, **params: object) -> Any:
     async with engine.begin() as conn:
         await conn.execute(text("SET LOCAL ROLE feelings_worker"))
@@ -579,22 +588,26 @@ async def test_pipeline_functions_are_single_shot(
 ) -> None:
     """Конвейер (ТЗ §6.2 п.3–7) применяется к сообщению один раз: повторная доставка не
     подменяет версию для получателя, доставленное нельзя «остановить», остановленное —
-    доставить; оригинал конвейеру отдаётся только до доставки."""
-    deliver = "SELECT pipeline_deliver(:m, :t, true, 2::smallint, false)"
+    доставить; оригинал конвейеру отдаётся только до доставки. Путь — как у воркера (Б-83):
+    захват → чтение и завершение по токену; завершённое захват больше не выдаёт."""
     msg = await _send(sessionmaker, w.a, w.a.draft_id)
-    assert bytes(await _worker(engine, "SELECT pipeline_original(:m)", m=msg)) == (
-        "черновик Анна".encode()
-    )
-    assert await _worker(engine, deliver, m=msg, t=b"first") is True
-    assert await _worker(engine, deliver, m=msg, t=b"evil") is False
-    assert await _worker(engine, "SELECT pipeline_withhold(:m)", m=msg) is False
-    assert await _worker(engine, "SELECT pipeline_original(:m)", m=msg) is None
+    c = await pipeline.claim(engine, msg)
+    assert c is not None
+    assert bytes(await _worker(engine, READ, m=msg, t=c.token)) == "черновик Анна".encode()
+    assert await _worker(engine, DELIVER, m=msg, t=c.token, b=b"first") == "delivered"
+    assert await _worker(engine, DELIVER, m=msg, t=c.token, b=b"evil") == "lost"
+    assert await pipeline.claim(engine, msg) is None  # доставленное снова не выдаётся
+    assert await pipeline.worker_call(engine, pipeline.withhold_leased, msg, c.token) is False
+    assert await _worker(engine, READ, m=msg, t=c.token) is None
     row = await _message_row(engine, msg)
     assert (bytes(row[4]), row[5]) == (b"first", "delivered")
 
     stopped = await _send(sessionmaker, w.a, await _new_draft(sessionmaker, w.a, b"opasno"))
-    assert await _worker(engine, "SELECT pipeline_withhold(:m)", m=stopped) is True
-    assert await _worker(engine, deliver, m=stopped, t=b"late") is False
+    c2 = await pipeline.claim(engine, stopped)
+    assert c2 is not None
+    assert await pipeline.worker_call(engine, pipeline.withhold_leased, stopped, c2.token) is True
+    assert await _worker(engine, DELIVER, m=stopped, t=c2.token, b=b"late") == "lost"
+    assert await pipeline.claim(engine, stopped) is None
     assert (await _message_row(engine, stopped))[5] == "withheld"
     feed = await _feed_ids(sessionmaker, w.b.user_id)
     assert msg in feed
@@ -911,9 +924,6 @@ APP_FUNCS = [
     "app_couple_feed_page(integer, timestamp with time zone, uuid)",  # 0012, задача 3.3
 ]
 PIPELINE_FUNCS = [
-    "pipeline_original(uuid)",
-    "pipeline_deliver(uuid, bytea, boolean, smallint, boolean)",
-    "pipeline_withhold(uuid)",
     "kb_set_chunk_embedding(uuid, text, text)",  # 0008, задача 2.0v: воркер индексации
     "memory_claim_extraction(interval, interval, integer)",  # 0009, задача 2.4: воркер памяти
     "memory_claim_compaction(interval, interval, integer)",  # 0009
@@ -925,13 +935,19 @@ PIPELINE_FUNCS = [
     "pipeline_claim(interval, integer, integer)",  # 0013, задача 3.2: воркер конвейера
     "pipeline_read(uuid, uuid)",  # 0013
     "pipeline_deliver_leased(uuid, uuid, bytea, boolean, smallint, boolean, safety_event_type[])",
-    "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[])",  # 0013
     "pipeline_claim_notify(interval, integer, integer)",  # 0013: очередь уведомлений (Б-47)
     "pipeline_notify_done(uuid, uuid)",  # 0013
     "pipeline_release(uuid, uuid, interval, boolean)",  # 0014, раунд 1 задачи 3.2 (АР-45)
     "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[], "
     "safety_event_type)",  # 0014: с типом кризиса
     "pipeline_notify_release(uuid, uuid, interval, boolean)",  # 0015, раунд 1 задачи 3.5
+]
+# Б-83, 0016 (АР-48): функции конвейера без проверки аренды и 4-аргументная обёртка сняты.
+REMOVED_PIPELINE_FUNCS = [
+    "pipeline_original(uuid)",  # 0001
+    "pipeline_deliver(uuid, bytea, boolean, smallint, boolean)",  # 0001/0005
+    "pipeline_withhold(uuid)",  # 0001/0005
+    "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[])",  # 0013
 ]
 # 0011, задача 2.6: функции администратора (feelings_admin) — загрузка и удаление материала.
 ADMIN_FUNCS = [
@@ -977,6 +993,53 @@ async def test_definer_functions_executable_only_by_intended_roles(engine: Async
             paths = [c for c in (cfg or []) if c.startswith("search_path=")]
             assert paths, name
             assert paths[0].replace(" ", "").endswith(",pg_temp"), (name, paths[0])
+
+
+async def test_unleased_pipeline_functions_removed(engine: AsyncEngine) -> None:
+    """Б-83, 0016 (АР-48): функций конвейера без проверки аренды нет (обхода «ровно один раз» и
+    одобрения Б-48 не осталось); `pipeline_withhold_leased` — только 5-аргументная. Взамен роли
+    ничего не получили: прав воркера на таблицу сообщений нет, полный набор SECURITY DEFINER и их
+    права сверяет `test_definer_functions_executable_only_by_intended_roles`."""
+    async with engine.connect() as conn:
+        for f in REMOVED_PIPELINE_FUNCS:
+            row = await conn.execute(text("SELECT to_regprocedure(:f)"), {"f": f})
+            assert row.scalar_one() is None, f
+        names = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    "WHERE n.nspname = 'public' AND p.proname IN "
+                    "('pipeline_original', 'pipeline_deliver', 'pipeline_withhold')"
+                )
+            )
+        ).scalar_one()
+        assert names == 0
+        leased = (
+            await conn.execute(
+                text(
+                    "SELECT array_agg(pg_get_function_identity_arguments(p.oid)) FROM pg_proc p "
+                    "JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    "WHERE n.nspname = 'public' AND p.proname = 'pipeline_withhold_leased'"
+                )
+            )
+        ).scalar_one()
+        assert len(leased) == 1 and "p_crisis" in leased[0], leased
+        # Воркер по-прежнему без доступа к таблице: ни строк, ни колонок текста.
+        for priv in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            ok = await conn.execute(
+                text("SELECT has_table_privilege('feelings_worker', 'partner_messages', :p)"),
+                {"p": priv},
+            )
+            assert ok.scalar_one() is False, priv
+        for col in ("original_enc", "adapted_enc", "status", "work_lease_token"):
+            for priv in ("SELECT", "UPDATE"):
+                ok = await conn.execute(
+                    text(
+                        "SELECT has_column_privilege('feelings_worker', 'partner_messages', :c, :p)"
+                    ),
+                    {"c": col, "p": priv},
+                )
+                assert ok.scalar_one() is False, (col, priv)
 
 
 async def test_no_temp_privilege_for_any_app_role(

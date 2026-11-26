@@ -9,6 +9,7 @@ from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.db import user_scope
+from tests import _pipeline_helpers as pipeline
 from tests.conftest import app_database_url
 from tests.test_rls_isolation import World, _draft_id
 
@@ -28,13 +29,9 @@ async def _send(sm: async_sessionmaker[AsyncSession], uid: uuid.UUID) -> uuid.UU
 
 
 async def _deliver(engine: AsyncEngine, msg: uuid.UUID, text_for_recipient: bytes) -> None:
-    async with engine.begin() as conn:
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        ok = await conn.execute(
-            text("SELECT pipeline_deliver(:m, :t, true, 2::smallint, false)"),
-            {"m": msg, "t": text_for_recipient},
-        )
-        assert ok.scalar_one() is True
+    """Конвейер как у воркера: захват → доставка по токену (Б-83)."""
+    ok = await pipeline.deliver_blob(engine, msg, text_for_recipient, is_adapted=True, tone=2)
+    assert ok == "delivered"
 
 
 @pytest.mark.parametrize(
@@ -125,9 +122,7 @@ async def test_withheld_message_never_reaches_recipient(
 ) -> None:
     """ТЗ §6.2 п.3, §9.3: остановленное проверкой безопасности сообщение получатель не видит."""
     msg = await _send(sessionmaker, world.a.user_id)
-    async with engine.begin() as conn:
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        assert (await conn.execute(text("SELECT pipeline_withhold(:m)"), {"m": msg})).scalar_one()
+    assert await pipeline.withhold(engine, msg)
     async with user_scope(sessionmaker, world.b.user_id) as s:
         assert msg not in {r[0] for r in await s.execute(text("SELECT id FROM partner_messages"))}
         assert (
@@ -184,9 +179,7 @@ async def test_withheld_reply_does_not_reveal_safety_event(
 ) -> None:
     """Ревью 0.7 N1, ТЗ §9.3: остановленный ответ не меняет статус входящего у партнёра."""
     reply = await _reply(sessionmaker, world)
-    async with engine.begin() as conn:
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        await conn.execute(text("SELECT pipeline_withhold(:m)"), {"m": reply})
+    assert await pipeline.withhold(engine, reply)
     assert await _status(sessionmaker, world.a.user_id, world.message_id) == "delivered"
     async with user_scope(sessionmaker, world.a.user_id) as s:
         answered = await s.execute(
@@ -200,12 +193,16 @@ async def test_pipeline_deliver_requires_text(
     world: World, sessionmaker: async_sessionmaker[AsyncSession], engine: AsyncEngine
 ) -> None:
     msg = await _send(sessionmaker, world.a.user_id)
-    async with engine.begin() as conn:
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        ok = await conn.execute(
-            text("SELECT pipeline_deliver(:m, NULL, false, 0::smallint, false)"), {"m": msg}
+    c = await pipeline.claim(engine, msg)
+    assert c is not None
+    # Без версии для получателя доставка отклоняется (22023), сообщение остаётся в конвейере.
+    with pytest.raises(DBAPIError, match="no text for recipient"):
+        await pipeline.worker_call(engine, pipeline.deliver_blob_leased, msg, c.token, None)
+    async with engine.connect() as conn:
+        status = await conn.execute(
+            text("SELECT status FROM partner_messages WHERE id = :m"), {"m": msg}
         )
-        assert ok.scalar_one() is False
+        assert status.scalar_one() == "processing"
 
 
 @pytest.mark.parametrize(
@@ -303,8 +300,11 @@ async def test_app_cannot_call_pipeline_functions(
     with pytest.raises(ProgrammingError, match="permission denied"):
         async with user_scope(sessionmaker, world.a.user_id) as s:
             await s.execute(
-                text("SELECT pipeline_deliver(:m, 'x', false, 0::smallint, false)"),
-                {"m": world.message_id},
+                text(
+                    "SELECT pipeline_deliver_leased(:m, :t, 'x', false, 0::smallint, false, "
+                    "NULL::safety_event_type[])"
+                ),
+                {"m": world.message_id, "t": uuid.uuid4()},
             )
 
 

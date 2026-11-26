@@ -16,8 +16,6 @@ import asyncio
 import hashlib
 import secrets
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,7 +28,9 @@ from app.core import crypto
 from app.core.crypto import Keyring, generate_key_entry, parse_keyring
 from app.db import user_scope
 from app.repositories import couples, texts, users
+from app.repositories.pipeline_work import PipelineClaim
 from app.schemas import OnboardingRequest
+from tests import _pipeline_helpers as pipeline
 
 # 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
 from tests.conftest import TEST_FP
@@ -82,12 +82,12 @@ async def _su_rows(engine: AsyncEngine, sql: str, **params: object) -> list[Any]
         return list((await conn.execute(text(sql), params)).all())
 
 
-@asynccontextmanager
-async def _worker(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
-    """Сессия конвейера (задача 3.2): роль feelings_worker."""
-    async with async_sessionmaker(engine)() as s, s.begin():
-        await s.execute(text("SET LOCAL ROLE feelings_worker"))
-        yield s
+async def _claim(engine: AsyncEngine, msg: uuid.UUID) -> PipelineClaim:
+    """Аренда сообщения настоящим захватом конвейера (`pipeline_claim`, Б-83) — до гонки, как
+    у воркера (захват — своя короткая транзакция)."""
+    c = await pipeline.claim(engine, msg)
+    assert c is not None
+    return c
 
 
 @dataclass
@@ -153,11 +153,10 @@ async def _onboard(sm: SM, keys: Keyring, label: str, partner_name: str) -> Huma
 
 
 async def _deliver(engine: AsyncEngine, keys: Keyring, msg: uuid.UUID, body: str) -> None:
-    async with _worker(engine) as w:
-        delivered = await texts.pipeline_deliver(
-            w, keys, msg, body, is_adapted=True, tone=2, harsh=False
-        )
-    assert delivered
+    """Конвейер как у воркера: захват → доставка по токену (`pipeline_work.deliver`)."""
+    assert await pipeline.deliver_text(engine, keys, msg, body, is_adapted=True, tone=2) == (
+        "delivered"
+    )
 
 
 async def _send(
@@ -841,30 +840,25 @@ async def test_race_free_running_send_deliver_delete(
     sessionmaker: SM, engine: AsyncEngine, keys: Keyring
 ) -> None:
     """Без принудительного порядка, 12 прогонов: Игорь отправляет черновик, конвейер
-    доставляет его ответ на сообщение Анны (ответ → исходное, pipeline_deliver), Анна удаляет
-    аккаунт. Допустимы только: удаление успешно; отправка — id сообщения или FA003;
-    доставка — True. Ни 40P01, ни 23503, ни сообщений Анны после."""
+    доставляет его ответ на сообщение Анны (ответ → исходное, `pipeline_deliver_leased`; ответ
+    захвачен до гонки), Анна удаляет аккаунт. Допустимы только: удаление успешно; отправка — id
+    сообщения или FA003; доставка — `delivered` или `couple_ended` (получатель удалил аккаунт
+    раньше — обмен прекращён, АР-44). Ни 40P01, ни 23503, ни сообщений Анны после."""
     seen_send: set[str] = set()
     for _ in range(12):
         anna, igor, couple, draft = await _ready_pair(sessionmaker, keys)
         _, anna_msg = await _send(sessionmaker, keys, anna, f"исходное {anna.marker}")
         await _deliver(engine, keys, anna_msg, f"адаптировано {anna.marker}")
         _, reply = await _send(sessionmaker, keys, igor, f"ответ {igor.marker}", anna_msg)
+        claimed = await _claim(engine, reply)
 
         async def deliver(
-            reply: uuid.UUID = reply, body: str = f"адаптированный ответ {igor.marker}"
+            c: PipelineClaim = claimed, body: str = f"адаптированный ответ {igor.marker}"
         ) -> object:
             try:
-                async with _worker(engine) as w:
-                    return await texts.pipeline_deliver(
-                        w,
-                        keys,
-                        reply,
-                        body,
-                        is_adapted=True,
-                        tone=1,
-                        harsh=False,
-                    )
+                return await pipeline.deliver_text(
+                    engine, keys, c.message_id, body, is_adapted=True, tone=1, c=c
+                )
             except DBAPIError as exc:
                 return _code(exc)
 
@@ -878,7 +872,7 @@ async def test_race_free_running_send_deliver_delete(
         )
         sent, delivered, deleted = res
         assert deleted is None, res
-        assert delivered is True, res
+        assert delivered in ("delivered", "couple_ended"), res
         assert isinstance(sent, uuid.UUID) or sent == "FA003", res
         seen_send.add("ok" if isinstance(sent, uuid.UUID) else str(sent))
         left = await _su_rows(
@@ -949,12 +943,9 @@ async def _cross_replies(
     return anna, igor, x, y, z
 
 
-async def _deliver_outcome(engine: AsyncEngine, keys: Keyring, msg: uuid.UUID) -> object:
+async def _deliver_outcome(engine: AsyncEngine, keys: Keyring, c: PipelineClaim) -> object:
     try:
-        async with _worker(engine) as w:
-            return await texts.pipeline_deliver(
-                w, keys, msg, "версия для получателя", is_adapted=False, tone=0, harsh=False
-            )
+        return await pipeline.deliver_text(engine, keys, c.message_id, "версия для получателя", c=c)
     except DBAPIError as exc:
         return _code(exc)
 
@@ -964,17 +955,19 @@ async def test_race_delete_vs_pipeline_delivering_own_reply_no_deadlock(
 ) -> None:
     """Анна удаляет аккаунт, пока конвейер доставляет её ответ Z на ответ Игоря Y (Y отвечает
     на её X). Карточка: «без взаимоблокировок»; АР-23 — «без взаимоблокировки с конвейером».
-    Допустимо: удаление успешно, доставка True/False (сообщения уже нет) — но не 40P01."""
+    Допустимо: удаление успешно, доставка `delivered`/`lost` (сообщения уже нет) — но не 40P01.
+    Z захвачен до гонки (аренда, как у воркера)."""
     anna, _igor, _x, y, z = await _cross_replies(sessionmaker, engine, keys)
+    cz = await _claim(engine, z)
     res = await _hold_rows_and_race(
         engine,
         [y],
         [
             ("app_delete_account", _outcome(sessionmaker, anna.uid, DELETE)),
-            ("pipeline_deliver", _deliver_outcome(engine, keys, z)),
+            ("pipeline_deliver_leased", _deliver_outcome(engine, keys, cz)),
         ],
     )
-    assert res[0] is None and res[1] in (True, False), res
+    assert res[0] is None and res[1] in ("delivered", "lost"), res
 
 
 async def test_race_both_former_partners_delete_with_cross_replies_no_deadlock(
@@ -1020,11 +1013,11 @@ async def test_stale_session_cannot_put_deleted_id_back_into_audit(
 # --- 8. Раунд 2 (после 54c83ca): конвейер при удалённом получателе, журнал, гонки -----------
 #
 # Исправления A1: app_delete_account блокирует все свои пары FOR UPDATE до строк сообщений;
-# pipeline_deliver/withhold первым шагом берут пару FOR KEY SHARE; сообщения партнёра меняются
+# конвейер берёт пару FOR KEY SHARE (с 0013 — после строки автора, АР-44; функции без аренды
+# сняты в 0016, Б-83 — завершения только по токену захвата); сообщения партнёра меняются
 # одной командой; адаптация у сообщений удалённому обнуляется; audit_insert требует
 # существующего пользователя (EXISTS … FOR KEY SHARE). ТЗ §6.2 п.4–6, §7, §9.1 п.5; АР-13, АР-23.
 
-WITHHOLD = "SELECT pipeline_withhold(:m)"
 LEAVE = "SELECT app_leave_couple()"
 # RETURNING 1: у feelings_app нет SELECT на audit_log (журнал только на запись).
 AUDIT_SELF = (
@@ -1034,23 +1027,23 @@ AUDIT_SELF = (
 _BAD = {"40P01", "23503", "40001"}  # взаимоблокировка, FK, сериализация — не должно быть
 
 
-async def _withhold_outcome(engine: AsyncEngine, msg: uuid.UUID) -> object:
+async def _withhold_outcome(engine: AsyncEngine, c: PipelineClaim) -> object:
+    """Остановка безопасностью по токену (`pipeline_withhold_leased`) — результат или код."""
     try:
-        async with _worker(engine) as w:
-            return (await w.execute(text(WITHHOLD), {"m": msg})).scalar_one()
+        return await pipeline.worker_call(engine, pipeline.withhold_leased, c.message_id, c.token)
     except DBAPIError as exc:
         return _code(exc)
 
 
 async def _deliver_adapted(
-    engine: AsyncEngine, keys: Keyring, msg: uuid.UUID, body: str, *, tone: int = 3
+    engine: AsyncEngine, keys: Keyring, c: PipelineClaim, body: str, *, tone: int = 3
 ) -> object:
-    """Доставка адаптированной версии (is_adapted, тон, предупреждение) — результат или код."""
+    """Доставка адаптированной версии (is_adapted, тон, предупреждение) по токену — результат
+    (`delivered` / `couple_ended` / `lost`) или код."""
     try:
-        async with _worker(engine) as w:
-            return await texts.pipeline_deliver(
-                w, keys, msg, body, is_adapted=True, tone=tone, harsh=True
-            )
+        return await pipeline.deliver_text(
+            engine, keys, c.message_id, body, is_adapted=True, tone=tone, harsh=True, c=c
+        )
     except DBAPIError as exc:
         return _code(exc)
 
@@ -1100,16 +1093,18 @@ def _no_recipient_version(author: uuid.UUID, status: str) -> dict[str, Any]:
 async def test_r2_withhold_after_recipient_deleted_stays_with_author(
     sessionmaker: SM, engine: AsyncEngine, keys: Keyring
 ) -> None:
-    """ТЗ §9.3, §6.2 п.3: остановка безопасностью после удаления получателя работает;
-    сообщение остаётся у автора («остановлено»), без версии для получателя, оригинал читается.
-    Сообщение удалённого автора (ещё в конвейере) — withhold и deliver дают false: его нет."""
+    """ТЗ §9.3, §6.2 п.3: остановка безопасностью после удаления получателя работает (кризис
+    сильнее распада пары, АР-45 О-3); сообщение остаётся у автора («остановлено»), без версии
+    для получателя, оригинал читается. Сообщение удалённого автора (ещё в конвейере) —
+    withhold и deliver дают false/`lost`: его нет. Оба захвачены до удаления."""
     anna, igor, _couple, _ = await _ready_pair(sessionmaker, keys)
     _, to_anna = await _send(sessionmaker, keys, igor, f"Анне {igor.marker}")
     _, from_anna = await _send(sessionmaker, keys, anna, f"Игорю {anna.marker}")
+    c_to, c_from = await _claim(engine, to_anna), await _claim(engine, from_anna)
 
     await _scalar(sessionmaker, anna.uid, DELETE)
 
-    assert await _withhold_outcome(engine, to_anna) is True
+    assert await _withhold_outcome(engine, c_to) is True
     assert await _msg_row(engine, to_anna) == _no_recipient_version(igor.uid, "withheld")
     feed = await texts.read_feed(sessionmaker, keys, igor.uid)
     assert [(f.id, f.outgoing, f.text, f.is_adapted, f.status) for f in feed] == [
@@ -1118,12 +1113,13 @@ async def test_r2_withhold_after_recipient_deleted_stays_with_author(
     assert await texts.read_original(sessionmaker, keys, igor.uid, to_anna) == (
         f"Анне {igor.marker}"
     )
-    # Повторная остановка/доставка того же — false (уже не в конвейере).
-    assert await _withhold_outcome(engine, to_anna) is False
-    assert await _deliver_adapted(engine, keys, to_anna, "поздно") is False
-    # Сообщения удалённого автора нет — конвейер получает false, а не ошибку.
-    assert await _withhold_outcome(engine, from_anna) is False
-    assert await _deliver_adapted(engine, keys, from_anna, "поздно") is False
+    # Повторная остановка/доставка того же — false/`lost` (уже не в конвейере), захват не выдаёт.
+    assert await _withhold_outcome(engine, c_to) is False
+    assert await _deliver_adapted(engine, keys, c_to, "поздно") == "lost"
+    assert await pipeline.claim(engine, to_anna) is None
+    # Сообщения удалённого автора нет — конвейер получает false/`lost`, а не ошибку.
+    assert await _withhold_outcome(engine, c_from) is False
+    assert await _deliver_adapted(engine, keys, c_from, "поздно") == "lost"
     assert await _msg_row(engine, from_anna) is None
 
 
@@ -1132,17 +1128,19 @@ async def test_r2_withhold_after_recipient_deleted_stays_with_author(
 async def test_r2_race_pipeline_vs_recipient_delete_ordered(
     sessionmaker: SM, engine: AsyncEngine, keys: Keyring, op: str, first: str
 ) -> None:
-    """Сообщение Игоря Анне в конвейере; Анна удаляет аккаунт. Порядок задан держателем
-    строки сообщения: первый встаёт на ней, второй — на паре. В обоих порядках без 40P01;
-    итог одинаков: сообщение у Игоря, получателя и версии для получателя нет (АР-23,
-    ревью A6 MINOR-3) — даже если доставка успела записать адаптацию раньше удаления."""
+    """Сообщение Игоря Анне в конвейере (захвачено); Анна удаляет аккаунт. Порядок задан
+    держателем строки сообщения: первый встаёт на ней, второй — на паре. В обоих порядках без
+    40P01; итог: сообщение у Игоря, получателя и версии для получателя нет (АР-23, ревью A6
+    MINOR-3) — даже если доставка успела записать адаптацию раньше удаления. Доставка после
+    удаления — `couple_ended` (обмен прекращён, АР-44), остановка безопасностью — проходит."""
     anna, igor, _couple, _ = await _ready_pair(sessionmaker, keys)
     _, m = await _send(sessionmaker, keys, igor, f"в конвейере {igor.marker}")
-    fn = "pipeline_withhold" if op == "withhold" else "pipeline_deliver"
+    c = await _claim(engine, m)
+    fn = "pipeline_withhold_leased" if op == "withhold" else "pipeline_deliver_leased"
     pipe = (
-        _withhold_outcome(engine, m)
+        _withhold_outcome(engine, c)
         if op == "withhold"
-        else _deliver_adapted(engine, keys, m, f"мягче {igor.marker}")
+        else _deliver_adapted(engine, keys, c, f"мягче {igor.marker}")
     )
     delete = ("app_delete_account", _outcome(sessionmaker, anna.uid, DELETE))
     steps = [delete, (fn, pipe)] if first == "delete" else [(fn, pipe), delete]
@@ -1150,8 +1148,13 @@ async def test_r2_race_pipeline_vs_recipient_delete_ordered(
         engine, "SELECT 1 FROM partner_messages WHERE id = :m FOR UPDATE", {"m": m}, steps
     )
     got = dict(zip([s[0] for s in steps], res, strict=True))
-    assert got == {"app_delete_account": None, fn: True}, got
-    status = "withheld" if op == "withhold" else "delivered"
+    if op == "withhold":
+        want, status = True, "withheld"
+    elif first == "pipeline":
+        want, status = "delivered", "delivered"
+    else:
+        want, status = "couple_ended", "withheld"
+    assert got == {"app_delete_account": None, fn: want}, got
     assert await _msg_row(engine, m) == _no_recipient_version(igor.uid, status)
     feed = await texts.read_feed(sessionmaker, keys, igor.uid)
     assert [(f.id, f.text, f.is_adapted) for f in feed] == [
@@ -1165,21 +1168,20 @@ async def test_r2_active_pair_pipeline_still_adapts_and_marks(
     """Регрессия конвейера 3.2 при живом получателе (ТЗ §6.2 п.4–6, принцип 3): версия для
     получателя, пометка «адаптировано», тон и предупреждение сохраняются; оригинал — по запросу;
     автор видит свой оригинал. Копия без адаптации — is_adapted false. Выход из пары (не
-    удаление) версию не трогает; удаление постороннего — тоже."""
+    удаление) доставленную версию не трогает; удаление постороннего — тоже. Захваченное до
+    выхода и завершаемое после — не доставляется (`couple_ended`, АР-44), получатель остаётся."""
     anna, igor, couple, _ = await _ready_pair(sessionmaker, keys)
     olga = await _onboard(sessionmaker, keys, "Ольга", "Пётр")
     _, m1 = await _send(sessionmaker, keys, anna, f"резко {anna.marker}")
+    c1 = await _claim(engine, m1)
     # Посторонняя удаляет аккаунт одновременно с доставкой в чужой паре.
     d1, del_olga = await asyncio.gather(
-        _deliver_adapted(engine, keys, m1, f"мягко {anna.marker}", tone=3),
+        _deliver_adapted(engine, keys, c1, f"мягко {anna.marker}", tone=3),
         _outcome(sessionmaker, olga.uid, DELETE),
     )
-    assert (d1, del_olga) == (True, None)
+    assert (d1, del_olga) == ("delivered", None)
     _, m2 = await _send(sessionmaker, keys, anna, f"как есть {anna.marker}")
-    async with _worker(engine) as w:
-        assert await texts.pipeline_deliver(
-            w, keys, m2, f"как есть {anna.marker}", is_adapted=False, tone=0, harsh=False
-        )
+    assert await pipeline.deliver_text(engine, keys, m2, f"как есть {anna.marker}") == ("delivered")
     r1 = await _msg_row(engine, m1)
     assert r1 is not None
     assert (r1["recipient_id"], r1["status"], r1["has_adapted"], r1["is_adapted"]) == (
@@ -1210,8 +1212,12 @@ async def test_r2_active_pair_pipeline_still_adapts_and_marks(
     assert feed_anna == {m1: (True, f"резко {anna.marker}"), m2: (True, f"как есть {anna.marker}")}
     # Выход из пары — не удаление: получатель остаётся, версия для получателя и пометка тоже.
     _, m3 = await _send(sessionmaker, keys, igor, f"последнее {igor.marker}")
+    assert await _deliver_adapted(
+        engine, keys, await _claim(engine, m3), f"мягко {igor.marker}"
+    ) == ("delivered")
+    _, m4 = await _send(sessionmaker, keys, igor, f"после выхода {igor.marker}")
+    c4 = await _claim(engine, m4)
     await couples.leave(sessionmaker, anna.uid)
-    assert await _deliver_adapted(engine, keys, m3, f"мягко {igor.marker}") is True
     r3 = await _msg_row(engine, m3)
     assert r3 is not None and (r3["recipient_id"], r3["has_adapted"], r3["is_adapted"]) == (
         anna.uid,
@@ -1219,6 +1225,14 @@ async def test_r2_active_pair_pipeline_still_adapts_and_marks(
         True,
     )
     assert (await _msg_row(engine, m1) or {})["is_adapted"] is True
+    # Пара распалась, пока сообщение было в конвейере: не доставлено, версии нет (§4.5 п.2).
+    assert await _deliver_adapted(engine, keys, c4, f"мягко {igor.marker}") == "couple_ended"
+    r4 = await _msg_row(engine, m4)
+    assert r4 is not None and (r4["recipient_id"], r4["status"], r4["has_adapted"]) == (
+        anna.uid,
+        "withheld",
+        False,
+    )
     assert couple
 
 
@@ -1227,12 +1241,17 @@ async def test_r2_race_leave_vs_pipeline_delivering_reply_no_deadlock(
     sessionmaker: SM, engine: AsyncEngine, keys: Keyring, first: str
 ) -> None:
     """Игорь выходит из пары, пока конвейер доставляет ответ Анны Z на его Y (X ← Y ← Z).
-    Выход берёт пару FOR UPDATE, конвейер — пару FOR KEY SHARE, затем Z и Y. Без 40P01 в обоих
-    порядках; доставка проходит с адаптацией (получатель жив), Y — «отвечено»."""
+    Выход берёт пару FOR UPDATE, конвейер — автора и пару FOR KEY SHARE, затем Z и Y. Без 40P01
+    в обоих порядках. Доставка первой — с адаптацией (получатель жив), Y — «отвечено»; выход
+    первым — `couple_ended` (обмен прекращён, АР-44): версии нет, Y не «отвечено»."""
     anna, igor, _x, y, z = await _cross_replies(sessionmaker, engine, keys)
     couple = await _su(engine, "SELECT couple_id FROM partner_messages WHERE id = :m", m=z)
+    cz = await _claim(engine, z)
     leave = ("app_leave_couple", _outcome(sessionmaker, igor.uid, LEAVE))
-    deliver = ("pipeline_deliver", _deliver_adapted(engine, keys, z, f"Z* {anna.marker}"))
+    deliver = (
+        "pipeline_deliver_leased",
+        _deliver_adapted(engine, keys, cz, f"Z* {anna.marker}"),
+    )
     if first == "deliver":
         res = await _hold_race(
             engine,
@@ -1240,7 +1259,7 @@ async def test_r2_race_leave_vs_pipeline_delivering_reply_no_deadlock(
             {"y": y},
             [deliver, leave],
         )
-        got = {"pipeline_deliver": res[0], "app_leave_couple": res[1]}
+        got = {"pipeline_deliver_leased": res[0], "app_leave_couple": res[1]}
     else:
         res = await _hold_race(
             engine,
@@ -1248,12 +1267,21 @@ async def test_r2_race_leave_vs_pipeline_delivering_reply_no_deadlock(
             {"c": couple},
             [leave, deliver],
         )
-        got = {"app_leave_couple": res[0], "pipeline_deliver": res[1]}
-    assert got == {"app_leave_couple": couple, "pipeline_deliver": True}, got
+        got = {"app_leave_couple": res[0], "pipeline_deliver_leased": res[1]}
+    delivered = first == "deliver"
+    assert got == {
+        "app_leave_couple": couple,
+        "pipeline_deliver_leased": "delivered" if delivered else "couple_ended",
+    }, got
     rz, ry = await _msg_row(engine, z), await _msg_row(engine, y)
     assert rz is not None and ry is not None
-    assert (rz["recipient_id"], rz["is_adapted"], rz["has_adapted"]) == (igor.uid, True, True)
-    assert ry["status"] == "answered"
+    assert (rz["recipient_id"], rz["is_adapted"], rz["has_adapted"]) == (
+        igor.uid,
+        delivered,
+        delivered,
+    )
+    assert rz["status"] == ("delivered" if delivered else "withheld")
+    assert ry["status"] == ("answered" if delivered else "delivered")
 
 
 async def test_r2_audit_written_before_delete_is_anonymized(
@@ -1316,22 +1344,24 @@ async def test_r2_free_running_delete_leave_send_pipeline(
     """Без принудительного порядка, 15 прогонов: Анна удаляет аккаунт; Игорь одновременно
     выходит из пары и отправляет черновик; конвейер доставляет его ответ на сообщение Анны и
     останавливает другое его сообщение ей. Допустимо: удаление — успех; выход — id пары или
-    FB007 (пару уже распустило удаление); отправка — id или FA003; доставка и остановка —
-    True. Ни 40P01, ни 23503; после — у Игоря только свои сообщения без получателя и без
-    версии для получателя."""
+    FB007 (пару уже распустило удаление); отправка — id или FA003; доставка — `delivered` или
+    `couple_ended` (пара распалась раньше, АР-44), остановка — True (Y и W захвачены до гонки).
+    Ни 40P01, ни 23503; после — у Игоря только свои сообщения без получателя и без версии для
+    получателя."""
     for _ in range(15):
         anna, igor, couple, draft = await _ready_pair(sessionmaker, keys)
         _, x = await _send(sessionmaker, keys, anna, f"X {anna.marker}")
         await _deliver(engine, keys, x, f"X* {anna.marker}")
         _, y = await _send(sessionmaker, keys, igor, f"Y {igor.marker}", x)
         _, w = await _send(sessionmaker, keys, igor, f"W {igor.marker}")
+        cy, cw = await _claim(engine, y), await _claim(engine, w)
         res = await asyncio.wait_for(
             asyncio.gather(
                 _outcome(sessionmaker, anna.uid, DELETE),
                 _outcome(sessionmaker, igor.uid, LEAVE),
                 _outcome(sessionmaker, igor.uid, "SELECT app_send_draft(:d, 1)", d=draft),
-                _deliver_adapted(engine, keys, y, f"Y* {igor.marker}"),
-                _withhold_outcome(engine, w),
+                _deliver_adapted(engine, keys, cy, f"Y* {igor.marker}"),
+                _withhold_outcome(engine, cw),
             ),
             timeout=30,
         )
@@ -1340,7 +1370,7 @@ async def test_r2_free_running_delete_leave_send_pipeline(
         assert deleted is None, res
         assert left == couple or left == "FB007", res
         assert isinstance(sent, uuid.UUID) or sent == "FA003", res
-        assert (delivered, withheld) == (True, True), res
+        assert delivered in ("delivered", "couple_ended") and withheld is True, res
         rows = await _su_rows(
             engine,
             "SELECT author_id, recipient_id, reply_to_id, adapted_enc, is_adapted "
@@ -1361,9 +1391,10 @@ async def test_r2_free_running_both_partners_delete_with_pipeline(
     sessionmaker: SM, engine: AsyncEngine, keys: Keyring
 ) -> None:
     """15 прогонов без порядка: партнёры активной пары (чётные прогоны) или бывшие (нечётные)
-    удаляют аккаунты одновременно, пока конвейер доставляет встречные ответы Y и Z. Удаления —
-    успех, доставки — True/False (сообщение уже удалено); ни 40P01, ни 23503; после — ни
-    пользователей, ни пары, ни сообщений."""
+    удаляют аккаунты одновременно, пока конвейер доставляет встречные ответы Z и Y2 (захвачены
+    до выхода и гонки). Удаления — успех, доставки — `delivered`/`couple_ended`/`lost`
+    (сообщение уже удалено); ни 40P01, ни 23503; после — ни пользователей, ни пары, ни
+    сообщений."""
     for n in range(15):
         anna = await _onboard(sessionmaker, keys, "Анна", "Игорь")
         igor = await _onboard(sessionmaker, keys, "Игорь", "Аня")
@@ -1374,20 +1405,21 @@ async def test_r2_free_running_both_partners_delete_with_pipeline(
         await _deliver(engine, keys, y, "Y*")
         _, z = await _send(sessionmaker, keys, anna, f"Z {anna.marker}", y)
         _, y2 = await _send(sessionmaker, keys, igor, f"Y2 {igor.marker}")
+        cz, cy2 = await _claim(engine, z), await _claim(engine, y2)
         if n % 2:
             await couples.leave(sessionmaker, igor.uid)
         res = await asyncio.wait_for(
             asyncio.gather(
                 _outcome(sessionmaker, anna.uid, DELETE),
                 _outcome(sessionmaker, igor.uid, DELETE),
-                _deliver_adapted(engine, keys, z, "Z*"),
-                _deliver_adapted(engine, keys, y2, "Y2*"),
+                _deliver_adapted(engine, keys, cz, "Z*"),
+                _deliver_adapted(engine, keys, cy2, "Y2*"),
             ),
             timeout=30,
         )
         assert not _BAD & {str(v) for v in res}, res
         assert list(res[:2]) == [None, None], res
-        assert all(v in (True, False) for v in res[2:]), res
+        assert all(v in ("delivered", "couple_ended", "lost") for v in res[2:]), res
         for sql in (
             "SELECT count(*) FROM couples WHERE id = :c",
             "SELECT count(*) FROM partner_messages WHERE couple_id = :c",

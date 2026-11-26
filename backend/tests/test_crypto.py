@@ -17,6 +17,7 @@ from app.config import ConfigError, Settings, get_settings
 from app.core import crypto
 from app.core.crypto import DecryptionError, Field, KeyConfigError, Keyring, parse_keyring
 from app.repositories import texts
+from tests import _pipeline_helpers as pipeline
 
 # 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
 from tests.conftest import TEST_FP
@@ -410,13 +411,16 @@ async def _write_everything(
     draft = await texts.create_draft(sm, kr, a.user_id, a.agent_id, t["draft"])
     assert await texts.update_draft_text(sm, kr, a.user_id, draft, t["edited"]) == 2
     msg = await texts.send_draft(sm, a.user_id, draft, 2)
+    # Конвейер как у воркера (Б-83): захват → оригинал по аренде → доставка по токену.
+    c = await pipeline.claim(engine, msg)
+    assert c is not None
     async with engine.begin() as conn:
         s = AsyncSession(bind=conn)
         await s.execute(text("SET LOCAL ROLE feelings_worker"))
-        assert await texts.pipeline_read_original(s, kr, msg, draft) == t["edited"]
-        assert await texts.pipeline_deliver(
-            s, kr, msg, t["adapted"], is_adapted=True, tone=1, harsh=False
-        )
+        assert await texts.pipeline_read(s, kr, msg, c.token) == t["edited"]
+    assert await pipeline.deliver_text(
+        engine, kr, msg, t["adapted"], is_adapted=True, tone=1, c=c
+    ) == "delivered"  # fmt: skip
     # Чтение через слой доступа возвращает открытые тексты владельцу.
     chat = await texts.list_conversation_messages(sm, kr, a.user_id, a.conversation_id)
     assert [m.text for m in chat if m.id == chat_id] == [t["chat"]]
@@ -592,9 +596,7 @@ async def _send_and_deliver(
 ) -> tuple[uuid.UUID, uuid.UUID]:
     draft = await texts.create_draft(sm, kr, w.a.user_id, w.a.agent_id, body)
     msg = await texts.send_draft(sm, w.a.user_id, draft, 1)
-    async with engine.begin() as conn, AsyncSession(bind=conn) as s:
-        await s.execute(text("SET LOCAL ROLE feelings_worker"))
-        assert await texts.pipeline_deliver(s, kr, msg, body, is_adapted=False, tone=0, harsh=False)
+    assert await pipeline.deliver_text(engine, kr, msg, body) == "delivered"
     return draft, msg
 
 
@@ -691,17 +693,22 @@ async def test_db_functions_pass_ciphertext_as_opaque_bytes(
         keys.open(Field("partner_messages", "original_enc"), msg, row.original_enc)
 
     adapted_blob = keys.seal(crypto.MESSAGE_ADAPTED, msg, "мягче")
+    c = await pipeline.claim(engine, msg)
+    assert c is not None
     async with engine.begin() as conn:
         await conn.execute(text("SET LOCAL ROLE feelings_worker"))
         original = (
-            await conn.execute(text("SELECT pipeline_original(:m)"), {"m": msg})
-        ).scalar_one()
-        assert bytes(original) == bytes(draft_blob)
-        ok = await conn.execute(
-            text("SELECT pipeline_deliver(:m, :t, true, 1::smallint, false)"),
-            {"m": msg, "t": adapted_blob},
+            await conn.execute(
+                text("SELECT original_enc, draft_id FROM pipeline_read(:m, :t)"),
+                {"m": msg, "t": c.token},
+            )
+        ).one()
+        assert bytes(original.original_enc) == bytes(draft_blob)
+        assert original.draft_id == draft
+        ok = await pipeline.deliver_blob_leased(
+            conn, msg, c.token, adapted_blob, is_adapted=True, tone=1
         )
-        assert ok.scalar_one() is True
+        assert ok == "delivered"
     async with engine.connect() as conn:
         stored = (
             await conn.execute(
@@ -720,12 +727,10 @@ async def test_db_functions_pass_ciphertext_as_opaque_bytes(
         orig = (await s.execute(text("SELECT app_read_original(:m)"), {"m": msg})).scalar_one()
         assert bytes(orig) == bytes(draft_blob)
 
-    # Остановленное безопасностью сообщение: pipeline_withhold не трогает шифротекст.
+    # Остановленное безопасностью сообщение: pipeline_withhold_leased не трогает шифротекст.
     draft2 = await texts.create_draft(sessionmaker, keys, a.user_id, a.agent_id, "второе")
     msg2 = await texts.send_draft(sessionmaker, a.user_id, draft2, 1)
-    async with engine.begin() as conn:
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        assert (await conn.execute(text("SELECT pipeline_withhold(:m)"), {"m": msg2})).scalar_one()
+    assert await pipeline.withhold(engine, msg2) is True
     async with engine.connect() as conn:
         kept = (
             await conn.execute(
@@ -758,11 +763,14 @@ async def test_original_of_one_message_does_not_open_in_another(
     assert await texts.read_original(sessionmaker, keys, a.user_id, m1) == "одно"
     with pytest.raises(DecryptionError):
         await texts.read_original(sessionmaker, keys, a.user_id, m2)
+    # Воркер (по аренде) тоже не открывает подставленный оригинал: контекст — черновик m2.
+    c = await pipeline.claim(engine, m2)
+    assert c is not None
     async with engine.begin() as conn:
         s = AsyncSession(bind=conn)
         await s.execute(text("SET LOCAL ROLE feelings_worker"))
         with pytest.raises(DecryptionError):
-            await texts.pipeline_read_original(s, keys, m1, d2)  # чужой черновик в задании
+            await texts.pipeline_read(s, keys, m2, c.token)
 
 
 async def test_rotation_through_access_layer(

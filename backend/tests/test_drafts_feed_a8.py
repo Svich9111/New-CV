@@ -2,8 +2,8 @@
 (ФТ-07…ФТ-11; ТЗ §2 п.2–3, §4.3–4.4, §6.2 п.1–2, п.7, §7, §9.3; АР-11, АР-25, АР-40; Б-38, Б-77).
 
 Вход — initData, онбординг — по HTTP; пары и сообщения конвейера — суперпользователем и
-`texts.pipeline_deliver` под `feelings_worker` (конвейер 3.2 ещё не сделан). Модель — своя заглушка
-(`DModel`), сеть не используется. Хелперы исполнителей (`test_drafts_*`, `test_couple_messages_api`)
+конвейером под `feelings_worker` (захват → доставка/остановка по токену, Б-83). Модель — своя
+заглушка (`DModel`), сеть не используется. Хелперы исполнителей (`test_drafts_*`, `test_couple_messages_api`)
 не используются. Данные выдуманные. Дефекты — `xfail(strict=True)` (docs/reviews/3.1-3.3-test.md)."""
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from app.help import help_contacts
 from app.main import app
 from app.repositories import chat as chat_repo
 from app.repositories import couple_messages as cm_repo
-from app.repositories import texts
+from tests import _pipeline_helpers as pipeline
 from tests.contract import assert_matches
 from tests.test_chat_a8 import KEYS, _pmsg
 from tests.test_chat_api_a8 import UUID_RE, call
@@ -198,10 +198,9 @@ async def send(w: W, p: Person, d: str, v: int) -> httpx.Response:
 
 
 async def deliver(w: W, msg: uuid.UUID, version_text: str, *, adapted: bool) -> None:
-    async with async_sessionmaker(w.engine)() as s, s.begin():
-        await s.execute(text("SET LOCAL ROLE feelings_worker"))
-        assert await texts.pipeline_deliver(s, KEYS, msg, version_text, is_adapted=adapted,
-                                            tone=2 if adapted else 0, harsh=False)  # fmt: skip
+    """Конвейер как у воркера 3.2: захват → доставка по токену (Б-83)."""
+    assert await pipeline.deliver_text(w.engine, KEYS, msg, version_text, is_adapted=adapted,
+                                       tone=2 if adapted else 0) == "delivered"  # fmt: skip
 
 
 # =============================================================== 3.1: без «Отправить» — ничего
@@ -452,9 +451,7 @@ async def test_feed_roles_statuses_and_original(w: W, caplog: pytest.LogCaptureF
     mine = {i["id"]: i for i in (await feed(w, w.anna))["items"]}
     assert mine[str(m1)]["status"] == "processing" and mine[str(m1)]["direction"] == "outgoing"
     await deliver(w, m1, "АДАПТИРОВАНО-ДЛЯ-ИГОРЯ-a8", adapted=True)
-    async with async_sessionmaker(w.engine)() as s, s.begin():
-        await s.execute(text("SET LOCAL ROLE feelings_worker"))
-        await s.execute(text("SELECT pipeline_withhold(:m)"), {"m": held})
+    assert await pipeline.withhold(w.engine, held)
     ig = (await feed(w, w.igor))["items"]
     assert [(i["id"], i["text"], i["is_adapted"], i["direction"]) for i in ig] == [
         (str(m1), "АДАПТИРОВАНО-ДЛЯ-ИГОРЯ-a8", True, "incoming")]  # fmt: skip

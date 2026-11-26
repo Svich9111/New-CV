@@ -7,8 +7,9 @@
 
 Хелперы исполнителя (`test_account_api.py`, `test_account_export_db.py`) не используются: вход
 по initData, онбординг, пары — по HTTP своими функциями; тексты — слоем доступа приложения с
-настоящим шифрованием 4.2; конвейер — `texts.pipeline_deliver` под `feelings_worker`; подписки,
-платежи, события безопасности и порча шифротекста — суперпользователем.
+настоящим шифрованием 4.2; конвейер — захват и доставка по токену под `feelings_worker`
+(`tests/_pipeline_helpers.py`, Б-83); подписки, платежи, события безопасности и порча шифротекста —
+суперпользователем.
 
 Изоляция проверяется оракулом: у каждого человека мира (пользователь, текущий партнёр, бывший
 партнёр, посторонняя пара) каждый текст и каждый id помечены, для каждого выгружающего
@@ -50,6 +51,7 @@ from app.repositories import account as account_repo
 from app.repositories import texts
 
 # 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
+from tests import _pipeline_helpers as pipeline
 from tests.conftest import TEST_FP
 from tests.contract import SPEC, assert_matches
 
@@ -243,13 +245,6 @@ async def _pair(c: httpx.AsyncClient, a: Person, b: Person) -> uuid.UUID:
     return uuid.UUID(r.json()["id"])
 
 
-@asynccontextmanager
-async def _worker(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
-    async with async_sessionmaker(engine)() as s, s.begin():
-        await s.execute(text("SET LOCAL ROLE feelings_worker"))
-        yield s
-
-
 async def _send(
     sm: SM,
     engine: AsyncEngine,
@@ -271,18 +266,16 @@ async def _send(
         if adapted:
             # Версию для получателя делает агент получателя (ФТ-09): это данные получателя.
             shown = recipient.mark(f"adapted-for-me-{uuid.uuid4().hex[:6]}")
-        async with _worker(engine) as s:
-            assert await texts.pipeline_deliver(
-                s, keys, mid, shown, is_adapted=adapted, tone=3, harsh=adapted
-            )
+        assert await pipeline.deliver_text(
+            engine, keys, mid, shown, is_adapted=adapted, tone=3, harsh=adapted
+        ) == "delivered"  # fmt: skip
         status = "delivered"
         if kind == "read":
             async with user_scope(sm, recipient.uid) as s:
                 assert (await s.execute(text("SELECT app_mark_read(:m)"), {"m": mid})).scalar_one()
             status = "read"
     elif kind == "withheld":
-        async with _worker(engine) as s:
-            assert (await s.execute(text("SELECT pipeline_withhold(:m)"), {"m": mid})).scalar_one()
+        assert await pipeline.withhold(engine, mid)
         status = "withheld"
     return Msg(mid, draft, author, recipient, original, shown, adapted, status)
 
@@ -610,10 +603,7 @@ async def test_injection_text_is_data(
     )
     draft = await texts.create_draft(sessionmaker, keys, b.uid, b.agent, evil)
     mid = await texts.send_draft(sessionmaker, b.uid, draft, 1)
-    async with _worker(engine) as s:
-        assert await texts.pipeline_deliver(
-            s, keys, mid, evil, is_adapted=False, tone=1, harsh=False
-        )
+    assert await pipeline.deliver_text(engine, keys, mid, evil, tone=1) == "delivered"
     body, raw = await _export(api, a)
     (r,) = body["couple_messages"]["received"]
     assert r["text"] == evil and r["original"] == evil

@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.core import crypto
 from app.core.crypto import Keyring, generate_key_entry, parse_keyring
 from app.db import user_scope
+from tests import _pipeline_helpers as pipeline
 from tests.conftest import alembic
 from tests.test_account_delete import Person, _couple, _person, _send_encrypted
 from tests.test_couple_functions import SM, _call, _sqlstate
@@ -43,24 +44,15 @@ async def _export_fails(sm: SM, uid: uuid.UUID | None) -> str | None:
 async def _deliver(
     engine: AsyncEngine, keys: Keyring, msg: uuid.UUID, body: str, *, adapted: bool
 ) -> None:
-    """Конвейер (под feelings_worker): версия для получателя с контекстом сообщения."""
-    async with engine.connect() as conn, conn.begin():
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        ok = (
-            await conn.execute(
-                text("SELECT pipeline_deliver(:m, :t, :ad, 2::smallint, false)"),
-                {"m": msg, "t": keys.seal(crypto.MESSAGE_ADAPTED, msg, body), "ad": adapted},
-            )
-        ).scalar_one()
-    assert ok is True
+    """Конвейер как у воркера (захват → доставка по токену, Б-83): версия для получателя с
+    контекстом сообщения."""
+    assert await pipeline.deliver_text(engine, keys, msg, body, is_adapted=adapted, tone=2) == (
+        "delivered"
+    )
 
 
 async def _withhold(engine: AsyncEngine, msg: uuid.UUID) -> None:
-    async with engine.connect() as conn, conn.begin():
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        assert (
-            await conn.execute(text("SELECT pipeline_withhold(:m)"), {"m": msg})
-        ).scalar_one() is True
+    assert await pipeline.withhold(engine, msg) is True
 
 
 async def _viewed_at(engine: AsyncEngine, msg: uuid.UUID) -> object:
@@ -322,7 +314,7 @@ async def test_app_still_cannot_read_original_directly(
     assert _sqlstate(ei.value) == "42501"
 
 
-HEAD = "0015"  # последняя миграция (0015 — задача 3.5, раунд 1); после новой — обновить
+HEAD = "0016"  # последняя миграция (0016 — Б-83, АР-48); после новой — обновить
 
 
 async def _funcs_state(engine: AsyncEngine) -> tuple[object, ...]:

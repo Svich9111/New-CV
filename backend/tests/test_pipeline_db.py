@@ -45,8 +45,11 @@ DELIVER = (
     "SELECT pipeline_deliver_leased(:m, :t, :b, :ad, CAST(:tone AS smallint), :h, "
     "CAST(CAST(:ev AS text[]) AS safety_event_type[]))"
 )
+# 0014: 5 аргументов — тип кризиса (`safety` требует его). 4-аргументная обёртка 0013 снята в
+# 0016 (Б-83, АР-48): `cr` в вызовах ниже — тот тип, который выводила она (первый не-`underage`).
 WITHHOLD = (
-    "SELECT pipeline_withhold_leased(:m, :t, :r, CAST(CAST(:ev AS text[]) AS safety_event_type[]))"
+    "SELECT pipeline_withhold_leased(:m, :t, :r, CAST(CAST(:ev AS text[]) AS safety_event_type[]), "
+    "CAST(CAST(:cr AS text) AS safety_event_type))"
 )
 CLAIM_NOTIFY = "SELECT * FROM pipeline_claim_notify(CAST(CAST(:l AS text) AS interval), :n, :lim)"
 NOTIFY_DONE = "SELECT pipeline_notify_done(:m, :t)"
@@ -57,7 +60,8 @@ NEW_WORKER_FUNCS = (
     "pipeline_claim(interval, integer, integer)",
     "pipeline_read(uuid, uuid)",
     "pipeline_deliver_leased(uuid, uuid, bytea, boolean, smallint, boolean, safety_event_type[])",
-    "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[])",
+    "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[], "
+    "safety_event_type)",  # 0014 (4-аргументная 0013 снята в 0016)
     "pipeline_claim_notify(interval, integer, integer)",
     "pipeline_notify_done(uuid, uuid)",
 )
@@ -339,20 +343,31 @@ async def test_withhold_reasons_visible_to_author_only(
     got = await _claim(engine)
     for bad in (None, "attempts_exhausted", "couple_ended", "nope"):
         with pytest.raises(DBAPIError) as ei:
-            await _w(engine, WITHHOLD, m=crisis, t=got[crisis].token, r=bad, ev=None)
+            await _w(engine, WITHHOLD, m=crisis, t=got[crisis].token, r=bad, ev=None, cr=None)
         assert _sqlstate(ei.value) == "22023"
     assert (
-        await _w1(engine, WITHHOLD, m=crisis, t=uuid.uuid4(), r="safety", ev=["violence"]) is False
+        await _w1(
+            engine, WITHHOLD, m=crisis, t=uuid.uuid4(), r="safety", ev=["violence"], cr="violence"
+        )
+        is False
     )
     assert await _events(engine, anna.user_id) == []
     assert (
         await _w1(
-            engine, WITHHOLD, m=crisis, t=got[crisis].token, r="safety", ev=["threat_outgoing"]
+            engine,
+            WITHHOLD,
+            m=crisis,
+            t=got[crisis].token,
+            r="safety",
+            ev=["threat_outgoing"],
+            cr="threat_outgoing",
         )
         is True
     )
     assert (
-        await _w1(engine, WITHHOLD, m=refused, t=got[refused].token, r="model_refusal", ev=[])
+        await _w1(
+            engine, WITHHOLD, m=refused, t=got[refused].token, r="model_refusal", ev=[], cr=None
+        )
         is True
     )
     assert await _events(engine, anna.user_id) == ["threat_outgoing"]
@@ -364,7 +379,15 @@ async def test_withhold_reasons_visible_to_author_only(
     # Повторное завершение и доставка после остановки — ничего не меняют.
     assert await _deliver(engine, crisis, got[crisis].token) == "lost"
     assert (
-        await _w1(engine, WITHHOLD, m=refused, t=got[refused].token, r="safety", ev=["violence"])
+        await _w1(
+            engine,
+            WITHHOLD,
+            m=refused,
+            t=got[refused].token,
+            r="safety",
+            ev=["violence"],
+            cr="violence",
+        )
         is False
     )
     assert await _events(engine, anna.user_id) == ["threat_outgoing"]
@@ -381,13 +404,31 @@ async def test_deliver_rejects_null_text(sessionmaker: SM, engine: AsyncEngine) 
     assert (await _msg(engine, mid) or {})["status"] == "processing"
 
 
-async def test_old_withhold_sets_safety_reason(sessionmaker: SM, engine: AsyncEngine) -> None:
-    """`pipeline_withhold` (0005) остаётся и не нарушает CHECK причины."""
+UNLEASED = (
+    "SELECT pipeline_original(:m)",
+    "SELECT pipeline_deliver(:m, 'x', false, 0::smallint, false)",
+    "SELECT pipeline_withhold(:m)",
+    "SELECT pipeline_withhold_leased(:m, :t, 'safety', ARRAY['violence']::safety_event_type[])",
+)
+
+
+async def test_unleased_functions_removed(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Б-83, 0016 (АР-48): `pipeline_original`/`pipeline_deliver`/`pipeline_withhold` (0001/0005,
+    без аренды) и 4-аргументная обёртка `pipeline_withhold_leased` (0013) сняты — воркер их не
+    вызовет (42883), сообщение остаётся в конвейере; путь по аренде работает. Взамен у ролей
+    ничего не появилось — права функций конвейера сверяет `test_privileges` и
+    `test_rls_a8.py::test_definer_functions_executable_only_by_intended_roles`."""
+    await _park(engine)
     anna, _igor, _ = await _pair(sessionmaker, engine)
     mid, _ = await _send(sessionmaker, engine, anna, b"orig")
-    assert await _w1(engine, "SELECT pipeline_withhold(:m)", m=mid) is True
+    for sql in UNLEASED:
+        with pytest.raises(DBAPIError) as ei:
+            await _w(engine, sql, m=mid, t=uuid.uuid4())
+        assert _sqlstate(ei.value) == "42883", sql
     row = await _msg(engine, mid)
-    assert row is not None and (row["status"], row["withheld_reason"]) == ("withheld", "safety")
+    assert row is not None and (row["status"], row["work_lease_token"]) == ("processing", None)
+    tok = (await _claim(engine))[mid].token
+    assert await _deliver(engine, mid, tok) == "delivered"
 
 
 async def test_reason_check_constraints(sessionmaker: SM, engine: AsyncEngine) -> None:
@@ -563,7 +604,7 @@ async def test_parallel_deliveries_with_same_token_only_one_wins(
     tok = (await _claim(engine))[mid].token
     res = await asyncio.gather(
         _deliver(engine, mid, tok, ev=["underage"]),
-        _w1(engine, WITHHOLD, m=mid, t=tok, r="safety", ev=["violence"]),
+        _w1(engine, WITHHOLD, m=mid, t=tok, r="safety", ev=["violence"], cr="violence"),
         _deliver(engine, mid, tok, ev=["underage"]),
     )
     wins = [r for r in res if r in ("delivered", True)]
@@ -636,7 +677,7 @@ async def test_race_author_deletes_account_vs_finish(
     call = (
         _wtry(engine, DELIVER, m=mid, t=tok, b=b"x", ad=False, tone=0, h=False, ev=["underage"])
         if op == "deliver"
-        else _wtry(engine, WITHHOLD, m=mid, t=tok, r="safety", ev=["self_harm"])
+        else _wtry(engine, WITHHOLD, m=mid, t=tok, r="safety", ev=["self_harm"], cr="self_harm")
     )
     delete = ("app_delete_account", _try(sessionmaker, anna.user_id, DELETE))
     finish = (fn, call)
@@ -769,10 +810,6 @@ async def test_downgrade_0012_upgrade_backfill_check(
 # --------------------------------------------------------------------------- 0014 (раунд 1, АР-45)
 
 RELEASE = "SELECT pipeline_release(:m, :t, CAST(CAST(:r AS text) AS interval), CAST(:c AS boolean))"
-WITHHOLD5 = (
-    "SELECT pipeline_withhold_leased(:m, :t, :r, CAST(CAST(:ev AS text[]) AS safety_event_type[]), "
-    "CAST(CAST(:cr AS text) AS safety_event_type))"
-)
 
 
 async def _released(engine: AsyncEngine, m: uuid.UUID) -> tuple[Any, Any, Any]:
@@ -876,12 +913,12 @@ async def test_crisis_type_kept_for_author_only(sessionmaker: SM, engine: AsyncE
     )
     for reason, crisis in bad:
         with pytest.raises(DBAPIError) as ei:
-            await _w(engine, WITHHOLD5, m=threat, t=got[threat].token, r=reason, ev=None, cr=crisis)
+            await _w(engine, WITHHOLD, m=threat, t=got[threat].token, r=reason, ev=None, cr=crisis)
         assert _sqlstate(ei.value) == "22023", (reason, crisis)
     assert (
         await _w1(
             engine,
-            WITHHOLD5,
+            WITHHOLD,
             m=threat,
             t=got[threat].token,
             r="safety",
@@ -890,15 +927,24 @@ async def test_crisis_type_kept_for_author_only(sessionmaker: SM, engine: AsyncE
         )
         is True
     )
-    # Прежняя сигнатура (обёртка): главный тип — первый не-«младше 18» из событий.
+    # Главный тип — не «младше 18», хотя `underage` в событиях первым (тип выбирает воркер —
+    # `pipeline_work.crisis_type`; обёртка 0013, выводившая его в БД, снята в 0016).
     assert (
         await _w1(
-            engine, WITHHOLD, m=harm, t=got[harm].token, r="safety", ev=["underage", "self_harm"]
+            engine,
+            WITHHOLD,
+            m=harm,
+            t=got[harm].token,
+            r="safety",
+            ev=["underage", "self_harm"],
+            cr="self_harm",
         )
         is True
     )
     assert (
-        await _w1(engine, WITHHOLD, m=refused, t=got[refused].token, r="model_refusal", ev=None)
+        await _w1(
+            engine, WITHHOLD, m=refused, t=got[refused].token, r="model_refusal", ev=None, cr=None
+        )
         is True
     )
     feed = await _feed(sessionmaker, anna.user_id)
@@ -937,7 +983,7 @@ async def test_crisis_after_couple_ended_stays_safety(
     tok = (await _claim(engine))[mid].token
     await _call(sessionmaker, igor.user_id, LEAVE)
     assert (
-        await _w1(engine, WITHHOLD5, m=mid, t=tok, r="safety", ev=["life_threat"], cr="life_threat")
+        await _w1(engine, WITHHOLD, m=mid, t=tok, r="safety", ev=["life_threat"], cr="life_threat")
         is True
     )
     row = await _msg(engine, mid)
@@ -966,18 +1012,18 @@ async def test_finish_retry_after_failed_write_is_idempotent(
         tx = await conn.begin()
         await conn.execute(text("SET LOCAL ROLE feelings_worker"))
         res = await conn.execute(
-            text(WITHHOLD5), {"m": mid, "t": tok, "r": "model_refusal", "ev": None, "cr": None}
+            text(WITHHOLD), {"m": mid, "t": tok, "r": "model_refusal", "ev": None, "cr": None}
         )
         assert res.scalar_one() is True
         await tx.rollback()  # «соединение оборвалось до фиксации»
     assert await _claim(engine) == {}  # аренда жива — не выдаётся
     await _expire(engine, mid)
     assert (
-        await _w1(engine, WITHHOLD5, m=mid, t=tok, r="model_refusal", ev=["underage"], cr=None)
+        await _w1(engine, WITHHOLD, m=mid, t=tok, r="model_refusal", ev=["underage"], cr=None)
         is True
     )
     assert (
-        await _w1(engine, WITHHOLD5, m=mid, t=tok, r="model_refusal", ev=["underage"], cr=None)
+        await _w1(engine, WITHHOLD, m=mid, t=tok, r="model_refusal", ev=["underage"], cr=None)
         is False
     )
     row = await _msg(engine, mid)
@@ -989,21 +1035,23 @@ async def test_finish_retry_after_failed_write_is_idempotent(
     assert await _claim(engine) == {}
 
 
-async def test_old_functions_do_not_touch_leased_messages(
+async def test_leased_message_not_finished_by_other_token(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
-    """MINOR-8, Б-83: `pipeline_original`/`pipeline_deliver`/`pipeline_withhold` без аренды не
-    читают и не завершают сообщение, которое держит воркер."""
+    """MINOR-8, Б-83: сообщение, которое держит воркер, никто другой не читает и не завершает —
+    функций без аренды больше нет (0016), а чужой токен даёт пусто / `lost` / false."""
     await _park(engine)
     anna, _igor, _ = await _pair(sessionmaker, engine)
     mid, _ = await _send(sessionmaker, engine, anna, b"orig")
     tok = (await _claim(engine))[mid].token
-    assert await _w1(engine, "SELECT pipeline_original(:m)", m=mid) is None
+    other = uuid.uuid4()
+    assert await _w(engine, READ, m=mid, t=other) == []
+    assert await _deliver(engine, mid, other) == "lost"
     assert (
-        await _w1(engine, "SELECT pipeline_deliver(:m, 'x', false, 0::smallint, false)", m=mid)
+        await _w1(engine, WITHHOLD, m=mid, t=other, r="safety", ev=["violence"], cr="violence")
         is False
     )
-    assert await _w1(engine, "SELECT pipeline_withhold(:m)", m=mid) is False
+    assert await _events(engine, anna.user_id) == []
     assert (await _msg(engine, mid) or {})["status"] == "processing"
     assert await _deliver(engine, mid, tok) == "delivered"
 
@@ -1020,7 +1068,7 @@ async def test_downgrade_0013_upgrade_check(
     got = await _claim(engine)
     assert await _w1(engine, RELEASE, m=mid, t=got[mid].token, r="1 hour", c=False) is True
     assert await _w1(
-        engine, WITHHOLD5, m=held, t=got[held].token, r="safety", ev=None, cr="violence"
+        engine, WITHHOLD, m=held, t=got[held].token, r="safety", ev=None, cr="violence"
     )
     alembic("downgrade", "0013")
     await engine.dispose()
@@ -1051,3 +1099,65 @@ async def test_downgrade_0013_upgrade_check(
         await engine.dispose()
         await app_engine.dispose()
     alembic("check")
+
+
+# --------------------------------------------------------------------------- 0016 (Б-83, АР-48)
+
+REMOVED_0016 = (
+    "pipeline_original(uuid)",
+    "pipeline_deliver(uuid, bytea, boolean, smallint, boolean)",
+    "pipeline_withhold(uuid)",
+    "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[])",
+)
+
+
+async def _removed_state(engine: AsyncEngine) -> dict[str, Any]:
+    """Сигнатура → (определение, ACL, SECURITY DEFINER, настройки, владелец) или None."""
+    out: dict[str, Any] = {}
+    async with engine.connect() as conn:
+        for sig in REMOVED_0016:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_functiondef(p.oid) AS def, p.proacl::text AS acl, "
+                        "p.prosecdef, p.proconfig, pg_get_userbyid(p.proowner) AS owner "
+                        "FROM pg_proc p WHERE p.oid = to_regprocedure(:f)"
+                    ),
+                    {"f": sig},
+                )
+            ).one_or_none()
+            out[sig] = None if row is None else tuple(row)
+    return out
+
+
+async def test_migration_0016_reversible_restores_functions_exactly(
+    engine: AsyncEngine, app_engine: AsyncEngine
+) -> None:
+    """0016: upgrade снимает 4 функции без аренды; downgrade восстанавливает их точно как было
+    до 0016 (тело 0014, ACL — только владелец и `feelings_worker`, SECURITY DEFINER,
+    `search_path`, владелец); снова upgrade — их нет; `alembic check` чист. Эталон «как было» —
+    состояние, собранное настоящими миграциями до 0015 (через 0013 → 0015)."""
+    assert set((await _removed_state(engine)).values()) == {None}
+    try:
+        alembic("downgrade", "0013")
+        alembic("upgrade", "0015")
+        await engine.dispose()
+        before = await _removed_state(engine)
+        assert None not in before.values()
+        for sig, (_body, acl, definer, cfg, _owner) in before.items():
+            assert definer is True, sig
+            assert any(c.startswith("search_path=") for c in cfg or []), sig
+            assert "feelings_worker=X/" in acl and not acl.startswith("{=X"), (sig, acl)
+            assert ",=X/" not in acl, (sig, acl)  # PUBLIC без EXECUTE
+        alembic("upgrade", "0016")
+        await engine.dispose()
+        assert set((await _removed_state(engine)).values()) == {None}
+        alembic("downgrade", "0015")
+        await engine.dispose()
+        assert await _removed_state(engine) == before
+    finally:
+        alembic("upgrade", "head")
+        await engine.dispose()
+        await app_engine.dispose()
+    alembic("check")
+    assert set((await _removed_state(engine)).values()) == {None}

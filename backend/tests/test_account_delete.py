@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.core.crypto import Keyring, generate_key_entry, parse_keyring
 from app.db import user_scope
 from app.repositories import texts
+from tests import _pipeline_helpers as pipeline
 from tests.conftest import alembic
 from tests.test_couple_functions import (
     ACCEPT,
@@ -766,8 +767,21 @@ async def _worker_try(engine: AsyncEngine, sql: str, **params: object) -> object
         return _sqlstate(exc)
 
 
-DELIVER = "SELECT pipeline_deliver(:m, '\\x01'::bytea, true, 2::smallint, true)"
-WITHHOLD = "SELECT pipeline_withhold(:m)"
+# Завершение по аренде, как у воркера 3.2 (Б-83): токен выдаёт захват (`_pipeline_helpers.claim`).
+DELIVER = (
+    "SELECT pipeline_deliver_leased(:m, :t, '\\x01'::bytea, true, 2::smallint, true, "
+    "NULL::safety_event_type[])"
+)
+WITHHOLD = (
+    "SELECT pipeline_withhold_leased(:m, :t, 'safety', NULL::safety_event_type[], "
+    "'violence'::safety_event_type)"
+)
+
+
+async def _claimed(engine: AsyncEngine, msg: uuid.UUID) -> uuid.UUID:
+    c = await pipeline.claim(engine, msg)
+    assert c is not None
+    return c.token
 
 
 async def _cross(
@@ -792,13 +806,14 @@ async def test_race_delete_vs_pipeline_delivering_own_reply(
 ) -> None:
     """Ревью 4.5 MAJOR-1 (а): Анна удаляет аккаунт, пока конвейер доставляет её ответ Z на
     ответ Игоря Y. Раньше удаление брало Y → Z, доставка Z → Y: 40P01. Теперь обе сначала
-    берут пару (удаление FOR UPDATE, конвейер FOR KEY SHARE) и идут по очереди.
-    Удаление первым — доставка false (Z удалено); доставка первой — Y «отвечено», затем Z
-    удаляется вместе с аккаунтом. Держатель строки Y задаёт порядок: первый встаёт на Y, второй
-    — на паре."""
+    берут строку автора и пару (удаление FOR UPDATE, конвейер FOR KEY SHARE; АР-44) и идут по
+    очереди. Удаление первым — доставка `lost` (Z удалено); доставка первой — Y «отвечено», затем
+    Z удаляется вместе с аккаунтом. Держатель строки Y задаёт порядок: первый встаёт на Y,
+    второй — на строке автора. Z захвачен до гонки (аренда, как у воркера)."""
     anna, igor, couple, _x, y, z = await _cross(sessionmaker, engine)
+    token = await _claimed(engine, z)
     delete = ("app_delete_account", _try(sessionmaker, anna.user_id, DELETE))
-    deliver = ("pipeline_deliver", _worker_try(engine, DELIVER, m=z))
+    deliver = ("pipeline_deliver_leased", _worker_try(engine, DELIVER, m=z, t=token))
     steps = [delete, deliver] if first == "delete" else [deliver, delete]
     got = dict(
         zip(
@@ -809,7 +824,10 @@ async def test_race_delete_vs_pipeline_delivering_own_reply(
             strict=True,
         )
     )
-    assert got == {"app_delete_account": None, "pipeline_deliver": first == "deliver"}
+    assert got == {
+        "app_delete_account": None,
+        "pipeline_deliver_leased": "delivered" if first == "deliver" else "lost",
+    }
     assert await _traces(engine, anna) == {}
     row = await _row(
         engine,
@@ -877,9 +895,11 @@ async def test_race_former_partners_delete_with_cross_replies(
 async def test_pipeline_after_recipient_deleted_keeps_no_recipient_version(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
-    """Сообщение Игоря Анне ещё в конвейере, Анна удаляет аккаунт: доставка проходит, но
-    версии для получателя (адаптация, тон, предупреждение) нет — её некому показывать (АР-23,
-    ревью 4.5 MINOR-3). Остановка безопасностью (withhold) по-прежнему работает."""
+    """Сообщение Игоря Анне ещё в конвейере (захвачено), Анна удаляет аккаунт: версии для
+    получателя (адаптация, тон, предупреждение) нет — её некому показывать (АР-23, ревью 4.5
+    MINOR-3); с 0013 такое сообщение не доставляется, а останавливается как `couple_ended`
+    (АР-44, ТЗ §4.5 п.2). Не захваченное до удаления завершает сам захват так же. Остановка
+    безопасностью (withhold) по-прежнему работает — кризис сильнее распада пары (АР-45, О-3)."""
     anna, igor = await _person(engine, "Анна"), await _person(engine, "Игорь")
     couple, _ = await _couple(sessionmaker, anna, igor)
     p1 = await _message(engine, couple, igor, anna, b"p1 " + igor.marker)
@@ -892,27 +912,45 @@ async def test_pipeline_after_recipient_deleted_keeps_no_recipient_version(
             ),
             {"a": p1, "b": p2},
         )
+    t1, t2 = await _claimed(engine, p1), await _claimed(engine, p2)
+    p4 = await _message(engine, couple, igor, anna, b"p4 " + igor.marker)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE partner_messages SET status = 'processing', adapted_enc = NULL "
+                "WHERE id = :m"
+            ),
+            {"m": p4},
+        )
     await _call(sessionmaker, anna.user_id, DELETE)
-    assert await _worker_try(engine, DELIVER, m=p1) is True
-    assert await _worker_try(engine, WITHHOLD, m=p2) is True
-    row = await _row(
+    assert await _worker_try(engine, DELIVER, m=p1, t=t1) == "couple_ended"
+    assert await _worker_try(engine, WITHHOLD, m=p2, t=t2) is True
+    assert await pipeline.claim(engine, p4) is None  # захват сам завершает без модели
+    for m, body in ((p1, b"p1 "), (p4, b"p4 ")):
+        row = await _row(
+            engine,
+            "SELECT recipient_id, status::text AS status, withheld_reason, adapted_enc, "
+            "is_adapted, tone_score, harsh_tone_warning, original_enc, work_lease_token, "
+            "work_lease_until FROM partner_messages WHERE id = :m",
+            m=m,
+        )
+        assert row == {
+            "recipient_id": None,
+            "status": "withheld",
+            "withheld_reason": "couple_ended",
+            "adapted_enc": None,
+            "is_adapted": False,
+            "tone_score": None,
+            "harsh_tone_warning": False,
+            "original_enc": body + igor.marker,
+            "work_lease_token": None,
+            "work_lease_until": None,
+        }, m
+    assert await _row(
         engine,
-        "SELECT recipient_id, status::text AS status, adapted_enc, is_adapted, tone_score, "
-        "harsh_tone_warning, original_enc FROM partner_messages WHERE id = :m",
-        m=p1,
-    )
-    assert row == {
-        "recipient_id": None,
-        "status": "delivered",
-        "adapted_enc": None,
-        "is_adapted": False,
-        "tone_score": None,
-        "harsh_tone_warning": False,
-        "original_enc": b"p1 " + igor.marker,
-    }
-    assert (
-        await _row(engine, "SELECT status::text AS s FROM partner_messages WHERE id = :m", m=p2)
-    )["s"] == "withheld"
+        "SELECT status::text AS s, withheld_reason AS r FROM partner_messages WHERE id = :m",
+        m=p2,
+    ) == {"s": "withheld", "r": "safety"}
     # Получатель есть — версия для получателя сохраняется как раньше (контракт 3.2).
     olga = await _person(engine, "Ольга")
     c2, _ = await _couple(sessionmaker, igor, olga)
@@ -921,7 +959,7 @@ async def test_pipeline_after_recipient_deleted_keeps_no_recipient_version(
         await conn.execute(
             text("UPDATE partner_messages SET status = 'processing' WHERE id = :m"), {"m": p3}
         )
-    assert await _worker_try(engine, DELIVER, m=p3) is True
+    assert await _worker_try(engine, DELIVER, m=p3, t=await _claimed(engine, p3)) == "delivered"
     row = await _row(
         engine,
         "SELECT adapted_enc, is_adapted, tone_score, harsh_tone_warning FROM partner_messages "
@@ -1069,7 +1107,8 @@ async def test_audit_insert_waits_for_running_delete(sessionmaker: SM, engine: A
 async def test_migration_0005_reversible(engine: AsyncEngine, app_engine: AsyncEngine) -> None:
     """0005 → 0004 → 0005: downgrade возвращает DELETE на users и agents, политики users_self,
     agents_owner, drafts_delete и audit_insert из 0001, app_send_draft, pipeline_deliver и
-    pipeline_withhold из 0001 и убирает app_delete_account; повторный upgrade снова их меняет."""
+    pipeline_withhold из 0001 и убирает app_delete_account; повторный upgrade снова их меняет
+    (проверяется на ревизии 0005: на последней старых функций конвейера нет — 0016, Б-83)."""
 
     async def state() -> tuple[object, ...]:
         async with engine.connect() as conn:
@@ -1084,10 +1123,11 @@ async def test_migration_0005_reversible(engine: AsyncEngine, app_engine: AsyncE
                     "to_regprocedure('app_delete_account()') IS NOT NULL, "
                     "position('FOR KEY SHARE' IN "
                     "pg_get_functiondef('app_send_draft(uuid, integer)'::regprocedure)) > 0, "
-                    "position('FOR KEY SHARE' IN pg_get_functiondef("
-                    "'pipeline_deliver(uuid, bytea, boolean, smallint, boolean)'::regprocedure)) > 0, "
+                    # С 0016 (Б-83) функций нет — NULL; тело 0005 проверяется на ревизии 0005.
+                    "position('FOR KEY SHARE' IN pg_get_functiondef(to_regprocedure("
+                    "'pipeline_deliver(uuid, bytea, boolean, smallint, boolean)'))) > 0, "
                     "position('FOR KEY SHARE' IN "
-                    "pg_get_functiondef('pipeline_withhold(uuid)'::regprocedure)) > 0, "
+                    "pg_get_functiondef(to_regprocedure('pipeline_withhold(uuid)'))) > 0, "
                     "(SELECT position('users' IN with_check) > 0 FROM pg_policies "
                     " WHERE policyname = 'audit_insert')"
                 )
@@ -1111,8 +1151,9 @@ async def test_migration_0005_reversible(engine: AsyncEngine, app_engine: AsyncE
         True,
         True,
     )
+    at_head = (*upgraded[:6], None, None, upgraded[8])  # 0016: старых функций конвейера нет
     try:
-        assert await state() == upgraded
+        assert await state() == at_head
         alembic("downgrade", "0004")
         await engine.dispose()
         assert await state() == (
@@ -1126,11 +1167,14 @@ async def test_migration_0005_reversible(engine: AsyncEngine, app_engine: AsyncE
             False,
             False,
         )
+        alembic("upgrade", "0005")
+        await engine.dispose()
+        assert await state() == upgraded
     finally:
         alembic("upgrade", "head")
         await engine.dispose()
         await app_engine.dispose()
-    assert await state() == upgraded
+    assert await state() == at_head
 
 
 # --- Б-38: оригинал не теряет контекст черновика -------------------------------------------

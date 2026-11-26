@@ -26,6 +26,7 @@ from app.core.crypto import DecryptionError, KeyConfigError, Keyring, parse_keyr
 from app.repositories import texts
 
 # 2.4 (A3): отпечаток записи памяти обязателен (Б-68) — выдуманный ключ тестов.
+from tests import _pipeline_helpers as pipeline
 from tests.conftest import TEST_FP
 from tests.test_rls_isolation import World
 
@@ -469,11 +470,10 @@ def ring() -> Keyring:
 async def deliver(
     engine: AsyncEngine, ring: Keyring, msg: uuid.UUID, body: str, adapted: bool = True
 ) -> None:
-    async with engine.begin() as conn, AsyncSession(bind=conn) as s:
-        await s.execute(text("SET LOCAL ROLE feelings_worker"))
-        assert await texts.pipeline_deliver(
-            s, ring, msg, body, is_adapted=adapted, tone=1, harsh=False
-        )
+    """Конвейер как у воркера: захват → доставка по токену (Б-83)."""
+    assert await pipeline.deliver_text(engine, ring, msg, body, is_adapted=adapted, tone=1) == (
+        "delivered"
+    )
 
 
 async def send(
@@ -806,12 +806,14 @@ async def test_no_plaintext_anywhere_after_all_seven_texts(
     d2 = await texts.create_draft(sm, ring, a.user_id, a.agent_id, "черновик-v1")
     assert await texts.update_draft_text(sm, ring, a.user_id, d2, t["orig"]) == 2
     msg = await texts.send_draft(sm, a.user_id, d2, 2)
+    c = await pipeline.claim(engine, msg)
+    assert c is not None
     async with engine.begin() as conn, AsyncSession(bind=conn) as s:
         await s.execute(text("SET LOCAL ROLE feelings_worker"))
-        assert await texts.pipeline_read_original(s, ring, msg, d2) == t["orig"]
-        assert await texts.pipeline_deliver(
-            s, ring, msg, t["adapt"], is_adapted=True, tone=1, harsh=False
-        )
+        assert await texts.pipeline_read(s, ring, msg, c.token) == t["orig"]
+    assert await pipeline.deliver_text(
+        engine, ring, msg, t["adapt"], is_adapted=True, tone=1, c=c
+    ) == "delivered"  # fmt: skip
     assert await texts.read_original(sm, ring, w.b.user_id, msg) == t["orig"]
 
     # Все семь колонок заполнены шифротекстом под текущим ключом.

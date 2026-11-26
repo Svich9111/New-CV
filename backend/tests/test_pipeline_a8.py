@@ -1309,7 +1309,8 @@ async def test_race_worker_holds_then_user_op(
                 await conn.execute(
                     text(
                         "SELECT pipeline_withhold_leased(:m, :t, 'safety', "
-                        "CAST(ARRAY['threat_outgoing', 'underage'] AS safety_event_type[]))"
+                        "CAST(ARRAY['threat_outgoing', 'underage'] AS safety_event_type[]), "
+                        "CAST('threat_outgoing' AS safety_event_type))"
                     ),
                     {"m": mid, "t": c.token},
                 )

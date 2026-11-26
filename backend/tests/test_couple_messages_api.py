@@ -3,8 +3,8 @@
 
 ФТ-10, ФТ-11; ТЗ §2 п.3, §4.4 п.3–4, §6.2 п.7, §7; DECISIONS.md АР-11, АР-24, АР-25. Сообщения
 отправляются слоем доступа (черновик → `app_send_draft`), доставляются конвейером под
-`feelings_worker` (`pipeline_deliver` / `pipeline_withhold`), читаются по HTTP. Данные выдуманные;
-тексты помечены метками — утечки ищутся поиском меток."""
+`feelings_worker` (захват → `pipeline_deliver_leased` / `pipeline_withhold_leased`, Б-83),
+читаются по HTTP. Данные выдуманные; тексты помечены метками — утечки ищутся поиском меток."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.config import Settings, get_settings
-from app.core import crypto
 from app.core.crypto import Keyring, generate_key_entry, parse_keyring
 from app.main import app
 from app.repositories import texts
+from tests import _pipeline_helpers as pipeline
 from tests.contract import assert_matches
 from tests.test_auth_api import SECRET, TOKEN, _init_data, _tg
 from tests.test_couple_api import BOT, LINK_RE
@@ -125,28 +125,17 @@ async def send(env: Env, author: U, body: str, reply_to: uuid.UUID | None = None
 
 
 async def deliver(env: Env, msg: uuid.UUID, shown: str, *, adapted: bool) -> None:
-    async with env.engine.connect() as conn, conn.begin():
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        ok = (
-            await conn.execute(
-                text("SELECT pipeline_deliver(:m, :t, :ad, 2::smallint, :h)"),
-                {
-                    "m": msg,
-                    "t": env.keys.seal(crypto.MESSAGE_ADAPTED, msg, shown),
-                    "ad": adapted,
-                    "h": adapted,
-                },
-            )
-        ).scalar_one()
-    assert ok is True
+    """Конвейер как у воркера: захват → доставка по токену (Б-83)."""
+    result = await pipeline.deliver_text(
+        env.engine, env.keys, msg, shown, is_adapted=adapted, tone=2, harsh=adapted
+    )
+    assert result == "delivered"
 
 
 async def withhold(env: Env, msg: uuid.UUID) -> None:
-    async with env.engine.connect() as conn, conn.begin():
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        assert (
-            await conn.execute(text("SELECT pipeline_withhold(:m)"), {"m": msg})
-        ).scalar_one() is True
+    """Остановка безопасностью как у воркера (захват → ``pipeline_withhold_leased``, тип
+    кризиса — ``violence``)."""
+    assert await pipeline.withhold(env.engine, msg) is True
 
 
 async def viewed_at(env: Env, msg: uuid.UUID) -> Any:
@@ -313,12 +302,7 @@ async def test_feed_shows_undecryptable_as_unavailable_text(
     ok = await send(env, anna, "читается")
     await deliver(env, ok, "читается", adapted=False)
     bad = await send(env, anna, "испортится")
-    async with env.engine.connect() as conn, conn.begin():
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        await conn.execute(
-            text("SELECT pipeline_deliver(:m, :t, false, 0::smallint, false)"),
-            {"m": bad, "t": b"\x00broken"},
-        )
+    assert await pipeline.deliver_blob(env.engine, bad, b"\x00broken") == "delivered"
     items = {i["id"]: i for i in (await feed(env, igor))["items"]}
     assert set(items) == {str(ok), str(bad)}
     assert items[str(ok)]["text"] == "читается"
@@ -468,28 +452,26 @@ NO_WITHHELD = (None, None)
 
 
 async def withhold_leased(env: Env, msg: uuid.UUID, reason: str, crisis: str | None = None) -> None:
-    """Остановка, как у воркера: аренда (выдана «захватом» — здесь проставлена напрямую, чтобы
-    не забирать чужие сообщения общей тестовой БД) → ``pipeline_withhold_leased`` (0014)."""
-    token = uuid.uuid4()
-    async with env.engine.connect() as conn, conn.begin():
-        await conn.execute(
-            text(
-                "UPDATE partner_messages SET work_lease_token = :t, "
-                "work_lease_until = now() + interval '1 minute' WHERE id = :m"
-            ),
-            {"m": msg, "t": token},
-        )
-        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
-        ok = (
-            await conn.execute(
-                text(
-                    "SELECT pipeline_withhold_leased(:m, :t, CAST(:r AS varchar), "
-                    "CAST(:ev AS safety_event_type[]), CAST(:c AS safety_event_type))"
-                ),
-                {"m": msg, "t": token, "r": reason, "ev": [crisis] if crisis else [], "c": crisis},
-            )
-        ).scalar_one()
+    """Остановка, как у воркера: захват → ``pipeline_withhold_leased`` (0014, 5 аргументов)."""
+    c = await pipeline.claim(env.engine, msg)
+    assert c is not None
+    ok = await pipeline.worker_call(env.engine, pipeline.withhold_leased, msg, c.token, reason,
+                                    crisis, [crisis] if crisis else [])  # fmt: skip
     assert ok is True
+
+
+async def legacy_withheld(env: Env, msg: uuid.UUID) -> None:
+    """Строка, остановленная до 0014 (``safety`` без типа кризиса; функции без аренды сняты в
+    0016) — проставлена напрямую так, как её записывал ``pipeline_withhold``."""
+    async with env.engine.connect() as conn, conn.begin():
+        done = await conn.execute(
+            text(
+                "UPDATE partner_messages SET status = 'withheld', withheld_reason = 'safety' "
+                "WHERE id = :m AND status = 'processing'"
+            ),
+            {"m": msg},
+        )
+    assert done.rowcount == 1
 
 
 async def exhaust(env: Env, msg: uuid.UUID) -> None:
@@ -510,15 +492,20 @@ def _withheld(item: dict[str, Any]) -> tuple[Any, Any]:
 
 
 async def reasons_scene(env: Env) -> tuple[Scene, dict[str, tuple[str | None, str | None]]]:
-    """К сцене (доставленные, ``processing``, остановленное прежней функцией — ``safety`` без
-    типа) — остановки Анны по каждой причине и каждому типу кризиса и остановка Игоря."""
+    """К сцене (доставленные, ``processing``, остановленное безопасностью — ``safety`` с типом
+    ``violence``) — остановки Анны по каждой причине и каждому типу кризиса, строка до 0014
+    (``safety`` без типа) и остановка Игоря."""
     sc = await scene(env)
     want: dict[str, tuple[str | None, str | None]] = {
         "adapted": NO_WITHHELD,
         "plain": NO_WITHHELD,
         "processing": NO_WITHHELD,
-        "withheld": ("safety", None),  # до 0014: тип неизвестен — общий протокол
+        "withheld": ("safety", pipeline.CRISIS),
     }
+    sc.texts["legacy"] = env.mark("orig-legacy")
+    sc.ids["legacy"] = await send(env, sc.anna, sc.texts["legacy"])
+    await legacy_withheld(env, sc.ids["legacy"])
+    want["legacy"] = ("safety", None)  # до 0014: тип неизвестен — общий протокол
     cases = [("safety", c) for c in CRISES] + [
         ("model_refusal", None),
         ("pipeline_error", None),
