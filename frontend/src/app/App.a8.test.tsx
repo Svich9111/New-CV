@@ -158,25 +158,40 @@ describe("A8 · 429, 5xx, обрыв при входе", () => {
   });
 
   // A8-1.5-D1 (в интерфейсе): вход повис — «Входим через Telegram…» без конца, без причины и повтора.
-  // A4, р.1: дефект исправлен (срок входа TIMEOUTS.login), но этот страж остаётся `it.fails`: тело включает
-  // поддельные таймеры уже после начала входа, поэтому таймер срока, взведённый настоящим setTimeout при
-  // запросе, поддельные часы не двигают. Тело не правится (правило раунда); то же поведение с таймерами,
-  // включёнными до входа, проверяет App.fixes.test.tsx «D1: срок ответа». Нужна правка тела стражем A8.
-  it.fails("A8-1.5-D1: повисший вход через 60 с показывает причину и «Попробовать снова»", async () => {
-    const server = new FakeServer();
-    server.fetch = () => new Promise<Response>(() => undefined);
-    const r = renderApp({ server });
-    expect(await screen.findByText("Входим через Telegram…")).toBeInTheDocument();
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  // Р.2 (A8): в р.1 тело стража включало поддельные таймеры уже после начала входа — таймер срока,
+  // взведённый настоящим setTimeout при запросе, поддельные часы не двигали, и страж падал при
+  // исправленном коде (ошибка стража, не продукта; подтверждено прогоном). Теперь часы подделаны до
+  // запуска приложения; смысл тот же: повисший вход → причина подписью и «Попробовать снова» в срок
+  // (≤ 60 с), повтор действительно входит.
+  it("A8-1.5-D1: повисший вход через 60 с показывает причину и «Попробовать снова»", async () => {
+    // shouldAdvanceTime: часы идут и сами (иначе внутренний setTimeout(0) testing-library не сработает),
+    // но 60 с срока проходят только через advanceTimersByTimeAsync.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
     try {
+      const server = new FakeServer();
+      const base = server.fetch;
+      let hang = true;
+      server.fetch = (i, init) => (hang ? new Promise<Response>(() => undefined) : base(i, init));
+      const r = renderApp({ server });
+      expect(await screen.findByText("Входим через Telegram…")).toBeInTheDocument();
+      // До срока — всё ещё вход, без ложной ошибки.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.advanceTimersByTimeAsync(1_000);
       });
+      expect(screen.getByText("Входим через Telegram…")).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(59_000);
+      });
+      expect(await heading("Не получилось войти")).toBeInTheDocument();
+      expect(screen.getByRole("alert")).not.toHaveTextContent(/^\s*$/);
+      expect(r.tg!.main).toMatchObject({ visible: true, text: "Попробовать снова" });
+      expect(helpLink()).toBeInTheDocument();
+      hang = false;
+      await r.pressMain();
+      expect(await heading("Твой личный агент")).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
-    expect(await heading("Не получилось войти")).toBeInTheDocument();
-    expect(r.tg!.main.text).toBe("Попробовать снова");
   });
 });
 
@@ -613,6 +628,8 @@ describe("A8 · доступность (роли и имена; axe — в ру�
     const group = await screen.findByRole("group", { name: "Ссылка-приглашение" });
     expect(within(group).getByText("Ссылка-приглашение")).toBeVisible();
     expect(group.querySelector("[aria-label]")).toBeNull();
+    // р.2 (A8): сама ссылка — внутри названной группы, иначе имя группы ни к чему не относится.
+    expect(within(group).getByText(/^https:\/\/t\.me\/test_bot\?startapp=/)).toBeVisible();
   });
 
   test("фокус на заголовке нового экрана после ошибки входа и на «Помощи»", async () => {
