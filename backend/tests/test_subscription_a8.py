@@ -1966,16 +1966,19 @@ async def _r3_no_leftovers(engine: AsyncEngine) -> None:
 async def test_r3_admin_holders_escalate_and_next_run_catches(
     engine: AsyncEngine, case: str
 ) -> None:
-    """К A8-4.4-D4 — что даёт пропущенный ADMIN: страж сейчас пропускает подготовку; роль с
-    ADMIN (прямо, по наследованию от группы, роль входа бота с ADMIN, ADMIN на роль входа бота)
-    сама выдаёт SET на ``feelings_billing`` себе или ``feelings_api``. Следующий запуск стража
-    это ловит — окно открыто до следующего ``alembic upgrade``. Откат."""
+    """К A8-4.4-D4 — что даёт ADMIN вне владельца схемы: правила 1–6 (``GUARD_SQL`` — кто
+    **уже** может стать ролью платежей) подготовку пропускают; роль с ADMIN (прямо, по
+    наследованию от группы, роль входа бота с ADMIN, ADMIN на роль входа бота) сама выдаёт SET на
+    ``feelings_billing`` себе или ``feelings_api``, и после этого правила 1–6 останавливают.
+    Подготовку останавливают правила 7–8 (``MIGRATION_GUARD_SQL``, его исполняют env.py и 0020) —
+    ``test_r3_guard_stops_admin_outside_schema_owner`` и ``test_r4_d4_paths_stop_by_admin_rules``.
+    Откат."""
     setup, (actor, escalate), target = R3_ADMIN_HOLES[case]
     async with engine.connect() as c:
         tx = await c.begin()
         for sql in setup:
             await c.execute(text(sql))
-        await c.execute(text(GUARD_R3.GUARD_SQL))  # пропущено (см. D4)
+        await c.execute(text(GUARD_R3.GUARD_SQL))  # правила 1–6 пропускают (ADMIN — правила 7–8)
         assert not await c.scalar(
             text("SELECT pg_has_role(:r, 'feelings_billing', 'SET')"), {"r": target}
         )
@@ -2014,4 +2017,410 @@ async def test_r3_guard_stops_admin_outside_schema_owner(engine: AsyncEngine, ca
             await c.execute(text("ROLLBACK TO SAVEPOINT g"))
         await tx.rollback()
     await _r3_no_leftovers(engine)
+    assert stopped, case
+
+
+# =========================================================================== раунд 4 (D4 исправлен)
+# docs/reviews/4.4-s1-test-r4.md. АР-50 п.7, Б-97, ТЗ §9.2. Всё — в откатываемых транзакциях
+# суперпользователя; временные роли ``a8r4_*`` и ``feelings_billing_login`` после теста не остаются.
+
+R4_BOT_LOGIN = [
+    "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+    "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+]
+R4_DB_OWNER = (
+    "DO $$BEGIN EXECUTE format('ALTER DATABASE %I OWNER TO a8r4_dbo', current_database()); END$$"
+)
+R4_DBO_ADMIN = [
+    "CREATE ROLE a8r4_dbo LOGIN NOINHERIT",
+    R4_DB_OWNER,
+    "GRANT feelings_billing TO a8r4_dbo WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+]
+R4_RULE7 = "не только у роли входа бота и владельца схемы: "
+R4_RULE6 = "лишние права или объекты: "
+
+# Пути эскалации D4 (R3_ADMIN_HOLES) → ожидаемое правило в сообщении стража.
+R4_D4_STOPS = {
+    "other_login_admin_only": R4_RULE7 + "a8r3_wlogin",
+    "login_inherits_admin_of_group": R4_RULE7 + "a8r3_grp, a8r3_login",
+    "bot_login_with_admin_grants_api": "feelings_billing_login может выдавать feelings_billing",
+    "stranger_admin_on_bot_login": R4_RULE7 + "a8r3_x",
+}
+
+
+async def _r4_no_leftovers(engine: AsyncEngine) -> None:
+    async with engine.connect() as c:
+        left = await c.scalar(
+            text(
+                "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'a8r4\\_%' "
+                "OR rolname LIKE 'a8r3\\_%' OR rolname = 'feelings_billing_login'"
+            )
+        )
+        assert left == 0
+        members = await c.scalar(
+            text(
+                "SELECT count(*) FROM pg_auth_members m WHERE m.roleid = "
+                "to_regrole('feelings_billing') OR m.member = to_regrole('feelings_billing')"
+            )
+        )
+        assert members == 0
+        owner = await c.scalar(
+            text(
+                "SELECT pg_get_userbyid(datdba) = current_user FROM pg_database "
+                "WHERE datname = current_database()"
+            )
+        )
+        assert owner
+        await c.execute(text(GUARD_R3.MIGRATION_GUARD_SQL))
+
+
+@pytest.mark.parametrize("case", list(R4_D4_STOPS))
+async def test_r4_d4_paths_stop_by_admin_rules(engine: AsyncEngine, case: str) -> None:
+    """A8-4.4-D4 (АР-50 п.7): все четыре пути эскалации через ADMIN останавливают и ``alembic
+    upgrade head``, и ``alembic downgrade 0019`` (страж env.py, R7) — с сообщением правила 7
+    (ADMIN не у владельца схемы) или 8 (ADMIN OPTION у роли входа бота). Правила 1–6 эти
+    подготовки пропускают (их ловит только ``ADMIN_GUARD_SQL``). Версия схемы не меняется. Откат."""
+    setup, _escalation, _target = R3_ADMIN_HOLES[case]
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for sql in setup:
+            await c.execute(text(sql))
+        await c.execute(text(GUARD_R3.GUARD_SQL))
+        for step in (("upgrade", "head"), ("downgrade", "0019")):
+            await c.execute(text("SAVEPOINT g"))
+            with pytest.raises(DBAPIError) as ei:
+                await c.run_sync(alembic_on, *step)
+            assert R4_D4_STOPS[case] in str(ei.value.orig), (case, step, str(ei.value.orig))
+            await c.execute(text("ROLLBACK TO SAVEPOINT g"))
+            await c.execute(text("SAVEPOINT g"))
+            with pytest.raises(DBAPIError):
+                await c.execute(text(GUARD_R3.ADMIN_GUARD_SQL))
+            await c.execute(text("ROLLBACK TO SAVEPOINT g"))
+            version = await c.scalar(text("SELECT version_num FROM alembic_version"))
+            assert version == HEAD, (case, step)
+        await tx.rollback()
+    await _r4_no_leftovers(engine)
+
+
+# Новые попытки обхода р.4 → часть сообщения стража.
+R4_GUARD_STOPS: dict[str, tuple[list[str], str]] = {
+    # Владелец базы (при владельце схемы pg_database_owner) доверен; его члены — нет.
+    "member_of_db_owner_inherit": (
+        [
+            *R4_DBO_ADMIN,
+            "CREATE ROLE a8r4_m LOGIN INHERIT",
+            "GRANT a8r4_dbo TO a8r4_m WITH INHERIT TRUE, SET FALSE",
+        ],
+        R4_RULE7 + "a8r4_m",
+    ),
+    "member_of_db_owner_set_only": (
+        [
+            *R4_DBO_ADMIN,
+            "CREATE ROLE a8r4_m LOGIN NOINHERIT",
+            "GRANT a8r4_dbo TO a8r4_m WITH INHERIT FALSE, SET TRUE",
+        ],
+        R4_RULE7 + "a8r4_m",
+    ),
+    "member_of_db_owner_admin_only": (
+        [
+            *R4_DBO_ADMIN,
+            "CREATE ROLE a8r4_m LOGIN NOINHERIT",
+            "GRANT a8r4_dbo TO a8r4_m WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ],
+        R4_RULE7 + "a8r4_m",
+    ),
+    "db_owner_with_set": (
+        [
+            "CREATE ROLE a8r4_dbo LOGIN NOINHERIT",
+            R4_DB_OWNER,
+            "GRANT feelings_billing TO a8r4_dbo WITH ADMIN TRUE, INHERIT FALSE, SET TRUE",
+        ],
+        "стать feelings_billing может не только роль входа бота: a8r4_dbo",
+    ),
+    # Явный владелец схемы — доверен он, а не владелец базы.
+    "explicit_schema_owner_db_owner_not_trusted": (
+        [
+            "CREATE ROLE a8r4_so NOLOGIN",
+            "ALTER SCHEMA public OWNER TO a8r4_so",
+            *R4_DBO_ADMIN,
+        ],
+        R4_RULE7 + "a8r4_dbo",
+    ),
+    "app_role_as_db_owner_with_admin": (
+        [
+            "DO $$BEGIN EXECUTE format('ALTER DATABASE %I OWNER TO feelings_admin', "
+            "current_database()); END$$",
+            "GRANT feelings_billing TO feelings_admin WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ],
+        "роли приложения: feelings_admin",
+    ),
+    "bot_login_member_of_db_owner": (
+        [
+            *R4_BOT_LOGIN,
+            "CREATE ROLE a8r4_dbo LOGIN NOINHERIT",
+            R4_DB_OWNER,
+            "GRANT a8r4_dbo TO feelings_billing_login WITH INHERIT FALSE, SET FALSE",
+        ],
+        "feelings_billing_login входит в другие роли: a8r4_dbo",
+    ),
+    # ADMIN OPTION у роли входа бота от второго выдавшего (вторая строка pg_auth_members).
+    "bot_login_admin_from_second_grantor": (
+        [
+            *R4_BOT_LOGIN,
+            "CREATE ROLE a8r4_g LOGIN CREATEROLE",
+            "GRANT feelings_billing TO a8r4_g WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+            "GRANT feelings_billing TO feelings_billing_login WITH ADMIN TRUE GRANTED BY a8r4_g",
+        ],
+        R4_RULE7 + "a8r4_g",
+    ),
+    "createrole_with_admin_on_bot_login": (
+        [
+            *R4_BOT_LOGIN,
+            "CREATE ROLE a8r4_cr LOGIN CREATEROLE",
+            "GRANT feelings_billing_login TO a8r4_cr WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ],
+        R4_RULE7 + "a8r4_cr",
+    ),
+    "bot_login_renamed_away": (
+        [*R4_BOT_LOGIN, "ALTER ROLE feelings_billing_login RENAME TO a8r4_old"],
+        "стать feelings_billing может не только роль входа бота: a8r4_old",
+    ),
+    # Права по умолчанию (R6).
+    "default_privileges_in_schema": (
+        ["ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO feelings_billing"],
+        R4_RULE6 + "DEFAULT PRIVILEGES SELECT (r)",
+    ),
+    "default_privileges_for_other_role": (
+        [
+            "CREATE ROLE a8r4_o NOLOGIN",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE a8r4_o GRANT EXECUTE ON FUNCTIONS TO "
+            "feelings_billing",
+        ],
+        R4_RULE6 + "DEFAULT PRIVILEGES EXECUTE (f)",
+    ),
+    "default_privileges_schemas": (
+        ["ALTER DEFAULT PRIVILEGES GRANT USAGE ON SCHEMAS TO feelings_billing"],
+        R4_RULE6 + "DEFAULT PRIVILEGES USAGE (n)",
+    ),
+    # Владение объектами (R6).
+    "owns_view": (
+        [
+            "CREATE VIEW a8r4_v AS SELECT id FROM users",
+            "ALTER VIEW a8r4_v OWNER TO feelings_billing",
+        ],
+        R4_RULE6 + "OWNER OF a8r4_v",
+    ),
+    "owns_matview": (
+        [
+            "CREATE MATERIALIZED VIEW a8r4_mv AS SELECT 1 AS x",
+            "ALTER MATERIALIZED VIEW a8r4_mv OWNER TO feelings_billing",
+        ],
+        R4_RULE6 + "OWNER OF a8r4_mv",
+    ),
+    "owns_schema": (
+        ["CREATE SCHEMA a8r4_sch AUTHORIZATION feelings_billing"],
+        R4_RULE6 + "OWNER OF SCHEMA a8r4_sch",
+    ),
+    "owns_domain": (
+        ["CREATE DOMAIN a8r4_d AS int", "ALTER DOMAIN a8r4_d OWNER TO feelings_billing"],
+        R4_RULE6 + "OWNER OF TYPE a8r4_d",
+    ),
+    "owns_procedure": (
+        [
+            "CREATE PROCEDURE a8r4_p() LANGUAGE sql AS 'SELECT 1'",
+            "ALTER PROCEDURE a8r4_p() OWNER TO feelings_billing",
+        ],
+        R4_RULE6 + "OWNER OF FUNCTION a8r4_p()",
+    ),
+    "owns_large_object": (
+        [
+            "DO $$DECLARE o oid := lo_create(0); BEGIN "
+            "EXECUTE format('ALTER LARGE OBJECT %s OWNER TO feelings_billing', o); END$$"
+        ],
+        R4_RULE6 + "OWNER OF LARGE OBJECT",
+    ),
+    "usage_on_language": (
+        ["GRANT USAGE ON LANGUAGE plpgsql TO feelings_billing"],
+        R4_RULE6 + "USAGE ON LANGUAGE plpgsql",
+    ),
+    "set_on_parameter": (
+        ["GRANT SET ON PARAMETER work_mem TO feelings_billing"],
+        R4_RULE6 + "SET ON PARAMETER work_mem",
+    ),
+    "bot_function_name_in_other_schema": (
+        [
+            "CREATE SCHEMA a8r4_x",
+            "CREATE FUNCTION a8r4_x.app_bot_payment_lookup() RETURNS int LANGUAGE sql "
+            "AS 'SELECT 1'",
+            "GRANT EXECUTE ON FUNCTION a8r4_x.app_bot_payment_lookup() TO feelings_billing",
+        ],
+        R4_RULE6 + "EXECUTE ON FUNCTION a8r4_x.app_bot_payment_lookup()",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(R4_GUARD_STOPS))
+async def test_r4_guard_stops_new_bypass_attempts(engine: AsyncEngine, case: str) -> None:
+    """АР-50 п.7, Б-97 (р.3: N1, R5, R6): доверен ADMIN только владельца схемы ``public`` (при
+    ``pg_database_owner`` — владельца базы), а не его членов (INHERIT, только SET, только ADMIN);
+    владелец с SET остановлен правилом 4; при явном владельце схемы владелец базы не доверен; роль
+    приложения не становится доверенной, став владельцем базы; роль входа бота — не член
+    владельца, без ADMIN OPTION от второго выдавшего; переименованная роль входа бота — посторонняя;
+    права по умолчанию, владение объектами, права на язык/параметр и функция с именем функции бота
+    в чужой схеме — остановка (страж миграций). Откат."""
+    setup, stop = R4_GUARD_STOPS[case]
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for sql in setup:
+            await c.execute(text(sql))
+        await c.execute(text("SAVEPOINT g"))
+        with pytest.raises(DBAPIError) as ei:
+            await c.execute(text(GUARD_R3.MIGRATION_GUARD_SQL))
+        assert stop in str(ei.value.orig), (case, str(ei.value.orig))
+        await c.execute(text("ROLLBACK TO SAVEPOINT g"))
+        await tx.rollback()
+    await _r4_no_leftovers(engine)
+
+
+R4_ALLOWED = {
+    "bot_login_as_in_b97": R4_BOT_LOGIN,
+    "db_owner_admin_only": R4_DBO_ADMIN,
+    "db_owner_admin_on_both_with_bot_login": [
+        *R4_BOT_LOGIN,
+        *R4_DBO_ADMIN,
+        "GRANT feelings_billing_login TO a8r4_dbo WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+    ],
+    "connect_revoked_from_public": [
+        "DO $$BEGIN EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', "
+        "current_database()); EXECUTE format('GRANT CONNECT ON DATABASE %I TO "
+        "feelings_billing', current_database()); END$$",
+    ],
+}
+
+
+@pytest.mark.parametrize("case", list(R4_ALLOWED))
+async def test_r4_guard_has_no_false_stops(engine: AsyncEngine, case: str) -> None:
+    """АР-50 п.7, Б-97: ожидаемые конфигурации — роль входа бота ``LOGIN NOINHERIT`` c ``SET``
+    без ``INHERIT``; ADMIN без SET у владельца базы (владелец схемы — ``pg_database_owner``), в
+    т.ч. на роль входа бота; ``CONNECT`` у роли платежей при отзыве у ``PUBLIC`` — страж
+    пропускает, и ``alembic upgrade head`` и ``downgrade 0019`` → ``upgrade head`` проходят. Откат."""
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for sql in R4_ALLOWED[case]:
+            await c.execute(text(sql))
+        await c.execute(text(GUARD_R3.MIGRATION_GUARD_SQL))
+        for step in (("upgrade", "head"), ("downgrade", "0019"), ("upgrade", "head")):
+            await c.run_sync(alembic_on, *step)
+        await c.execute(text(GUARD_R3.MIGRATION_GUARD_SQL))
+        assert await c.scalar(text("SELECT version_num FROM alembic_version")) == HEAD
+        await tx.rollback()
+    await _r4_no_leftovers(engine)
+
+
+async def test_r4_clean_roundtrip_to_0017_has_no_false_stops(engine: AsyncEngine) -> None:
+    """R5/R6 без ложных остановок на чистой схеме (АР-4, АР-50 п.7): head → downgrade 0017 → head
+    с ролью входа бота по Б-97 — на каждом шаге страж env.py проходит; на 0017 у роли платежей
+    (она общая для кластера и остаётся) нет прав; на голове права роли — ровно ожидаемые (EXECUTE
+    на четыре функции бота), страж проходит. Откат."""
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for sql in R4_BOT_LOGIN:
+            await c.execute(text(sql))
+        await c.run_sync(alembic_on, "downgrade", "0017")
+        assert await c.scalar(text("SELECT version_num FROM alembic_version")) == "0017"
+        await c.execute(text(GUARD_R3.MIGRATION_GUARD_SQL))
+        assert not await c.scalar(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a "
+                "WHERE a.grantee = to_regrole('feelings_billing'))"
+            )
+        )
+        await c.run_sync(alembic_on, "upgrade", "head")
+        assert await c.scalar(text("SELECT version_num FROM alembic_version")) == HEAD
+        await c.execute(text(GUARD_R3.MIGRATION_GUARD_SQL))
+        granted = await c.scalar(
+            text(
+                "SELECT string_agg(p.oid::regprocedure::text, ',' ORDER BY p.proname) "
+                "FROM pg_proc p, aclexplode(p.proacl) a "
+                "WHERE a.grantee = to_regrole('feelings_billing')"
+            )
+        )
+        assert sorted(str(granted).split(",")) == sorted(
+            str(
+                await c.scalar(
+                    text(
+                        "SELECT string_agg(oid::regprocedure::text, ',') FROM pg_proc "
+                        "WHERE proname LIKE 'app\\_bot\\_payment\\_%' "
+                        "AND pronamespace = 'public'::regnamespace"
+                    )
+                )
+            ).split(",")
+        )
+        await c.run_sync(alembic_on, "upgrade", "head")  # повторный запуск — страж снова чист
+        await tx.rollback()
+    await _r4_no_leftovers(engine)
+
+
+# Пробелы R6 (A8-4.4-D5, D6): страж пропускает, хотя docstring стража (правило 6) обещает
+# остановку на «другие функции» и «владение объектами».
+R4_GUARD_GAPS: dict[str, list[str]] = {
+    "overload_of_bot_function_name": [
+        "CREATE FUNCTION public.app_bot_payment_lookup(text) RETURNS int LANGUAGE sql "
+        "SECURITY DEFINER AS 'SELECT 1'",
+        "REVOKE ALL ON FUNCTION public.app_bot_payment_lookup(text) FROM PUBLIC",
+        "GRANT EXECUTE ON FUNCTION public.app_bot_payment_lookup(text) TO feelings_billing",
+    ],
+    "owns_collation": [
+        'CREATE COLLATION a8r4_c FROM "C"',
+        "ALTER COLLATION a8r4_c OWNER TO feelings_billing",
+    ],
+    "owns_publication": [
+        "CREATE PUBLICATION a8r4_pub",
+        "ALTER PUBLICATION a8r4_pub OWNER TO feelings_billing",
+    ],
+    "owns_foreign_server": [
+        "CREATE FOREIGN DATA WRAPPER a8r4_fdw",
+        "CREATE SERVER a8r4_srv FOREIGN DATA WRAPPER a8r4_fdw",
+        "ALTER SERVER a8r4_srv OWNER TO feelings_billing",
+    ],
+    "owns_text_search_dictionary": [
+        "CREATE TEXT SEARCH DICTIONARY a8r4_td (TEMPLATE = simple)",
+        "ALTER TEXT SEARCH DICTIONARY a8r4_td OWNER TO feelings_billing",
+    ],
+    "owns_operator": [
+        "CREATE OPERATOR public.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq)",
+        "ALTER OPERATOR public.=== (int, int) OWNER TO feelings_billing",
+    ],
+    "owns_statistics": [
+        "CREATE STATISTICS a8r4_st ON id, couple_id FROM subscriptions",
+        "ALTER STATISTICS a8r4_st OWNER TO feelings_billing",
+    ],
+    "create_on_tablespace": ["GRANT CREATE ON TABLESPACE pg_default TO feelings_billing"],
+}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="A8-4.4-D5/D6: правило 6 стража сверяет функции бота только по имени (перегрузка "
+    "public.app_bot_payment_*(…) с EXECUTE у feelings_billing проходит) и не проверяет владение "
+    "сортировками, публикациями, внешними серверами, словарями поиска, операторами, объектами "
+    "статистики и права на табличные пространства",
+)
+@pytest.mark.parametrize("case", list(R4_GUARD_GAPS))
+async def test_r4_guard_stops_remaining_r6_gaps(engine: AsyncEngine, case: str) -> None:
+    """АР-50 п.7 («без прав на таблицы»), docstring стража п.6 («другие функции … владение
+    объектами — остановка»): ожидается остановка стража миграций. Откат."""
+    stopped = False
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for sql in R4_GUARD_GAPS[case]:
+            await c.execute(text(sql))
+        await c.execute(text("SAVEPOINT g"))
+        try:
+            await c.execute(text(GUARD_R3.MIGRATION_GUARD_SQL))
+        except DBAPIError as e:
+            stopped = R4_RULE6 in str(e.orig)
+            await c.execute(text("ROLLBACK TO SAVEPOINT g"))
+        await tx.rollback()
+    await _r4_no_leftovers(engine)
     assert stopped, case
