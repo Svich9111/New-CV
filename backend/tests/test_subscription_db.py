@@ -1080,6 +1080,77 @@ GUARD_CASES = {
         ],
         None,
     ),
+    # A8-4.4-D5: EXECUTE разрешён по сигнатуре, перегрузка с именем функции бота — остановка.
+    "billing_bot_function_overload": (
+        [
+            "CREATE FUNCTION public.app_bot_payment_refunded(text) RETURNS int LANGUAGE sql "
+            "SECURITY DEFINER AS 'SELECT 1'",
+            "GRANT EXECUTE ON FUNCTION public.app_bot_payment_refunded(text) TO feelings_billing",
+        ],
+        "лишние права или объекты: EXECUTE ON FUNCTION app_bot_payment_refunded(text)",
+    ),
+    "billing_bot_function_exact_ok": (
+        [f"GRANT EXECUTE ON FUNCTION {sig} TO feelings_billing" for sig in BOT_FUNCS],
+        None,
+    ),
+    # A8-4.4-D6: владение объектами прочих видов и права на табличные пространства (pg_shdepend).
+    "billing_owns_collation": (
+        [
+            'CREATE COLLATION a1g_coll FROM "C"',
+            "ALTER COLLATION a1g_coll OWNER TO feelings_billing",
+        ],
+        "лишние права или объекты: OWNER OF collation a1g_coll",
+    ),
+    "billing_owns_ts_configuration": (
+        [
+            "CREATE TEXT SEARCH CONFIGURATION a1g_tsc (COPY = simple)",
+            "ALTER TEXT SEARCH CONFIGURATION a1g_tsc OWNER TO feelings_billing",
+        ],
+        "лишние права или объекты: OWNER OF text search configuration a1g_tsc",
+    ),
+    "billing_owns_conversion": (
+        [
+            "CREATE CONVERSION a1g_conv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8",
+            "ALTER CONVERSION a1g_conv OWNER TO feelings_billing",
+        ],
+        "лишние права или объекты: OWNER OF conversion a1g_conv",
+    ),
+    "billing_owns_operator_family": (
+        [
+            "CREATE OPERATOR FAMILY a1g_opf USING btree",
+            "ALTER OPERATOR FAMILY a1g_opf USING btree OWNER TO feelings_billing",
+        ],
+        "лишние права или объекты: OWNER OF operator family a1g_opf for access method btree",
+    ),
+    "billing_usage_on_tablespace": (
+        ["GRANT CREATE ON TABLESPACE pg_default TO feelings_billing"],
+        "лишние права или объекты: CREATE ON TABLESPACE pg_default",
+    ),
+    # A8 R10: выдача роли платежей роли входа бота — только INHERIT FALSE.
+    "bot_login_grant_with_inherit": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT TRUE, SET TRUE",
+        ],
+        "feelings_billing_login получила feelings_billing WITH INHERIT TRUE",
+    ),
+    # A8 R11: ни роль платежей, ни роль входа бота не члены суперпользовательской роли.
+    "bot_login_member_of_superuser_role": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+            "DO $$BEGIN EXECUTE format('GRANT %I TO feelings_billing_login "
+            "WITH INHERIT FALSE, SET FALSE', current_user); END$$",
+        ],
+        "роль входа бота feelings_billing_login входит в другие роли: ",
+    ),
+    "billing_member_of_superuser_role": (
+        [
+            "DO $$BEGIN EXECUTE format('GRANT %I TO feelings_billing "
+            "WITH INHERIT FALSE, SET FALSE', current_user); END$$",
+        ],
+        "роль feelings_billing — член других ролей: ",
+    ),
     "clean": ([], None),
 }
 
@@ -1153,6 +1224,42 @@ async def test_billing_guard_allows_admin_of_migration_runner(engine: AsyncEngin
         await tx.rollback()
     async with engine.connect() as c:
         left = await c.execute(text("SELECT count(*) FROM pg_roles WHERE rolname LIKE 'a1g\\_%'"))
+        assert left.scalar() == 0
+
+
+async def test_billing_guard_clean_roundtrip_to_0017(engine: AsyncEngine) -> None:
+    """A8-4.4-D5, D6, R10 без ложных остановок (АР-4, АР-50 п.7): head → downgrade 0017 → head
+    с ролью входа бота по Б-97 (``LOGIN NOINHERIT``, ``INHERIT FALSE, SET TRUE``) — страж env.py
+    проходит на каждом шаге; на голове у роли платежей в ``pg_shdepend`` ровно ожидаемое: права
+    (``a``) на четыре функции бота с полной сигнатурой и схему ``public``, владения нет. Откат."""
+    async with engine.connect() as c:
+        tx = await c.begin()
+        await c.execute(text("CREATE ROLE feelings_billing_login LOGIN NOINHERIT"))
+        await c.execute(
+            text("GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE")
+        )
+        for step in (("downgrade", "0017"), ("upgrade", "head"), ("upgrade", "head")):
+            await c.run_sync(alembic_on, *step)
+            await c.execute(text(GUARD.MIGRATION_GUARD_SQL))
+        deps = (
+            await c.execute(
+                text(
+                    "SELECT s.deptype::text || ' ' || pg_describe_object(s.classid, s.objid, s.objsubid) "
+                    "FROM pg_shdepend s WHERE s.refclassid = 'pg_authid'::regclass "
+                    "AND s.refobjid = to_regrole('feelings_billing') AND s.dbid IN (0, "
+                    "(SELECT oid FROM pg_database WHERE datname = current_database()))"
+                )
+            )
+        ).scalars()
+        assert sorted(deps) == sorted(
+            ["a schema public"] + [f"a function {sig.replace(', ', ',')}" for sig in BOT_FUNCS]
+        )
+        assert (await c.execute(text("SELECT version_num FROM alembic_version"))).scalar() == HEAD
+        await tx.rollback()
+    async with engine.connect() as c:
+        left = await c.execute(
+            text("SELECT count(*) FROM pg_roles WHERE rolname = 'feelings_billing_login'")
+        )
         assert left.scalar() == 0
 
 

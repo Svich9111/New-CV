@@ -139,11 +139,18 @@ FEELINGS_WORKER_DB_PASSWORD=... FEELINGS_ADMIN_DB_PASSWORD=... FEELINGS_API_DB_P
   или унаследованное от группы) есть у кого-то, кроме суперпользователей, владельца схемы
   `public` (при `pg_database_owner` — владельца базы, на стенде `feelings_owner`) и роли, под
   которой запущены миграции;
-- `feelings_billing_login` — суперпользователь, член любой роли, кроме `feelings_billing`, имеет
-  `ADMIN OPTION` на неё, `INHERIT`, `CREATEROLE`, `CREATEDB`, `REPLICATION` или `BYPASSRLS`;
-- у `feelings_billing` в базе есть права или объекты сверх `EXECUTE` на четыре функции бота,
-  `USAGE` на схему `public` и `CONNECT` к базе (права на таблицы, столбцы, последовательности,
-  другие функции и схемы, права по умолчанию, владение объектами и т.п.).
+- `feelings_billing_login` — суперпользователь, член любой роли (в том числе суперпользовательской),
+  кроме `feelings_billing`, имеет `ADMIN OPTION` на неё, получила её с `INHERIT TRUE` (нужно
+  `GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE`), имеет `INHERIT`,
+  `CREATEROLE`, `CREATEDB`, `REPLICATION` или `BYPASSRLS`;
+- у `feelings_billing` в базе есть права или объекты сверх `EXECUTE` на четыре функции бота
+  (ровно `public.app_bot_payment_*` с их сигнатурами — перегрузка с тем же именем не в счёт),
+  `USAGE` на схему `public` и `CONNECT` к базе: права на таблицы, столбцы, последовательности,
+  другие функции и схемы, табличные пространства, права по умолчанию, владение **любым** объектом
+  этой базы (по `pg_shdepend`: таблицы, функции, типы, сортировки, публикации, внешние серверы,
+  словари поиска, операторы, статистика, расширения…) и общим объектом кластера (табличное
+  пространство, другая база). Не проверяются: объекты и права внутри других баз кластера (их
+  проверит страж той базы), политики RLS с `TO feelings_billing` и права `PUBLIC`.
 
 В сообщении остановки — правило и имена ролей или объектов (текстов и данных нет).
 
@@ -153,7 +160,8 @@ FEELINGS_WORKER_DB_PASSWORD=... FEELINGS_ADMIN_DB_PASSWORD=... FEELINGS_API_DB_P
 1. Выключить приём платежей (бот перестаёт подключаться под `feelings_billing_login`).
 2. Под суперпользователем кластера (или владельцем схемы, если ему хватает прав) по сообщению
    стража снять лишнее: `REVOKE feelings_billing FROM <роль>`, `REVOKE feelings_billing_login FROM
-   <роль>`, `REVOKE <роль> FROM feelings_billing`, `ALTER ROLE feelings_billing_login NOINHERIT
+   <роль>`, `REVOKE <роль> FROM feelings_billing`, `GRANT feelings_billing TO
+   feelings_billing_login WITH INHERIT FALSE`, `ALTER ROLE feelings_billing_login NOINHERIT
    NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS`, `REVOKE … ON … FROM feelings_billing`,
    `ALTER DEFAULT PRIVILEGES … REVOKE … FROM feelings_billing`, `REASSIGN OWNED BY feelings_billing
    TO feelings_owner` — по каждой строке сообщения. Кто и когда выдал лишнее — разобрать по журналу

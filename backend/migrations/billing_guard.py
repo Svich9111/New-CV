@@ -1,5 +1,5 @@
 """Страж роли платежей ``feelings_billing`` (АР-50 п.7; ревью 4.4 э.1 р.2 MAJOR-1, A8-4.4-D3;
-р.3 N1, A8-4.4-D4, R5, R6, R8).
+р.3 N1, A8-4.4-D4, R5, R6, R8; р.4 A8-4.4-D5, D6, R10–R12).
 
 Роли общие для кластера: ``feelings_billing`` может появиться до миграции или измениться после
 неё (другая база того же кластера, эксперимент, ошибочный ``GRANT``). Граница «функции бота —
@@ -17,19 +17,34 @@
    правило попадают и роли входа из ``infra/db/roles.sql``, и владелец схемы, и посторонние);
 5. роль входа бота ``feelings_billing_login``, если она есть, — суперпользователь, член
    какой-либо роли, кроме ``feelings_billing`` (её член только бот, Б-97), или имеет ``INHERIT``/
-   ``CREATEROLE``/``CREATEDB``/``REPLICATION``/``BYPASSRLS`` (Б-97: ``LOGIN NOINHERIT``; R5);
+   ``CREATEROLE``/``CREATEDB``/``REPLICATION``/``BYPASSRLS`` (Б-97: ``LOGIN NOINHERIT``; R5),
+   или получила ``feelings_billing`` с ``INHERIT TRUE`` (``pg_auth_members.inherit_option``; в
+   PG 16 атрибут роли — лишь значение по умолчанию для выдачи; Б-97: ``INHERIT FALSE, SET TRUE``;
+   R10). Членство в суперпользовательской роли (R11) — тоже «член другой роли» (правила 2 и 5);
 6. у ``feelings_billing`` в текущей базе есть права или объекты сверх ожидаемых (R6): ожидаются
-   только ``EXECUTE`` на четыре функции бота ``app_bot_payment_*`` и ``USAGE`` на схему
-   ``public`` (без права передачи) и, при отзыве ``CONNECT`` у ``PUBLIC``, ``CONNECT`` к базе.
-   Любые права на таблицы, столбцы, последовательности, другие функции, схемы, типы, языки,
-   внешние серверы, большие объекты, параметры сервера, права по умолчанию, а также владение
-   объектами — остановка (п.7 «без прав на таблицы»);
+   только ``EXECUTE`` на четыре функции бота — **ровно эти** ``public.app_bot_payment_*`` с
+   полной сигнатурой (``to_regprocedure``; перегрузка с тем же именем — «другая функция», D5) —
+   и ``USAGE`` на схему ``public`` (без права передачи) и, при отзыве ``CONNECT`` у ``PUBLIC``,
+   ``CONNECT`` к базе. Любые права на таблицы, столбцы, последовательности, другие функции,
+   схемы, типы, языки, обёртки и внешние серверы, большие объекты, параметры сервера,
+   табличные пространства, права по умолчанию — остановка; владение **любым** объектом текущей
+   базы и общим объектом кластера (табличное пространство, база) — тоже (D6: каталог
+   зависимостей ``pg_shdepend``, ``deptype`` ``o``/``a``, ``dbid`` текущей базы или 0 — сортировки,
+   публикации, внешние серверы, словари и конфигурации поиска, операторы, семейства операторов,
+   статистика, расширения и пр.). Не проверяются (Б-97): объекты и права **внутри других баз**
+   кластера и права на сами эти базы (их видит страж той базы при её миграциях; владение
+   другой базой — остановка), ссылки политик RLS на роль
+   (``CREATE POLICY … TO feelings_billing`` без прав на таблицу доступа не даёт) и права
+   ``PUBLIC`` (не относятся к роли);
 7. **ADMIN** (N1, A8-4.4-D4): членство в ``feelings_billing`` или в ``feelings_billing_login``
    в любом виде, в том числе только с ``ADMIN`` и унаследованное от группы, есть у кого-то,
    кроме суперпользователей, самой роли входа бота (в ``feelings_billing``), владельца схемы
    ``public`` (``nspowner``; если это ``pg_database_owner`` — владелец базы ``datdba``) и роли,
    исполняющей миграции (``current_user``). Так владелец получает созданную им роль (``ADMIN``
-   без ``SET``/``INHERIT``, Б-97); владелец с ``SET``/``INHERIT`` по-прежнему остановлен правилом 4;
+   без ``SET``/``INHERIT``, Б-97); владелец с ``SET``/``INHERIT`` по-прежнему остановлен правилом 4.
+   ``current_user`` доверен потому, что роль, исполняющая миграции, и так создаёт и меняет функции
+   бота и их права (``CREATE ROLE`` без суперпользователя сам выдаёт ей ``ADMIN``); результат
+   правила зависит от того, кто запускает Alembic, — на стенде это ``feelings_owner`` (R12);
 8. у роли входа бота есть ``ADMIN OPTION`` на ``feelings_billing`` (бот выдал бы роль платежей
    сессии пользователя).
 
@@ -50,12 +65,15 @@ BACKLOG Б-97). Суперпользователи проходят любую �
 BILLING_ROLE = "feelings_billing"
 BILLING_LOGIN = "feelings_billing_login"
 APP_ROLES = ("feelings_app", "feelings_api", "feelings_worker", "feelings_admin")
+# Полные сигнатуры функций бота (A8-4.4-D5): EXECUTE разрешён ровно на эти oid
+# (``to_regprocedure``), перегрузка с тем же именем — «другая функция».
 BOT_FUNCTIONS = (
-    "app_bot_payment_precheck",
-    "app_bot_payment_credit",
-    "app_bot_payment_refunded",
-    "app_bot_payment_lookup",
+    "app_bot_payment_precheck(uuid, bigint, integer, character varying)",
+    "app_bot_payment_credit(uuid, bigint, integer, character varying, character varying)",
+    "app_bot_payment_refunded(character varying)",
+    "app_bot_payment_lookup(character varying)",
 )
+
 
 ATTRS_MESSAGE = "роль feelings_billing уже есть и имеет вход, INHERIT или особые права"
 
@@ -66,6 +84,7 @@ DECLARE
     v_login oid := to_regrole('feelings_billing_login');
     v_owner oid;
     v_runner oid := (SELECT r.oid FROM pg_roles r WHERE r.rolname = current_user);
+    v_db oid := (SELECT d.oid FROM pg_database d WHERE d.datname = current_database());
     v_bad text;
 BEGIN
     IF v_billing IS NULL THEN
@@ -125,6 +144,13 @@ _MEMBERSHIP = r"""
             RAISE EXCEPTION 'роль входа бота feelings_billing_login имеет INHERIT или особые права '
                 '(CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS)';
         END IF;
+        -- R10: атрибут NOINHERIT — лишь значение по умолчанию для новых выдач (PG 16); сама
+        -- выдача feelings_billing роли входа бота — только INHERIT FALSE (Б-97).
+        IF EXISTS (SELECT 1 FROM pg_auth_members m
+                    WHERE m.roleid = v_billing AND m.member = v_login AND m.inherit_option) THEN
+            RAISE EXCEPTION 'роль входа бота feelings_billing_login получила feelings_billing '
+                'WITH INHERIT TRUE (нужно INHERIT FALSE, SET TRUE)';
+        END IF;
     END IF;
 """
 
@@ -145,9 +171,11 @@ _GRANTS = r"""
           FROM pg_proc p, aclexplode(p.proacl) a
          WHERE a.grantee = v_billing
            AND NOT (a.privilege_type = 'EXECUTE' AND NOT a.is_grantable
-                    AND p.pronamespace = 'public'::regnamespace
-                    AND p.proname IN ('app_bot_payment_precheck', 'app_bot_payment_credit',
-                                      'app_bot_payment_refunded', 'app_bot_payment_lookup'))
+                    AND p.oid IN (
+                        to_regprocedure('public.app_bot_payment_precheck(uuid, bigint, integer, character varying)'),
+                        to_regprocedure('public.app_bot_payment_credit(uuid, bigint, integer, character varying, character varying)'),
+                        to_regprocedure('public.app_bot_payment_refunded(character varying)'),
+                        to_regprocedure('public.app_bot_payment_lookup(character varying)')))
         UNION ALL
         SELECT format('OWNER OF FUNCTION %s', p.oid::regprocedure)
           FROM pg_proc p WHERE p.proowner = v_billing
@@ -196,11 +224,46 @@ _GRANTS = r"""
         UNION ALL
         SELECT format('OWNER OF DATABASE %I', d.datname)
           FROM pg_database d WHERE d.datname = current_database() AND d.datdba = v_billing
+        UNION ALL
+        SELECT format('%s ON TABLESPACE %I', a.privilege_type, t.spcname)
+          FROM pg_tablespace t, aclexplode(t.spcacl) a WHERE a.grantee = v_billing
+        UNION ALL
+        -- A8-4.4-D6: владение и права на объекты любых прочих видов (сортировки, публикации,
+        -- внешние серверы, словари и конфигурации поиска, операторы, статистика, расширения,
+        -- табличные пространства, другие базы кластера …) — по общему каталогу зависимостей
+        -- pg_shdepend текущей базы и общих объектов (dbid = 0). Виды, проверенные выше,
+        -- пропущены, чтобы не дублировать строку сообщения.
+        SELECT format(CASE s.deptype WHEN 'o' THEN 'OWNER OF %s' ELSE 'PRIVILEGES ON %s' END,
+                      pg_describe_object(s.classid, s.objid, s.objsubid))
+          FROM pg_shdepend s
+         WHERE s.refclassid = 'pg_authid'::regclass AND s.refobjid = v_billing
+           AND s.dbid IN (0, v_db)
+           AND ((s.deptype = 'o'
+                 AND s.classid NOT IN ('pg_class'::regclass, 'pg_proc'::regclass,
+                                       'pg_namespace'::regclass, 'pg_type'::regclass,
+                                       'pg_largeobject'::regclass,
+                                       'pg_largeobject_metadata'::regclass)
+                 AND NOT (s.classid = 'pg_database'::regclass AND s.objid = v_db))
+             OR (s.deptype = 'a'
+                 AND s.classid NOT IN ('pg_class'::regclass, 'pg_proc'::regclass,
+                                       'pg_namespace'::regclass, 'pg_type'::regclass,
+                                       'pg_language'::regclass,
+                                       'pg_foreign_data_wrapper'::regclass,
+                                       'pg_foreign_server'::regclass,
+                                       'pg_largeobject'::regclass,
+                                       'pg_largeobject_metadata'::regclass,
+                                       'pg_parameter_acl'::regclass,
+                                       'pg_default_acl'::regclass, 'pg_database'::regclass,
+                                       'pg_tablespace'::regclass)))
     ) s(x);
     IF v_bad IS NOT NULL THEN
         RAISE EXCEPTION 'у роли feelings_billing лишние права или объекты: %', v_bad;
     END IF;
 """
+
+# Список функций в SQL и BOT_FUNCTIONS не должны разойтись.
+if any(f"to_regprocedure('public.{sig}')" not in _GRANTS for sig in BOT_FUNCTIONS):
+    raise RuntimeError("billing_guard: BOT_FUNCTIONS не совпадает с правилом 6")
 
 _ADMIN = r"""
     SELECT string_agg(r.rolname, ', ' ORDER BY r.rolname) INTO v_bad

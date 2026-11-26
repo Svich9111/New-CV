@@ -2399,13 +2399,6 @@ R4_GUARD_GAPS: dict[str, list[str]] = {
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-4.4-D5/D6: правило 6 стража сверяет функции бота только по имени (перегрузка "
-    "public.app_bot_payment_*(…) с EXECUTE у feelings_billing проходит) и не проверяет владение "
-    "сортировками, публикациями, внешними серверами, словарями поиска, операторами, объектами "
-    "статистики и права на табличные пространства",
-)
 @pytest.mark.parametrize("case", list(R4_GUARD_GAPS))
 async def test_r4_guard_stops_remaining_r6_gaps(engine: AsyncEngine, case: str) -> None:
     """АР-50 п.7 («без прав на таблицы»), docstring стража п.6 («другие функции … владение
