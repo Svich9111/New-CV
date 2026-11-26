@@ -1,30 +1,71 @@
 /**
  * Тексты ошибок для человека — на «ты», как весь интерфейс (ТЗ §2, тон). Сервер отдаёт `message`
- * на «вы»; клиент показывает свой текст по `code`, а для незнакомого кода — `message` сервера.
- * Ни одна ошибка не окрашивается красным (ТЗ §8): красный — только главное действие и близость.
+ * на «вы»; клиент показывает свой текст по паре (операция, `code`), а для незнакомого кода — `message`
+ * сервера. Ни одна ошибка не окрашивается красным (ТЗ §8): красный — только главное действие и близость.
+ *
+ * Коды контракта общие для разных путей (`not_found` отдают и приглашение, и пара, а в 2.x — черновик
+ * и сообщения), поэтому общий текст нейтрален, а точный — в переопределении для операции.
  */
+
+/** Операция клиента: определяет, какой текст получит общий код. */
+export type Op =
+  | "login"
+  | "me"
+  | "onboarding"
+  | "couple"
+  | "createCouple"
+  | "reissueInvite"
+  | "invite"
+  | "acceptInvite"
+  | "help";
+
+const INVITE_NOT_FOUND = "Приглашение не найдено. Попроси партнёра прислать новую ссылку.";
+
 const BY_CODE: Record<string, string> = {
   network: "Нет связи с сервером. Проверь интернет и попробуй ещё раз.",
+  timeout: "Сервер не ответил вовремя. Проверь интернет и попробуй ещё раз.",
+  bad_response: "Сервер ответил непонятно. Попробуй ещё раз чуть позже.",
   invalid_init_data: "Не получилось подтвердить вход через Telegram. Закрой приложение и открой его снова.",
   unauthorized: "Сессия закончилась. Закрой приложение и открой его снова.",
   account_deleted: "Этот аккаунт удалён. Повторная регистрация появится позже.",
-  validation_error: "Проверь, что все поля заполнены — каждое не длиннее 64 символов.",
+  validation_error: "Сервер не принял данные. Проверь их и попробуй ещё раз.",
   service_unavailable: "Сервис временно недоступен. Попробуй чуть позже.",
   onboarding_required: "Сначала нужно познакомиться: заполни поля и отметь согласия.",
   underage: "Сервис доступен только с 18 лет.",
-  not_found: "Приглашение не найдено. Попроси партнёра прислать новую ссылку.",
+  not_found: "Не нашли то, что нужно. Попробуй ещё раз.",
   already_in_couple: "У тебя уже есть пара. Одновременно можно состоять только в одной.",
   own_invite: "Это твоё приглашение — отправь ссылку партнёру.",
-  couple_not_pending: "Эта пара уже не ждёт партнёра. Попроси новую ссылку.",
+  couple_not_pending: "Пара уже не ждёт партнёра.",
   invite_expired: "Срок приглашения истёк. Попроси партнёра прислать новую ссылку.",
   invite_used: "Приглашение уже использовано или заменено новым. Попроси партнёра прислать новую ссылку.",
   conflict_retry: "Не получилось с первого раза. Попробуй ещё раз.",
+  // Для путей 1.5 контракт 429 не описывает; это общий ограничитель частоты. Для чата (2.2) `rate_limited`
+  // по контракту — исчерпан дневной лимит реплик: там нужен свой текст через переопределение операции.
   rate_limited: "Слишком много запросов подряд. Подожди немного и попробуй снова.",
   internal: "Что-то пошло не так. Попробуй ещё раз.",
 };
 
-export function errorText(code: string, serverMessage?: string, retryAfter?: number): string {
-  const base = BY_CODE[code] ?? serverMessage ?? BY_CODE.internal;
-  if (code === "rate_limited" && retryAfter) return `${base.replace(/\.$/, "")} — через ${retryAfter} с.`;
+const BY_OP: Partial<Record<Op, Record<string, string>>> = {
+  onboarding: { validation_error: "Проверь, что все поля заполнены — каждое не длиннее 64 символов." },
+  invite: { not_found: INVITE_NOT_FOUND },
+  acceptInvite: { not_found: INVITE_NOT_FOUND },
+  // Ссылку выпускает сам инициатор — «попроси партнёра» здесь не к месту.
+  reissueInvite: {
+    not_found: "Пары пока нет. Создай новую ссылку-приглашение.",
+    couple_not_pending: "Пара уже не ждёт партнёра — новая ссылка не нужна.",
+  },
+  createCouple: { couple_not_pending: "Пара уже не ждёт партнёра — новая ссылка не нужна." },
+};
+
+/** Срок ожидания из `Retry-After` по-человечески: секунды, минуты или часы (с округлением вверх). */
+export function waitText(seconds: number): string {
+  if (seconds < 60) return `${seconds} с.`;
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} мин.`;
+  return `${Math.ceil(seconds / 3600)} ч.`;
+}
+
+export function errorText(code: string, serverMessage?: string, retryAfter?: number, op?: Op): string {
+  const base = (op && BY_OP[op]?.[code]) ?? BY_CODE[code] ?? serverMessage ?? BY_CODE.internal;
+  if (code === "rate_limited" && retryAfter) return `${base.replace(/\.$/, "")} — через ${waitText(retryAfter)}`;
   return base;
 }

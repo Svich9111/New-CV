@@ -8,6 +8,7 @@ export interface FakeTelegram {
   opened: string[];
   haptics: string[];
   headerColors: string[];
+  backgroundColors: string[];
   emit(event: "themeChanged" | "activated"): void;
   readyCalled: () => boolean;
 }
@@ -15,7 +16,17 @@ export interface FakeTelegram {
 export const INIT_DATA = "query_id=TEST&user=%7B%22id%22%3A1%2C%22first_name%22%3A%22%D0%90%D0%BD%D1%8F%22%7D&auth_date=1&hash=fake";
 
 export function fakeTelegram(
-  opts: { initData?: string; startParam?: string; colorScheme?: "light" | "dark"; version?: string; firstName?: string } = {},
+  opts: {
+    initData?: string;
+    startParam?: string;
+    colorScheme?: "light" | "dark";
+    version?: string;
+    firstName?: string;
+    /** Цвета темы клиента Telegram (не совпадают с нашими токенами — как обычно и бывает). */
+    themeParams?: { bg_color?: string; secondary_bg_color?: string };
+    /** Методы SDK, которые бросают исключение (проверка устойчивости запуска). */
+    throwOn?: ("setHeaderColor" | "setBackgroundColor" | "onEvent" | "expand")[];
+  } = {},
 ): FakeTelegram {
   const mainHandlers = new Set<() => void>();
   const backHandlers = new Set<() => void>();
@@ -32,6 +43,14 @@ export function fakeTelegram(
     return 0;
   };
 
+  const atLeast = (v: string) => cmp(version, v) >= 0;
+  const themeParams = opts.themeParams ?? { bg_color: "#17212b", secondary_bg_color: "#232e3c" };
+  const broken = (name: NonNullable<typeof opts.throwOn>[number]) => {
+    if (opts.throwOn?.includes(name)) throw new Error(`fake ${name} failure`);
+  };
+  const HEX = /^#[0-9a-f]{6}$/i;
+  const isKey = (c: string) => c === "bg_color" || c === "secondary_bg_color";
+
   const fake: FakeTelegram = {
     main: {
       text: "",
@@ -45,6 +64,7 @@ export function fakeTelegram(
     opened: [],
     haptics: [],
     headerColors: [],
+    backgroundColors: [],
     emit: (e) => events.get(e)?.forEach((h) => h()),
     readyCalled: () => ready,
     webApp: undefined as unknown as TelegramWebApp,
@@ -55,14 +75,36 @@ export function fakeTelegram(
     initDataUnsafe: { start_param: opts.startParam, user: { first_name: opts.firstName ?? "Аня" } },
     version,
     colorScheme: opts.colorScheme ?? "light",
-    isVersionAtLeast: (v) => cmp(version, v) >= 0,
+    isVersionAtLeast: atLeast,
     ready: () => {
       ready = true;
     },
-    expand: () => undefined,
-    setHeaderColor: (c) => fake.headerColors.push(c),
-    setBackgroundColor: () => undefined,
+    expand: () => broken("expand"),
+    themeParams,
+    // Как официальный telegram-web-app.js: до 6.1 — предупреждение без смены цвета; в 6.1–6.8 — только ключ
+    // темы (или hex, равный цвету темы клиента), иначе исключение WebAppHeaderColorKeyInvalid; с 6.9 — hex.
+    // Вывод SDK в консоль не повторяется: консоль в тестах запрещена.
+    setHeaderColor: (c) => {
+      broken("setHeaderColor");
+      if (!atLeast("6.1")) return;
+      let color = c;
+      if (!atLeast("6.9")) {
+        if (themeParams.bg_color && themeParams.bg_color === c) color = "bg_color";
+        else if (themeParams.secondary_bg_color && themeParams.secondary_bg_color === c) color = "secondary_bg_color";
+        if (!isKey(color)) throw new Error("WebAppHeaderColorKeyInvalid");
+      } else if (!isKey(color) && !HEX.test(color)) {
+        throw new Error("WebAppHeaderColorInvalid");
+      }
+      fake.headerColors.push(color);
+    },
+    setBackgroundColor: (c) => {
+      broken("setBackgroundColor");
+      if (!atLeast("6.1")) return;
+      if (!isKey(c) && !HEX.test(c)) throw new Error("WebAppBackgroundColorInvalid");
+      fake.backgroundColors.push(c);
+    },
     onEvent: (e, cb) => {
+      broken("onEvent");
       if (!events.has(e)) events.set(e, new Set());
       events.get(e)!.add(cb);
     },

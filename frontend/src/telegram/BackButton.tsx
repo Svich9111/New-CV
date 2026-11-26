@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 import { useTelegram } from "./context";
 
 /**
@@ -11,11 +11,11 @@ export function BackButton({ onBack }: { onBack: (() => void) | null }) {
   const ref = useRef(onBack);
   const visible = onBack !== null;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     ref.current = onBack;
   });
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!native) return;
     const bb = native.BackButton;
     if (!visible) {

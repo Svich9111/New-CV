@@ -158,6 +158,10 @@ describe("A8 · 429, 5xx, обрыв при входе", () => {
   });
 
   // A8-1.5-D1 (в интерфейсе): вход повис — «Входим через Telegram…» без конца, без причины и повтора.
+  // A4, р.1: дефект исправлен (срок входа TIMEOUTS.login), но этот страж остаётся `it.fails`: тело включает
+  // поддельные таймеры уже после начала входа, поэтому таймер срока, взведённый настоящим setTimeout при
+  // запросе, поддельные часы не двигают. Тело не правится (правило раунда); то же поведение с таймерами,
+  // включёнными до входа, проверяет App.fixes.test.tsx «D1: срок ответа». Нужна правка тела стражем A8.
   it.fails("A8-1.5-D1: повисший вход через 60 с показывает причину и «Попробовать снова»", async () => {
     const server = new FakeServer();
     server.fetch = () => new Promise<Response>(() => undefined);
@@ -295,7 +299,9 @@ describe("A8 · согласия и 18+ нельзя обойти (ФТ-02, ТЗ
     await r.pressMain();
     await r.pressMain();
     expect(r.server.calls("PUT", "/me/onboarding")).toHaveLength(0);
-    expect(screen.getByRole("status")).toHaveTextContent("отметь все четыре пункта");
+    // m-7 (A4, р.1): подсказка про 18+ нейтральная — правило, а не просьба поставить отметку.
+    expect(screen.getByRole("status")).toHaveTextContent("Сервис только для взрослых 18+.");
+    expect(screen.getByRole("status")).not.toHaveTextContent(/отметь/);
   });
 
   test("двойной Enter подряд при заполненной форме — один запрос", async () => {
@@ -451,7 +457,8 @@ describe("A8 · «Помощь» на каждом экране и при нед
     });
   }
 
-  test("/help/contacts повис — пока загрузка, номера 112 на экране нет (замечание)", async () => {
+  // Факт обращён после исправления D1 (A4, р.1): раньше здесь фиксировалось, что 112 во время загрузки нет.
+  test("/help/contacts повис — пока загрузка, запасной 112 уже на экране", async () => {
     const server = new FakeServer();
     const base = server.fetch;
     server.fetch = (i, init) => (String(i).endsWith("/help/contacts") ? new Promise<Response>(() => undefined) : base(i, init));
@@ -460,7 +467,7 @@ describe("A8 · «Помощь» на каждом экране и при нед
     await r.user.click(helpLink());
     await heading("Помощь");
     expect(screen.getByText("Загружаем контакты…")).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "112" })).toBeNull();
+    expect(screen.getByRole("link", { name: "112" })).toHaveAttribute("href", "tel:112");
   });
 
   // A8-1.5-D2 (в интерфейсе) фиксируется на уровне клиента (client.a8.test.ts): 200 text/html на
@@ -544,7 +551,7 @@ describe("A8 · переключение темы на лету (ТЗ §8 «сл
   // A8-1.5-D3: цвета MainButton задаются только при смене text/disabled/progress; на `themeChanged`
   // они не пересчитываются. Недоступная кнопка остаётся светло-серой (#d9d5d1) в тёмной теме, где
   // токен --disabled-bg = #2c2c2c (карточка: «цвета MainButton берутся из токенов; смена темы на лету»).
-  it.fails("A8-1.5-D3: после themeChanged недоступная MainButton берёт --disabled-bg тёмной темы", async () => {
+  it("A8-1.5-D3: после themeChanged недоступная MainButton берёт --disabled-bg тёмной темы", async () => {
     const tg = fakeTelegram({ colorScheme: "light" });
     const r = renderApp({ tg });
     await toOnboarding(r);
@@ -598,13 +605,14 @@ describe("A8 · доступность (роли и имена; axe — в ру�
     expect(alert).toHaveTextContent(/^!?Ошибка: Сервис временно недоступен/);
   });
 
-  test("ссылка-приглашение: aria-label на <p> (замечание: имя у абзаца без роли диктор может не озвучить)", async () => {
+  // Факт обращён после исправления m-10 (A4, р.1): раньше здесь фиксировался aria-label на <p> без роли.
+  test("ссылка-приглашение: видимая подпись и группа с именем (не aria-label на <p>)", async () => {
     const r = renderApp({ server: new FakeServer().onboarded() });
     await heading("Пригласи партнёра");
     await r.pressMain();
-    const p = await screen.findByLabelText("Ссылка-приглашение");
-    expect(p.tagName).toBe("P");
-    expect(p.getAttribute("role")).toBeNull();
+    const group = await screen.findByRole("group", { name: "Ссылка-приглашение" });
+    expect(within(group).getByText("Ссылка-приглашение")).toBeVisible();
+    expect(group.querySelector("[aria-label]")).toBeNull();
   });
 
   test("фокус на заголовке нового экрана после ошибки входа и на «Помощи»", async () => {

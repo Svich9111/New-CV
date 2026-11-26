@@ -48,6 +48,7 @@ export interface TelegramWebApp {
   setBackgroundColor?(color: string): void;
   onEvent(event: "themeChanged" | "activated", cb: () => void): void;
   offEvent(event: "themeChanged" | "activated", cb: () => void): void;
+  themeParams?: { bg_color?: string; secondary_bg_color?: string };
   openTelegramLink(url: string): void;
   MainButton: TgMainButton;
   BackButton: TgBackButton;
@@ -74,12 +75,47 @@ export function cssToken(name: string): string {
 
 const HEX = /^#[0-9a-f]{6}$/i;
 
+function safely(fn: () => void): void {
+  try {
+    fn();
+  } catch {
+    // Отказ SDK не журналируется (консоль не используется) и не прерывает запуск.
+  }
+}
+
+/** Скрипт SDK в index.html грузится асинхронно — страница и «Помощь» не ждут telegram.org. */
+export const SDK_SCRIPT_ID = "telegram-web-app-sdk";
+export const SDK_WAIT_MS = 4_000;
+
+/**
+ * Дождаться SDK Telegram: он уже загружен, или скрипт загрузился, или не загрузился, или вышел срок.
+ * Никогда не отклоняется: без SDK приложение покажет «Открой в Telegram» и «Помощь».
+ */
+export function waitForTelegramSdk(win: Window = window, timeoutMs = SDK_WAIT_MS): Promise<void> {
+  if (win.Telegram?.WebApp) return Promise.resolve();
+  const script = win.document.getElementById(SDK_SCRIPT_ID);
+  // Скрипт мог успеть загрузиться или упасть до запуска приложения — index.html отмечает это в data-state.
+  if (!script || script.dataset.state) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      script.removeEventListener("load", done);
+      script.removeEventListener("error", done);
+      resolve();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    script.addEventListener("load", done);
+    script.addEventListener("error", done);
+  });
+}
+
 /**
  * API платформы для экранов. Вне Telegram (`webApp === null`) нативных кнопок нет — экраны рисуют
  * запасные кнопки в странице, а тактильный отклик молчит.
  */
 export class TelegramApi {
   readonly webApp: TelegramWebApp | null;
+  private readonly themeListeners = new Set<() => void>();
 
   constructor(webApp: TelegramWebApp | null) {
     this.webApp = webApp;
@@ -118,22 +154,43 @@ export class TelegramApi {
     document.documentElement.dataset.theme = wa.colorScheme === "dark" ? "dark" : "light";
     if (!wa.isVersionAtLeast("6.1")) return;
     const bg = cssToken("--bg");
-    if (HEX.test(bg)) {
-      wa.setHeaderColor?.(bg);
-      wa.setBackgroundColor?.(bg);
-    }
+    // Каждый вызов SDK — отдельно: отказ одного (старый клиент, неожиданный формат) не мешает остальным
+    // и не роняет запуск приложения.
+    safely(() => {
+      // Цвет шапки как hex SDK принимает только с Bot API 6.9; в 6.1–6.8 — только ключ темы
+      // (`bg_color` / `secondary_bg_color`), на любой другой hex он бросает WebAppHeaderColorKeyInvalid.
+      if (wa.isVersionAtLeast("6.9")) {
+        if (HEX.test(bg)) wa.setHeaderColor?.(bg);
+      } else {
+        wa.setHeaderColor?.("bg_color");
+      }
+    });
+    // Фон как hex SDK принимает с 6.1.
+    if (HEX.test(bg)) safely(() => wa.setBackgroundColor?.(bg));
   }
 
-  /** Запуск: тема, подписка на смену темы, сигнал готовности. Возвращает отписку. */
+  /** Подписка на смену темы (после того как data-theme уже обновлён). Возвращает отписку. */
+  onThemeChange(cb: () => void): () => void {
+    this.themeListeners.add(cb);
+    return () => this.themeListeners.delete(cb);
+  }
+
+  /**
+   * Запуск: тема, подписка на смену темы, сигнал готовности. Возвращает отписку. Не бросает: ошибка SDK
+   * не должна оставить человека на вечной заставке Telegram — `ready()` и `expand()` вызываются всегда.
+   */
   start(): () => void {
     const wa = this.webApp;
     if (!wa) return () => undefined;
-    const onTheme = () => this.applyTheme();
-    this.applyTheme();
-    wa.onEvent("themeChanged", onTheme);
-    wa.ready();
-    wa.expand();
-    return () => wa.offEvent("themeChanged", onTheme);
+    const onTheme = () => {
+      safely(() => this.applyTheme());
+      for (const cb of [...this.themeListeners]) safely(cb);
+    };
+    safely(() => this.applyTheme());
+    safely(() => wa.onEvent("themeChanged", onTheme));
+    safely(() => wa.ready());
+    safely(() => wa.expand());
+    return () => safely(() => wa.offEvent("themeChanged", onTheme));
   }
 
   impact(style: HapticImpact = "light"): void {

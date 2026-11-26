@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import { ApiError } from "../api/client";
 import { errorText } from "../api/messages";
 import { useApp } from "../app/store";
@@ -14,7 +14,13 @@ export const POLL_MS = 10_000;
 const SHARE_TEXT =
   "Приглашаю тебя в «Чувства AI». У каждого из нас будет свой агент, который поможет говорить о важном. Ссылка одноразовая.";
 
-type State = { kind: "loading" } | { kind: "none" } | { kind: "pending" } | { kind: "error"; text: string };
+type State =
+  | { kind: "loading" }
+  | { kind: "none" }
+  /** Прежняя пара распалась (контракт: `Couple.status = dissolved`) — можно пригласить заново. */
+  | { kind: "dissolved" }
+  | { kind: "pending" }
+  | { kind: "error"; text: string };
 
 function text(e: unknown): string {
   return e instanceof ApiError ? e.message : errorText("internal");
@@ -32,6 +38,7 @@ export function Invite() {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(app.inviteError);
+  const linkId = useId();
 
   const load = useCallback(
     async (quiet: boolean) => {
@@ -43,11 +50,18 @@ export function Invite() {
         } else if (couple.status === "active") {
           tg.notify("success");
           reset({ name: "paired" });
-        } else {
+        } else if (couple.status === "dissolved") {
+          setInvite(null);
+          setState({ kind: "dissolved" });
+        } else if (couple.status === "pending") {
           setState({ kind: "pending" });
+        } else {
+          setState({ kind: "error", text: errorText("bad_response") });
         }
       } catch (e) {
-        if (!quiet) setState({ kind: "error", text: text(e) });
+        // Тихий опрос молчит о временных сбоях, но не о потерянной сессии: если повторный вход не удался
+        // (401), опрос останавливается и причина видна — иначе «Ждём партнёра» висело бы бесконечно.
+        if (!quiet || (e instanceof ApiError && e.status === 401)) setState({ kind: "error", text: text(e) });
       }
     },
     [api, reset, setInvite, tg],
@@ -109,7 +123,7 @@ export function Invite() {
   }
 
   let main: { text: string; onClick: () => void } | null = null;
-  if (state.kind === "none") main = { text: "Создать ссылку-приглашение", onClick: () => void issue("create") };
+  if (state.kind === "none" || state.kind === "dissolved") main = { text: "Создать ссылку-приглашение", onClick: () => void issue("create") };
   else if (state.kind === "pending" && invite)
     main = { text: shared ? "Отправить ещё раз в Telegram" : "Отправить в Telegram", onClick: share };
   else if (state.kind === "pending") main = { text: "Получить новую ссылку", onClick: () => void issue("reissue") };
@@ -139,11 +153,28 @@ export function Invite() {
         </div>
       )}
 
+      {state.kind === "dissolved" && (
+        <div className="card card--soft">
+          <div className="status" data-status="dissolved" role="status">
+            <span className="status__mark" aria-hidden="true">
+              ○
+            </span>
+            <span>
+              <b>Прежней пары больше нет.</b> Создай новую ссылку и отправь её партнёру в Telegram.
+            </span>
+          </div>
+        </div>
+      )}
+
       {state.kind === "pending" && invite && (
         <>
-          <p className="link-box" aria-label="Ссылка-приглашение">
-            {invite.link}
-          </p>
+          {/* Видимая подпись и группа с именем: у абзаца без роли aria-label не озвучивается (ARIA 1.2). */}
+          <div className="field" role="group" aria-labelledby={linkId}>
+            <div className="label" id={linkId}>
+              Ссылка-приглашение
+            </div>
+            <p className="link-box">{invite.link}</p>
+          </div>
           <p className="small muted">Ссылка одноразовая и действует 7 дней — до {formatDay(invite.expires_at)}.</p>
           <div className="card card--soft">
             {shared ? (

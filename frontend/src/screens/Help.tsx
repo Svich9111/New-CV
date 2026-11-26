@@ -21,21 +21,32 @@ function tel(phone: string): string {
   return "tel:" + phone.replace(/[^\d+]/g, "");
 }
 
-/** Помощь (ТЗ §8, §9.3, §9.4): контакты служб, правила, документы. Доступна без входа и без подписки. */
+function valid(c: unknown): c is HelpContact {
+  const v = c as HelpContact;
+  return typeof c === "object" && c !== null && typeof v.name === "string" && typeof v.phone === "string" && v.phone.length > 0;
+}
+
+/**
+ * Помощь (ТЗ §8, §9.3, §9.4): контакты служб, правила, документы. Доступна без входа и без подписки.
+ * Запасной 112 виден сразу — не дожидаясь сервера; список с сервера заменяет его, когда придёт.
+ */
 export function Help({ api }: { api: Api }) {
-  const [contacts, setContacts] = useState<HelpContact[] | null>(null);
-  const [failed, setFailed] = useState(false);
+  const [contacts, setContacts] = useState<HelpContact[]>(FALLBACK);
+  const [status, setStatus] = useState<"loading" | "loaded" | "failed">("loading");
 
   useEffect(() => {
     let alive = true;
-    api.helpContacts().then(
-      (list) => alive && setContacts(list.length ? list : FALLBACK),
-      () => {
+    api
+      .helpContacts()
+      .then((list) => {
         if (!alive) return;
-        setFailed(true);
-        setContacts(FALLBACK);
-      },
-    );
+        const ok = Array.isArray(list) ? list.filter(valid) : [];
+        setContacts(ok.length ? ok : FALLBACK);
+        setStatus("loaded");
+      })
+      .catch(() => {
+        if (alive) setStatus("failed");
+      });
     return () => {
       alive = false;
     };
@@ -53,10 +64,11 @@ export function Help({ api }: { api: Api }) {
       </div>
 
       <h2>Если тебе или кому-то рядом опасно</h2>
-      {contacts === null && <Loading>Загружаем контакты…</Loading>}
-      {failed && <Notice>Не получилось загрузить полный список. Вот номер, по которому помогут всегда.</Notice>}
-      {contacts && (
-        <ul className="contacts">
+      {status === "loading" && <Loading>Загружаем контакты…</Loading>}
+      {status === "failed" && (
+        <Notice>Не получилось загрузить полный список. Вот номер, по которому помогут всегда.</Notice>
+      )}
+      <ul className="contacts">
           {contacts.map((c) => (
             <li key={c.name + c.phone} className="contact">
               <div>{c.name}</div>
@@ -69,8 +81,7 @@ export function Help({ api }: { api: Api }) {
               </div>
             </li>
           ))}
-        </ul>
-      )}
+      </ul>
       <p className="small muted">Контакты помощи доступны всегда, даже без подписки.</p>
 
       <h2>Правила</h2>

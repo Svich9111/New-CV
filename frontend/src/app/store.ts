@@ -9,6 +9,14 @@ export interface PendingAccept {
   inviterName: string | null;
 }
 
+/** Введённое на онбординге: живёт в памяти сессии, чтобы уход в «Помощь» и «Назад» его не стирали. */
+export interface OnboardingDraft {
+  name: string;
+  addressForm: string;
+  partnerName: string;
+  checks: Record<"consent_terms" | "consent_data" | "consent_sensitive" | "age_confirmed", boolean>;
+}
+
 export interface AppState {
   api: Api;
   me: Me;
@@ -24,6 +32,8 @@ export interface AppState {
   /** Ошибка выпуска ссылки сразу после онбординга — показывается на экране приглашения. */
   inviteError: string | null;
   setInviteError(e: string | null): void;
+  onboardingDraft: OnboardingDraft | null;
+  setOnboardingDraft(d: OnboardingDraft | null): void;
   push(route: Route): void;
   /** Заменить весь стек: после шага, к которому возвращаться нельзя (онбординг пройден, пара создана). */
   reset(route: Route): void;

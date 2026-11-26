@@ -41,7 +41,9 @@ describe("Онбординг (ФТ-02, ТЗ §4.1 п.2)", () => {
   test("MainButton недоступна, пока не заполнены поля и не отмечены все четыре пункта; причина подписью", async () => {
     const r = await openOnboarding();
     expect(r.tg!.main).toMatchObject({ visible: true, text: "Продолжить", active: false });
-    expect(screen.getByRole("status")).toHaveTextContent("заполни поля и отметь все четыре пункта");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Чтобы продолжить, заполни все три поля и отметь все три согласия. Сервис только для взрослых 18+.",
+    );
     await r.pressMain();
     expect(r.server.calls("PUT", "/me/onboarding")).toHaveLength(0);
   });
@@ -51,7 +53,14 @@ describe("Онбординг (ФТ-02, ТЗ §4.1 п.2)", () => {
       const r = await openOnboarding();
       await fill(r, { skip: missing });
       expect(r.tg!.main.active).toBe(false);
-      expect(screen.getByRole("status")).toHaveTextContent("отметь все четыре пункта");
+      if (missing === "Мне исполнилось 18 лет") {
+        // m-7: про возраст — нейтральное правило без «отметь» (АР-14 — за оператором).
+        expect(screen.getByRole("status")).toHaveTextContent("Сервис только для взрослых 18+.");
+        expect(screen.getByRole("status")).not.toHaveTextContent(/отметь/);
+      } else {
+        expect(screen.getByRole("status")).toHaveTextContent("Чтобы продолжить, отметь все три согласия.");
+        expect(screen.getByRole("status")).not.toHaveTextContent(/18/);
+      }
       await r.pressMain();
       expect(r.server.calls("PUT", "/me/onboarding")).toHaveLength(0);
     });

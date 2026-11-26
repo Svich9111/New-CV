@@ -18,7 +18,7 @@ describe("Помощь (ТЗ §9.3, §9.4) — доступна всегда", (
     await heading("Твой личный агент");
     await r.user.click(screen.getByRole("button", { name: /Помощь/ }));
     expect(await screen.findByRole("link", { name: "112" })).toBeInTheDocument();
-    expect(screen.getByText(/Не получилось загрузить полный список/)).toBeInTheDocument();
+    expect(await screen.findByText(/Не получилось загрузить полный список/)).toBeInTheDocument();
   });
 
   test("доступна и когда вход не удался", async () => {

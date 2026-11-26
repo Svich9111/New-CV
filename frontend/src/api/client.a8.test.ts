@@ -215,7 +215,7 @@ describe("A8 · 5xx, обрыв, таймаут", () => {
   // A8-1.5-D1: у запросов нет таймаута (нет AbortSignal/AbortController). Повисший запрос оставляет
   // экран «Входим через Telegram…» без причины и без «Попробовать снова» (карточка: «обрыв связи при
   // входе — причина подписью, повтор»). Ожидается: через разумное время — ApiError network/timeout.
-  it.fails("A8-1.5-D1: повисший запрос завершается ошибкой по таймауту", async () => {
+  it("A8-1.5-D1: повисший запрос завершается ошибкой по таймауту", async () => {
     vi.useFakeTimers();
     try {
       let signal: AbortSignal | null | undefined;
@@ -245,22 +245,24 @@ describe("A8 · успешный ответ не того вида (2xx без J
   // (Help.tsx: `list.length` на null — исключение внутри then, отклонение никто не ловит), экран
   // входящего приглашения падает при отрисовке (`state.invite.inviter_name`), `GET /couple` → «пары нет».
   // Ожидается: 2xx с телом не по схеме — ApiError (ТЗ §9.3 «помощь доступна всегда»).
-  it.fails("A8-1.5-D2: GET /help/contacts 200 text/html — ошибка, а не null", async () => {
+  it("A8-1.5-D2: GET /help/contacts 200 text/html — ошибка, а не null", async () => {
     const server = new FakeServer();
     server.fetch = async () => new Response("<!doctype html><html></html>", { status: 200, headers: { "Content-Type": "text/html" } });
     await expect(apiFor(server).helpContacts()).rejects.toBeInstanceOf(ApiError);
   });
 
-  it.fails("A8-1.5-D2: POST /auth/telegram 200 text/html — ApiError, а не TypeError", async () => {
+  it("A8-1.5-D2: POST /auth/telegram 200 text/html — ApiError, а не TypeError", async () => {
     const server = new FakeServer();
     server.fetch = async () => new Response("<html></html>", { status: 200 });
     await expect(apiFor(server).login()).rejects.toBeInstanceOf(ApiError);
   });
 
-  test("факт по D2: 200 с HTML на /help/contacts сейчас даёт null", async () => {
+  // Факт по D2 обращён после исправления (A4, р.1): раньше здесь фиксировалось `null`.
+  test("факт по D2: 200 с HTML на /help/contacts — ApiError bad_response, а не null", async () => {
     const server = new FakeServer();
     server.fetch = async () => new Response("<html></html>", { status: 200, headers: { "Content-Type": "text/html" } });
-    await expect(apiFor(server).helpContacts()).resolves.toBeNull();
+    const e = await caught(apiFor(server).helpContacts());
+    expect(e).toMatchObject({ status: 200, code: "bad_response" });
   });
 });
 

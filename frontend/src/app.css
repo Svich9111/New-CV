@@ -159,6 +159,7 @@ fieldset.field { border: 0; padding: 0; margin-left: 0; margin-right: 0; min-wid
 
 /* Приглашение */
 .link-box {
+  display: block;
   font-family: var(--font-mono);
   font-size: var(--font-size-small);
   background: var(--bg-secondary);

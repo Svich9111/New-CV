@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import { FakeServer } from "../test/fakeApi";
 import { fakeTelegram, INIT_DATA } from "../test/fakeTelegram";
 import { heading, renderApp } from "../test/renderApp";
@@ -106,7 +106,7 @@ describe("Тема Telegram (ТЗ §8)", () => {
     await heading("Твой личный агент");
     expect(document.documentElement.dataset.theme).toBe("light");
     tg.webApp.colorScheme = "dark";
-    tg.emit("themeChanged");
+    act(() => tg.emit("themeChanged"));
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
   });
 });

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ApiError } from "../api/client";
+import { ApiError, isRetryable } from "../api/client";
 import { errorText } from "../api/messages";
 import type { InvitePreview } from "../api/types";
 import { INVITE_TOKEN } from "../app/routes";
@@ -25,7 +25,7 @@ export function Incoming({ token }: { token: string }) {
   const { api } = app;
   const wellFormed = INVITE_TOKEN.test(token);
   const [state, setState] = useState<State>(
-    wellFormed ? { kind: "loading" } : { kind: "invalid", text: errorText("not_found"), retry: false },
+    wellFormed ? { kind: "loading" } : { kind: "invalid", text: errorText("not_found", undefined, undefined, "invite"), retry: false },
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -38,7 +38,7 @@ export function Incoming({ token }: { token: string }) {
       (invite) => alive && setState({ kind: "ok", invite }),
       (e: unknown) => {
         if (!alive) return;
-        const retry = !(e instanceof ApiError) || e.status === 0 || e.status >= 500 || e.status === 429;
+        const retry = isRetryable(e);
         setState({ kind: "invalid", text: e instanceof ApiError ? e.message : errorText("internal"), retry });
       },
     );

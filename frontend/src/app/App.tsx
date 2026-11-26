@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Component, Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Api, ApiError } from "../api/client";
 import { errorText } from "../api/messages";
 import type { InviteCreated, Me } from "../api/types";
@@ -17,7 +17,9 @@ import type { TelegramApi } from "../telegram/webapp";
 import { Heading } from "../ui/Heading";
 import { Loading } from "../ui/Notice";
 import type { Route } from "./routes";
-import { AppContext, type AppState, type PendingAccept } from "./store";
+import { MainButton } from "../telegram/MainButton";
+import { Notice } from "../ui/Notice";
+import { AppContext, type AppState, type OnboardingDraft, type PendingAccept } from "./store";
 
 /** Первый экран после входа. */
 export function initialRoute(me: Me, startParam: string | null): Route {
@@ -82,6 +84,7 @@ function Session({ api, tg, initialMe }: { api: Api; tg: TelegramApi; initialMe:
   const [shared, setShared] = useState(false);
   const [pendingAccept, setPendingAccept] = useState<PendingAccept | null>(null);
   const [inviteError, setInviteError] = useState<string | null>(null);
+  const [onboardingDraft, setOnboardingDraft] = useState<OnboardingDraft | null>(null);
 
   const push = useCallback((r: Route) => setStack((s) => [...s, r]), []);
   const reset = useCallback((r: Route) => setStack([r]), []);
@@ -103,12 +106,14 @@ function Session({ api, tg, initialMe }: { api: Api; tg: TelegramApi; initialMe:
       setPendingAccept,
       inviteError,
       setInviteError,
+      onboardingDraft,
+      setOnboardingDraft,
       push,
       reset,
       back,
       canGoBack,
     }),
-    [api, me, invite, shared, pendingAccept, inviteError, push, reset, back, canGoBack],
+    [api, me, invite, shared, pendingAccept, inviteError, onboardingDraft, push, reset, back, canGoBack],
   );
 
   return (
@@ -121,6 +126,53 @@ function Session({ api, tg, initialMe }: { api: Api; tg: TelegramApi; initialMe:
       </Frame>
     </AppContext.Provider>
   );
+}
+
+/** Запасной экран, если экран упал при отрисовке: причина подписью, «Помощь» и перезапуск (ТЗ §9.3). */
+function Crashed({ api, onRestart }: { api: Api; onRestart: () => void }) {
+  const [help, setHelp] = useState(false);
+  return (
+    <Frame onBack={help ? () => setHelp(false) : null} onHelp={help ? null : () => setHelp(true)}>
+      {help ? (
+        <Help api={api} />
+      ) : (
+        <section data-screen="crashed">
+          <Heading>Что-то пошло не так</Heading>
+          <Notice kind="error">
+            Экран не открылся из-за ошибки в приложении. Введённое не отправлено. Перезапусти приложение — если
+            ошибка повторится, закрой его и открой снова.
+          </Notice>
+          <p className="small muted">Если тебе или кому-то рядом опасно — звони 112, это бесплатно и круглосуточно.</p>
+          <MainButton text="Перезапустить" onClick={onRestart} />
+        </section>
+      )}
+    </Frame>
+  );
+}
+
+/**
+ * Граница ошибок: исключение при отрисовке экрана не оставляет пустую страницу без «Помощи».
+ * Ошибка не журналируется (консоль не используется) и не показывается человеку как есть.
+ */
+class Boundary extends Component<{ api: Api; onRestart: () => void; children: ReactNode }, { crashed: boolean }> {
+  state = { crashed: false };
+
+  static getDerivedStateFromError(): { crashed: boolean } {
+    return { crashed: true };
+  }
+
+  render() {
+    if (!this.state.crashed) return this.props.children;
+    return (
+      <Crashed
+        api={this.props.api}
+        onRestart={() => {
+          this.setState({ crashed: false });
+          this.props.onRestart();
+        }}
+      />
+    );
+  }
 }
 
 type Boot = { kind: "loading" } | { kind: "error"; error: ApiError } | { kind: "ready"; me: Me };
@@ -143,6 +195,7 @@ export function App({ tg, api }: { tg: TelegramApi; api: Api }) {
   const [boot, setBoot] = useState<Boot>({ kind: "loading" });
   const [helpBeforeLogin, setHelpBeforeLogin] = useState(false);
   const started = useRef(false);
+  const [generation, setGeneration] = useState(0);
 
   const login = useCallback(() => {
     setBoot({ kind: "loading" });
@@ -184,5 +237,17 @@ export function App({ tg, api }: { tg: TelegramApi; api: Api }) {
     );
   }
 
-  return <TelegramContext.Provider value={tg}>{body}</TelegramContext.Provider>;
+  const restart = useCallback(() => {
+    setHelpBeforeLogin(false);
+    setGeneration((g) => g + 1);
+    if (tg.inside) login();
+  }, [tg, login]);
+
+  return (
+    <TelegramContext.Provider value={tg}>
+      <Boundary api={api} onRestart={restart}>
+        <Fragment key={generation}>{body}</Fragment>
+      </Boundary>
+    </TelegramContext.Provider>
+  );
 }

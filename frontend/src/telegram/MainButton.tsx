@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import { useTelegram } from "./context";
+import { useLayoutEffect, useRef } from "react";
+import { useTelegram, useThemeVersion } from "./context";
 import { cssToken } from "./webapp";
 
 /** Второе касание в течение этого времени игнорируется — пока экран не успел показать «идёт запрос». */
@@ -16,11 +16,14 @@ interface Props {
 /**
  * Главное действие экрана — нативная MainButton Telegram (ТЗ §8). Красный акцент — только здесь.
  * Вне Telegram (или в тестах без SDK) — запасная кнопка в странице с тем же поведением.
- * На экране одновременно не больше одной MainButton.
+ * На экране одновременно не больше одной MainButton. Нативная кнопка обновляется в той же фиксации, что и
+ * страница (layout-эффект): экран и кнопка Telegram не расходятся ни на кадр.
  */
 export function MainButton({ text, onClick, disabled = false, progress = false }: Props) {
   const tg = useTelegram();
   const wa = tg.webApp;
+  // Цвета кнопки — из токенов текущей темы: при смене темы на лету они перечитываются.
+  const theme = useThemeVersion();
   const state = useRef({ onClick, blocked: disabled || progress });
   const lastTap = useRef(0);
 
@@ -33,11 +36,11 @@ export function MainButton({ text, onClick, disabled = false, progress = false }
     state.current.onClick();
   });
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     state.current = { onClick, blocked: disabled || progress };
   });
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!wa) return;
     const mb = wa.MainButton;
     const handler = () => press.current(() => tg.impact("light"));
@@ -50,7 +53,7 @@ export function MainButton({ text, onClick, disabled = false, progress = false }
     };
   }, [wa, tg]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!wa) return;
     const mb = wa.MainButton;
     mb.setText(text);
@@ -63,7 +66,7 @@ export function MainButton({ text, onClick, disabled = false, progress = false }
     else mb.disable();
     if (progress) mb.showProgress(false);
     else mb.hideProgress();
-  }, [wa, text, disabled, progress]);
+  }, [wa, text, disabled, progress, theme]);
 
   if (wa) return null;
   return (

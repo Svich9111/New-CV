@@ -1,9 +1,9 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 
 /** Заголовок экрана; при открытии экрана фокус переходит на него (экранные дикторы читают новый экран). */
 export function Heading({ children }: { children: ReactNode }) {
   const ref = useRef<HTMLHeadingElement>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     ref.current?.focus({ preventScroll: true });
   }, []);
   return (

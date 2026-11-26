@@ -1,4 +1,4 @@
-import { Api, ApiError } from "./client";
+import { Api, ApiError, TIMEOUTS } from "./client";
 import { FakeServer, json } from "../test/fakeApi";
 import { INIT_DATA } from "../test/fakeTelegram";
 
@@ -203,4 +203,148 @@ describe("Api — ошибки по контракту", () => {
     const api = new Api({ initData: () => INIT_DATA, fetch: async () => json(204) });
     await expect(api.helpContacts()).resolves.toBeUndefined();
   });
+});
+
+describe("Api — срок ответа, вид ответа, общий вход (исправления 1.5, р.1)", () => {
+  function hanging(onSignal?: (s: AbortSignal | null | undefined) => void): typeof fetch {
+    return (_i, init) => {
+      onSignal?.(init?.signal);
+      return new Promise<Response>(() => undefined); // сигнал не слушает — срок всё равно должен сработать
+    };
+  }
+
+  test("повисший вход — ApiError timeout через TIMEOUTS.login, запрос прерван сигналом", async () => {
+    vi.useFakeTimers();
+    try {
+      let signal: AbortSignal | null | undefined;
+      const api = new Api({ initData: () => INIT_DATA, fetch: hanging((s) => (signal = s)) });
+      const p = caught(api.login());
+      await vi.advanceTimersByTimeAsync(TIMEOUTS.login - 1);
+      expect(signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const e = await p;
+      expect(e).toMatchObject({ status: 0, code: "timeout" });
+      expect(e.message).toBe("Сервер не ответил вовремя. Проверь интернет и попробуй ещё раз.");
+      expect(signal?.aborted).toBe(true);
+      expect(api.hasSession).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("/help/contacts ждёт недолго (TIMEOUTS.help), остальные пути — TIMEOUTS.default", async () => {
+    expect(TIMEOUTS.help).toBeLessThan(TIMEOUTS.login);
+    expect(TIMEOUTS.login).toBeLessThanOrEqual(TIMEOUTS.default);
+    vi.useFakeTimers();
+    try {
+      const api = new Api({ initData: () => INIT_DATA, fetch: hanging() });
+      const p = caught(api.helpContacts());
+      await vi.advanceTimersByTimeAsync(TIMEOUTS.help);
+      expect((await p).code).toBe("timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("тело, повисшее после заголовков, тоже ограничено сроком", async () => {
+    vi.useFakeTimers();
+    try {
+      const body = new ReadableStream({ start: () => undefined }); // заголовки пришли, тело — нет
+      const api = new Api({ initData: () => INIT_DATA, fetch: async () => new Response(body, { status: 200 }) });
+      const p = caught(api.login());
+      await vi.advanceTimersByTimeAsync(TIMEOUTS.login);
+      expect((await p).code).toBe("timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("срок не срабатывает после ответа (таймер снят)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { api } = setup();
+      await api.login();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  for (const [label, body] of [
+    ["пустое тело", ""],
+    ["HTML", "<html></html>"],
+    ["null", "null"],
+    ["объект не той схемы", '{"inviter_name":"Игорь"}'],
+  ] as const) {
+    test(`2xx «${label}» на GET /invites/{token} — ApiError bad_response`, async () => {
+      const server = new FakeServer();
+      const api = new Api({
+        initData: () => INIT_DATA,
+        fetch: (i, init) => (String(i).includes("/invites/") ? Promise.resolve(new Response(body, { status: 200 })) : server.fetch(i, init)),
+      });
+      await api.login();
+      const e = await caught(api.invite("A".repeat(43)));
+      expect(e).toMatchObject({ status: 200, code: "bad_response" });
+      expect(e.message).toBe("Сервер ответил непонятно. Попробуй ещё раз чуть позже.");
+    });
+  }
+
+  test("204 без тела — успех (пустой ответ по контракту)", async () => {
+    const { server, api } = setup();
+    await api.login();
+    server.inject("GET", "/me", 204);
+    await expect(api.me()).resolves.toBeUndefined();
+  });
+
+  test("m-2: одновременные 401 — один повторный вход на всех, каждый запрос повторён один раз", async () => {
+    const { server, api } = setup();
+    server.onboarded().pendingCouple();
+    await api.login();
+    server.expireSession();
+    const results = await Promise.all([api.me(), api.couple(), api.me()]);
+    expect(results[1]?.status).toBe("pending");
+    expect(server.calls("POST", "/auth/telegram")).toHaveLength(2);
+    expect(server.calls("GET", "/me")).toHaveLength(4);
+    expect(server.calls("GET", "/couple")).toHaveLength(2);
+  });
+
+  test("m-2: вход уже идёт — защищённый запрос ждёт его, а не начинает свой", async () => {
+    const { server, api } = setup();
+    const login = api.login();
+    const me = api.me();
+    await Promise.all([login, me]);
+    expect(server.calls("POST", "/auth/telegram")).toHaveLength(1);
+  });
+
+  test("m-1: тексты зависят от операции — инициатору не советуют «попросить партнёра»", async () => {
+    const { server, api } = setup();
+    server.onboarded();
+    await api.login();
+    const reissue = await caught(api.reissueInvite()); // пары нет — 404 not_found
+    expect(reissue.code).toBe("not_found");
+    expect(reissue.message).not.toMatch(/Попроси партн/);
+    expect(reissue.message).toMatch(/Создай новую ссылку/);
+    const invite = await caught(api.invite("Z".repeat(43)));
+    expect(invite.message).toBe("Приглашение не найдено. Попроси партнёра прислать новую ссылку.");
+    server.inject("GET", "/me", 404, { code: "not_found", message: "x" });
+    expect((await caught(api.me())).message).not.toMatch(/Приглашение/);
+  });
+
+  for (const [seconds, text] of [
+    ["45", "через 45 с."],
+    ["60", "через 1 мин."],
+    ["299", "через 5 мин."],
+    ["3600", "через 1 ч."],
+    ["86400", "через 24 ч."],
+  ] as const) {
+    test(`m-11: Retry-After ${seconds} — «${text}»`, async () => {
+      const { server, api } = setup();
+      server.onboarded();
+      await api.login();
+      server.inject("POST", "/couple", 429, { code: "rate_limited", message: "x" }, { "Retry-After": seconds });
+      const e = await caught(api.createCouple());
+      expect(e.retryAfter).toBe(Number(seconds));
+      expect(e.message.endsWith(text)).toBe(true);
+    });
+  }
 });

@@ -1,5 +1,5 @@
-import { useId, useState } from "react";
-import { ApiError } from "../api/client";
+import { useEffect, useId, useState } from "react";
+import { ApiError, isRetryable } from "../api/client";
 import { errorText } from "../api/messages";
 import type { Me } from "../api/types";
 import { useApp } from "../app/store";
@@ -41,34 +41,71 @@ export function Onboarding() {
   const tg = useTelegram();
   const ids = useId();
   const pending = app.pendingAccept;
-  const [name, setName] = useState(app.me.name ?? tg.firstName.slice(0, MAX));
-  const [addressForm, setAddressForm] = useState(app.me.address_form ?? "");
-  const [partnerName, setPartnerName] = useState(app.me.partner_name ?? pending?.inviterName?.slice(0, MAX) ?? "");
-  const [checks, setChecks] = useState<Record<Consent, boolean>>({
-    consent_terms: false,
-    consent_data: false,
-    consent_sensitive: false,
-    age_confirmed: false,
-  });
+  // Черновик формы хранится в сессии: уход в «Помощь» (экран сам туда отправляет) и «Назад» его не стирают.
+  const draft = app.onboardingDraft;
+  const [name, setName] = useState(draft?.name ?? app.me.name ?? tg.firstName.slice(0, MAX));
+  const [addressForm, setAddressForm] = useState(draft?.addressForm ?? app.me.address_form ?? "");
+  const [partnerName, setPartnerName] = useState(
+    draft?.partnerName ?? app.me.partner_name ?? pending?.inviterName?.slice(0, MAX) ?? "",
+  );
+  const [checks, setChecks] = useState<Record<Consent, boolean>>(
+    draft?.checks ?? { consent_terms: false, consent_data: false, consent_sensitive: false, age_confirmed: false },
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [acceptFailed, setAcceptFailed] = useState(false);
+  /**
+   * Онбординг сохранён, а принять приглашение не удалось. Повтор только принимает приглашение (согласия
+   * второй раз не отправляются); `retry` — помогает ли повтор (сеть, 5xx, 429), иначе остаётся одно
+   * действие — «Продолжить без приглашения».
+   */
+  const [acceptFailed, setAcceptFailed] = useState<{ saved: Me; retry: boolean } | null>(null);
+
+  const { setOnboardingDraft } = app;
+  useEffect(() => {
+    setOnboardingDraft({ name, addressForm, partnerName, checks });
+  }, [name, addressForm, partnerName, checks, setOnboardingDraft]);
 
   const fields = [name, addressForm, partnerName].map((v) => v.trim());
   const fieldsOk = fields.every((v) => v.length > 0 && v.length <= MAX);
   const checksOk = CONSENTS.every((c) => checks[c.key]);
   const valid = fieldsOk && checksOk;
 
+  const consentsOk = CONSENTS.every((c) => c.key === "age_confirmed" || checks[c.key]);
+  // Подсказка про возраст — нейтральная: она сообщает правило, а не просит поставить отметку
+  // (АР-14: форма ответа «мне нет 18» — за оператором).
+  const todo = [!fieldsOk && "заполни все три поля", !consentsOk && "отметь все три согласия"].filter(Boolean);
   const hint = valid
     ? null
-    : !fieldsOk && !checksOk
-      ? "Чтобы продолжить, заполни поля и отметь все четыре пункта."
-      : !fieldsOk
-        ? "Чтобы продолжить, заполни все три поля."
-        : "Чтобы продолжить, отметь все четыре пункта.";
+    : [todo.length ? `Чтобы продолжить, ${todo.join(" и ")}.` : "", checks.age_confirmed ? "" : "Сервис только для взрослых 18+."]
+        .filter(Boolean)
+        .join(" ");
+
+  async function accept(saved: Me, token: string) {
+    try {
+      await app.api.acceptInvite(token);
+      app.setPendingAccept(null);
+      app.setOnboardingDraft(null);
+      app.setMe({ ...saved, has_active_couple: true });
+      tg.notify("success");
+      app.reset({ name: "paired" });
+    } catch (e) {
+      setBusy(false);
+      tg.notify("error");
+      setError(message(e));
+      const retry = isRetryable(e);
+      setAcceptFailed({ saved, retry });
+    }
+  }
+
+  async function retryAccept() {
+    if (!acceptFailed || !pending || busy) return;
+    setBusy(true);
+    setError(null);
+    await accept(acceptFailed.saved, pending.token);
+  }
 
   async function submit() {
-    if (!valid || busy) return;
+    if (!valid || busy || acceptFailed) return;
     setBusy(true);
     setError(null);
     let saved: Me;
@@ -87,6 +124,7 @@ export function Onboarding() {
     } catch (e) {
       setBusy(false);
       if (e instanceof ApiError && e.code === "underage") {
+        app.setOnboardingDraft(null);
         app.reset({ name: "underage" });
         return;
       }
@@ -96,18 +134,7 @@ export function Onboarding() {
     }
 
     if (pending) {
-      try {
-        await app.api.acceptInvite(pending.token);
-        app.setPendingAccept(null);
-        app.setMe({ ...saved, has_active_couple: true });
-        tg.notify("success");
-        app.reset({ name: "paired" });
-      } catch (e) {
-        setBusy(false);
-        tg.notify("error");
-        setError(message(e));
-        setAcceptFailed(true);
-      }
+      await accept(saved, pending.token);
       return;
     }
 
@@ -120,12 +147,14 @@ export function Onboarding() {
       // Пара уже есть (например, создана с другого устройства) — экран приглашения покажет её статус.
       app.setInviteError(e instanceof ApiError && e.code === "already_in_couple" ? null : message(e));
     }
+    app.setOnboardingDraft(null);
     tg.notify("success");
     app.reset({ name: "invite" });
   }
 
   function continueWithoutInvite() {
     app.setPendingAccept(null);
+    app.setOnboardingDraft(null);
     app.reset({ name: "invite" });
   }
 
@@ -133,64 +162,66 @@ export function Onboarding() {
     <section data-screen="onboarding">
       <Heading>Давай познакомимся</Heading>
       <p className="muted">Это нужно агенту, чтобы говорить с тобой по-человечески. Номер телефона не нужен.</p>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void submit();
-        }}
-        noValidate
-      >
-        <div className="field">
-          <label htmlFor={`${ids}-name`}>Твоё имя</label>
-          <input
-            className="input"
-            id={`${ids}-name`}
-            value={name}
-            maxLength={MAX}
-            autoComplete="off"
-            required
-            onChange={(e) => setName(e.target.value)}
-          />
-        </div>
-        <div className="field">
-          <label htmlFor={`${ids}-call`}>Как к тебе обращаться</label>
-          <input
-            className="input"
-            id={`${ids}-call`}
-            value={addressForm}
-            maxLength={MAX}
-            autoComplete="off"
-            required
-            placeholder="Например: Аня, на «ты»"
-            onChange={(e) => setAddressForm(e.target.value)}
-          />
-        </div>
-        <div className="field">
-          <label htmlFor={`${ids}-partner`}>Имя партнёра</label>
-          <input
-            className="input"
-            id={`${ids}-partner`}
-            value={partnerName}
-            maxLength={MAX}
-            autoComplete="off"
-            required
-            onChange={(e) => setPartnerName(e.target.value)}
-          />
-        </div>
-        <fieldset className="field consents">
-          <legend className="label">Согласия</legend>
-          {CONSENTS.map((c) => (
-            <label key={c.key} className="check">
-              <input
-                type="checkbox"
-                checked={checks[c.key]}
-                onChange={(e) => setChecks((prev) => ({ ...prev, [c.key]: e.target.checked }))}
-              />
-              <span>{c.label}</span>
-            </label>
-          ))}
-        </fieldset>
-      </form>
+      {!acceptFailed && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void submit();
+          }}
+          noValidate
+        >
+          <div className="field">
+            <label htmlFor={`${ids}-name`}>Твоё имя</label>
+            <input
+              className="input"
+              id={`${ids}-name`}
+              value={name}
+              maxLength={MAX}
+              autoComplete="off"
+              required
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor={`${ids}-call`}>Как к тебе обращаться</label>
+            <input
+              className="input"
+              id={`${ids}-call`}
+              value={addressForm}
+              maxLength={MAX}
+              autoComplete="off"
+              required
+              placeholder="Например: Аня, на «ты»"
+              onChange={(e) => setAddressForm(e.target.value)}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor={`${ids}-partner`}>Имя партнёра</label>
+            <input
+              className="input"
+              id={`${ids}-partner`}
+              value={partnerName}
+              maxLength={MAX}
+              autoComplete="off"
+              required
+              onChange={(e) => setPartnerName(e.target.value)}
+            />
+          </div>
+          <fieldset className="field consents">
+            <legend className="label">Согласия</legend>
+            {CONSENTS.map((c) => (
+              <label key={c.key} className="check">
+                <input
+                  type="checkbox"
+                  checked={checks[c.key]}
+                  onChange={(e) => setChecks((prev) => ({ ...prev, [c.key]: e.target.checked }))}
+                />
+                <span>{c.label}</span>
+              </label>
+            ))}
+          </fieldset>
+        </form>
+      )}
       <Notice>
         Сервис не оказывает психологических и медицинских услуг. Тексты правил и согласий готовит юрист — они
         появятся в разделе «Помощь» до запуска.
@@ -200,16 +231,22 @@ export function Onboarding() {
       )}
       {error && <Notice kind="error">{error}</Notice>}
       {acceptFailed && (
-        <button type="button" className="btn btn--block btn--ghost" onClick={continueWithoutInvite}>
-          Продолжить без приглашения
-        </button>
+        <>
+          <p className="small muted">Знакомство сохранено — заполнять заново не нужно.</p>
+          <button type="button" className="btn btn--block btn--ghost" onClick={continueWithoutInvite}>
+            Продолжить без приглашения
+          </button>
+          {acceptFailed.retry && (
+            <MainButton text="Принять приглашение снова" progress={busy} onClick={() => void retryAccept()} />
+          )}
+        </>
       )}
-      {hint && (
+      {!acceptFailed && hint && (
         <p className="main-hint" role="status">
           {hint}
         </p>
       )}
-      <MainButton text="Продолжить" disabled={!valid} progress={busy} onClick={() => void submit()} />
+      {!acceptFailed && <MainButton text="Продолжить" disabled={!valid} progress={busy} onClick={() => void submit()} />}
     </section>
   );
 }
