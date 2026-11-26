@@ -3,7 +3,7 @@
  * `Api.memoryList` и `Api.memoryDelete` на заглушке сервера.
  */
 import { Api, ApiError } from "./client";
-import { MEMORY_TYPES, isDay, isMemoryItem, isMemoryList } from "./memory";
+import { MEMORY_TYPES, isDateTime, isDay, isMemoryItem, isMemoryList } from "./memory";
 import { FakeServer } from "../test/fakeApi";
 import { INIT_DATA } from "../test/fakeTelegram";
 
@@ -77,6 +77,53 @@ describe("isMemoryItem — неверные", () => {
   test("isDay: только YYYY-MM-DD существующего дня", () => {
     expect(isDay("2026-12-31")).toBe(true);
     for (const v of ["2026-13-01", "2026-00-10", "2026-1-01", "26-01-01", "", null]) expect(isDay(v)).toBe(false);
+  });
+});
+
+describe("isDay и isDateTime — строго по контракту (A8-1, A8-3)", () => {
+  test("isDay: годы 1–99 — существующие дни (Date.UTC не сдвигает их в 1900-е)", () => {
+    for (const v of ["0001-01-01", "0050-03-01", "0099-12-31", "0004-02-29"]) expect(isDay(v), v).toBe(true);
+    for (const v of ["0000-01-01", "0050-02-29", "0099-02-30"]) expect(isDay(v), v).toBe(false);
+  });
+
+  test("isDateTime: RFC 3339 с временем и поясом", () => {
+    for (const v of [
+      "2026-11-01T09:00:00Z",
+      "2026-11-01T09:00:00.123Z",
+      "2026-11-01T09:00:00.123456+00:00",
+      "2026-11-01T12:00:00+03:00",
+      "2026-11-01t09:00:00z",
+      "2026-11-01 09:00:00-05:30",
+      "2016-12-31T23:59:60Z",
+      "0050-03-01T00:00:00Z",
+    ])
+      expect(isDateTime(v), v).toBe(true);
+  });
+
+  test("isDateTime: «1», «2026», «Nov 5», без пояса, без времени, несуществующие день и время — отвергаются", () => {
+    for (const v of [
+      "1",
+      "2026",
+      "Nov 5",
+      "Nov 5, 2026 09:00:00 GMT",
+      "2026-11-01",
+      "2026-11-01T09:00:00",
+      "2026-11-01T09:00Z",
+      "2026-02-30T09:00:00Z",
+      "2026-11-01T24:00:00Z",
+      "2026-11-01T09:60:00Z",
+      "2026-11-01T09:00:61Z",
+      "2026-11-01T09:00:00+24:00",
+      "2026-11-01T09:00:00+0300",
+      " 2026-11-01T09:00:00Z",
+      1730451600000,
+      null,
+    ])
+      expect(isDateTime(v), String(v)).toBe(false);
+  });
+
+  test("isMemoryItem отвергает created_at, который понимает Date.parse, но не контракт", () => {
+    for (const created_at of ["1", "2026", "Nov 5"]) expect(isMemoryItem({ ...ok, created_at }), created_at).toBe(false);
   });
 });
 
@@ -164,11 +211,35 @@ describe("Api.memoryDelete", () => {
     expect((await a.memoryList()).map((i) => i.id)).not.toContain(id);
   });
 
-  test("чужая и несуществующая запись — 404 → gone", async () => {
+  test("чужая запись (есть в хранилище, владелец — партнёр) — 404 → gone, запись партнёра цела", async () => {
     const { a, server } = await api(new FakeServer().onboarded().seedMemory());
-    const [partnerId] = [...server.partnerMemory];
-    expect(await a.memoryDelete(partnerId)).toBe("gone");
+    const partner = server.partnerMemoryItems[0];
+    expect(await a.memoryDelete(partner.id)).toBe("gone");
+    expect(server.partnerMemoryItems).toContainEqual(partner);
+    expect(server.deletedMemory.has(partner.id)).toBe(false);
+    expect((await a.memoryList()).map((i) => i.id)).not.toContain(partner.id);
+    // Своя запись при этом не тронута.
+    expect((await a.memoryList()).map((i) => i.id)).toEqual(server.memory.map((m) => m.id));
+  });
+
+  test("несуществующая запись — 404 → gone (ответ неотличим от чужой)", async () => {
+    const { a, server } = await api(new FakeServer().onboarded().seedMemory());
+    const before = server.memory.length;
     expect(await a.memoryDelete("30000000-0000-4000-8000-00000000dead")).toBe("gone");
+    expect(server.memory).toHaveLength(before);
+  });
+
+  test("404 не от API (HTML, пустое тело, иной код) — ApiError, а не gone; запись на сервере цела (A8-2)", async () => {
+    const { a, server } = await api(new FakeServer().onboarded().seedMemory());
+    const id = server.memory[0].id;
+    for (const body of ["<html>Not Found</html>", undefined, { code: "route_missing", message: "x" }]) {
+      server.inject("DELETE", `/memory/${id}`, 404, body);
+      const e = await err(a.memoryDelete(id));
+      expect(e.status).toBe(404);
+      expect(e.code).not.toBe("not_found");
+    }
+    expect(server.deletedMemory.has(id)).toBe(false);
+    expect((await a.memoryList()).map((i) => i.id)).toContain(id);
   });
 
   test("id кодируется в пути", async () => {

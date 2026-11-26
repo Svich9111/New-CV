@@ -335,7 +335,9 @@ export class Api {
       });
       return "deleted";
     } catch (e) {
-      if (e instanceof ApiError && e.status === 404) return "gone";
+      // «Уже удалено» — только 404 API с кодом `not_found` (контракт `NotFound`); 404 прокси или чужой страницы —
+      // ошибка: запись на сервере может быть цела (A8-2).
+      if (e instanceof ApiError && e.status === 404 && e.code === "not_found") return "gone";
       throw e;
     }
   }

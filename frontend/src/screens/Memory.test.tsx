@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { FakeServer } from "../test/fakeApi";
 import { fakeTelegram } from "../test/fakeTelegram";
 import { heading, renderApp, type Rendered } from "../test/renderApp";
-import { CONFIRM_TEXT } from "./Memory";
+import { CONFIRM_TEXT, NAME_LIMIT, shortName } from "./Memory";
 
 const FACT = "Работает дизайнером, по вторникам часто задерживается";
 const OBSERVATION = "Чаще пишет поздно вечером";
@@ -147,8 +147,25 @@ describe("Категории и подписи (ТЗ §6.3, ФТ-14)", () => {
 });
 
 describe("Приватность на экране (ТЗ §8, §2 п.4)", () => {
-  test("пояснение «Партнёр и его агент этого не видят» — и при загрузке, и при ошибке", async () => {
-    await openMemory();
+  test("пояснение «Партнёр и его агент этого не видят» — пока память загружается и после загрузки", async () => {
+    const server = pairedServer().seedMemory();
+    // Ответ на GET /memory задержан, пока тест его не отпустит.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((res) => (release = res));
+    const real = server.fetch;
+    server.fetch = async (input, init) => {
+      const path = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url, "http://app.test").pathname;
+      if ((init?.method ?? "GET") === "GET" && path.endsWith("/memory")) await held;
+      return real(input, init);
+    };
+    const r = renderApp({ server });
+    await heading("Вы пара");
+    await r.user.click(screen.getByRole("button", { name: /Что агент помнит/ }));
+    await heading("Что агент помнит");
+    expect(screen.getByText("Загружаем память…")).toBeInTheDocument();
+    expect(screen.getByText("Партнёр и его агент этого не видят.")).toBeInTheDocument();
+    await act(async () => release());
+    expect(await screen.findByText(FACT)).toBeInTheDocument();
     expect(screen.getByText("Партнёр и его агент этого не видят.")).toBeInTheDocument();
   });
 
@@ -197,9 +214,10 @@ describe("Удаление: подтверждение и 204", () => {
     expect(screen.queryByText(FACT)).toBeNull();
   });
 
-  test("подтверждение текстом не обещает очистку сводок и реплик (АР-37 ждёт оператора)", () => {
-    expect(CONFIRM_TEXT).toMatch(/навсегда/);
-    expect(CONFIRM_TEXT).not.toMatch(/сводк|реплик|переписк/i);
+  test("подтверждение обещает ровно то, что гарантирует ТЗ §6.3 (MAJOR-1 ревью 2.5; АР-37 ждёт оператора)", () => {
+    // §6.3: «не восстанавливается и не извлекается повторно из старых диалогов» — и ничего сверх этого.
+    expect(CONFIRM_TEXT).toBe("Удалить навсегда? Запись не восстановится, и агент не извлечёт её снова из прошлых разговоров.");
+    expect(CONFIRM_TEXT).not.toMatch(/не запомн|не вспомн|забуд|забыв|сводк|реплик|переписк/i);
   });
 
   test("удалена последняя запись — экран объясняет, что памяти нет", async () => {
@@ -288,6 +306,18 @@ describe("Удаление: ошибки", () => {
     await r.user.click(within(row(FACT)).getByRole("button", { name: /^Повторить удаление/ }));
     await waitFor(() => expect(screen.queryByText(FACT)).toBeNull());
     expect(server.deletedMemory.has(id)).toBe(true);
+  });
+
+  test("404 не от API (страница прокси) — запись на месте, ошибка и «Повторить», а не «уже удалена» (A8-2)", async () => {
+    const server = pairedServer().seedMemory();
+    const id = server.memory.find((m) => m.text === FACT)!.id;
+    server.inject("DELETE", `/memory/${id}`, 404, "<html>Not Found</html>");
+    const r = await openMemory(server);
+    await confirmDelete(r, FACT);
+    expect(await within(row(FACT)).findByRole("alert")).toBeInTheDocument();
+    expect(screen.queryByText("Эта запись уже была удалена.")).toBeNull();
+    expect(within(row(FACT)).getByRole("button", { name: /^Повторить удаление/ })).toBeInTheDocument();
+    expect(server.deletedMemory.has(id)).toBe(false);
   });
 
   test("5xx — запись на месте, подпись нейтральная (без красного), «Повторить»", async () => {
@@ -404,6 +434,34 @@ describe("Доступность", () => {
     expect(delBtn(FACT)).toHaveAccessibleName(`Удалить запись: «${FACT}» (Факты)`);
     expect(delBtn(OBSERVATION)).toHaveAccessibleName(`Удалить запись: «${OBSERVATION}» (Наблюдения агента)`);
     expect(screen.getByRole("list", { name: "Факты" })).toBeInTheDocument();
+  });
+
+  test("длинная запись: в доступном имени «Удалить»/«Повторить» — первые знаки текста с «…», а не весь текст (MINOR-4)", async () => {
+    const long = "Тяжело переживает, когда планы на выходные меняются в последний момент без объяснения причин и без извинений";
+    expect(Array.from(long).length).toBeGreaterThan(NAME_LIMIT);
+    const server = pairedServer();
+    const item = server.addMemory({ type: "sensitive_topic", text: long });
+    server.inject("DELETE", `/memory/${item.id}`, 503, { code: "service_unavailable", message: "x" });
+    const r = await openMemory(server);
+    const btn = delBtn(long);
+    const name = `Удалить запись: «${shortName(long)}» (Чувствительные темы)`;
+    expect(btn).toHaveAccessibleName(name);
+    expect(shortName(long).endsWith("…")).toBe(true);
+    expect(Array.from(shortName(long)).length).toBeLessThanOrEqual(NAME_LIMIT);
+    expect(long.startsWith(shortName(long).slice(0, -1))).toBe(true);
+    // Сам текст записи на экране — целиком.
+    expect(screen.getByText(long)).toBeInTheDocument();
+    await confirmDelete(r, long);
+    const retry = await within(row(long)).findByRole("button", { name: /^Повторить удаление/ });
+    expect(retry).toHaveAccessibleName(`Повторить удаление: «${shortName(long)}» (Чувствительные темы)`);
+  });
+
+  test("shortName: короткий текст без изменений; обрезка по знакам, а не по UTF-16", () => {
+    expect(shortName("Чаще пишет поздно вечером")).toBe("Чаще пишет поздно вечером");
+    const exact = "я".repeat(NAME_LIMIT);
+    expect(shortName(exact)).toBe(exact);
+    const emoji = "🙂".repeat(NAME_LIMIT + 5);
+    expect(shortName(emoji)).toBe(`${"🙂".repeat(NAME_LIMIT - 1)}…`);
   });
 
   test("подтверждение: фокус на «Отмена»; после отмены — снова на «Удалить» этой записи", async () => {

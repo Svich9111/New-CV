@@ -172,19 +172,11 @@ describe("A8: поддельные данные в ответе (контрак�
   // ДЕФЕКТ A8-1 (MAJOR): запись с датой события года < 100 (законная `format: date`, сервер её отдаёт — см.
   // backend/tests/test_memory_a8_2_5.py::test_server_emits_event_date_with_year_below_100) делает весь экран
   // «Память пришла с ошибкой»: человек не видит и не может удалить ни одной записи (ТЗ §2 п.6, ФТ-13).
-  test.fails("запись «год 50» не блокирует экран: остальные записи видны и удаляются", async () => {
+  test("запись «год 50» не блокирует экран: остальные записи видны и удаляются", async () => {
     const server = pairedServer().seedMemory();
     server.addMemory({ type: "date", text: "День основания города", event_date: "0050-03-01" });
     await openMemory(server);
     expect(screen.queryByText(/Память пришла с ошибкой/)).toBeNull();
     expect(screen.getByText(FACT)).toBeInTheDocument();
-  });
-
-  test("фиксация дефекта A8-1 как есть: экран «Память пришла с ошибкой», записей нет", async () => {
-    const server = pairedServer().seedMemory();
-    server.addMemory({ type: "date", text: "День основания города", event_date: "0050-03-01" });
-    await openMemory(server);
-    expect(screen.getByText(/Память пришла с ошибкой/)).toBeInTheDocument();
-    expect(document.querySelectorAll("[data-memory-id]")).toHaveLength(0);
   });
 });

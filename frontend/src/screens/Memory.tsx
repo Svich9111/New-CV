@@ -40,9 +40,21 @@ const BADGE: Partial<Record<MemoryItem["source"], string>> = {
 
 /**
  * Текст подтверждения не обещает больше, чем делает сервер (АР-37 на подтверждении оператора): запись удаляется
- * навсегда и не извлекается повторно (ТЗ §6.3). Про краткие сводки и недавние реплики — ничего.
+ * навсегда и не извлекается повторно из прошлых разговоров (ТЗ §6.3) — и только это. «Не запомнит» и «не вспомнит»
+ * обещали бы больше: то же, сказанное в новом разговоре, агент вправе запомнить снова, а про краткие сводки и недавние
+ * реплики решение ещё не принято (MAJOR-1 ревью 2.5, раунд 1).
  */
-export const CONFIRM_TEXT = "Удалить навсегда? Запись не восстановится, и агент не запомнит это снова.";
+export const CONFIRM_TEXT = "Удалить навсегда? Запись не восстановится, и агент не извлечёт её снова из прошлых разговоров.";
+
+/** Сколько знаков текста записи входит в доступное имя кнопок «Удалить»/«Повторить» (MINOR-4 ревью 2.5). */
+export const NAME_LIMIT = 60;
+
+/** Текст записи для доступного имени: длинный обрезается по знакам (не по UTF-16) с «…» в конце. */
+export function shortName(text: string): string {
+  const chars = Array.from(text);
+  if (chars.length <= NAME_LIMIT) return text;
+  return `${chars.slice(0, NAME_LIMIT - 1).join("").trimEnd()}…`;
+}
 
 /** Ниже этого уровня уверенности вывод агента помечается «агент не уверен» (вопрос 3 карточки 2.5). */
 export const LOW_CONFIDENCE = 0.5;
@@ -186,7 +198,7 @@ export function Memory() {
     const badge = BADGE[m.source];
     const meta = [`Источник: ${SOURCE[m.source]}`, formatDay(m.created_at)];
     if (m.source === "agent_inference" && m.confidence < LOW_CONFIDENCE) meta.push("агент не уверен");
-    const name = text === null ? "текст записи недоступен" : `«${text}»`;
+    const name = text === null ? "текст записи недоступен" : `«${shortName(text)}»`;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") cancel(m.id);
     };

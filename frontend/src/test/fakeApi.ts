@@ -199,8 +199,26 @@ export class FakeServer {
   memory: MemoryItem[] = [];
   /** id удалённых записей: повторный `GET` их не возвращает, повторный `DELETE` — 404 (функция БД, АР-36). */
   deletedMemory = new Set<string>();
-  /** id записей партнёра: «мне» не видны, удалить нельзя — 404, как несуществующая (контракт). */
-  partnerMemory = new Set<string>(["30000000-0000-4000-8000-0000000000ff"]);
+  /**
+   * Записи партнёра — в том же хранилище заглушки, что и мои, но с другим владельцем (как строки одной таблицы на
+   * сервере): «мне» не видны, удалить нельзя — 404 из проверки владельца, неотличимый от несуществующей записи
+   * (контракт). Запись при этом цела (MINOR-3 ревью 2.5).
+   */
+  partnerMemoryItems: MemoryItem[] = [
+    {
+      id: "30000000-0000-4000-8000-0000000000ff",
+      type: "fact",
+      text: "Запись партнёра: выдуманный факт",
+      event_date: null,
+      source: "owner_dialog",
+      confidence: 0.9,
+      created_at: "2026-11-01T09:00:00.000Z",
+    },
+  ];
+  /** id записей партнёра. */
+  get partnerMemory(): Set<string> {
+    return new Set(this.partnerMemoryItems.map((m) => m.id));
+  }
   private memorySeq = 0;
 
   /** Запись памяти (выдуманный текст); по умолчанию — факт из диалога с владельцем. */
@@ -242,8 +260,14 @@ export class FakeServer {
   }
 
   private memoryDelete(id: string): Response {
-    const own = this.memory.find((m) => m.id === id);
-    if (!own || this.deletedMemory.has(id) || this.partnerMemory.has(id)) return json(404, err("not_found", "Не найдено"));
+    // Поиск по всему хранилищу, затем проверка владельца — как `delete_memory_item` на сервере.
+    const row =
+      this.memory.find((m) => m.id === id) !== undefined
+        ? { owner: "me" as const }
+        : this.partnerMemoryItems.find((m) => m.id === id) !== undefined
+          ? { owner: "partner" as const }
+          : null;
+    if (row === null || row.owner !== "me" || this.deletedMemory.has(id)) return json(404, err("not_found", "Не найдено"));
     this.deletedMemory.add(id);
     this.memory = this.memory.filter((m) => m.id !== id);
     return json(204, undefined, { "Cache-Control": "no-store" });
