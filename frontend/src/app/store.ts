@@ -50,6 +50,11 @@ export interface AppState {
   reset(route: Route): void;
   /** Заменить верхний экран: «Назад» после него ведёт туда же, куда вёл бы с заменённого (черновик → лента). */
   replace(route: Route): void;
+  /**
+   * Вернуться к уже открытому экрану `route.name` (стек срезается до него), а если его в стеке нет — как `replace`.
+   * После «Отправить» из «лента → чат → черновик» в стеке одна лента, а не две (ревью 3.4 MINOR-3).
+   */
+  backTo(route: Route): void;
   back(): void;
   canGoBack: boolean;
 }

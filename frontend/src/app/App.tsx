@@ -37,7 +37,10 @@ export function initialRoute(me: Me, startParam: string | null): Route {
 }
 
 function routeKey(r: Route): string {
-  return r.name === "welcome" ? `welcome-${r.slide}` : r.name;
+  if (r.name === "welcome") return `welcome-${r.slide}`;
+  // Черновик для другого ответа — другой экран: состояние прежнего черновика не переносится (ревью 3.4 BLOCKER-1).
+  if (r.name === "draft") return `draft-${r.replyTo ?? "new"}`;
+  return r.name;
 }
 
 /** Каркас экрана: «Назад», содержимое, ссылка на «Помощь» — на каждом экране (ТЗ §9.3). */
@@ -140,6 +143,14 @@ function Session({
   const reset = useCallback((r: Route) => setStack([r]), []);
   const replace = useCallback((r: Route) => setStack((s) => [...s.slice(0, -1), r]), []);
   const back = useCallback(() => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s)), []);
+  const backTo = useCallback(
+    (r: Route) =>
+      setStack((s) => {
+        for (let i = s.length - 2; i >= 0; i -= 1) if (s[i].name === r.name) return s.slice(0, i + 1);
+        return [...s.slice(0, -1), r];
+      }),
+    [],
+  );
 
   const route = stack.length > 0 ? stack[stack.length - 1] : null;
   const canGoBack = stack.length > 1;
@@ -166,9 +177,10 @@ function Session({
         reset,
         replace,
         back,
+        backTo,
         canGoBack,
       },
-    [api, me, invite, shared, pendingAccept, inviteError, onboardingDraft, chat, couple, push, reset, replace, back, canGoBack],
+    [api, me, invite, shared, pendingAccept, inviteError, onboardingDraft, chat, couple, push, reset, replace, back, backTo, canGoBack],
   );
 
   if (!state || !route) {

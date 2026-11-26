@@ -291,7 +291,7 @@ describe("A8 · гонки send / regenerate / PATCH (§10, ФТ-08)", () => {
     expect(r.server.feed).toHaveLength(0);
   });
 
-  test.fails("ДЕФЕКТ A8-3.4-1: regenerate 409 not_editable при черновике в статусе draft — правка не должна пропадать с экрана", async () => {
+  test("ДЕФЕКТ A8-3.4-1: regenerate 409 not_editable при черновике в статусе draft — правка не должна пропадать с экрана", async () => {
     const r = await openDraft();
     const d = [...r.server.draftRows.values()][0];
     r.server.draftRows.set(d.id, { ...d, text: "Правка из второй вкладки", version: 2 });
@@ -471,7 +471,7 @@ describe("A8 · инструкции и разметка в тексте чер�
 });
 
 describe("A8 · независимое подтверждение замечаний ревью 3.4-r1", () => {
-  test.fails("ДЕФЕКТ A8-3.4-2 (= BLOCKER-1 ревью): опоздавший POST /drafts ответа подменяет показанный черновик — «Отправить» шлёт чужой", async () => {
+  test("ДЕФЕКТ A8-3.4-2 (= BLOCKER-1 ревью): опоздавший POST /drafts ответа подменяет показанный черновик — «Отправить» шлёт чужой", async () => {
     const server = pairedServer();
     const g = gates(server);
     const m1 = server.addFeed({ author: "partner", original: "Входящее для ответа", status: "read" });
@@ -502,7 +502,7 @@ describe("A8 · независимое подтверждение замечан
     expect(sends(r).map((s) => s.path)).toEqual([`/drafts/${b.id}/send`]);
   });
 
-  test.fails("ДЕФЕКТ A8-3.4-3 (= MINOR-2 ревью): 2500 эмодзи (2500 символов ≤ 4000) — «Отправить» должна быть доступна", async () => {
+  test("ДЕФЕКТ A8-3.4-3 (= MINOR-2 ревью): 2500 эмодзи (2500 символов ≤ 4000) — «Отправить» должна быть доступна", async () => {
     const r = await openDraft(pairedServer().draftReply({ kind: "draft", text: "😀".repeat(2500) }));
     expect([...field().value].length).toBe(2500);
     expect(r.tg!.main.active).toBe(true);

@@ -2,7 +2,7 @@
  * A4, задача 3.4 — экран «Черновик» (ФТ-07, ФТ-08; ТЗ §2 п.2, §4.3, §8, §9.3, §10) на заглушке API по контракту.
  * Главный страж: `POST /drafts/{id}/send` уходит только после нажатия «Отправить». Тексты выдуманные.
  */
-import { cleanup, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { CONTACTS, FakeServer } from "../test/fakeApi";
 import { fakeTelegram } from "../test/fakeTelegram";
 import { heading, renderApp, type Rendered } from "../test/renderApp";
@@ -196,10 +196,17 @@ describe("ФТ-08, §2 п.2: send — только по нажатию «Отп�
     expect(sends(r)).toHaveLength(0);
   });
 
-  test("поле ограничено 4000 знаками; счётчик с 3500", async () => {
-    await openDraft(pairedServer().draftReply({ kind: "draft", text: "а".repeat(3600) }));
-    expect(field()).toHaveAttribute("maxLength", "4000");
+  test("поле ограничено 4000 символами Unicode, как на сервере; счётчик с 3500 (ревью 3.4 MINOR-2)", async () => {
+    const r = await openDraft(pairedServer().draftReply({ kind: "draft", text: "а".repeat(3600) }));
     expect(screen.getByText("3600 из 4000 символов")).toBeInTheDocument();
+    // Вставка сверх предела обрезается до 4000 символов; эмодзи — один символ и не режется пополам.
+    fireEvent.change(field(), { target: { value: "😀".repeat(3999) + "аб" } });
+    expect([...field().value]).toHaveLength(4000);
+    expect(field().value).toBe("😀".repeat(3999) + "а");
+    expect(screen.getByText("4000 из 4000 символов")).toBeInTheDocument();
+    expect(r.tg!.main.active).toBe(true);
+    fireEvent.change(field(), { target: { value: "а".repeat(3999) + "😀😀" } });
+    expect(field().value).toBe("а".repeat(3999) + "😀");
   });
 });
 

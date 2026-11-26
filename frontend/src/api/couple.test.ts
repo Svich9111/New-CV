@@ -261,9 +261,20 @@ describe("Протокол помощи под остановленным соо
   test.each(Object.keys(CRISIS_BLOCKS))("блок %s совпадает с prompts/crisis.v2.md", (name) => {
     expect(CRISIS_BLOCKS[name as keyof typeof CRISIS_BLOCKS]).toBe(block(name));
   });
-  test("выбор блоков по типу: отправителю — без «вина не на тебе»; остальным — «не отправлено» первым", () => {
-    expect(crisisBlocks("threat_outgoing")).toEqual(["outgoing_threat"]);
-    for (const k of ["violence", "self_harm", "life_threat", null, undefined] as const) expect(crisisBlocks(k)[0]).toBe("not_sent");
+  test("консервативный выбор блоков по главному типу (ревью 3.4 MAJOR-1): «не отправлено» первым всегда", () => {
+    expect(crisisBlocks("threat_outgoing")).toEqual(["not_sent", "outgoing_threat_brief", "author_safety"]);
+    expect(crisisBlocks("violence")).toEqual(["not_sent", "author_safety"]);
+    expect(crisisBlocks("self_harm")).toEqual(["not_sent", "self_harm", "author_safety"]);
+    expect(crisisBlocks("life_threat")).toEqual(["not_sent", "author_safety_life"]);
     expect(crisisBlocks(null)).toEqual(["not_sent", "author_safety"]);
+    expect(crisisBlocks(undefined)).toEqual(["not_sent", "author_safety"]);
+  });
+  test("блоков, которые crisis.respond запрещает при смешанном наборе, на клиенте нет вовсе", () => {
+    // violence («вина не на тебе»), life_threat («твоя жизнь в опасности») — при угрозе от автора; полный
+    // outgoing_threat / outgoing_threat_mixed («вернёмся к разговору») — при self_harm (R2-MAJOR-1, R5-MAJOR-1).
+    for (const name of ["violence", "life_threat", "outgoing_threat", "outgoing_threat_mixed"]) expect(name in CRISIS_BLOCKS).toBe(false);
+    const all = Object.values(CRISIS_BLOCKS).join("\n");
+    for (const phrase of ["Вина за это не на тебе", "Твоя жизнь сейчас в опасности", "вернёмся к разговору", "подумаем, как сказать"])
+      expect(all).not.toContain(phrase);
   });
 });

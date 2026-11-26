@@ -61,13 +61,21 @@ describe("Отправленные — свой оригинал и статус
 });
 
 describe("Не доставлено — причина подписью (АР-44, Б-86)", () => {
+  // Консервативный набор по главному типу (ревью 3.4 MAJOR-1): клиент не знает остальных признаков.
   const CRISES = [
-    ["threat_outgoing", ["outgoing_threat"]],
-    ["violence", ["not_sent", "violence"]],
-    ["self_harm", ["not_sent", "self_harm"]],
-    ["life_threat", ["not_sent", "life_threat"]],
+    ["threat_outgoing", ["not_sent", "outgoing_threat_brief", "author_safety"]],
+    ["violence", ["not_sent", "author_safety"]],
+    ["self_harm", ["not_sent", "self_harm", "author_safety"]],
+    ["life_threat", ["not_sent", "author_safety_life"]],
     [null, ["not_sent", "author_safety"]],
   ] as const;
+  /** Фразы блоков, которые `crisis.respond` запрещает хотя бы при одном наборе признаков с этим главным типом. */
+  const FORBIDDEN = [
+    "Вина за это не на тебе", // violence — только пострадавшему, нельзя при угрозе от автора
+    "Твоя жизнь сейчас в опасности", // life_threat — то же
+    "Давай вернёмся к разговору", // outgoing_threat(_mixed) — нельзя при self_harm
+    "подумаем, как сказать", // outgoing_threat — нельзя при смешанном наборе
+  ];
   for (const [kind, blocks] of CRISES) {
     test(`safety / ${kind ?? "null"}: «Не отправлено», протокол целиком, контакты и 112`, async () => {
       const server = pairedServer();
@@ -78,6 +86,7 @@ describe("Не доставлено — причина подписью (АР-44
       const help = within(li).getByRole("region", { name: "Контакты помощи" });
       for (const b of blocks) expect(within(help).getByText(CRISIS_BLOCKS[b])).toBeInTheDocument();
       expect(help.querySelectorAll(".crisis__text")).toHaveLength(blocks.length);
+      for (const phrase of FORBIDDEN) expect(li).not.toHaveTextContent(phrase);
       expect(await within(help).findByRole("link", { name: "112" })).toHaveAttribute("href", "tel:112");
       await waitFor(() => expect(r.server.calls("GET", "/help/contacts")).toHaveLength(1));
       // Ошибка и «не доставлено» — нейтрально: без красной линии карточки партнёра.

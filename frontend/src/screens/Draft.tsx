@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiError, isRetryable } from "../api/client";
-import { DRAFT_MAX, WISH_MAX, type CrisisView, type DraftResult } from "../api/couple";
+import { DRAFT_MAX, WISH_MAX, charCount, clipChars, type CrisisView, type DraftResult } from "../api/couple";
 import { errorText, type Op } from "../api/messages";
 import type { Draft as DraftData } from "../api/types";
 import { useApp } from "../app/store";
@@ -38,6 +38,11 @@ type Busy = "regenerate" | "send" | "reject" | null;
 
 const codeOf = (e: unknown) => (e instanceof ApiError ? e.code : "internal");
 const textOf = (e: unknown, op: Op) => (e instanceof ApiError ? e.message : errorText("internal", undefined, undefined, op));
+/** 409 `not_editable` на «Другом варианте», когда черновик ещё `draft`: его изменили, пока агент писал вариант. */
+const REGEN_CHANGED =
+  "Черновик изменился, пока агент писал другой вариант: в поле — его актуальный текст. Партнёру ничего не отправлено.";
+/** Показанный черновик расходится с памятью сессии — отправка не выполняется. */
+const STALE = "Этот черновик уже не текущий — партнёру ничего не отправлено. Вернись в чат и открой черновик заново.";
 /** Ошибки, после которых стоит показать строку о помощи со 112: отказ модели мог быть кризисом (АР-34 п.2). */
 const HELP_CODES = new Set(["llm_refusal", "blocked_by_safety"]);
 
@@ -48,14 +53,22 @@ function reusable(couple: CoupleSession, replyTo: string | null): DraftMemory | 
   return (d.draft.reply_to_id ?? null) === replyTo ? d : null;
 }
 
-/** `POST /drafts` — один на открытие экрана (повторный запуск эффекта ждёт тот же запрос). */
+/**
+ * `POST /drafts` — один на открытие экрана (повторный запуск эффекта ждёт тот же запрос).
+ *
+ * Ответ запоминается в сессии, только если запрос ещё текущий: человек мог уйти и открыть черновик для другого
+ * ответа (`replyTo`), и тогда `couple.creating` уже указывает на новый запрос. Опоздавший ответ прежнего запроса
+ * память сессии не трогает — иначе он подменил бы показанный черновик (ревью 3.4 BLOCKER-1, A8-3.4-2). Такой
+ * черновик остаётся на сервере в статусе `draft` без доступа с экрана (до `GET /drafts`, предложение A1 № 3).
+ */
 function create(couple: CoupleSession, api: ReturnType<typeof useApp>["api"], replyTo: string | null): Promise<DraftResult> {
   if (couple.creating && couple.creating.replyTo === replyTo) return couple.creating.promise;
   const promise = api.draftCreate(replyTo).then(
     (r) => {
-      if (couple.creating?.promise === promise) couple.creating = null;
-      // Черновик запоминается, даже если человек ушёл с экрана, — вернувшись, он увидит его, а не новый запрос.
-      if (r.kind === "draft") couple.setDraft({ draft: r.draft, text: r.draft.text, lostEdit: null });
+      const current = couple.creating?.promise === promise;
+      if (current) couple.creating = null;
+      // Текущий запрос запоминается, даже если человек ушёл с экрана, — вернувшись, он увидит черновик, а не новый запрос.
+      if (current && r.kind === "draft") couple.setDraft({ draft: r.draft, text: r.draft.text, lostEdit: null });
       return r;
     },
     (e: unknown) => {
@@ -96,7 +109,7 @@ function Crisis({ view, onHelp, onChat }: { view: CrisisView; onHelp: () => void
  * она остаётся в памяти сессии и снова видна при возврате. Отправка подтверждает ровно показанную версию.
  */
 export function Draft({ replyTo }: { replyTo: string | null }) {
-  const { api, me, couple, chat, back, push, replace } = useApp();
+  const { api, me, couple, chat, back, backTo, push } = useApp();
   const tg = useTelegram();
   const textId = useId();
   const counterId = useId();
@@ -134,7 +147,9 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
           setLive("Черновика нет. Ниже — ответ и контакты помощи.");
           return;
         }
-        const m = couple.draft;
+        // На экране — черновик **этого** запроса (а не то, что сейчас лежит в памяти сессии).
+        const m = couple.draft?.draft.id === r.draft.id ? couple.draft : { draft: r.draft, text: r.draft.text, lostEdit: null };
+        if (couple.draft === null) couple.setDraft(m);
         setMemory(m);
         setPhase({ kind: "ready" });
         setLive(`Черновик готов: ${r.draft.text}`);
@@ -161,55 +176,65 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
   const partner = me.partner_name ?? null;
   const text = memory?.text ?? "";
   const edited = memory !== null && memory.text !== memory.draft.text;
-  const tooLong = text.length > DRAFT_MAX;
+  /** Длина в символах Unicode, как у сервера (ревью 3.4 MINOR-2). */
+  const length = charCount(text);
+  const tooLong = length > DRAFT_MAX;
   const canSend = phase.kind === "ready" && memory !== null && busy === null && !isBlank(text) && !tooLong;
 
-  /** Изменить черновик в памяти сессии и на экране. */
-  const remember = (m: DraftMemory | null) => {
-    couple.setDraft(m);
+  /**
+   * Изменить черновик `id` на экране и в памяти сессии. Память сессии меняется, только если в ней этот же черновик
+   * (или пусто): действие над показанным черновиком никогда не трогает другой (ревью 3.4 BLOCKER-1).
+   */
+  const remember = (id: string, m: DraftMemory | null) => {
+    if (couple.draft === null || couple.draft.draft.id === id) couple.setDraft(m);
     if (alive.current) setMemory(m);
   };
 
   const setText = (value: string) => {
     if (!memory) return;
-    remember({ ...memory, text: value.slice(0, DRAFT_MAX) });
+    remember(memory.draft.id, { ...memory, text: clipChars(value, DRAFT_MAX) });
   };
 
   /** Черновик закрыт (уже отправлен/отклонён или не найден): из памяти убирается, отправлять нечего. */
-  const close = (e: unknown, op: Op) => {
-    remember(null);
+  const close = (mine: DraftMemory, e: unknown, op: Op) => {
+    remember(mine.draft.id, null);
     if (alive.current) setPhase({ kind: "closed", text: textOf(e, op) });
   };
 
   /**
-   * 409 `version_conflict`: ничего не отправлено. Актуальный текст сервера — в поле; правка автора, если она
-   * отличается, сохраняется рядом («Вернуть мою правку») — не теряется.
+   * Перечитать черновик (`GET /drafts/{id}`), ничего не отправляя: после 409 `version_conflict` и после 409
+   * `not_editable` на «Другом варианте» (его правили, пока шла модель, — черновик ещё `draft`, ревью 3.4 MINOR-1).
+   * Закрывается он, только если сервер подтвердил, что статус уже не `draft`. Актуальный текст сервера — в поле;
+   * правка автора, если он правил и она отличается, сохраняется рядом («Вернуть мою правку») — не теряется.
    */
-  const reload = async (mine: DraftMemory, op: Op, err: unknown) => {
+  const reload = async (mine: DraftMemory, op: Op, err: unknown, message?: string) => {
     try {
       const fresh = await api.draftGet(mine.draft.id);
-      const lost = mine.text !== fresh.text ? mine.text : null;
+      const editedByMe = op !== "draftRegenerate" || mine.text !== mine.draft.text;
+      const lost = editedByMe && mine.text !== fresh.text ? mine.text : null;
       if (fresh.status !== "draft") {
-        close(new ApiError(409, "not_editable", errorText("not_editable", undefined, undefined, op)), op);
+        close(mine, new ApiError(409, "not_editable", errorText("not_editable", undefined, undefined, op)), op);
         return;
       }
-      remember({ draft: fresh, text: fresh.text, lostEdit: lost });
-      if (alive.current) setNotice({ text: textOf(err, op), error: true });
+      remember(mine.draft.id, { draft: fresh, text: fresh.text, lostEdit: lost });
+      if (alive.current) setNotice({ text: message ?? textOf(err, op), error: true });
     } catch (e) {
       if (e instanceof ApiError && e.code === "not_found") {
-        close(e, "draftGet");
+        close(mine, e, "draftGet");
         return;
       }
-      if (alive.current) setNotice({ text: `${textOf(err, op)} ${textOf(e, "draftGet")}`, error: true });
+      if (alive.current) setNotice({ text: `${message ?? textOf(err, op)} ${textOf(e, "draftGet")}`, error: true });
     }
   };
 
-  /** Общая обработка ошибки действия над черновиком. */
+  /** Общая обработка ошибки действия над черновиком `mine` (показанным на экране). */
   const failed = async (e: unknown, op: Op, mine: DraftMemory) => {
     tg.notify("error");
     const code = codeOf(e);
     if (code === "version_conflict") return reload(mine, op, e);
-    if (code === "not_editable" || code === "not_found") return close(e, op);
+    // Контракт `regenerate`: not_editable и тогда, когда автор правил текст, пока шла модель, — черновик жив.
+    if (code === "not_editable" && op === "draftRegenerate") return reload(mine, op, e, REGEN_CHANGED);
+    if (code === "not_editable" || code === "not_found") return close(mine, e, op);
     if (alive.current)
       setNotice({
         text: textOf(e, op),
@@ -220,32 +245,43 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
       });
   };
 
-  /** «Отправить» — единственный путь сообщения к партнёру (ФТ-08). Только по нажатию человека. */
+  /**
+   * «Отправить» — единственный путь сообщения к партнёру (ФТ-08). Только по нажатию человека и только черновик,
+   * показанный на экране (`memory`: его id и версия), — не то, что лежит в памяти сессии (ревью 3.4 BLOCKER-1).
+   */
   const send = async () => {
-    const mine = couple.draft;
+    const mine = memory;
     if (inFlight.current || !mine || !canSend) return;
+    if (couple.draft !== null && couple.draft.draft.id !== mine.draft.id) {
+      // Страж в глубину: в памяти сессии другой черновик — что-то разошлось; ничего не отправляем.
+      setNotice({ text: STALE, error: true });
+      return;
+    }
     inFlight.current = true;
     setBusy("send");
     setNotice(null);
     setLive("Отправляем…");
     let shown: DraftData = mine.draft;
+    let latest: DraftMemory = mine;
     let op: Op = "draftPatch";
     try {
       // Правка автора — на сервер одним `PATCH` с версией, которую он правил; затем отправка этой новой версии.
       if (mine.text !== shown.text) {
         shown = await api.draftPatch(shown.id, mine.text, shown.version);
-        remember({ draft: shown, text: shown.text, lostEdit: null });
+        latest = { draft: shown, text: shown.text, lostEdit: null };
+        remember(shown.id, latest);
       }
       op = "draftSend";
       await api.draftSend(shown.id, shown.version);
       tg.notify("success");
-      couple.setDraft(null);
+      remember(shown.id, null);
       if (replyTo && couple.reply?.id === replyTo) couple.setReply(null);
       chat.dismissSuggest();
-      if (alive.current) replace({ name: "messages" });
+      // К уже открытой ленте, если черновик открыт из неё (лента → чат → черновик), иначе лента вместо черновика.
+      if (alive.current) backTo({ name: "messages" });
     } catch (e) {
       setLive("");
-      await failed(e, op, couple.draft ?? { ...mine, draft: shown });
+      await failed(e, op, latest);
     } finally {
       inFlight.current = false;
       if (alive.current) setBusy(null);
@@ -264,7 +300,7 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
   };
 
   const regenerate = async () => {
-    const mine = couple.draft;
+    const mine = memory;
     if (inFlight.current || !mine) return;
     inFlight.current = true;
     setConfirmVariant(false);
@@ -275,14 +311,14 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
       const r = await api.draftRegenerate(mine.draft.id, wish.trim() ? wish.trim() : undefined);
       if (r.kind === "crisis") {
         // Прежний черновик сервер не изменил, но на экране его больше нет: при кризисе отправлять нечего (§9.3).
-        remember(null);
+        remember(mine.draft.id, null);
         if (alive.current) {
           setPhase({ kind: "crisis", view: r });
           setLive("Черновика нет. Ниже — ответ и контакты помощи.");
         }
         return;
       }
-      remember({ draft: r.draft, text: r.draft.text, lostEdit: null });
+      remember(mine.draft.id, { draft: r.draft, text: r.draft.text, lostEdit: null });
       if (alive.current) {
         setWish("");
         setLive(`Новый вариант: ${r.draft.text}`);
@@ -299,7 +335,7 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
 
   /** «Не отправлять»: черновик отклоняется, партнёру ничего не уходит; возврат в чат. */
   const reject = async () => {
-    const mine = couple.draft;
+    const mine = memory;
     if (inFlight.current || !mine) return;
     inFlight.current = true;
     tg.impact("light");
@@ -307,7 +343,7 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
     setNotice(null);
     try {
       await api.draftReject(mine.draft.id);
-      remember(null);
+      remember(mine.draft.id, null);
       if (alive.current) back();
     } catch (e) {
       await failed(e, "draftReject", mine);
@@ -367,7 +403,7 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
       {phase.kind === "closed" && (
         <>
           <Notice kind="error">{phase.text}</Notice>
-          <button type="button" className="btn btn--block" onClick={() => replace({ name: "messages" })}>
+          <button type="button" className="btn btn--block" onClick={() => backTo({ name: "messages" })}>
             Открыть сообщения пары
           </button>
           <button type="button" className="btn btn--block btn--ghost" onClick={toChat}>
@@ -385,15 +421,14 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
               id={textId}
               className="input draft-text"
               value={text}
-              maxLength={DRAFT_MAX}
               readOnly={busy !== null}
-              aria-describedby={text.length >= COUNTER_FROM ? counterId : undefined}
+              aria-describedby={length >= COUNTER_FROM ? counterId : undefined}
               onChange={(e) => setText(e.target.value)}
             />
           </div>
-          {text.length >= COUNTER_FROM && (
+          {length >= COUNTER_FROM && (
             <p className="small muted" id={counterId}>
-              {text.length} из {DRAFT_MAX} символов
+              {length} из {DRAFT_MAX} символов
             </p>
           )}
           <p className="small muted" data-draft-state>
@@ -411,7 +446,7 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
               <button
                 type="button"
                 className="btn btn--block btn--ghost"
-                onClick={() => remember({ ...memory, text: memory.lostEdit ?? memory.text, lostEdit: null })}
+                onClick={() => remember(memory.draft.id, { ...memory, text: memory.lostEdit ?? memory.text, lostEdit: null })}
               >
                 Вернуть мою правку
               </button>
@@ -432,9 +467,8 @@ export function Draft({ replyTo }: { replyTo: string | null }) {
               id={wishId}
               className="input"
               value={wish}
-              maxLength={WISH_MAX}
               placeholder="Например: мягче, короче"
-              onChange={(e) => setWish(e.target.value.slice(0, WISH_MAX))}
+              onChange={(e) => setWish(clipChars(e.target.value, WISH_MAX))}
             />
           </div>
           {confirmVariant ? (

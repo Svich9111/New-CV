@@ -21,6 +21,19 @@ export const DRAFT_MAX = 4000;
 /** Предел пожелания к «другому варианту» (контракт `regenerate.wish`). */
 export const WISH_MAX = 500;
 
+/**
+ * Длина в символах Unicode (кодовых точках), как считает сервер (`max_length` у строки Python) и JSON Schema, а не в
+ * единицах UTF-16 (`String.length`): эмодзи — один символ, не два (ревью 3.4 MINOR-2, A8-3.4-3).
+ */
+export const charCount = (s: string): number => [...s].length;
+
+/** Обрезать до `max` символов Unicode — не посреди суррогатной пары. */
+export function clipChars(s: string, max: number): string {
+  if (s.length <= max) return s; // единиц UTF-16 не больше предела — символов тем более
+  const cps = [...s];
+  return cps.length <= max ? s : cps.slice(0, max).join("");
+}
+
 export const DRAFT_STATUSES: readonly Draft["status"][] = ["draft", "approved", "rejected", "blocked", "sent"];
 export const MESSAGE_STATUSES: readonly PartnerMessage["status"][] = ["processing", "withheld", "delivered", "read", "answered"];
 /** Получателю видны только доставленные (контракт `PartnerMessage.status`). */
