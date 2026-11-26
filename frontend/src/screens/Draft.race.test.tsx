@@ -167,6 +167,40 @@ describe("BLOCKER-1: опоздавший «Другой вариант» пре
   });
 });
 
+describe("BLOCKER-1 / ревью 3.4-r2 MINOR-B: «Отправить» берёт черновик экрана, а не памяти сессии", () => {
+  test("опоздавший «Другой вариант» прежнего экрана → вход заново с тем же replyTo → «Отправить»: уходит только показанное", async () => {
+    const server = pairedServer();
+    server.draftReply({ kind: "draft", text: A });
+    const hold = holdOnce(server, "POST", /\/regenerate$/); // до renderApp: Api берёт server.fetch при создании
+    const r = await toReply(server);
+    await r.user.click(screen.getByRole("button", { name: "Подготовить ответ" }));
+    await waitFor(() => expect(field().value).toBe(A));
+    const a = draftId(server, "Черновик А");
+    server.draftReply({ kind: "draft", text: "Вариант А2, которого на экране не было" });
+    await r.user.click(screen.getByRole("button", { name: "Другой вариант" }));
+    await r.pressBack();
+    await heading("Твой агент");
+    // Тот же replyTo: экран берёт черновик v1 из памяти сессии, нового POST /drafts нет.
+    await r.user.click(screen.getByRole("button", { name: "Подготовить ответ" }));
+    await waitFor(() => expect(field().value).toBe(A));
+    expect(r.server.calls("POST", "/drafts")).toHaveLength(1);
+    hold.release();
+    await flush();
+    // Вариант пришёл: на сервере (и в памяти сессии) v2, на экране по-прежнему v1.
+    expect(server.draftRows.get(a)!.version).toBe(2);
+    const shown = field().value;
+    expect(shown).toBe(A);
+    await r.pressMain();
+    await flush();
+    // Партнёру уходит только показанный текст; при расхождении версий — ничего (409 → перечитать).
+    const sent = r.server.log.filter((l) => l.method === "POST" && l.path === `/drafts/${a}/send`);
+    for (const l of sent) expect(l.body).toEqual({ expected_version: 1 });
+    const delivered = r.server.feed.filter((f) => f.author === "me").map((f) => f.original);
+    for (const t of delivered) expect(t).toBe(shown);
+    expect(delivered).not.toContain("Вариант А2, которого на экране не было");
+  });
+});
+
 describe("MINOR-3: после «Отправить» из «лента → чат → черновик» в стеке одна лента", () => {
   test("«Назад» из ленты ведёт на главный экран, а не в чат", async () => {
     const server = pairedServer();
