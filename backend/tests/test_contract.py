@@ -38,7 +38,7 @@ FT_ENDPOINTS = {
     "ФТ-13": ("delete", "/memory/{memory_id}"),
     "ФТ-15": ("post", "/admin/kb/documents"),
     "ФТ-17": ("get", "/help/contacts"),
-    "ФТ-19": ("get", "/subscription"),
+    "ФТ-19": ("get", "/couple/subscription"),  # 4.4: подписка — свойство пары
     "ФТ-20": ("get", "/admin/metrics"),
     "ФТ-21": ("delete", "/me"),
 }
@@ -416,3 +416,60 @@ def test_drafts_are_served() -> None:
     served = {(m, p) for p, ms in _served_routes(app.routes) for m in ms}
     for method, path in DRAFT_OPERATIONS:
         assert (method.upper(), "/api/v1" + path) in served
+
+
+# --- 4.4: подписка и оплата Telegram Stars (АР-50) --------------------------------------------
+
+
+def test_subscription_contract() -> None:
+    """4.4 этап 1 (A1): статус, срок и лимиты — обоим партнёрам; счёт для openInvoice с ценой
+    из настроек сервера; 402/409/429/503 объявлены; старые пути /subscription сняты."""
+    spec = _spec()
+    paths, schemas = spec["paths"], spec["components"]["schemas"]
+    assert "/subscription" not in paths and "/subscription/invoice" not in paths
+    get = paths["/couple/subscription"]["get"]
+    assert get["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Subscription"
+    }
+    assert get["responses"]["200"]["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
+    assert get["responses"]["403"] == {"$ref": "#/components/responses/OnboardingRequired"}
+    sub = schemas["Subscription"]
+    assert sub["additionalProperties"] is False
+    assert set(sub["required"]) == {"status", "has_access", "trial_used", "limits", "plans"}
+    assert sub["properties"]["status"]["enum"] == ["none", "trial", "active", "expired", "canceled"]
+    limits = schemas["SubscriptionLimits"]
+    assert set(limits["required"]) == {
+        "chat_daily_limit", "chat_used_today", "window_resets_at", "can_send_messages",
+    }  # fmt: skip
+    offer = schemas["SubscriptionOffer"]
+    assert offer["properties"]["currency"]["const"] == "XTR"
+    post = paths["/couple/subscription/invoice"]["post"]
+    body = post["requestBody"]["content"]["application/json"]["schema"]
+    # Цену клиент не передаёт — только тариф (Д6: цена — в настройках).
+    assert body["required"] == ["plan"] and set(body["properties"]) == {"plan"}
+    assert body["additionalProperties"] is False
+    assert schemas["SubscriptionPlan"]["enum"] == ["month", "year"]
+    created = post["responses"]["201"]["content"]["application/json"]["schema"]
+    assert created == {"$ref": "#/components/schemas/SubscriptionInvoice"}
+    invoice = schemas["SubscriptionInvoice"]
+    assert {"invoice_id", "invoice_link", "amount", "currency", "expires_at"} <= set(
+        invoice["required"]
+    )
+    assert invoice["properties"]["currency"]["const"] == "XTR"
+    responses = post["responses"]
+    assert {"201", "401", "403", "409", "422", "429", "503"} <= set(responses)
+    assert _example_codes(_resolve(spec, responses["409"])) == [
+        "couple_not_active",
+        "conflict_retry",
+    ]
+    limited = _resolve(spec, responses["429"])
+    assert limited["headers"]["Retry-After"]["required"] is True
+    assert _example_codes(limited) == ["rate_limited"]
+    assert _example_codes(_resolve(spec, responses["503"])) == ["service_unavailable"]
+    required = _resolve(spec, {"$ref": "#/components/responses/SubscriptionRequired"})
+    assert _example_codes(required) == ["subscription_required"]
+    assert "§11 п.5" in required["description"]  # кризис и помощь — без подписки
+    # 402 — там, где действие требует подписки: отправка сообщения и реплика агенту.
+    assert "402" in paths["/drafts/{draft_id}/send"]["post"]["responses"]
+    assert "402" in paths["/chat/messages"]["post"]["responses"]
+    assert "402" not in post["responses"]  # оплатить можно и без доступа

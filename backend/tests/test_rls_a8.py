@@ -922,6 +922,15 @@ APP_FUNCS = [
     "app_memory_extraction_done(uuid, uuid, uuid)",  # 0009
     "app_memory_compaction_done(uuid)",  # 0009
     "app_couple_feed_page(integer, timestamp with time zone, uuid)",  # 0012, задача 3.3
+    "app_subscription_status()",  # 0017, задача 4.4: подписка пары (АР-50)
+    "app_has_access()",  # 0017
+    "app_subscription_start_trial(integer)",  # 0017
+    "app_subscription_create_invoice(character varying, integer, integer, interval)",  # 0017
+    # 0017: служебный контекст бота (app.user_id пуст) — pre_checkout, зачисление, возврат.
+    "app_bot_payment_precheck(uuid, bigint, integer, character varying)",
+    "app_bot_payment_credit(uuid, bigint, integer, character varying, character varying)",
+    "app_bot_payment_refunded(character varying)",
+    "app_bot_payment_lookup(character varying)",
 ]
 PIPELINE_FUNCS = [
     "kb_set_chunk_embedding(uuid, text, text)",  # 0008, задача 2.0v: воркер индексации

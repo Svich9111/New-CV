@@ -1378,14 +1378,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/subscription": {
+    "/couple/subscription": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** Статус подписки пары — виден обоим (ФТ-19) */
+        /**
+         * Подписка текущей пары — статус, срок, лимиты; видна обоим партнёрам (ФТ-19)
+         * @description Подписка оформляется на пару: платит один, доступ получают оба (ТЗ §11, п.1). Статус и
+         *     срок одинаковы у обоих партнёров; `paid_by_me` — свой у каждого. Источник — функция БД
+         *     `app_subscription_status()` (миграция 0017, DECISIONS.md АР-50).
+         *
+         *     - `status`: `none` — нет текущей пары, пара ещё ждёт партнёра (§11 п.3: до принятия
+         *       приглашения — бесплатно в пределах дневного лимита) или периодов ещё не было;
+         *       `trial` — идёт пробный период (§11 п.2, Д6); `active` — идёт оплаченный период;
+         *       `expired` — периоды закончились; `canceled` — последний период отменён возвратом.
+         *     - `period_end` — до какого момента есть доступ (конец непрерывной цепочки периодов: оплата
+         *       во время пробного периода начинается после него); без доступа — конец последнего
+         *       периода.
+         *     - `has_access` — у пользователя есть доступ (подписка текущей пары или оплаченный период
+         *       распавшейся пары до его конца, §11 п.6). Без доступа история и память сохраняются, новые
+         *       диалоги и отправка сообщений ограничиваются (§11 п.4) — лимиты в `limits`. Кризисный
+         *       протокол и контакты помощи работают всегда, без подписки (§11 п.5).
+         *     - `plans` — что можно оплатить: цена в Telegram Stars (`XTR`) и длина периода — из
+         *       настроек сервера (Д6, [уточняется] АР-50); пусто, если оплата сейчас недоступна (нет
+         *       активной пары или оплата не настроена).
+         *
+         *     Пробный период начинается автоматически при активации пары (принятии приглашения) и
+         *     считается от неё; повторно не выдаётся. Ответ не кэшируется (`Cache-Control: no-store`).
+         */
         get: {
             parameters: {
                 query?: never;
@@ -1398,12 +1421,16 @@ export interface paths {
                 /** @description OK */
                 200: {
                     headers: {
+                        "Cache-Control": "no-store";
                         [name: string]: unknown;
                     };
                     content: {
                         "application/json": components["schemas"]["Subscription"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["OnboardingRequired"];
+                409: components["responses"]["ConflictRetry"];
             };
         };
         put?: never;
@@ -1414,7 +1441,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/subscription/invoice": {
+    "/couple/subscription/invoice": {
         parameters: {
             query?: never;
             header?: never;
@@ -1423,7 +1450,28 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Счёт Telegram Stars на оплату подписки пары (ФТ-19, допущение Д9) */
+        /**
+         * Счёт Telegram Stars на оплату подписки пары (ФТ-19, Д9)
+         * @description Создаёт счёт на выбранный тариф для текущей **активной** пары; платить может любой из
+         *     партнёров (§11 п.1). Цена и длина периода берутся из настроек сервера, а не из запроса
+         *     (Д6). Сервер записывает счёт (`payments`, статус `pending`, без личных данных; миграция
+         *     0017) и получает у Telegram ссылку `createInvoiceLink` (валюта `XTR`, одна позиция цены,
+         *     `provider_token` пустой; payload — `invoice_id`). Клиент открывает её
+         *     `Telegram.WebApp.openInvoice(invoice_link, callback)`.
+         *
+         *     Итог оплаты подтверждает только сервер: Telegram присылает боту `pre_checkout_query`
+         *     (проверка счёта, суммы и того, что платящий — участник активной пары) и
+         *     `successful_payment` (зачисление идемпотентно по `telegram_payment_charge_id`). Статус
+         *     `paid` в `callback` клиента — не доказательство оплаты: после него клиент перечитывает
+         *     `GET /couple/subscription` (зачисление может прийти с задержкой в несколько секунд).
+         *
+         *     Повторный запрос с тем же тарифом, пока счёт действует, возвращает тот же `invoice_id`.
+         *     Ошибки: 409 `couple_not_active` — нет активной пары (пара ждёт партнёра или распалась);
+         *     409 `conflict_retry` (АР-24); 422 `validation_error` — неизвестный тариф; 429
+         *     `rate_limited` — слишком много счетов подряд (`Retry-After`); 503 `service_unavailable` —
+         *     оплата не настроена или Telegram не выдал ссылку (ничего не списано). В журналы и
+         *     `audit_log` — только коды и идентификаторы, без текстов (ТЗ §9.1 п.5).
+         */
         post: {
             parameters: {
                 query?: never;
@@ -1434,25 +1482,27 @@ export interface paths {
             requestBody: {
                 content: {
                     "application/json": {
-                        /** @enum {string} */
-                        plan: "month" | "year";
+                        plan: components["schemas"]["SubscriptionPlan"];
                     };
                 };
             };
             responses: {
-                /** @description Ссылка на счёт для Telegram.WebApp.openInvoice */
+                /** @description Счёт создан (или возвращён действующий) — параметры для openInvoice */
                 201: {
                     headers: {
+                        "Cache-Control": "no-store";
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": {
-                            /** Format: uri */
-                            invoice_link: string;
-                        };
+                        "application/json": components["schemas"]["SubscriptionInvoice"];
                     };
                 };
-                404: components["responses"]["NotFound"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["OnboardingRequired"];
+                409: components["responses"]["SubscriptionConflict"];
+                422: components["responses"]["Validation"];
+                429: components["responses"]["InvoiceRateLimited"];
+                503: components["responses"]["PaymentsUnavailable"];
             };
         };
         delete?: never;
@@ -2064,13 +2114,72 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
+        /**
+         * @description Оплачиваемый тариф; цена и длина периода — настройки сервера (Д6, АР-50)
+         * @enum {string}
+         */
+        SubscriptionPlan: "month" | "year";
+        SubscriptionOffer: {
+            plan: components["schemas"]["SubscriptionPlan"];
+            /** @description Цена в Telegram Stars */
+            amount: number;
+            /** @constant */
+            currency: "XTR";
+            period_days: number;
+        };
+        /** @description Действующие лимиты пользователя (ТЗ §10, §11 п.3–5): с доступом — обычный дневной лимит реплик агенту, без доступа — лимит без подписки ([уточняется] АР-50). Окно — календарные сутки UTC (`app/core/limits.py`). Кризисные реплики не отклоняются никогда (§9.3). */
+        SubscriptionLimits: {
+            /** @description Реплик агенту в сутки */
+            chat_daily_limit: number;
+            chat_used_today: number;
+            /** Format: date-time */
+            window_resets_at: string;
+            /** @description Можно отправлять сообщения партнёру — активная пара и доступ (§11 п.4) */
+            can_send_messages: boolean;
+        };
         Subscription: {
             /** @enum {string} */
             status: "none" | "trial" | "active" | "expired" | "canceled";
-            plan?: string | null;
+            /** @enum {string|null} */
+            couple_status?: "pending" | "active" | null;
+            /**
+             * @description Тариф текущего (без доступа — последнего) периода
+             * @enum {string|null}
+             */
+            plan?: "trial" | "month" | "year" | null;
             /** Format: date-time */
             period_end?: string | null;
+            /** Format: date-time */
+            trial_ends_at?: string | null;
+            /** @description Пробный период этой пары уже выдан */
+            trial_used: boolean;
+            /** @description Последний оплаченный период оплатил я; null — оплат не было */
             paid_by_me?: boolean | null;
+            has_access: boolean;
+            limits: components["schemas"]["SubscriptionLimits"];
+            plans: components["schemas"]["SubscriptionOffer"][];
+        };
+        SubscriptionInvoice: {
+            /**
+             * Format: uuid
+             * @description payload счёта Telegram
+             */
+            invoice_id: string;
+            /**
+             * Format: uri
+             * @description Ссылка createInvoiceLink для Telegram.WebApp.openInvoice
+             */
+            invoice_link: string;
+            plan: components["schemas"]["SubscriptionPlan"];
+            amount: number;
+            /** @constant */
+            currency: "XTR";
+            period_days: number;
+            /**
+             * Format: date-time
+             * @description После этого времени оплата по ссылке отклоняется (pre_checkout_query)
+             */
+            expires_at: string;
         };
         HelpContact: {
             name: string;
@@ -2455,8 +2564,37 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Подписка закончилась или исчерпан дневной лимит без подписки (ТЗ §11) */
+        /** @description Код `subscription_required` (ТЗ §11 п.4): у пользователя нет доступа (пробный или оплаченный период закончился, возвращён или пара распалась без оплаченного периода), а действие требует подписки. История и память остаются доступны; кризисный протокол и контакты помощи — всегда, без подписки (§11 п.5): при кризисе 402 не отдаётся. Статус — `GET /couple/subscription`. */
         SubscriptionRequired: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description `couple_not_active` — нет активной пары: оплачивать нечего (пара ждёт партнёра или распалась); `conflict_retry` — одновременное изменение (40P01/40001, АР-24), ничего не изменено, запрос можно повторить. */
+        SubscriptionConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Код `rate_limited`: слишком много счетов подряд (у пары не больше 20 действующих счетов, функция БД отвечает FC002; частоту запросов ограничивает и сервер). Ничего не создано. */
+        InvoiceRateLimited: {
+            headers: {
+                /** @description Целое число секунд (не меньше 1), через которое можно повторить */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Код `service_unavailable`: оплата временно недоступна — не настроена (нет токена бота или цен) или Telegram не выдал ссылку на счёт. Ничего не списано, повтор безопасен. */
+        PaymentsUnavailable: {
             headers: {
                 [name: string]: unknown;
             };

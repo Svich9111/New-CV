@@ -833,40 +833,96 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/ConflictRetry" }
 
-  /subscription:
+  /couple/subscription:
     get:
       tags: [subscription]
-      summary: Статус подписки пары — виден обоим (ФТ-19)
+      summary: Подписка текущей пары — статус, срок, лимиты; видна обоим партнёрам (ФТ-19)
+      description: |
+        Подписка оформляется на пару: платит один, доступ получают оба (ТЗ §11, п.1). Статус и
+        срок одинаковы у обоих партнёров; `paid_by_me` — свой у каждого. Источник — функция БД
+        `app_subscription_status()` (миграция 0017, DECISIONS.md АР-50).
+
+        - `status`: `none` — нет текущей пары, пара ещё ждёт партнёра (§11 п.3: до принятия
+          приглашения — бесплатно в пределах дневного лимита) или периодов ещё не было;
+          `trial` — идёт пробный период (§11 п.2, Д6); `active` — идёт оплаченный период;
+          `expired` — периоды закончились; `canceled` — последний период отменён возвратом.
+        - `period_end` — до какого момента есть доступ (конец непрерывной цепочки периодов: оплата
+          во время пробного периода начинается после него); без доступа — конец последнего
+          периода.
+        - `has_access` — у пользователя есть доступ (подписка текущей пары или оплаченный период
+          распавшейся пары до его конца, §11 п.6). Без доступа история и память сохраняются, новые
+          диалоги и отправка сообщений ограничиваются (§11 п.4) — лимиты в `limits`. Кризисный
+          протокол и контакты помощи работают всегда, без подписки (§11 п.5).
+        - `plans` — что можно оплатить: цена в Telegram Stars (`XTR`) и длина периода — из
+          настроек сервера (Д6, [уточняется] АР-50); пусто, если оплата сейчас недоступна (нет
+          активной пары или оплата не настроена).
+
+        Пробный период начинается автоматически при активации пары (принятии приглашения) и
+        считается от неё; повторно не выдаётся. Ответ не кэшируется (`Cache-Control: no-store`).
       responses:
         "200":
           description: OK
+          headers:
+            Cache-Control:
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Subscription" }
-  /subscription/invoice:
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "409": { $ref: "#/components/responses/ConflictRetry" }
+
+  /couple/subscription/invoice:
     post:
       tags: [subscription]
-      summary: Счёт Telegram Stars на оплату подписки пары (ФТ-19, допущение Д9)
+      summary: Счёт Telegram Stars на оплату подписки пары (ФТ-19, Д9)
+      description: |
+        Создаёт счёт на выбранный тариф для текущей **активной** пары; платить может любой из
+        партнёров (§11 п.1). Цена и длина периода берутся из настроек сервера, а не из запроса
+        (Д6). Сервер записывает счёт (`payments`, статус `pending`, без личных данных; миграция
+        0017) и получает у Telegram ссылку `createInvoiceLink` (валюта `XTR`, одна позиция цены,
+        `provider_token` пустой; payload — `invoice_id`). Клиент открывает её
+        `Telegram.WebApp.openInvoice(invoice_link, callback)`.
+
+        Итог оплаты подтверждает только сервер: Telegram присылает боту `pre_checkout_query`
+        (проверка счёта, суммы и того, что платящий — участник активной пары) и
+        `successful_payment` (зачисление идемпотентно по `telegram_payment_charge_id`). Статус
+        `paid` в `callback` клиента — не доказательство оплаты: после него клиент перечитывает
+        `GET /couple/subscription` (зачисление может прийти с задержкой в несколько секунд).
+
+        Повторный запрос с тем же тарифом, пока счёт действует, возвращает тот же `invoice_id`.
+        Ошибки: 409 `couple_not_active` — нет активной пары (пара ждёт партнёра или распалась);
+        409 `conflict_retry` (АР-24); 422 `validation_error` — неизвестный тариф; 429
+        `rate_limited` — слишком много счетов подряд (`Retry-After`); 503 `service_unavailable` —
+        оплата не настроена или Telegram не выдал ссылку (ничего не списано). В журналы и
+        `audit_log` — только коды и идентификаторы, без текстов (ТЗ §9.1 п.5).
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [plan]
               properties:
-                plan: { type: string, enum: [month, year] }
+                plan: { $ref: "#/components/schemas/SubscriptionPlan" }
       responses:
         "201":
-          description: Ссылка на счёт для Telegram.WebApp.openInvoice
+          description: Счёт создан (или возвращён действующий) — параметры для openInvoice
+          headers:
+            Cache-Control:
+              required: true
+              schema: { type: string, const: no-store }
           content:
             application/json:
-              schema:
-                type: object
-                required: [invoice_link]
-                properties:
-                  invoice_link: { type: string, format: uri }
-        "404": { $ref: "#/components/responses/NotFound" }
+              schema: { $ref: "#/components/schemas/SubscriptionInvoice" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/OnboardingRequired" }
+        "409": { $ref: "#/components/responses/SubscriptionConflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "429": { $ref: "#/components/responses/InvoiceRateLimited" }
+        "503": { $ref: "#/components/responses/PaymentsUnavailable" }
 
   /help/contacts:
     get:
@@ -1207,8 +1263,56 @@ components:
       description: Ошибка данных
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     SubscriptionRequired:
-      description: Подписка закончилась или исчерпан дневной лимит без подписки (ТЗ §11)
-      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      description: >-
+        Код `subscription_required` (ТЗ §11 п.4): у пользователя нет доступа (пробный или
+        оплаченный период закончился, возвращён или пара распалась без оплаченного периода), а
+        действие требует подписки. История и память остаются доступны; кризисный протокол и
+        контакты помощи — всегда, без подписки (§11 п.5): при кризисе 402 не отдаётся.
+        Статус — `GET /couple/subscription`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            subscription_required:
+              value: { code: subscription_required, message: Подписка закончилась — продлите её, чтобы продолжить }
+    SubscriptionConflict:
+      description: >-
+        `couple_not_active` — нет активной пары: оплачивать нечего (пара ждёт партнёра или
+        распалась); `conflict_retry` — одновременное изменение (40P01/40001, АР-24), ничего не
+        изменено, запрос можно повторить.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            couple_not_active:
+              value: { code: couple_not_active, message: Оплата откроется, когда партнёр примет приглашение }
+            conflict_retry:
+              value: { code: conflict_retry, message: Не получилось с первого раза — повторите, пожалуйста }
+    InvoiceRateLimited:
+      description: >-
+        Код `rate_limited`: слишком много счетов подряд (у пары не больше 20 действующих счетов,
+        функция БД отвечает FC002; частоту запросов ограничивает и сервер). Ничего не создано.
+      headers:
+        Retry-After:
+          description: Целое число секунд (не меньше 1), через которое можно повторить
+          required: true
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            rate_limited:
+              value: { code: rate_limited, message: Слишком много попыток оплаты — попробуйте чуть позже }
+    PaymentsUnavailable:
+      description: >-
+        Код `service_unavailable`: оплата временно недоступна — не настроена (нет токена бота или
+        цен) или Telegram не выдал ссылку на счёт. Ничего не списано, повтор безопасен.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            service_unavailable:
+              value: { code: service_unavailable, message: Оплата временно недоступна — попробуйте позже }
     RateLimited:
       description: >-
         Код `rate_limited`: исчерпан дневной лимит реплик в личном чате (ТЗ §10 «лимит запросов
@@ -1515,14 +1619,78 @@ components:
         confidence: { type: number, minimum: 0, maximum: 1 }
         created_at: { type: string, format: date-time }
 
+    SubscriptionPlan:
+      type: string
+      enum: [month, year]
+      description: Оплачиваемый тариф; цена и длина периода — настройки сервера (Д6, АР-50)
+
+    SubscriptionOffer:
+      type: object
+      additionalProperties: false
+      required: [plan, amount, currency, period_days]
+      properties:
+        plan: { $ref: "#/components/schemas/SubscriptionPlan" }
+        amount: { type: integer, minimum: 1, description: Цена в Telegram Stars }
+        currency: { type: string, const: XTR }
+        period_days: { type: integer, minimum: 1, maximum: 400 }
+
+    SubscriptionLimits:
+      type: object
+      additionalProperties: false
+      required: [chat_daily_limit, chat_used_today, window_resets_at, can_send_messages]
+      description: >-
+        Действующие лимиты пользователя (ТЗ §10, §11 п.3–5): с доступом — обычный дневной лимит
+        реплик агенту, без доступа — лимит без подписки ([уточняется] АР-50). Окно — календарные
+        сутки UTC (`app/core/limits.py`). Кризисные реплики не отклоняются никогда (§9.3).
+      properties:
+        chat_daily_limit: { type: integer, minimum: 0, description: Реплик агенту в сутки }
+        chat_used_today: { type: integer, minimum: 0 }
+        window_resets_at: { type: string, format: date-time }
+        can_send_messages:
+          type: boolean
+          description: Можно отправлять сообщения партнёру — активная пара и доступ (§11 п.4)
+
     Subscription:
       type: object
-      required: [status]
+      additionalProperties: false
+      required: [status, has_access, trial_used, limits, plans]
       properties:
         status: { type: string, enum: [none, trial, active, expired, canceled] }
-        plan: { type: [string, "null"] }
+        couple_status: { type: [string, "null"], enum: [pending, active, null] }
+        plan:
+          type: [string, "null"]
+          enum: [trial, month, year, null]
+          description: Тариф текущего (без доступа — последнего) периода
         period_end: { type: [string, "null"], format: date-time }
-        paid_by_me: { type: [boolean, "null"] }
+        trial_ends_at: { type: [string, "null"], format: date-time }
+        trial_used: { type: boolean, description: Пробный период этой пары уже выдан }
+        paid_by_me:
+          type: [boolean, "null"]
+          description: Последний оплаченный период оплатил я; null — оплат не было
+        has_access: { type: boolean }
+        limits: { $ref: "#/components/schemas/SubscriptionLimits" }
+        plans:
+          type: array
+          items: { $ref: "#/components/schemas/SubscriptionOffer" }
+
+    SubscriptionInvoice:
+      type: object
+      additionalProperties: false
+      required: [invoice_id, invoice_link, plan, amount, currency, period_days, expires_at]
+      properties:
+        invoice_id: { type: string, format: uuid, description: payload счёта Telegram }
+        invoice_link:
+          type: string
+          format: uri
+          description: Ссылка createInvoiceLink для Telegram.WebApp.openInvoice
+        plan: { $ref: "#/components/schemas/SubscriptionPlan" }
+        amount: { type: integer, minimum: 1 }
+        currency: { type: string, const: XTR }
+        period_days: { type: integer, minimum: 1, maximum: 400 }
+        expires_at:
+          type: string
+          format: date-time
+          description: После этого времени оплата по ссылке отклоняется (pre_checkout_query)
 
     HelpContact:
       type: object

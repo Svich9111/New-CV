@@ -591,7 +591,17 @@ class Subscription(Base):
     """§7 subscriptions: id, couple_id, плательщик, тариф, статус, период."""
 
     __tablename__ = "subscriptions"
-    __table_args__ = (CheckConstraint("period_end > period_start", name="period_order"),)
+    # Строка — период доступа пары: пробный (plan 'trial') или оплаченный; возврат — canceled.
+    # Пробный — один раз на пару (миграция 0017, АР-50).
+    __table_args__ = (
+        CheckConstraint("period_end > period_start", name="period_order"),
+        Index(
+            "uq_subscriptions_trial_per_couple",
+            "couple_id",
+            unique=True,
+            postgresql_where=sa_text("plan = 'trial'"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
     couple_id: Mapped[uuid.UUID] = mapped_column(
@@ -609,17 +619,44 @@ class Payment(Base):
     """§7 payments: id, subscription_id, сумма, провайдер, статус, время."""
 
     __tablename__ = "payments"
-    __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)
+    # Счёт — строка pending без периода (id — payload счёта Telegram); зачисление — succeeded с
+    # периодом и telegram_payment_charge_id; возврат — refunded (миграция 0017, АР-50).
+    # Личных данных нет: плательщик — subscriptions.payer_id.
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="amount_positive"),
+        CheckConstraint(
+            "couple_id IS NOT NULL OR subscription_id IS NOT NULL", name="couple_or_subscription"
+        ),
+        CheckConstraint(
+            "status <> 'pending' OR subscription_id IS NOT NULL OR (couple_id IS NOT NULL "
+            "AND plan IS NOT NULL AND period_days IS NOT NULL AND expires_at IS NOT NULL)",
+            name="invoice_complete",
+        ),
+        CheckConstraint(
+            "period_days IS NULL OR period_days BETWEEN 1 AND 400", name="period_days_range"
+        ),
+        CheckConstraint("refunded_at IS NULL OR status = 'refunded'", name="refunded_at_status"),
+        CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_code"),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    subscription_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False, index=True
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("subscriptions.id", ondelete="CASCADE"), index=True
+    )
+    couple_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("couples.id", ondelete="CASCADE"), index=True
     )
     amount: Mapped[int] = mapped_column(Integer, nullable=False)  # в минимальных единицах / Stars
     currency: Mapped[str] = mapped_column(String(8), nullable=False, server_default="XTR")
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    # telegram_payment_charge_id: идемпотентность зачисления и возврат (refundStarPayment).
     provider_charge_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     status: Mapped[str] = mapped_column(PaymentStatus, nullable=False)
+    plan: Mapped[str | None] = mapped_column(String(32))  # тариф счёта: month / year
+    period_days: Mapped[int | None] = mapped_column(Integer)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # срок счёта
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = created_at()
 
 

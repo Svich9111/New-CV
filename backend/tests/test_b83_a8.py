@@ -8,7 +8,7 @@
   набору на 0015 за вычетом четырёх снятых; права на таблицы не изменились;
 - 0016 → 0015 → 0016 не трогает данные сообщений; на 0015 прежние функции снова исполнимы
   воркером (downgrade рабочий, не только «определение совпало»), на 0016 — 42883; ``alembic check``
-  чист, голова одна — 0016;
+  чист, голова одна — текущая (``HEAD``);
 - помощник тестов ``_pipeline_helpers`` не крадёт чужие строки: соседнее сообщение
   ``processing`` после доставки/остановки нужного — без аренды и с прежним счётчиком; сообщение
   под чужой арендой помощник не перехватывает;
@@ -43,6 +43,7 @@ from app.repositories.couple_messages import _withheld
 from tests import _pipeline_helpers as helpers
 from tests import test_couple_messages_api as base
 from tests.conftest import TEST_DATABASE_URL, alembic
+from tests.test_account_export_db import HEAD
 from tests.test_couple_functions import SM
 from tests.test_couple_messages_api import FEED, Env, _pair, _person, feed, send
 from tests.test_pipeline_db import _msg, _park, _send
@@ -181,7 +182,7 @@ async def test_0016_round_trip_rights_data_and_working_downgrade(
     """0016 → 0015 → 0016: (1) права — у каждой роли набор исполнимых функций на 0016 = на 0015
     минус четыре снятых (новых прав никому), права на таблицы равны; (2) данные сообщений
     побайтно те же; (3) на 0015 прежние функции исполнимы воркером, на 0016 — 42883;
-    (4) ``alembic check`` чист, голова — 0016."""
+    (4) ``alembic check`` чист, голова одна — текущая (``HEAD``)."""
     await _park(engine)
     anna, _igor, _ = await _db_pair(sessionmaker, engine)
     await _send(sessionmaker, engine, anna, b"a8-round-trip")
@@ -198,13 +199,16 @@ async def test_0016_round_trip_rights_data_and_working_downgrade(
             assert await _call_as_worker(engine, call) not in ("42883", "42501"), call
         alembic("upgrade", "0016")
         await engine.dispose()
+        # Сравнение 0015 ↔ 0016 — на самой 0016: после неё есть новые миграции (0017 — 4.4),
+        # их права к Б-83 не относятся.
+        new_exec, at16_tables = await _exec_sets(engine), await _table_grants(engine)
     finally:
         alembic("upgrade", "head")
         await engine.dispose()
         await app_engine.dispose()
-    new_exec = await _exec_sets(engine)
-    assert new_exec == head_exec
-    assert await _table_grants(engine) == head_tables == old_tables
+    assert await _exec_sets(engine) == head_exec
+    assert await _table_grants(engine) == head_tables
+    assert at16_tables == old_tables
     assert await _messages_digest(engine) == digest
     removed_now = {r: old_exec.get(r, set()) - new_exec.get(r, set()) for r in old_exec}
     gained = {r: new_exec.get(r, set()) - old_exec.get(r, set()) for r in new_exec}
@@ -220,7 +224,7 @@ async def test_0016_round_trip_rights_data_and_working_downgrade(
         [sys.executable, "-m", "alembic", "-x", f"db_url={TEST_DATABASE_URL}", "heads"],
         cwd=BACKEND, capture_output=True, text=True, check=True,
     ).stdout  # fmt: skip
-    assert heads.split() == ["0016", "(head)"], heads
+    assert heads.split() == [HEAD, "(head)"], heads
 
 
 # =========================================================================== Б-83: помощник
