@@ -18,8 +18,18 @@
 воркер (health check тогда покажет устаревший пульс).
 
 Длинная работа в последовательных воркерах (memory, kb: один захват — минуты работы модели и
-разбора) — ``Heartbeat.working(limit_s)``: пульс идёт, пока работа не вышла за свою аренду; работа
-дольше аренды (зависла) — пульс останавливается.
+разбора) — ``Heartbeat.working(limit_s)``: пульс идёт (с последним записанным состоянием), пока
+работа не вышла за свою аренду; работа дольше аренды (зависла) — пульс останавливается. У
+параллельных воркеров (pipeline, notify) при всех занятых слотах пульс идёт, только пока хотя бы
+одна начатая задача моложе своей аренды (``any_within``): все слоты заняты зависшими задачами —
+пульс устаревает (ревью р.1 MINOR-3).
+
+Состояние ``paused`` (ошибка настройки) держится до первого вызова, доказавшего, что настройка
+исправна (модель ответила; Telegram принял токен), а не только на время паузы: при пустой очереди
+неверный ключ или токен не становится ``healthy`` через 5 минут (ревью р.1 MINOR-2).
+
+Проверка (``check``): метка из будущего дальше допуска (``FUTURE_SKEW_S``) — неисправный пульс
+(часы или файл испорчены); состояние печатается только из известного набора (иначе ``other``).
 
 Модуль лёгкий (только стандартная библиотека): health check запускается каждые 30 с."""
 
@@ -34,9 +44,9 @@ import os
 import re
 import sys
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +57,7 @@ DEFAULT_MAX_AGE_S = 120.0
 State = Literal["starting", "ok", "waiting", "paused"]
 STATES: frozenset[str] = frozenset({"starting", "ok", "waiting", "paused"})
 HEALTHY: frozenset[str] = frozenset({"ok"})
+FUTURE_SKEW_S = 5.0  # метка из будущего дальше этого — не свежая (ревью р.1 MINOR-5)
 _REASON = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
@@ -100,10 +111,16 @@ class Heartbeat:
             yield
             return
 
+        # Последнее записанное состояние (``ok`` или ``paused`` после захвата); до первого
+        # прохода — ``ok``.
+        known = self.state in STATES and self.state != "starting"
+        state = cast(State, self.state) if known else "ok"
+        reason = self.reason if known else None
+
         async def tick() -> None:
             end = time.monotonic() + limit_s
             while True:
-                self.beat("ok")
+                self.beat(state, reason)
                 left = end - time.monotonic()
                 if left <= 0:
                     return
@@ -116,6 +133,12 @@ class Heartbeat:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+
+def any_within(started: Iterable[float], limit_s: float, *, now: float | None = None) -> bool:
+    """Хотя бы одна задача (время начала по ``time.monotonic``) моложе ``limit_s`` (аренды)."""
+    t = time.monotonic() if now is None else now
+    return any(t - s < limit_s for s in started)
 
 
 def check(
@@ -132,9 +155,12 @@ def check(
     except (OSError, ValueError, KeyError, TypeError):
         return False, "heartbeat unreadable"
     age = (time.time() if now is None else now) - ts
-    detail = f"state={state} reason={_safe_reason(reason) if reason else None} age={age:.0f}s"
+    shown = state if state in STATES else "other"  # в вывод — только известное состояние
+    detail = f"state={shown} reason={_safe_reason(reason) if reason else None} age={age:.0f}s"
     if state not in HEALTHY:
         return False, detail
+    if age < -FUTURE_SKEW_S:
+        return False, f"from the future: {detail} (skew over {FUTURE_SKEW_S:.0f}s)"
     if age > max_age_s:
         return False, f"stale: {detail} (max {max_age_s:.0f}s)"
     return True, detail

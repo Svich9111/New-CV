@@ -13,7 +13,11 @@
 пока она в пределах аренды материала; БД недоступна или индексация зависла — пульс устаревает.
 БД отвергла роль входа — ``ConfigError``, выход с кодом 78; модель недоступна при старте —
 повтор в процессе; ключа OpenRouter нет — индексация без меток, как раньше
-(``app.workers.startup``)."""
+(``app.workers.startup``).
+
+Остановка (SIGTERM; ревью р.1 MINOR-1): ``stop`` проверяется перед захватом и между материалами
+пачки — новое не захватывается, начатая индексация дорабатывается; захваченные и не начатые — до
+истечения аренды (у kb нет ``stop_grace_period``: Docker ждёт 10 с)."""
 
 from __future__ import annotations
 
@@ -78,13 +82,18 @@ class KbWorker:
         self.embedder = embedder
         self.settings = settings or KbSettings()
 
-    async def run_once(self) -> list[IndexOutcome]:
-        out = []
+    async def run_once(self, stop: asyncio.Event | None = None) -> list[IndexOutcome]:
+        out: list[IndexOutcome] = []
+        if stop is not None and stop.is_set():
+            return out
         claims = await kb_work.claim_index(
             self.sm, lease=self.settings.lease, limit=self.settings.batch
         )
         self.heartbeat.beat("ok")
-        for claim in claims:
+        for n, claim in enumerate(claims):
+            if stop is not None and stop.is_set():
+                logger.warning("kb: %d claimed documents left until lease expiry", len(claims) - n)
+                break
             try:
                 async with self.heartbeat.working(self.settings.lease.total_seconds()):
                     result = await self.index(claim)
@@ -155,7 +164,7 @@ class KbWorker:
         stop = stop or asyncio.Event()
         while not stop.is_set():
             try:
-                done = await self.run_once()
+                done = await self.run_once(stop)
             except Exception as exc:
                 raise_if_config_db_error(exc, name="kb worker")
                 logger.warning("kb worker pass failed: %s", type(exc).__name__)
@@ -198,15 +207,14 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
         models = await startup_retry(
             load_models, name="kb worker", what="models", heartbeat=heartbeat, stop=stop
         )
-        if stop.is_set():
-            return
-        worker = KbWorker(
-            worker_sm=make_sessionmaker(make_engine(settings.worker_database_url)),
-            models=models,
-            embedder=None,  # модель эмбеддингов не выбрана (Б-66)
-            heartbeat=heartbeat,
-        )
-        await worker.run_forever(stop=stop)
+        if not stop.is_set():  # остановка во время ожидания — сразу выход
+            worker = KbWorker(
+                worker_sm=make_sessionmaker(make_engine(settings.worker_database_url)),
+                models=models,
+                embedder=None,  # модель эмбеддингов не выбрана (Б-66)
+                heartbeat=heartbeat,
+            )
+            await worker.run_forever(stop=stop)
     logger.info("kb worker stopped")
 
 

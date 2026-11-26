@@ -15,6 +15,18 @@
   время работы над задачей — пока она в пределах своей аренды; БД недоступна или задача зависла —
   пульс устаревает, health check — unhealthy. БД отвергла роль входа — ``ConfigError``, выход с
   кодом 78; модель недоступна при старте — повтор в процессе (``app.workers.startup``).
+- **Ключ модели отклонён во время работы** (исход задачи ``error`` с видом
+  ``auth``/``quota``/``config``/``model_not_found`` — «сервис не настроен», как выключатель
+  конвейера АР-45 п.2; A8 р.1 MINOR-2): пауза воркера на ``pause`` — новое не захватывается,
+  остаток пачки не обрабатывается (вызовов модели нет), пульс ``paused`` (unhealthy). После паузы
+  — **пробный захват одной задачи**; ``paused`` держится, пока модель не ответит. Попытки:
+  функции снятия аренды у памяти нет (захват сам прибавляет попытку), поэтому за паузу расходуется
+  не больше одной попытки у задач, захваченных до отказа, и по одной у пробной; успех обнуляет
+  счётчик. Пока ключ отклонён, очередь попытки не расходует.
+- **Остановка** (SIGTERM; ревью р.1 MINOR-1): ``stop`` проверяется перед каждым захватом и
+  между задачами пачки — новое (в том числе сжатие) не захватывается, начатая задача
+  дорабатывается; оставшиеся захваченные — до истечения аренды (у memory нет
+  ``stop_grace_period``: Docker ждёт 10 с).
 
 Запуск: ``python -m app.workers.memory``; БД — ``FEELINGS_WORKER_DATABASE_URL`` (роль входа —
 член ``feelings_worker`` и ``feelings_app``, NOINHERIT; Б-69 — инфраструктура)."""
@@ -23,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -33,10 +46,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.ai import memory
 from app.ai.embeddings import Embedder
 from app.ai.models import AgentModels
+from app.config import Settings
 from app.core.crypto import Keyring
 from app.core.fingerprint import FingerprintKeys
 from app.repositories import memory_work as mw
 from app.workers.health import Heartbeat
+from app.workers.pipeline import PAUSE_KINDS
 from app.workers.startup import raise_if_config_db_error, run_worker, startup_retry
 
 logger = logging.getLogger(__name__)
@@ -50,6 +65,13 @@ class WorkerSettings:
     max_attempts: int = 5
     batch: int = 10
     merge_distance: float = memory.MERGE_DISTANCE
+    # Пауза при ошибке настройки модели (auth/quota/config/model_not_found).
+    pause: timedelta = timedelta(minutes=5)
+
+
+def _model_answered(result: memory.Outcome) -> bool:
+    """Модель ответила хотя бы на один вызов задачи (ключ принят) — пауза снимается."""
+    return result.status == "refused" or any(c.error is None for c in result.calls)
 
 
 class MemoryWorker:
@@ -76,16 +98,61 @@ class MemoryWorker:
         self.models = models
         self.embedder = embedder
         self.settings = settings or WorkerSettings()
+        self._paused_until = 0.0  # time.monotonic()
+        # Вид ошибки настройки модели; держится до первого ответа модели (пульс ``paused``).
+        self._pause_kind: str | None = None
 
-    async def run_once(self) -> list[memory.Outcome]:
-        """Один проход: захват и обработка извлечения, затем сжатия."""
+    # ----------------------------------------------------------------- пауза (настройка модели)
+
+    @property
+    def paused(self) -> bool:
+        return time.monotonic() < self._paused_until
+
+    def _pulse(self) -> None:
+        if self._pause_kind is not None:
+            self.heartbeat.beat("paused", self._pause_kind)
+        else:
+            self.heartbeat.beat("ok")
+
+    def _limit(self) -> int:
+        """После паузы — пробный захват одной задачи, пока модель не ответит."""
+        return 1 if self._pause_kind is not None else self.settings.batch
+
+    def _blocked(self, stop: asyncio.Event | None) -> bool:
+        return self.paused or (stop is not None and stop.is_set())
+
+    def _note(self, result: memory.Outcome) -> None:
+        if result.status == "error" and result.error in PAUSE_KINDS:
+            pause_s = self.settings.pause.total_seconds()
+            if not self.paused:
+                logger.error("memory paused: model %s, resume in %ds", result.error, int(pause_s))
+            self._paused_until = time.monotonic() + pause_s
+            self._pause_kind = result.error
+            self._pulse()
+        elif self._pause_kind is not None and _model_answered(result):
+            logger.info("memory resumed: model answered")
+            self._pause_kind = None
+            self._pulse()
+
+    # ----------------------------------------------------------------- проход
+
+    async def run_once(self, stop: asyncio.Event | None = None) -> list[memory.Outcome]:
+        """Один проход: захват и обработка извлечения, затем сжатия. На паузе (ошибка
+        настройки модели) или после остановки — ничего нового не захватывается."""
         cfg = self.settings
         out: list[memory.Outcome] = []
+        if self.paused:  # цикл жив, захват не нужен
+            self._pulse()
+        if self._blocked(stop):
+            return out
         extractions = await mw.claim_extraction(
-            self.worker_sm, gap=cfg.session_gap, lease=cfg.lease, limit=cfg.batch
+            self.worker_sm, gap=cfg.session_gap, lease=cfg.lease, limit=self._limit()
         )
-        self.heartbeat.beat("ok")
-        for claim in extractions:
+        self._pulse()
+        for n, claim in enumerate(extractions):
+            if self._blocked(stop):
+                self._left(len(extractions) - n)
+                return out
             out.append(
                 await self._guard(
                     "extract",
@@ -101,11 +168,17 @@ class MemoryWorker:
                     ),
                 )
             )
+            self._note(out[-1])
+        if self._blocked(stop):
+            return out
         compactions = await mw.claim_compaction(
-            self.worker_sm, every=cfg.compact_every, lease=cfg.lease, limit=cfg.batch
+            self.worker_sm, every=cfg.compact_every, lease=cfg.lease, limit=self._limit()
         )
-        self.heartbeat.beat("ok")
-        for comp in compactions:
+        self._pulse()
+        for n, comp in enumerate(compactions):
+            if self._blocked(stop):
+                self._left(len(compactions) - n)
+                return out
             out.append(
                 await self._guard(
                     "compact",
@@ -121,7 +194,13 @@ class MemoryWorker:
                     ),
                 )
             )
+            self._note(out[-1])
         return out
+
+    @staticmethod
+    def _left(n: int) -> None:
+        """Захваченные, но не начатые задачи (остановка или пауза): аренда истечёт сама."""
+        logger.warning("memory: %d claimed jobs left until lease expiry", n)
 
     async def _guard(
         self, kind: Literal["extract", "compact"], job: Awaitable[memory.Outcome]
@@ -155,12 +234,12 @@ class MemoryWorker:
         stop = stop or asyncio.Event()
         while not stop.is_set():
             try:
-                done = await self.run_once()
+                done = await self.run_once(stop)
             except Exception as exc:  # БД недоступна и т. п. — повтор после паузы
                 raise_if_config_db_error(exc, name="memory worker")
                 logger.warning("memory worker pass failed: %s", type(exc).__name__)
                 done = []
-            if not done:
+            if not done or self.paused:
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=poll_s)
                 except TimeoutError:
@@ -172,7 +251,6 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
     from app.config import ConfigError, get_settings
     from app.core.crypto import load_keyring
     from app.core.fingerprint import load_fingerprint_keys
-    from app.db import make_engine, make_sessionmaker
     from app.workers.signals import stop_on_signals
 
     heartbeat = Heartbeat.from_env()
@@ -194,26 +272,38 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
             heartbeat=heartbeat,
             stop=stop,
         )
-        if models is None:  # остановка во время ожидания
-            return
-        sm = make_sessionmaker(make_engine(settings.worker_database_url))
-        worker = MemoryWorker(
-            worker_sm=sm,
-            app_sm=sm,
-            keys=keys,
-            fingerprints=fingerprints,
-            models=models,
-            embedder=None,  # модель эмбеддингов не выбрана (Б-66): память по свежести
-            settings=WorkerSettings(
-                session_gap=timedelta(minutes=settings.memory_session_gap_min),
-                lease=timedelta(minutes=settings.memory_lease_min),
-                compact_every=timedelta(hours=settings.memory_compact_every_h),
-                max_attempts=settings.memory_max_attempts,
-            ),
-            heartbeat=heartbeat,
-        )
-        await worker.run_forever(stop=stop)
+        if models is not None:  # ``None`` — остановка во время ожидания
+            await _loop(settings, models, keys, fingerprints, heartbeat, stop)
     logger.info("memory worker stopped")
+
+
+async def _loop(  # pragma: no cover — запуск процесса
+    settings: Settings,
+    models: AgentModels,
+    keys: Keyring,
+    fingerprints: FingerprintKeys,
+    heartbeat: Heartbeat,
+    stop: asyncio.Event,
+) -> None:
+    from app.db import make_engine, make_sessionmaker
+
+    sm = make_sessionmaker(make_engine(settings.worker_database_url))
+    worker = MemoryWorker(
+        worker_sm=sm,
+        app_sm=sm,
+        keys=keys,
+        fingerprints=fingerprints,
+        models=models,
+        embedder=None,  # модель эмбеддингов не выбрана (Б-66): память по свежести
+        settings=WorkerSettings(
+            session_gap=timedelta(minutes=settings.memory_session_gap_min),
+            lease=timedelta(minutes=settings.memory_lease_min),
+            compact_every=timedelta(hours=settings.memory_compact_every_h),
+            max_attempts=settings.memory_max_attempts,
+        ),
+        heartbeat=heartbeat,
+    )
+    await worker.run_forever(stop=stop)
 
 
 if __name__ == "__main__":  # pragma: no cover

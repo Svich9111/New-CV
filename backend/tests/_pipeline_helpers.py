@@ -8,7 +8,11 @@
    Тестовая БД общая: чтобы захват не забрал сообщения других тестов, на время вызова все прочие
    строки `processing` держит блокировкой суперпользователь (`FOR UPDATE SKIP LOCKED`), а захват
    их пропускает (`SKIP LOCKED`) — в выдачу попадает только нужное сообщение. Распавшаяся пара и
-   исчерпанные попытки завершаются самим захватом (`couple_ended`/`attempts_exhausted`);
+   исчерпанные попытки завершаются самим захватом (`couple_ended`/`attempts_exhausted`).
+   **Параллельные прогоны тестов на одной БД не поддерживаются**: удержание видит только строки,
+   которые есть в момент `SELECT … FOR UPDATE`; строку, вставленную позже другим прогоном, захват
+   выдаст. Тогда помощник снимает выданные аренды (`pipeline_release(…, NULL, false)` — без
+   расхода попытки и без отсрочки) и только затем падает `AssertionError` (ревью р.1, Б-83);
 2. **чтение** — `pipeline_read` по токену (`read_original`);
 3. **завершение** — `pipeline_deliver_leased` / `pipeline_withhold_leased` (5 аргументов) по
    токену, одна транзакция на сообщение; аренда и срок (`work_lease_until`) снимаются.
@@ -38,6 +42,7 @@ _CLAIM = (
     "SELECT message_id, token, attempts "
     "FROM pipeline_claim(CAST(CAST(:l AS text) AS interval), :n, 100)"
 )
+_RELEASE = "SELECT pipeline_release(:m, :t, NULL, false)"
 _DELIVER = (
     "SELECT pipeline_deliver_leased(:m, :t, :b, :ad, CAST(:tone AS smallint), :h, "
     "CAST(CAST(:ev AS text[]) AS safety_event_type[]))"
@@ -63,6 +68,12 @@ async def claim(engine: AsyncEngine, message_id: uuid.UUID) -> PipelineClaim | N
     got = [PipelineClaim(uuid.UUID(str(r.message_id)), uuid.UUID(str(r.token)), int(r.attempts))
            for r in rows]  # fmt: skip
     if any(c.message_id != message_id for c in got):
+        # Чужую строку (параллельный прогон) — вернуть как была до захвата: аренда снята,
+        # попытка не израсходована; затем — ошибка теста.
+        async with engine.connect() as conn, conn.begin():
+            await conn.execute(text("SET LOCAL ROLE feelings_worker"))
+            for c in got:
+                await conn.execute(text(_RELEASE), {"m": c.message_id, "t": c.token})
         raise AssertionError("захват выдал чужое сообщение: удержание прочих строк не сработало")
     return got[0] if got else None
 

@@ -10,7 +10,7 @@
 - файл пульса без текстов и id: подделанная причина с текстом/uuid заменяется на ``other``;
   после настоящего прохода конвейера с секретным текстом в файле нет ни текста, ни id;
 - код выхода 78 у каждого из четырёх воркеров при отказе БД во входе (роль не существует —
-  28000, работает и на кластере ``trust``), значений секретов (пароль, ключи, токен) в выводе нет;
+  28000 на trust, 28P01 на scram), значений секретов (пароль, ключи, токен) в выводе нет;
 - повтор при старте (недоступна модель/БД) с растущей паузой и SIGTERM во время ожидания —
   выход 0 у memory, kb, notify (у pipeline — ``test_worker_health.py``);
 - серия коротких 429 в пределах окна аренды (настоящие паузы) не расходует попытки;
@@ -334,11 +334,7 @@ async def test_paused_by_config_error_health_cli_exit_1(
         await n.api.aclose()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8 р.1 MINOR-2: memory при отклонённом ключе модели во время работы остаётся healthy "
-    "(ошибка auth — исход задачи, паузы нет; задачи жгут попытки)",
-)
+# A8 р.1 MINOR-2 исправлен (A7): ошибка настройки модели у memory — пауза, пульс ``paused``.
 async def test_memory_rejected_model_key_during_work_is_unhealthy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -528,8 +524,9 @@ WORKERS = ("memory", "kb", "pipeline", "notify")
 async def test_each_worker_exits_78_on_rejected_login_without_secret_values(
     tmp_path: Path, module: str
 ) -> None:
-    """Б-90, АР-49 (2): БД отвергла роль входа (роли нет — SQLSTATE 28000; не зависит от
-    способа входа кластера) — каждый из четырёх воркеров завершается кодом 78 со строкой
+    """Б-90, АР-49 (2): БД отвергла роль входа (роли нет — SQLSTATE 28000 на trust; на scram
+    PostgreSQL не раскрывает, есть ли роль, и отвечает 28P01 — принимаются оба; A0, по отчёту A7
+    р.1) — каждый из четырёх воркеров завершается кодом 78 со строкой
     CRITICAL; ни пароля, ни ключей, ни токена бота в выводе нет, трассировки нет."""
     url = _login_url("a8_no_such_login_" + uuid.uuid4().hex[:6], SECRET_PW)
     proc = _spawn(tmp_path, module, "stub", url)
@@ -539,7 +536,8 @@ async def test_each_worker_exits_78_on_rejected_login_without_secret_values(
         if proc.poll() is None:
             proc.kill()
     assert proc.returncode == EX_CONFIG, out[-2000:]
-    assert "configuration error, exit 78 (EX_CONFIG)" in out and "SQLSTATE 28000" in out, out
+    assert "configuration error, exit 78 (EX_CONFIG)" in out, out
+    assert "SQLSTATE 28000" in out or "SQLSTATE 28P01" in out, out
     for secret in SECRET_VALUES:
         assert secret not in out, secret
     assert "Traceback" not in out

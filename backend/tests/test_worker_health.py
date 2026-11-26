@@ -264,29 +264,92 @@ async def test_pipeline_no_pulse_while_database_unavailable(tmp_path: Path) -> N
     assert not path.exists()
 
 
-def _with_password(url: str, password: str) -> str:
+def _with_login(url: str, user: str | None = None, password: str | None = None) -> str:
     u = urlsplit(url)
-    netloc = f"{u.username}:{password}@{u.hostname}:{u.port}"
+    netloc = f"{user or u.username}:{password or u.password or ''}@{u.hostname}:{u.port}"
     return urlunsplit((u.scheme, netloc, u.path, u.query, u.fragment))
 
 
-async def test_rejected_worker_login_is_config_error_not_retry() -> None:
-    """Б-90: БД отвергла роль входа (неверный пароль, нет базы) — ошибка настройки: цикл не
-    крутит «claim failed» бесконечно, а завершается ``ConfigError`` (процесс — код 78)."""
+def _with_password(url: str, password: str) -> str:
+    return _with_login(url, password=password)
+
+
+def _no_such_role() -> str:
+    return "a7_no_such_login_" + uuid.uuid4().hex[:8]
+
+
+async def _password_checked() -> bool:
+    """Пробное подключение с заведомо неверным паролем: ``True`` — кластер его отверг (28P01)."""
+    import asyncpg
+
+    u = urlsplit(TEST_DATABASE_URL)
+    try:
+        conn = await asyncpg.connect(
+            user=u.username, password="wrong-A7-probe-" + uuid.uuid4().hex[:8],
+            host=u.hostname, port=u.port, database=u.path.lstrip("/"), timeout=10,
+        )  # fmt: skip
+    except asyncpg.InvalidPasswordError:
+        return True
+    await conn.close()
+    return False
+
+
+async def _role_code() -> str:
+    """SQLSTATE отказа входа несуществующей роли: на ``trust`` — 28000 («роли нет»); с проверкой
+    пароля (scram) PostgreSQL не раскрывает, есть ли роль, — 28P01."""
+    return "28P01" if await _password_checked() else "28000"
+
+
+@pytest.fixture
+async def password_auth() -> None:
+    """Проверка неверного пароля (28P01) нужна кластер с проверкой пароля (scram). На кластере
+    ``trust`` (облачная сессия, CLAUDE.md) неверный пароль принимается — тест пропускается; в CI
+    (``CI=true``, контейнер с ``POSTGRES_PASSWORD``) пропуск был бы незаметной потерей проверки —
+    ошибка."""
+    if await _password_checked():
+        return
+    msg = (
+        "кластер без проверки пароля (trust): отказ входа по паролю не проверить — нужен scram, "
+        "см. CLAUDE.md"
+    )
+    if os.environ.get("CI") == "true":
+        pytest.fail(msg)
+    pytest.skip(msg)
+
+
+async def _run_until_config_error(url: str) -> ConfigError:
+    eng = make_engine(url)
+    try:
+        w = worker(eng, Model())
+        with pytest.raises(ConfigError) as err:
+            await asyncio.wait_for(w.run_forever(poll_s=0.05), 20)
+    finally:
+        await eng.dispose()
+    return err.value
+
+
+@pytest.mark.parametrize("case", ["no_such_role", "no_such_db"])
+async def test_rejected_worker_login_is_config_error_not_retry(case: str) -> None:
+    """Б-90: БД отвергла роль входа (роли нет, базы нет — 3D000; проверяется на любом кластере)
+    — ошибка настройки: цикл не крутит «claim failed» бесконечно, а завершается ``ConfigError``
+    (процесс — код 78). Пароля в тексте нет."""
+    secret = "SECRET-A7-pw-" + uuid.uuid4().hex[:8]
+    if case == "no_such_role":
+        url, code = _with_login(TEST_DATABASE_URL, _no_such_role(), secret), await _role_code()
+    else:
+        url, code = TEST_DATABASE_URL.rsplit("/", 1)[0] + "/a7_no_such_db", "3D000"
+    err = await _run_until_config_error(url)
+    assert f"SQLSTATE {code}" in str(err)
+    assert secret not in str(err)
+
+
+async def test_wrong_password_login_is_config_error(password_auth: None) -> None:
+    """Б-90: неверный пароль роли входа (28P01) — ``ConfigError``; пароля в тексте нет.
+    Только на кластере с проверкой пароля (``password_auth``)."""
     bad_password = "wrong-A7-" + uuid.uuid4().hex[:8]
-    for url, code in (
-        (_with_password(TEST_DATABASE_URL, bad_password), "28P01"),
-        (TEST_DATABASE_URL.rsplit("/", 1)[0] + "/a7_no_such_db", "3D000"),
-    ):
-        eng = make_engine(url)
-        try:
-            w = worker(eng, Model())
-            with pytest.raises(ConfigError) as err:
-                await asyncio.wait_for(w.run_forever(poll_s=0.05), 20)
-        finally:
-            await eng.dispose()
-        assert f"SQLSTATE {code}" in str(err.value)
-        assert bad_password not in str(err.value)
+    err = await _run_until_config_error(_with_password(TEST_DATABASE_URL, bad_password))
+    assert "SQLSTATE 28P01" in str(err)
+    assert bad_password not in str(err)
 
 
 async def test_unreachable_database_is_not_config_error() -> None:
@@ -557,6 +620,9 @@ def _proc_env(tmp_path: Path, **extra: str) -> dict[str, str]:
             "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": str(BACKEND),
             health.HEARTBEAT_ENV: str(tmp_path / "hb.json"),
+            # Тесты процесса не выходят к Telegram: проверку токена при старте проверяют
+            # отдельно (``run_with_token_check`` с подменённым Bot API).
+            "FEELINGS_NOTIFY_CHECK_TOKEN": "false",
         }
         | extra
     )
@@ -593,13 +659,11 @@ def test_process_config_error_exits_78_without_values(
     assert "SECRET-A7" not in out and "Traceback" not in out
 
 
-async def test_process_rejected_db_login_exits_78(tmp_path: Path) -> None:
-    """БД отвергла роль входа воркера (неверный пароль) — код 78, пароля в выводе нет."""
-    bad = "wrong-A7-" + uuid.uuid4().hex[:8]
+async def _notify_with_db(tmp_path: Path, db_url: str) -> str:
     env = _proc_env(
         tmp_path,
         FEELINGS_TELEGRAM_BOT_TOKEN="987654321:AAFakeNotifyTokenA7xxxxxxxxxxxxxxxxxx",
-        FEELINGS_WORKER_DATABASE_URL=_with_password(TEST_DATABASE_URL, bad),
+        FEELINGS_WORKER_DATABASE_URL=db_url,
         FEELINGS_NOTIFY_POLL_S="0.2",
     )
     r = await asyncio.to_thread(
@@ -608,7 +672,23 @@ async def test_process_rejected_db_login_exits_78(tmp_path: Path) -> None:
     )  # fmt: skip
     out = r.stdout + r.stderr
     assert r.returncode == EX_CONFIG, out[-1500:]
-    assert "SQLSTATE 28P01" in out and bad not in out and "AAFakeNotify" not in out
+    assert "AAFakeNotify" not in out and "Traceback" not in out
+    return out
+
+
+async def test_process_rejected_db_login_exits_78(tmp_path: Path) -> None:
+    """БД отвергла роль входа воркера (роли нет — на любом кластере: 28000 на ``trust``, 28P01
+    со scram) — код 78, пароля в выводе нет."""
+    secret = "SECRET-A7-pw-" + uuid.uuid4().hex[:8]
+    out = await _notify_with_db(tmp_path, _with_login(TEST_DATABASE_URL, _no_such_role(), secret))
+    assert f"SQLSTATE {await _role_code()}" in out and secret not in out
+
+
+async def test_process_wrong_db_password_exits_78(tmp_path: Path, password_auth: None) -> None:
+    """Неверный пароль роли входа (28P01) — код 78, пароля в выводе нет (кластер с паролем)."""
+    bad = "wrong-A7-" + uuid.uuid4().hex[:8]
+    out = await _notify_with_db(tmp_path, _with_password(TEST_DATABASE_URL, bad))
+    assert "SQLSTATE 28P01" in out and bad not in out
 
 
 # Процесс конвейера с подменённым каталогом OpenRouter: ``unavailable`` — недоступен (как сбой
@@ -690,3 +770,485 @@ async def test_process_pulse_ok_in_loop_and_health_cli_passes(
     finally:
         code, out = await _stop(proc)
     assert code == 0, out[-1500:]
+
+
+# =========================================================================== ревью р.1: MINOR-1…5
+
+
+def test_check_future_timestamp_and_unknown_state(tmp_path: Path) -> None:
+    """MINOR-5: метка из будущего дальше допуска — не свежая; в пределах допуска (часы
+    расходятся на доли секунды) — свежая. Состояние вне известного набора печатается как
+    ``other`` (наблюдение A8)."""
+    path = tmp_path / "hb.json"
+    path.write_text(json.dumps({"ts": 10_000.0, "state": "ok", "reason": None}))
+    ok, detail = check(path, max_age_s=120, now=10_000.0 - 60)
+    assert not ok and detail.startswith("from the future")
+    assert check(path, max_age_s=120, now=10_000.0 - 1)[0]
+    path.write_text(json.dumps({"ts": 10_000.0, "state": SECRET_TEXT, "reason": None}))
+    ok, detail = check(path, max_age_s=120, now=10_000.0)
+    assert not ok and "state=other" in detail and SECRET_TEXT not in detail
+
+
+def test_any_within() -> None:
+    assert health.any_within([10.0, 100.0], 5.0, now=103.0)
+    assert not health.any_within([10.0, 90.0], 5.0, now=103.0)
+    assert not health.any_within([], 5.0, now=103.0)
+
+
+def _claims(*batches: list[Any]) -> Callable[..., Any]:
+    """Подменённый захват: очередные пачки, дальше — пусто; ``limits`` — запрошенные пределы."""
+    left = list(batches)
+    limits: list[int] = []
+
+    async def claim(*a: Any, **k: Any) -> list[Any]:
+        limits.append(int(k["limit"]))
+        return left.pop(0) if left else []
+
+    claim.limits = limits  # type: ignore[attr-defined]
+    return claim
+
+
+def _outcome(kind: str, status: str, error: str | None = None, *, answered: bool) -> Any:
+    from app.ai.calls import CallRecord
+    from app.ai.memory import Outcome
+
+    calls = (CallRecord(role="memory", prompt="p", model="m", error=None),) if answered else ()
+    return Outcome(kind, status, error=error, calls=calls)  # type: ignore[arg-type]
+
+
+async def test_memory_stop_between_extraction_and_compaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-1: SIGTERM во время извлечения — начатое дорабатывается, следующая задача пачки и
+    сжатие не захватываются и не начинаются."""
+    from app.ai import memory as ai_memory
+
+    stop = asyncio.Event()
+    started: list[object] = []
+
+    async def extract(*a: Any, **k: Any) -> Any:
+        started.append(a[4])
+        stop.set()  # сигнал пришёл посреди первой задачи
+        await asyncio.sleep(0.05)
+        return _outcome("extract", "done", answered=True)
+
+    ext, comp = _claims([object(), object()]), _claims([object()])
+    monkeypatch.setattr(mw, "claim_extraction", ext)
+    monkeypatch.setattr(mw, "claim_compaction", comp)
+    monkeypatch.setattr(ai_memory, "run_extraction", extract)
+    w = _memory_worker(tmp_path / "hb.json")
+    await asyncio.wait_for(w.run_forever(poll_s=0.05, stop=stop), 5)
+    assert len(started) == 1  # вторая задача пачки не начата
+    assert comp.limits == [] and ext.limits == [10]  # type: ignore[attr-defined]  # сжатие не захвачено
+
+
+async def test_memory_stopped_before_pass_claims_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    ext, comp = _claims([object()]), _claims([object()])
+    monkeypatch.setattr(mw, "claim_extraction", ext)
+    monkeypatch.setattr(mw, "claim_compaction", comp)
+    stop = asyncio.Event()
+    stop.set()
+    w = _memory_worker(Path("/nonexistent/hb.json"))
+    assert await w.run_once(stop) == []
+    assert ext.limits == comp.limits == []  # type: ignore[attr-defined]
+
+
+async def test_kb_stop_between_documents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """MINOR-1 (kb): SIGTERM во время индексации — второй захваченный материал не начинается,
+    нового захвата нет; цикл завершается."""
+    stop = asyncio.Event()
+    started: list[IndexClaim] = []
+    claims = [IndexClaim(uuid.uuid4(), uuid.uuid4(), 1, "txt", 10) for _ in range(2)]
+    claim = _claims(claims, [IndexClaim(uuid.uuid4(), uuid.uuid4(), 1, "txt", 10)])
+
+    async def index(self: KbWorker, c: IndexClaim) -> IndexOutcome:
+        started.append(c)
+        stop.set()
+        return IndexOutcome("indexed", None, 1)
+
+    monkeypatch.setattr(kb_work, "claim_index", claim)
+    monkeypatch.setattr(KbWorker, "index", index)
+    w = KbWorker(worker_sm=None, heartbeat=Heartbeat(tmp_path / "hb.json"))  # type: ignore[arg-type]
+    await asyncio.wait_for(w.run_forever(poll_s=0.05, stop=stop), 5)
+    assert started == claims[:1]
+    assert claim.limits == [2]  # type: ignore[attr-defined]  # второго захвата не было
+
+
+async def test_memory_rejected_model_key_pauses_then_probes_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A8 р.1 MINOR-2: ключ модели отклонён во время работы — пауза памяти: остаток пачки не
+    обрабатывается (вызовов модели нет), на паузе новых захватов нет, пульс ``paused``
+    (unhealthy). После паузы — пробный захват одной задачи; ``paused`` держится, пока модель не
+    ответит; ответила — снова ``ok`` и полные пачки."""
+    from app.ai import memory as ai_memory
+
+    path = tmp_path / "hb.json"
+    script = [
+        _outcome("extract", "error", "auth", answered=False),
+        _outcome("extract", "error", "unavailable", answered=False),  # сеть — ключ не проверен
+        _outcome("extract", "done", answered=True),
+    ]
+    calls: list[object] = []
+
+    async def extract(*a: Any, **k: Any) -> Any:
+        calls.append(a[4])
+        return script.pop(0)
+
+    ext = _claims([object(), object(), object()], [object()], [object()])
+    comp = _claims()
+    monkeypatch.setattr(mw, "claim_extraction", ext)
+    monkeypatch.setattr(mw, "claim_compaction", comp)
+    monkeypatch.setattr(ai_memory, "run_extraction", extract)
+    w = _memory_worker(path)
+    w.settings = WorkerSettings(lease=timedelta(seconds=0.3), pause=timedelta(seconds=0.2))
+    out = await w.run_once()
+    assert [o.error for o in out] == ["auth"] and len(calls) == 1  # остаток пачки не начат
+    assert (read_beat(path)["state"], read_beat(path)["reason"]) == ("paused", "auth")
+    assert not check(path, max_age_s=60)[0]
+    assert await w.run_once() == [] and ext.limits == [10]  # type: ignore[attr-defined]  # на паузе — без захвата
+    assert read_beat(path)["state"] == "paused"
+    await asyncio.sleep(0.25)  # пауза прошла
+    out = await w.run_once()  # пробный захват: одна задача, модель недоступна
+    assert [o.error for o in out] == ["unavailable"]
+    assert ext.limits == [10, 1] and read_beat(path)["state"] == "paused"  # type: ignore[attr-defined]
+    out = await w.run_once()  # модель ответила
+    assert [o.status for o in out] == ["done"]
+    assert ext.limits == [10, 1, 1] and comp.limits == [1, 10]  # type: ignore[attr-defined]
+    assert read_beat(path) == {"ts": read_beat(path)["ts"], "state": "ok", "reason": None}
+    assert check(path, max_age_s=60)[0]
+
+
+async def test_notify_no_pulse_while_database_unavailable(tmp_path: Path) -> None:
+    """MINOR-4: у notify захват не прошёл (БД недоступна) — пульса нет."""
+    path = tmp_path / "hb.json"
+    eng = make_engine("postgresql+asyncpg://nobody:x@127.0.0.1:1/none")
+    try:
+        w = nworker(eng, FakeTg())
+        w.heartbeat = Heartbeat(path)
+        stop = asyncio.Event()
+        task = asyncio.create_task(w.run_forever(poll_s=0.05, stop=stop))
+        await asyncio.sleep(0.5)
+        stop.set()
+        await asyncio.wait_for(task, 10)
+        await w.api.aclose()
+    finally:
+        await eng.dispose()
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("kind", ["pipeline", "notify"])
+async def test_busy_slots_pulse_only_while_a_task_is_within_lease(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-3: все слоты заняты — пульс идёт, пока начатая задача моложе аренды; задача
+    зависла дольше аренды — пульс замирает (health check — unhealthy)."""
+    from app.repositories import notify_work as nw
+    from app.repositories import pipeline_work as pw
+    from app.repositories.notify_work import NotifyClaim
+    from app.repositories.pipeline_work import PipelineClaim
+
+    path = tmp_path / "hb.json"
+    eng = make_engine("postgresql+asyncpg://nobody:x@127.0.0.1:1/none")  # БД не нужна
+    lease = timedelta(seconds=0.4)
+    w: Any
+    if kind == "pipeline":
+        w = worker(eng, Model(), batch=1, lease=lease)
+        one: Any = PipelineClaim(uuid.uuid4(), uuid.uuid4(), 1)
+        monkeypatch.setattr(pw, "claim", _claims([one]))
+    else:
+        w = nworker(eng, FakeTg(), batch=1, lease=lease, margin=timedelta(seconds=0.1))
+        one = NotifyClaim(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), 1)
+        monkeypatch.setattr(nw, "claim", _claims([one]))
+
+    release = asyncio.Event()
+
+    async def hang(c: Any) -> Any:
+        await release.wait()  # «зависла» до конца теста
+
+    monkeypatch.setattr(w, "_guard", hang)
+    w.heartbeat = Heartbeat(path)
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run_forever(poll_s=0.05, stop=stop))
+    try:
+        await until(lambda: path.exists())
+        ts0 = read_beat(path)["ts"]
+        await asyncio.sleep(0.2)
+        assert read_beat(path)["ts"] > ts0  # задача моложе аренды — пульс идёт
+        await asyncio.sleep(0.5)  # аренда 0.4 с истекла
+        frozen = read_beat(path)["ts"]
+        await asyncio.sleep(0.3)
+        assert read_beat(path)["ts"] == frozen and not task.done()
+        assert not check(path, max_age_s=0.2)[0]
+    finally:
+        stop.set()
+        release.set()
+        await asyncio.wait_for(task, 10)
+        if kind == "notify":
+            await w.api.aclose()
+        await eng.dispose()
+
+
+async def test_pipeline_paused_holds_after_pause_until_model_answers(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID], tmp_path: Path
+) -> None:
+    """MINOR-2 (конвейер): ключ отклонён — ``paused``; пауза прошла, очередь пуста — всё ещё
+    ``paused`` (не healthy через 5 минут); следующее сообщение обработано (модель ответила) —
+    ``ok``. Попытка на паузе не расходуется."""
+    anna, _igor, _ = pair
+    path = tmp_path / "hb.json"
+    w = worker(
+        engine, Model(fail={"safety": [LLMAuthError("rejected")]}), pause=timedelta(seconds=0.3)
+    )
+    w.heartbeat = Heartbeat(path)
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run_forever(poll_s=0.05, stop=stop))
+    try:
+        mid = await send(sessionmaker, anna, CALM)
+        await until(lambda: _beat_state(path) == "paused")
+        await asyncio.sleep(0.6)  # пауза 0.3 с прошла; сообщение снова в очереди
+        await until(lambda: _beat_state(path) == "ok")
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 20)
+    from tests.test_pipeline_db import _msg
+
+    row = await _msg(engine, mid)
+    assert row is not None and row["status"] == "delivered" and row["work_attempts"] <= 1
+
+
+async def test_pipeline_paused_with_empty_queue_stays_unhealthy(
+    engine: AsyncEngine, tmp_path: Path
+) -> None:
+    await _park(engine)
+    path = tmp_path / "hb.json"
+    w = worker(engine, Model(), pause=timedelta(seconds=0.1))
+    w.heartbeat = Heartbeat(path)
+    w._pause("auth")
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run_forever(poll_s=0.05, stop=stop))
+    try:
+        await asyncio.sleep(0.5)  # пауза прошла, захват идёт, очередь пуста
+        assert not w.paused
+        beat = read_beat(path)
+        assert (beat["state"], beat["reason"]) == ("paused", "auth")
+        assert time.time() - beat["ts"] < 0.3  # пульс свежий, но unhealthy
+        assert not check(path, max_age_s=60)[0]
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 20)
+
+
+async def test_notify_paused_holds_after_pause_until_token_accepted(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID], tmp_path: Path
+) -> None:
+    """MINOR-2 (notify): 401 — ``paused``; пауза прошла, очередь пуста — всё ещё ``paused``;
+    Telegram принял токен (уведомление отправлено) — ``ok``."""
+    anna, _igor, _ = pair
+    path = tmp_path / "hb.json"
+    tg = FakeTg(tg_error(401))
+    w = nworker(engine, tg, pause=timedelta(seconds=0.3), sleep=asyncio.sleep)
+    w.heartbeat = Heartbeat(path)
+    w._config_reason = "http_401"  # прежний 401, очередь пуста
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run_forever(poll_s=0.05, stop=stop))
+    try:
+        await asyncio.sleep(0.3)
+        assert _beat_state(path) == "paused" and not w.paused
+        await delivered(sessionmaker, engine, anna)
+        await until(lambda: _beat_state(path) == "paused" and len(tg.requests) == 1)
+        await until(lambda: len(tg.sent) == 1)  # после паузы — отправлено
+        await until(lambda: _beat_state(path) == "ok")
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 20)
+        await w.api.aclose()
+    assert check(path, max_age_s=60)[0]
+
+
+def _getme_api(*responses: Any) -> Any:
+    import httpx
+
+    from app.bot.client import BotApi
+
+    seen: list[str] = []
+    left = list(responses)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path.rsplit("/", 1)[-1])
+        action = left.pop(0) if left else httpx.Response(200, json={"ok": True, "result": {}})
+        if isinstance(action, type):
+            raise action("simulated", request=request)
+        return action
+
+    api = BotApi(GETME_TOKEN, transport=httpx.MockTransport(handler), max_retries=0)
+    api.seen = seen  # type: ignore[attr-defined]
+    return api
+
+
+GETME_TOKEN = "987654321:AAFakeGetMeTokenA7xxxxxxxxxxxxxxxxxxx"
+
+
+@pytest.mark.parametrize("code", [401, 404])
+async def test_bot_token_check_rejected_is_config_error(
+    code: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """MINOR-2: при старте notify проверяет токен (``getMe``): 401/404 — ``ConfigError``
+    (процесс — код 78); в тексте — только код HTTP, без токена и описания от Telegram."""
+    from app.workers.notify import check_bot_token
+
+    api = _getme_api(tg_error(code))
+    try:
+        with pytest.raises(ConfigError) as err:
+            await check_bot_token(api)
+    finally:
+        await api.aclose()
+    assert api.seen == ["getMe"]
+    assert f"HTTP {code}" in str(err.value) and "FEELINGS_TELEGRAM_BOT_TOKEN" in str(err.value)
+    assert "AAFakeGetMe" not in str(err.value) and "DESCR-A5" not in str(err.value)
+    assert is_config_error(err.value)
+
+
+@pytest.mark.parametrize(
+    ("env", "flag", "want"),
+    [("production", None, True), ("staging", None, True), ("dev", None, False),
+     ("test", None, False), ("dev", True, True), ("production", False, False)],
+)  # fmt: skip
+def test_token_check_on_stand_and_production_by_default(
+    env: str, flag: bool | None, want: bool
+) -> None:
+    from app.workers.notify import token_check_enabled
+
+    assert token_check_enabled(Settings(env=env, notify_check_token=flag)) is want
+
+
+async def test_bot_token_check_unreachable_is_skipped(caplog: pytest.LogCaptureFixture) -> None:
+    """Сеть до Telegram недоступна, 5xx, 429 — не ошибка настройки: проверка пропускается."""
+    import httpx
+
+    from app.workers.notify import check_bot_token
+
+    for action in (httpx.ConnectError, tg_error(502), tg_error(429, retry_after=5)):
+        api = _getme_api(action)
+        with caplog.at_level(logging.WARNING, logger="app.workers.notify"):
+            assert await check_bot_token(api) is False
+        await api.aclose()
+    api = _getme_api()
+    assert await check_bot_token(api) is True
+    await api.aclose()
+    text = caplog.text
+    assert "bot token check skipped" in text and "AAFakeGetMe" not in text
+
+
+async def test_bot_token_check_timeout_is_skipped() -> None:
+    import httpx
+
+    from app.bot.client import BotApi
+    from app.workers.notify import check_bot_token
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        raise AssertionError  # pragma: no cover
+
+    api = BotApi(GETME_TOKEN, transport=httpx.MockTransport(slow), max_retries=0)
+    try:
+        assert await check_bot_token(api, timeout_s=0.1) is False
+    finally:
+        await api.aclose()
+
+
+async def test_run_with_token_check_rejected_token_stops_loop(
+    engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Проверка токена идёт параллельно с циклом; 401 — цикл останавливается (начатое
+    дорабатывается) и ``ConfigError`` выходит наружу (``run_worker`` → код 78)."""
+    from app.workers.notify import NotifyWorker, run_with_token_check
+
+    await _park(engine)
+    w = NotifyWorker(worker_sm=make_sessionmaker(engine), api=_getme_api(tg_error(401)))
+    w.heartbeat = Heartbeat(tmp_path / "hb.json")
+    stop = asyncio.Event()
+    try:
+        with pytest.raises(ConfigError, match="HTTP 401"):
+            await asyncio.wait_for(run_with_token_check(w, poll_s=0.05, stop=stop), 10)
+    finally:
+        await w.api.aclose()
+    assert stop.is_set()
+
+
+async def test_run_with_token_check_unreachable_telegram_keeps_loop(
+    engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Telegram недоступен при старте — цикл работает (пульс ``ok``), остановка — штатно."""
+    import httpx
+
+    from app.workers.notify import NotifyWorker, run_with_token_check
+
+    await _park(engine)
+    path = tmp_path / "hb.json"
+    w = NotifyWorker(worker_sm=make_sessionmaker(engine), api=_getme_api(httpx.ConnectError))
+    w.heartbeat = Heartbeat(path)
+    stop = asyncio.Event()
+    task = asyncio.create_task(run_with_token_check(w, poll_s=0.05, stop=stop))
+    try:
+        await until(lambda: _beat_state(path) == "ok")
+        assert not task.done()
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 10)
+        await w.api.aclose()
+
+
+# Процесс memory/kb с подменённым каталогом OpenRouter (заглушка) — для SIGTERM в цикле и во
+# время ожидания при старте (MINOR-1, MINOR-4; наблюдение A8: строка «worker stopped»).
+_MEMKB_LAUNCH = (
+    "import importlib, sys, types\n"
+    "import app.ai.models as m\n"
+    "from app.ai.llm import LLMUnavailable\n"
+    "async def _models(*a, **k):\n"
+    "    if sys.argv[2] == 'unavailable':\n"
+    "        raise LLMUnavailable('catalog down')\n"
+    "    return types.SimpleNamespace()\n"
+    "m.openrouter_models_async = _models\n"
+    "mod = importlib.import_module('app.workers.' + sys.argv[1])\n"
+    "from app.workers.startup import run_worker\n"
+    "run_worker(mod._main, name=sys.argv[1] + ' worker')\n"
+)
+
+
+def _spawn_memkb(module: str, mode: str, env: dict[str, str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [sys.executable, "-c", _MEMKB_LAUNCH, module, mode], cwd=BACKEND, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("module", ["memory", "kb"])
+@pytest.mark.parametrize("mode", ["loop", "unavailable"])
+async def test_memory_kb_sigterm_exit_0_and_logged(tmp_path: Path, module: str, mode: str) -> None:
+    """SIGTERM у memory/kb — в цикле (БД недоступна: захват падает, цикл ждёт) и во время
+    повтора при старте — код 0 и строка ``<воркер> worker stopped``."""
+    from app.core.crypto import generate_key_entry
+
+    entry = generate_key_entry("a7")
+    env = _proc_env(
+        tmp_path,
+        FEELINGS_WORKER_DATABASE_URL="postgresql+asyncpg://w:p@127.0.0.1:1/x",
+        FEELINGS_ENCRYPTION_KEYS=entry,
+        FEELINGS_ENCRYPTION_KEY_ID="a7",
+        FEELINGS_MEMORY_FINGERPRINT_KEY="A" * 43,
+    )
+    proc = _spawn_memkb(module, "stub" if mode == "loop" else mode, env)
+    path = tmp_path / "hb.json"
+    try:
+        want = "starting" if mode == "loop" else "waiting"
+        await until(lambda: _beat_state(path) == want or proc.poll() is not None)
+        await asyncio.sleep(1.5)
+        assert proc.poll() is None
+    finally:
+        code, out = await _stop(proc)
+    assert code == 0, out[-1500:]
+    assert f"{module} worker: SIGTERM received" in out and f"{module} worker stopped" in out, out
+    if mode == "loop":
+        assert f"{module} worker pass failed" in out, out[-1500:]
+    assert entry.split(":")[1] not in out and "Traceback" not in out

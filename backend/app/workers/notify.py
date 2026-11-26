@@ -47,8 +47,15 @@
 
 Пульс (Б-85, ``app.workers.health``): после каждого успешного прохода цикла (захват прошёл или
 не нужен) — ``ok`` (на паузе 429 — ``ok`` с причиной ``http_429``: лимит Telegram проходит сам);
-на паузе из-за неверного токена (401/404) — ``paused``: health check контейнера — unhealthy.
-БД отвергла роль входа (пароль, права) — ``ConfigError``, выход с кодом 78 (``startup``).
+при всех занятых слотах — только пока хотя бы одно начатое уведомление моложе аренды (ревью р.1
+MINOR-3). После неверного токена (401/404) — ``paused`` (health check контейнера — unhealthy) до
+первого ответа Telegram, принявшего токен (отправлено, 403, 400), а не только на время паузы
+(ревью р.1 MINOR-2). Токен проверяется и при старте (``check_bot_token``: ``getMe``; 401/404 —
+``ConfigError``, выход с кодом 78) — параллельно с циклом: сеть до Telegram недоступна — проверка
+пропускается с предупреждением, цикл не ждёт. Включена на стенде и в продуктиве; в разработке
+(``FEELINGS_ENV`` dev/local/test) — только при ``FEELINGS_NOTIFY_CHECK_TOKEN=true`` (тесты
+процесса и локальный запуск с ненастоящим токеном не ходят в Telegram). БД отвергла роль входа
+(пароль, права) — ``ConfigError``, выход с кодом 78 (``startup``).
 
 Остаточный риск «ровно одного»: процесс убит SIGKILL (или БД недоступна дольше аренды) между
 успешной отправкой и отметкой — после истечения аренды уведомление уйдёт ещё раз.
@@ -77,10 +84,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot.client import BotApi, BotApiError
 from app.bot.notifications import NotificationKind, notify
+from app.config import ConfigError, Settings
 from app.repositories import notify_work as nw
 from app.repositories import users
 from app.repositories.notify_work import NotifyClaim
-from app.workers.health import Heartbeat
+from app.workers.health import Heartbeat, any_within
 from app.workers.pipeline import transient_db_error
 from app.workers.signals import stop_on_signals
 from app.workers.startup import raise_if_config_db_error, run_worker
@@ -187,8 +195,8 @@ class NotifyWorker:
         self._sleep = sleep
         self.heartbeat = heartbeat or Heartbeat(None)
         self._paused_until = 0.0  # time.monotonic()
-        # Пауза из-за ошибки настройки бота (401/404) — отдельно от 429: только она unhealthy.
-        self._config_paused_until = 0.0
+        # Ошибка настройки бота (401/404) — отдельно от 429: только она unhealthy; держится до
+        # первого ответа Telegram, принявшего токен.
         self._config_reason: str | None = None
         self._stop: asyncio.Event | None = None  # остановка процесса (``run_forever``)
 
@@ -203,7 +211,13 @@ class NotifyWorker:
 
     @property
     def config_paused(self) -> bool:
-        return time.monotonic() < self._config_paused_until
+        """Последний ответ Telegram — «токен неверен» (401/404), принятого с тех пор не было."""
+        return self._config_reason is not None
+
+    def _token_accepted(self) -> None:
+        if self._config_reason is not None:
+            logger.info("notify resumed: bot token accepted")
+            self._config_reason = None
 
     def _pause_left(self) -> float:
         return max(self._paused_until - time.monotonic(), 0.0)
@@ -358,6 +372,7 @@ class NotifyWorker:
             raise _Sent("unknown", "deadline") from None
         except BotApiError as err:
             return self._classify(err)
+        self._token_accepted()
         raise _Sent("sent")
 
     def _classify(self, err: BotApiError) -> str:
@@ -371,9 +386,10 @@ class NotifyWorker:
             return reason
         if code in CONFIG_ERROR_CODES:
             self._pause_for(cfg.pause.total_seconds())
-            self._config_paused_until = time.monotonic() + cfg.pause.total_seconds()
             self._config_reason = reason
             raise _Leave("paused", reason, release_after=cfg.pause.total_seconds())
+        if code is not None and code != 429 and code < 500:
+            self._token_accepted()  # Telegram разобрал запрос с этим токеном (403, 400)
         if code in UNREACHABLE_CODES:
             raise _Sent("blocked", reason)
         if err.maybe_sent:
@@ -422,9 +438,11 @@ class NotifyWorker:
         запросы дорабатываются и отмечаются (дожидаемся их)."""
         stop = stop or asyncio.Event()
         self._stop = stop
-        running: set[asyncio.Task[NotifyOutcome]] = set()
+        # Начатые задачи и время их начала (``time.monotonic``) — для пульса при занятых слотах.
+        running: dict[asyncio.Task[NotifyOutcome], float] = {}
         stopper = asyncio.create_task(stop.wait())
         cfg = self.settings
+        lease_s = cfg.lease.total_seconds()
         try:
             while not stop.is_set():
                 claims: list[NotifyClaim] = []
@@ -438,12 +456,13 @@ class NotifyWorker:
                     except Exception as exc:  # БД недоступна и т. п. — повтор после паузы
                         raise_if_config_db_error(exc, name="notify worker")
                         logger.warning("notify worker claim failed: %s", type(exc).__name__)
-                else:  # пауза или все слоты заняты: цикл жив, захват не нужен
-                    self._pulse()
+                elif self.paused or any_within(running.values(), lease_s):
+                    self._pulse()  # пауза или слоты заняты живыми задачами: захват не нужен
+                # Все слоты заняты задачами старше аренды (зависли) — пульса нет (MINOR-3).
                 for c in claims:
                     task = asyncio.create_task(self._guard(c))
-                    running.add(task)
-                    task.add_done_callback(running.discard)
+                    running[task] = time.monotonic()
+                    task.add_done_callback(lambda t: running.pop(t, None))
                 if claims and len(running) < cfg.batch:
                     continue  # очередь, возможно, не пуста — сразу добираем
                 await asyncio.wait(
@@ -457,6 +476,65 @@ class NotifyWorker:
 
 def _fields(o: NotifyOutcome) -> tuple[str, str | None, int]:
     return o.status, o.reason, o.attempts
+
+
+TOKEN_CHECK_TIMEOUT_S = 15.0
+DEV_ENVS = frozenset({"dev", "local", "test"})
+
+
+def token_check_enabled(settings: Settings) -> bool:
+    """``FEELINGS_NOTIFY_CHECK_TOKEN``; не задано — проверка везде, кроме разработки."""
+    if settings.notify_check_token is not None:
+        return settings.notify_check_token
+    return settings.env.strip().lower() not in DEV_ENVS
+
+
+async def check_bot_token(api: BotApi, *, timeout_s: float = TOKEN_CHECK_TIMEOUT_S) -> bool:
+    """Проверка токена бота при старте (``getMe``; ревью р.1 MINOR-2): 401/404 — ``ConfigError``
+    (процесс — код 78). Сеть, 5xx, 429, тайм-аут — проверка пропускается (``False``) с
+    предупреждением: недоступность Telegram — не ошибка настройки, токен проверит первая отправка.
+    В тексте ошибки и журнале — только код HTTP, без токена и описания от Telegram."""
+    try:
+        async with asyncio.timeout(timeout_s):
+            await api.call("getMe", {})
+    except TimeoutError:
+        logger.warning("notify worker: bot token check skipped: timeout")
+        return False
+    except BotApiError as err:
+        if err.error_code in CONFIG_ERROR_CODES:
+            raise ConfigError(
+                f"notify worker: Telegram rejected FEELINGS_TELEGRAM_BOT_TOKEN "
+                f"(HTTP {err.error_code})"
+            ) from None
+        reason = f"http_{err.error_code}" if err.error_code is not None else "network"
+        logger.warning("notify worker: bot token check skipped: %s", reason)
+        return False
+    logger.info("notify worker: bot token accepted")
+    return True
+
+
+async def run_with_token_check(
+    worker: NotifyWorker, *, poll_s: float, stop: asyncio.Event, check_token: bool = True
+) -> None:
+    """Цикл воркера и, параллельно, проверка токена при старте: цикл её не ждёт (сеть до
+    Telegram может быть недоступна). Токен отклонён — остановка цикла (начатое дорабатывается)
+    и ``ConfigError``."""
+    loop = asyncio.create_task(worker.run_forever(poll_s=poll_s, stop=stop))
+    if not check_token:
+        await loop
+        return
+    probe = asyncio.create_task(check_bot_token(worker.api))
+    try:
+        await asyncio.wait({loop, probe}, return_when=asyncio.FIRST_COMPLETED)
+        if probe.done() and probe.exception() is not None:
+            stop.set()
+            await asyncio.gather(loop, return_exceptions=True)
+            probe.result()  # ConfigError — наружу (run_worker → код 78)
+        await loop
+    finally:
+        probe.cancel()
+        loop.cancel()
+        await asyncio.gather(probe, loop, return_exceptions=True)
 
 
 async def _main() -> None:  # pragma: no cover — запуск процесса (нужны роль входа и токен)
@@ -487,7 +565,12 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
     stop = asyncio.Event()
     try:
         with stop_on_signals(stop, name="notify worker"):
-            await worker.run_forever(poll_s=settings.notify_poll_s, stop=stop)
+            await run_with_token_check(
+                worker,
+                poll_s=settings.notify_poll_s,
+                stop=stop,
+                check_token=token_check_enabled(settings),
+            )
     finally:
         await api.aclose()
     logger.info("notify worker stopped")

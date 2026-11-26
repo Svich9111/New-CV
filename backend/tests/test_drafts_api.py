@@ -467,6 +467,8 @@ async def test_send_creates_processing_message_and_draft_is_frozen(env: Env) -> 
     m = resp.json()
     assert_matches(m, "PartnerMessage")
     assert (m["direction"], m["text"], m["status"]) == ("outgoing", mine, "processing")
+    # Б-84 (ревью р.1): у только что отправленного причины задержки нет — поля есть и пусты.
+    assert (m["withheld_reason"], m["withheld_crisis"]) == (None, None)
     assert await partner_messages(env) == before + 1
     feed = (await env.client.get("/api/v1/couple/messages", headers=anna.headers)).json()["items"]
     assert [i["id"] for i in feed] == [m["id"]] and feed[0]["text"] == mine

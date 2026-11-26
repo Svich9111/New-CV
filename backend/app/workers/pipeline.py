@@ -62,10 +62,16 @@
 модели означал бы оплаченный впустую вызов.
 
 Пульс (Б-85, ``app.workers.health``): после каждого успешного прохода цикла (захват прошёл или
-не нужен — все слоты заняты) — ``ok``; на паузе (выключатель АР-45 п.2) — ``paused`` с видом
-ошибки модели: health check контейнера — unhealthy. БД отвергла роль входа (пароль, права) —
-``ConfigError``, выход с кодом 78; модель недоступна при старте — повтор в процессе
-(``app.workers.startup``).
+не нужен — все слоты заняты) — ``ok``; при всех занятых слотах — только пока хотя бы одно начатое
+сообщение моложе аренды (все слоты заняты зависшими — пульс устаревает, ревью р.1 MINOR-3). После
+выключателя (АР-45 п.2) — ``paused`` с видом ошибки модели (health check контейнера — unhealthy),
+и не только на время паузы: ``paused`` держится до первого ответа модели (сообщение обработано
+или модель отказала). Так отклонённый ключ при пустой очереди не становится ``healthy`` через
+5 минут (ревью р.1 MINOR-2). Проверить ключ при старте нельзя без платного вызова (каталог цен
+OpenRouter открыт без ключа): ключ проверяет первый вызов, после паузы захват повторяется —
+попытка при этом не расходуется (``pipeline_release(…, false)``). БД отвергла роль входа
+(пароль, права) — ``ConfigError``, выход с кодом 78; модель недоступна при старте — повтор в
+процессе (``app.workers.startup``).
 
 Журнал — только исход, причина, вид ошибки и номер попытки: ни текстов, ни id (ТЗ §9.1 п.5).
 Уведомление получателю (3.5) — не здесь: доставленное попадает в очередь ``pipeline_claim_notify``
@@ -97,7 +103,7 @@ from app.core.crypto import DecryptionError, Keyring
 from app.db import sqlstate
 from app.repositories import pipeline_work as pw
 from app.repositories.pipeline_work import PipelineClaim, WithholdReason
-from app.workers.health import Heartbeat
+from app.workers.health import Heartbeat, any_within
 from app.workers.startup import raise_if_config_db_error, run_worker, startup_retry
 
 logger = logging.getLogger(__name__)
@@ -261,9 +267,16 @@ class PipelineWorker:
         self._paused_until = max(self._paused_until, time.monotonic() + pause_s)
         self._pause_kind = kind
 
+    def _resume(self) -> None:
+        """Модель ответила — ключ принят: ``paused`` снимается (до этого — даже после паузы)."""
+        if self._pause_kind is not None:
+            logger.info("pipeline resumed: model answered")
+            self._pause_kind = None
+
     def _pulse(self) -> None:
-        """Пульс после успешного прохода цикла (Б-85): на паузе — ``paused`` (unhealthy)."""
-        if self.paused:
+        """Пульс после успешного прохода цикла (Б-85): после выключателя — ``paused``
+        (unhealthy), пока модель не ответит."""
+        if self._pause_kind is not None:
             self.heartbeat.beat("paused", self._pause_kind)
         else:
             self.heartbeat.beat("ok")
@@ -390,6 +403,7 @@ class PipelineWorker:
                 timeout=self.settings.timeout_s,
             )
         except LLMRefusal:
+            self._resume()  # модель ответила (отказом) — ключ принят
             # Отказ модели — решение «не доставлять» (АР-20/27): одобрение израсходовано; аренда
             # не снимается досрочно — до записи исхода сообщение никому не выдаётся (D1).
             return await self._withhold(c, "model_refusal")
@@ -406,6 +420,7 @@ class PipelineWorker:
             return await self._retry(c, "timeout")
         except Exception as exc:  # прочий сбой конвейера — повтор, предел попыток ставит БД
             return await self._retry(c, type(exc).__name__)
+        self._resume()
         # 5. Исход — одна транзакция на сообщение.
         if not delivery.delivered:
             return await self._withhold(
@@ -438,9 +453,11 @@ class PipelineWorker:
         сразу новый захват. Нечего захватывать или пауза — ждём ``poll_s``, конца любой задачи
         или остановки. При остановке — дожидаемся начатых сообщений."""
         stop = stop or asyncio.Event()
-        running: set[asyncio.Task[PipelineOutcome]] = set()
+        # Начатые задачи и время их начала (``time.monotonic``) — для пульса при занятых слотах.
+        running: dict[asyncio.Task[PipelineOutcome], float] = {}
         stopper = asyncio.create_task(stop.wait())
         cfg = self.settings
+        lease_s = cfg.lease.total_seconds()
         try:
             while not stop.is_set():
                 claims: list[PipelineClaim] = []
@@ -454,12 +471,13 @@ class PipelineWorker:
                     except Exception as exc:  # БД недоступна и т. п. — повтор после паузы
                         raise_if_config_db_error(exc, name="pipeline worker")
                         logger.warning("pipeline worker claim failed: %s", type(exc).__name__)
-                else:  # пауза или все слоты заняты: цикл жив, захват не нужен
-                    self._pulse()
+                elif self.paused or any_within(running.values(), lease_s):
+                    self._pulse()  # пауза или слоты заняты живыми задачами: захват не нужен
+                # Все слоты заняты задачами старше аренды (зависли) — пульса нет (MINOR-3).
                 for c in claims:
                     task = asyncio.create_task(self._guard(c))
-                    running.add(task)
-                    task.add_done_callback(running.discard)
+                    running[task] = time.monotonic()
+                    task.add_done_callback(lambda t: running.pop(t, None))
                 if claims and len(running) < cfg.batch:
                     continue  # очередь, возможно, не пуста — сразу добираем
                 await asyncio.wait(

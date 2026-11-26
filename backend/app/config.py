@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     notify_max_attempts: int = Field(default=5, ge=1, le=100)
     notify_poll_s: float = Field(default=1.0, gt=0, le=60)
     notify_batch: int = Field(default=10, ge=1, le=100)
+    # Проверка токена бота при старте воркера уведомлений (getMe; 401/404 — код 78). Не задано —
+    # на стенде и в продуктиве да, в разработке (dev/local/test) нет: тесты процесса и локальный
+    # запуск без настоящего токена не ходят в Telegram.
+    notify_check_token: bool | None = None
     session_ttl_s: int = 3600
     # Имя бота без «@» для ссылки-приглашения https://t.me/<бот>?startapp=<токен> (ФТ-03).
     # Не секрет; правила имени Telegram — 5–32 символа, латиница, цифры, «_».
