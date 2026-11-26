@@ -46,7 +46,7 @@ async function say(chat: ChatSession, text: string): Promise<string> {
 }
 
 describe("A8 р.2 — сверка по ключу (АР-51; карточка, критерий 4)", () => {
-  test("реплика сохранена, но вытеснена с первой страницы (31 реплика с другого устройства) — «Не отправлено», повтор тем же ключом даёт ответ без дубля", async () => {
+  test("реплика сохранена, но вытеснена с первой страницы (31 реплика с другого устройства) — «Сохранено, ответа нет» (О-4: поиск по ключу на следующей странице), повтор тем же ключом даёт ответ без дубля", async () => {
     const server = new FakeServer().onboarded();
     const hook: { fn: Hook | null } = { fn: null };
     const { chat } = await mk(server, {}, hook);
@@ -59,7 +59,7 @@ describe("A8 р.2 — сверка по ключу (АР-51; карточка, �
     };
     const key = await say(chat, "Своя");
     expect(owners(server, "Своя")).toHaveLength(1);
-    expect(mineByKey(chat, key).status?.kind).toBe("unsent");
+    expect(mineByKey(chat, key).status?.kind).toBe("unanswered");
     await chat.retry(key);
     await idle(chat);
     const sent = posts(server).map((c) => keyOf(c.body));
@@ -217,7 +217,7 @@ describe("A8 р.2 — 422 под ключом", () => {
   // ним ту самую чужую запись, из-за которой был 422: пузырь «Раз» получает её id, подпись «Сообщение
   // сохранено, ответа нет» (а сервер «Раз» не получал), на экране у двух пузырей один id. Ожидается: сверка
   // по новому ключу — «Не отправлено», id нет (ТЗ §10 «понятное состояние», карточка, критерий 4: сверка по ключу).
-  test.fails("A8-2.2-D7: после 422 и обрыва связи сверка не привязывает пузырь к чужой записи под старым ключом", async () => {
+  test("A8-2.2-D7: после 422 и обрыва связи сверка не привязывает пузырь к чужой записи под старым ключом", async () => {
     const taken = "11111111-2222-4333-8444-555555555555";
     const server = new FakeServer().onboarded();
     const foreign = server.addChat("owner", "Чужой текст", undefined, { client_message_id: taken });
@@ -370,7 +370,7 @@ describe("A8 р.2 — реплика, которую сервер считает
   // `test_control_whitespace_text_is_422` в test_chat_idempotency_a8.py), а экран под ключом показывает «Сервер не
   // принял это сообщение. Отправь его ещё раз — оно уйдёт как новое.» — повтор снова 422. Ожидается: такая
   // реплика не уходит, как пустая (карточка, критерий 2; ТЗ §10 «понятное сообщение»).
-  test.fails("A8-2.2-D6: реплика из U+001F/U+0085 не уходит (сервер её считает пустой)", async () => {
+  test("A8-2.2-D6: реплика из U+001F/U+0085 не уходит (сервер её считает пустой)", async () => {
     const { chat, server } = await mk();
     for (const text of ["\u001f", "\u001c\u001d", " \u0085 "]) {
       chat.setInput(text);

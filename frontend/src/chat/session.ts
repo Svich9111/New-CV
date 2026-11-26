@@ -28,6 +28,25 @@ export const MAX_TEXT = 4000;
  * ключом. Потом — «Повторить» вручную (сбойный процесс сервер отпускает не позже чем через 5 минут).
  */
 export const REPLY_WAIT_MS: readonly number[] = [3000, 6000, 10000];
+/**
+ * Своя реплика не нашлась на первой странице истории при сверке, а реплик из ленты до неё там тоже нет (с
+ * другого устройства пришло больше страницы, О-4): сколько более старых страниц ещё просмотреть.
+ */
+export const SCAN_PAGES = 5;
+
+/**
+ * Пробельные символы сервера: Python `str.strip()` без аргументов (`_not_blank`, контракт) — пробелы Unicode
+ * (`\s` JS) и ещё разделители U+001C…U+001F и U+0085, которые JS `trim` не убирает. Клиент строже сервера:
+ * U+FEFF (`\s` JS, Python его не убирает) тоже считается пустым — такую реплику не отправить.
+ */
+const PY_ONLY_SPACE = new Set([0x1c, 0x1d, 0x1e, 0x1f, 0x85]);
+const JS_SPACE = /^\s$/u;
+
+/** Текст пустой — для сервера (`str.strip`) или для клиента (`trim`): такая реплика не уходит (A8-2.2-D6). */
+export function isBlank(text: string): boolean {
+  for (const ch of text) if (!PY_ONLY_SPACE.has(ch.codePointAt(0) as number) && !JS_SPACE.test(ch)) return false;
+  return true;
+}
 
 /** Что с репликой владельца последнего обмена — подписью под пузырём (ТЗ §8: состояние не только цветом). */
 export type OwnerStatus =
@@ -45,8 +64,12 @@ export type OwnerStatus =
   | { kind: "unanswered"; note: string; retry: boolean; help?: boolean }
   /** Не удалось узнать, сохранилась ли реплика (нет связи и после сбоя). Повтор сначала проверит историю. */
   | { kind: "unknown"; note: string }
-  /** Дневной лимит (429): реплика сохранена, агент ответит после окна. */
-  | { kind: "limited" };
+  /**
+   * Дневной лимит (429): реплика сохранена, агент ответит после окна. `retryAt` — когда окно кончится (по
+   * `Retry-After`, часы устройства): с этого момента «Повторить» тем же ключом даст ответ на эту же реплику (АР-51).
+   * Без `Retry-After` срок неизвестен — повтора нет, экран говорит «завтра».
+   */
+  | { kind: "limited"; retryAt?: number };
 
 export interface ChatItem {
   /** id реплики сервера или локальный ключ (`local-N`) для реплики этой сессии. */
@@ -95,6 +118,8 @@ export interface ChatSessionOptions {
   newKey?: () => string;
   /** Паузы автоповтора при 409 «ответ ещё готовится» (по умолчанию — `REPLY_WAIT_MS`). */
   replyWaitMs?: readonly number[];
+  /** Часы для окна лимита (по умолчанию — `Date.now`). */
+  now?: () => number;
 }
 
 /**
@@ -175,12 +200,16 @@ export function visibleItems(items: ChatItem[]): ChatItem[] {
   });
 }
 
-/** Последний обмен: локальный ключ пузыря, текст, ключ идемпотентности и сколько раз ждали чужой ответ (409). */
+/**
+ * Последний обмен: локальный ключ пузыря, текст, ключ идемпотентности, сколько раз ждали чужой ответ (409) и id
+ * записей сервера, которые были в ленте при отправке (все они старше реплики — граница поиска при сверке, О-4).
+ */
 interface Turn {
   key: string;
   text: string;
   cmid: string;
   waits: number;
+  before: ReadonlySet<string>;
 }
 
 type Reconciled = "answered" | "unanswered" | "unsent" | "unknown";
@@ -203,6 +232,7 @@ export class ChatSession {
   private readonly crisisWaiting = new Set<string>();
   private readonly newKey: () => string;
   private readonly replyWaitMs: readonly number[];
+  readonly now: () => number;
 
   constructor(
     private readonly api: Api,
@@ -210,6 +240,7 @@ export class ChatSession {
   ) {
     this.newKey = opts.newKey ?? newMessageKey;
     this.replyWaitMs = opts.replyWaitMs ?? REPLY_WAIT_MS;
+    this.now = opts.now ?? (() => Date.now());
   }
 
   subscribe = (fn: () => void): (() => void) => {
@@ -374,10 +405,11 @@ export class ChatSession {
   /** Отправить текст из поля ввода. `false` — не отправлено (пусто, длиннее предела или ответ ещё идёт). */
   send(): boolean {
     const text = this.state.input;
-    if (this.busy || text.trim().length === 0 || text.length > MAX_TEXT) return false;
+    if (this.busy || isBlank(text) || text.length > MAX_TEXT) return false;
     const key = `local-${++this.seq}`;
     const cmid = this.newKey();
-    this.turn = { key, text, cmid, waits: 0 };
+    const before = new Set(this.state.items.map((it) => it.id).filter((id): id is string => id !== null));
+    this.turn = { key, text, cmid, waits: 0, before };
     this.set((s) => ({
       input: "",
       items: [...s.items, { key, id: null, author: "owner", text, cmid, status: { kind: "sending" } }],
@@ -394,13 +426,19 @@ export class ChatSession {
   /**
    * Повтор последней реплики тем же пузырём и с тем же ключом (АР-51): новой реплики сервер не создаёт. Если
    * неизвестно, сохранилась ли она, — сначала история: ответ уже есть — показывается он, без повторной отправки.
+   * Реплика под лимитом (429) — после окна по `Retry-After`: сервер ответит на эту же сохранённую реплику.
    */
   async retry(key: string): Promise<void> {
     const turn = this.turn;
     if (!turn || turn.key !== key || this.state.phase !== "idle") return;
     const item = this.state.items.find((it) => it.key === key);
     const st = item?.status;
-    if (!st || !(st.kind === "unknown" || ((st.kind === "unsent" || st.kind === "unanswered") && st.retry))) return;
+    if (!st) return;
+    const ok =
+      st.kind === "unknown" ||
+      ((st.kind === "unsent" || st.kind === "unanswered") && st.retry) ||
+      (st.kind === "limited" && st.retryAt !== undefined && this.now() >= st.retryAt);
+    if (!ok) return;
     turn.waits = 0;
     if (st.kind === "unknown") {
       this.set({ phase: "checking" });
@@ -531,7 +569,8 @@ export class ChatSession {
 
     if (err.status === 429) {
       const until = err.retryAfter ? limitUntilText(err.retryAfter) : null;
-      this.patchItem(key, { status: { kind: "limited" } });
+      const retryAt = err.retryAfter ? this.now() + err.retryAfter * 1000 : NaN;
+      this.patchItem(key, { status: Number.isFinite(retryAt) ? { kind: "limited", retryAt } : { kind: "limited" } });
       this.set({ phase: "idle", live: "", limit: until ?? "", outcome: this.next("failed") });
       return;
     }
@@ -541,10 +580,18 @@ export class ChatSession {
       await this.conflict(key);
       return;
     }
+    // 422 за пустой текст (`empty_text`; или `validation_error`, а текст пуст по правилам сервера): повтор того
+    // же текста снова получит 422 — подпись о пустом сообщении, без повтора.
+    if (err.status === 422 && (err.code === "empty_text" || isBlank(turn.text))) {
+      fail({ kind: "unsent", note: EMPTY_TEXT, retry: false });
+      return;
+    }
     // 422: текст проверен до отправки, значит, сервер не принял ключ (под ним другая реплика, АР-51). Под этим
-    // ключом наша реплика не сохранена — повтор уйдёт с новым ключом как новая реплика.
+    // ключом наша реплика не сохранена — повтор уйдёт с новым ключом как новая реплика. Новый ключ — и у
+    // пузыря: сверка ищет реплику по нему, а не по прежнему, под которым чужая запись (A8-2.2-D7).
     if (err.status === 422) {
       turn.cmid = this.newKey();
+      this.patchItem(key, { cmid: turn.cmid });
       fail({ kind: "unsent", note: KEY_REJECTED, retry: true });
       return;
     }
@@ -627,20 +674,30 @@ export class ChatSession {
    * (показывается он); `unanswered` — реплика сохранена без ответа; `unsent` — реплики нет; `unknown` — историю
    * прочитать не удалось. Записи страницы, которых в ленте нет (другое устройство, история не загрузилась),
    * встают в ленту по порядку сервера; если первая страница при открытии не загрузилась, это она и есть.
+   * Своей реплики на первой странице нет, а записей ленты до неё — тоже нет (пришло больше страницы с другого
+   * устройства, О-4): поиск по ключу идёт дальше по более старым страницам (`olderPages`), только для подписи —
+   * в ленту они не встают, пузырь остаётся на месте. Найти не удалось — «неизвестно», а не «не отправлено».
    */
   private async reconcile(key: string, note = chatErrorText("stream_broken")): Promise<Reconciled> {
-    let page: ChatHistory;
-    try {
-      page = await this.api.chatHistory({ limit: PAGE });
-    } catch {
+    const unknown = (): Reconciled => {
       this.patchItem(key, {
         status: { kind: "unknown", note: `${note} Не удалось проверить, дошло ли сообщение.` },
       });
       return "unknown";
+    };
+    let page: ChatHistory;
+    let older: ChatMessage[] | null;
+    try {
+      page = await this.api.chatHistory({ limit: PAGE });
+      older = await this.olderPages(key, page);
+    } catch {
+      return unknown();
     }
+    if (older === null) return unknown();
     const replyKey = `${key}-reply`;
     const server = chronological(page);
-    const byCmid = new Map(server.filter((m) => m.author === "owner" && m.client_message_id).map((m) => [m.client_message_id as string, m]));
+    const scanned = [...older, ...server];
+    const byCmid = new Map(scanned.filter((m) => m.author === "owner" && m.client_message_id).map((m) => [m.client_message_id as string, m]));
     let result: Reconciled = "unsent";
     this.set((s) => {
       // Реплики этой сессии без id (429, обрыв до ответа) находят свою запись по ключу.
@@ -649,7 +706,7 @@ export class ChatSession {
       );
       const own = local.find((it) => it.key === key);
       const ownerId = own?.id ?? null;
-      const reply = ownerId ? server.find((m) => m.author === "agent" && m.reply_to === ownerId) : undefined;
+      const reply = ownerId ? scanned.find((m) => m.author === "agent" && m.reply_to === ownerId) : undefined;
       result = reply ? "answered" : ownerId ? "unanswered" : "unsent";
       const status: OwnerStatus =
         result === "answered"
@@ -664,16 +721,46 @@ export class ChatSession {
       const after = fresh.filter(({ i }) => at >= 0 && i > at).map(({ m }) => this.item(m));
       // Недописанный ответ остаётся под своей репликой с пометкой «прерван», если ответа в истории нет.
       const partial = reply ? [] : local.filter((it) => it.key === replyKey).map((it) => ({ ...it, replyTo: ownerId }));
+      // Ответ нашёлся на более старой странице (О-4) — он встаёт под своей репликой.
+      const olderReply = reply && !have.has(reply.id) && !server.some((m) => m.id === reply.id) ? [this.item(reply)] : [];
       const rest = local.filter((it) => it.key !== key && it.key !== replyKey);
       const firstPage = s.history === "failed" ? { history: "loaded" as const, historyError: null, cursor: page.next_cursor } : {};
       return {
         ...firstPage,
-        items: [...rest, ...before, ...(own ? [{ ...own, status }] : []), ...partial, ...after],
+        items: [...rest, ...before, ...(own ? [{ ...own, status }] : []), ...olderReply, ...partial, ...after],
         live: reply ? `Ответ агента: ${textOf(reply) ?? ""}` : s.live,
       };
     });
     this.needContacts();
     return result;
+  }
+
+  /**
+   * Более старые страницы для сверки (О-4), от новых к старым. Не нужны (`[]`), если на первой странице есть своя
+   * реплика (по ключу или id) или запись, которая была в ленте при отправке (реплика новее её — дальше искать
+   * незачем). Иначе — до своей реплики, такой записи или конца истории, не больше `SCAN_PAGES` страниц;
+   * не дошли до конца поиска — `null` (неизвестно). Ошибка запроса — исключение.
+   */
+  private async olderPages(key: string, first: ChatHistory): Promise<ChatMessage[] | null> {
+    const item = this.state.items.find((it) => it.key === key);
+    const before = this.turn?.key === key ? this.turn.before : new Set<string>();
+    if (!item) return [];
+    const done = (p: ChatHistory) =>
+      p.items.some(
+        (m) =>
+          before.has(m.id) ||
+          (m.author === "owner" && ((item.id !== null && m.id === item.id) || (!!item.cmid && m.client_message_id === item.cmid))),
+      );
+    if (done(first)) return [];
+    const out: ChatMessage[] = [];
+    let cursor = first.next_cursor;
+    for (let i = 0; cursor && i < SCAN_PAGES; i++) {
+      const p = await this.api.chatHistory({ cursor, limit: PAGE });
+      out.unshift(...chronological(p));
+      if (done(p)) return out;
+      cursor = p.next_cursor;
+    }
+    return cursor ? null : out;
   }
 
   private next(kind: "done" | "crisis" | "failed") {
@@ -683,6 +770,8 @@ export class ChatSession {
 
 /** 422 на реплику с ключом: под ключом сохранена другая реплика (АР-51). */
 const KEY_REJECTED = "Сервер не принял это сообщение. Отправь его ещё раз — оно уйдёт как новое.";
+/** 422 за текст, пустой по правилам сервера (`str.strip`), — повтор не поможет. */
+const EMPTY_TEXT = "Сообщение пустое — напиши текст и отправь снова.";
 /** 409, а реплика сохранена без ответа: ответ на неё готовит другой запрос (АР-51). */
 const REPLY_BUSY = "Ответ на это сообщение ещё готовится. Повтори чуть позже — он придёт к этому же сообщению.";
 

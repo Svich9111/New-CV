@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent } from "react";
 import { useApp } from "../app/store";
-import { MAX_TEXT, visibleItems, type ChatItem, type ChatSession, type ChatState } from "../chat/session";
+import { MAX_TEXT, isBlank, visibleItems, type ChatItem, type ChatSession, type ChatState } from "../chat/session";
 import { DOUBLE_TAP_MS } from "../telegram/MainButton";
 import { useTelegram } from "../telegram/context";
 import { Heading } from "../ui/Heading";
@@ -39,6 +39,52 @@ function useChat(chat: ChatSession): ChatState {
   return useSyncExternalStore(chat.subscribe, chat.getSnapshot);
 }
 
+/** Дольше этого `setTimeout` не ждёт (2^31−1 мс): более далёкое окно перепроверяется по частям. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** Наступило ли время `at` по часам сессии; до него — перерисовка в момент `at`. `undefined` — никогда. */
+function useReached(at: number | undefined, now: () => number): boolean {
+  const [, tick] = useState(0);
+  const reached = at !== undefined && now() >= at;
+  useEffect(() => {
+    if (at === undefined || reached) return;
+    const timer = setTimeout(() => tick((n) => n + 1), Math.min(Math.max(at - now(), 0) + 50, MAX_TIMER_MS));
+    return () => clearTimeout(timer);
+  });
+  return reached;
+}
+
+/**
+ * Подпись реплики под дневным лимитом (429): до конца окна — без повтора; после окна (по `Retry-After`) —
+ * «Повторить» тем же ключом: агент ответит на эту же сохранённую реплику (АР-51, MINOR-N5).
+ */
+function LimitedCaption({ item, chat, phase, retryAt, onRetry }: {
+  item: ChatItem;
+  chat: ChatSession;
+  phase: ChatState["phase"];
+  retryAt: number | undefined;
+  onRetry: () => void;
+}) {
+  const ready = useReached(retryAt, chat.now);
+  if (!ready) return <span className="msg__meta">Сохранено. Ответа пока нет — лимит на сегодня.</span>;
+  return (
+    <div className="msg__fail">
+      <span>Сохранено. Ответа пока нет — лимит закончился, можно повторить.</span>
+      <button
+        type="button"
+        className="btn btn--ghost msg__retry"
+        disabled={phase !== "idle"}
+        onClick={() => {
+          onRetry();
+          void chat.retry(item.key);
+        }}
+      >
+        Повторить
+      </button>
+    </div>
+  );
+}
+
 /** Подпись под репликой владельца: что с ней (ТЗ §8 — состояние словами, не цветом) и повтор. */
 function OwnerCaption({
   item,
@@ -59,7 +105,7 @@ function OwnerCaption({
     if (phase !== "waiting") return null;
     return <span className="msg__meta">Отправляем…</span>;
   }
-  if (st.kind === "limited") return <span className="msg__meta">Сохранено. Ответа пока нет — лимит на сегодня.</span>;
+  if (st.kind === "limited") return <LimitedCaption item={item} chat={chat} phase={phase} retryAt={st.retryAt} onRetry={onRetry} />;
   const saved =
     st.kind === "unsent" ? "Не отправлено." : st.kind === "unanswered" ? "Сообщение сохранено, ответа нет." : "";
   const retry = st.kind === "unknown" || st.retry;
@@ -222,7 +268,7 @@ export function Chat() {
 
   const inFlight = state.phase === "waiting" || state.phase === "streaming";
   const canSend =
-    !chat.busy && state.input.trim().length > 0 && state.input.length <= MAX_TEXT && state.history !== "loading";
+    !chat.busy && !isBlank(state.input) && state.input.length <= MAX_TEXT && state.history !== "loading";
 
   const send = () => {
     if (!canSend) return;
