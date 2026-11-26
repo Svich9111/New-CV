@@ -1,4 +1,5 @@
 import { BadEvent, SseParser, isChatHistory, parseEvent, type AcceptedEvent, type CrisisEvent, type RawEvent } from "./chat";
+import { isMemoryList } from "./memory";
 import { errorText, type Op } from "./messages";
 import type {
   ApiErrorBody,
@@ -12,6 +13,8 @@ import type {
   InviteCreated,
   InvitePreview,
   Me,
+  MemoryItem,
+  MemoryList,
   OnboardingRequest,
   Session,
 } from "./types";
@@ -176,6 +179,7 @@ const checks = {
   // Сам список — массив; отдельные записи проверяет экран «Помощь» (`isHelpContact`) и отбрасывает неверные.
   helpContacts: (v: unknown) => Array.isArray(v),
   chatHistory: isChatHistory,
+  memoryList: isMemoryList,
 };
 
 class Timeout extends Error {}
@@ -308,6 +312,32 @@ export class Api {
       op: "chatHistory",
       check: checks.chatHistory,
     });
+  }
+
+  /** Все свои записи памяти одним запросом (ФТ-13); группирует экран. Ответ не по схеме — `bad_response`. */
+  async memoryList(): Promise<MemoryItem[]> {
+    const list = await this.call<MemoryList>("GET", "/memory", { op: "memoryList", check: checks.memoryList });
+    return list.items;
+  }
+
+  /**
+   * Удалить запись памяти (`DELETE /memory/{id}`, тело пустое). `deleted` — 204; `gone` — 404: запись уже удалена
+   * (например, с другого устройства) или недоступна — на экране её больше быть не должно. 409 `conflict_retry` —
+   * один повтор (общее правило клиента), 401 — один повторный вход; остальное — `ApiError`.
+   */
+  async memoryDelete(id: string): Promise<"deleted" | "gone"> {
+    try {
+      await this.call<undefined>("DELETE", `/memory/${encodeURIComponent(id)}`, {
+        op: "memoryDelete",
+        allowNoContent: true,
+        // Контракт объявляет только 204: другой успешный ответ — `bad_response`, а не «удалено».
+        check: () => false,
+      });
+      return "deleted";
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return "gone";
+      throw e;
+    }
   }
 
   /**

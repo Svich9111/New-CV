@@ -31,3 +31,7 @@ export type ChatStreamDone = Schemas["ChatStreamDone"];
 export type ChatStreamCrisis = Schemas["ChatStreamCrisis"];
 export type ChatStreamError = Schemas["ChatStreamError"];
 export type ChatErrorCode = Schemas["ChatErrorCode"];
+
+export type MemoryType = Schemas["MemoryType"];
+export type MemoryItem = Schemas["MemoryItem"];
+export type MemoryList = Json<paths["/memory"]["get"]["responses"][200]>;

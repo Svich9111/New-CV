@@ -7,6 +7,8 @@ import type {
   InviteCreated,
   InvitePreview,
   Me,
+  MemoryItem,
+  MemoryList,
   OnboardingRequest,
   Session,
 } from "../api/types";
@@ -169,6 +171,11 @@ export class FakeServer {
       return this.accept(decodeURIComponent(inv[1]));
     }
 
+    // Память — без требования онбординга (принцип 6, АР-17, АР-25): 403 этот путь не отдаёт.
+    if (method === "GET" && path === "/memory") return this.memoryList(url.searchParams);
+    const mem = path.match(/^\/memory\/([^/]+)$/);
+    if (mem && method === "DELETE") return this.memoryDelete(decodeURIComponent(mem[1]));
+
     if (!this.me.onboarding_completed) return json(403, err("onboarding_required", "Сначала завершите знакомство с сервисом"));
     if (method === "GET" && path === "/chat/messages") return this.chatHistory(url.searchParams);
     if (method === "POST" && path === "/chat/messages") return this.chatPost(body, signal);
@@ -184,6 +191,62 @@ export class FakeServer {
       return json(201, this.issue());
     }
     return json(404, err("not_found", "Не найдено"));
+  }
+
+  // ------------------------------------------------------------------ память (ФТ-13, ТЗ §6.3)
+
+  /** Записи памяти «меня» (неудалённые), в порядке создания. */
+  memory: MemoryItem[] = [];
+  /** id удалённых записей: повторный `GET` их не возвращает, повторный `DELETE` — 404 (функция БД, АР-36). */
+  deletedMemory = new Set<string>();
+  /** id записей партнёра: «мне» не видны, удалить нельзя — 404, как несуществующая (контракт). */
+  partnerMemory = new Set<string>(["30000000-0000-4000-8000-0000000000ff"]);
+  private memorySeq = 0;
+
+  /** Запись памяти (выдуманный текст); по умолчанию — факт из диалога с владельцем. */
+  addMemory(m: Partial<MemoryItem> = {}): MemoryItem {
+    const seq = ++this.memorySeq;
+    const item: MemoryItem = {
+      id: `30000000-0000-4000-8000-${String(seq).padStart(12, "0")}`,
+      type: "fact",
+      text: `Запись ${seq}`,
+      event_date: null,
+      source: "owner_dialog",
+      confidence: 0.9,
+      created_at: new Date(Date.UTC(2026, 10, seq, 9, 0, 0)).toISOString(),
+      ...m,
+    };
+    this.memory.push(item);
+    return item;
+  }
+
+  /** Записи всех шести типов ТЗ §6.3 и запись, текст которой не расшифровался (`UnavailableText`). */
+  seedMemory(): this {
+    this.addMemory({ type: "fact", text: "Работает дизайнером, по вторникам часто задерживается" });
+    this.addMemory({ type: "date", text: "Годовщина знакомства", event_date: "2027-06-14" });
+    this.addMemory({ type: "preference", text: "Не любит, когда планы меняются в последний момент" });
+    this.addMemory({ type: "sensitive_topic", text: "Тяжело переживает ощущение, что она не на первом месте" });
+    this.addMemory({ type: "observation", text: "Чаще пишет поздно вечером", source: "agent_inference", confidence: 0.4 });
+    this.addMemory({ type: "from_partner", text: "Игорь просил предупреждать об отменах заранее", source: "partner_message", confidence: 0.8 });
+    this.addMemory({ type: "fact", text: { unavailable: true, reason: "unknown_key" } });
+    return this;
+  }
+
+  private memoryList(q: URLSearchParams): Response {
+    const type = q.get("type");
+    const types = ["fact", "date", "preference", "sensitive_topic", "observation", "from_partner"];
+    if (type !== null && !types.includes(type)) return json(422, err("validation_error", "Проверьте данные"));
+    const items = this.memory.filter((m) => !this.deletedMemory.has(m.id) && (type === null || m.type === type));
+    const body: MemoryList = { items };
+    return json(200, body, { "Cache-Control": "no-store" });
+  }
+
+  private memoryDelete(id: string): Response {
+    const own = this.memory.find((m) => m.id === id);
+    if (!own || this.deletedMemory.has(id) || this.partnerMemory.has(id)) return json(404, err("not_found", "Не найдено"));
+    this.deletedMemory.add(id);
+    this.memory = this.memory.filter((m) => m.id !== id);
+    return json(204, undefined, { "Cache-Control": "no-store" });
   }
 
   // ------------------------------------------------------------------ личный чат (ФТ-05, контракт АР-32)

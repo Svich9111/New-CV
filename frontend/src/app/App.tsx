@@ -7,6 +7,7 @@ import { AuthError } from "../screens/AuthError";
 import { Chat } from "../screens/Chat";
 import { Help } from "../screens/Help";
 import { Incoming } from "../screens/Incoming";
+import { Memory } from "../screens/Memory";
 import { Invite } from "../screens/Invite";
 import { Onboarding } from "../screens/Onboarding";
 import { OpenInTelegram, TelegramUnavailable, WaitingForTelegram } from "../screens/OpenInTelegram";
@@ -75,6 +76,8 @@ function Screen({ route, api }: { route: Route; api: Api }) {
       return <Paired />;
     case "chat":
       return <Chat />;
+    case "memory":
+      return <Memory />;
     case "underage":
       return <Underage />;
     case "help":

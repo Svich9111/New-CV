@@ -7,6 +7,7 @@ import { Heart } from "../ui/Notice";
 /**
  * Главный экран пары (ТЗ §8 «Главный»): статус пары и вход в чат с агентом (2.2). Непрочитанные сообщения
  * партнёра — задача 3.4.
+ * Вход в «Что агент помнит» (2.5) — здесь, пока нет экрана «Профиль и пара».
  */
 export function Paired() {
   const { api, me, push } = useApp();
@@ -48,6 +49,10 @@ export function Paired() {
         <span className="small muted">
           Выговориться, разобраться в чувствах, подготовить сообщение. Этот разговор видишь только ты.
         </span>
+      </button>
+      <button type="button" className="card card--link" onClick={() => push({ name: "memory" })}>
+        <span className="card__title">Что агент помнит</span>
+        <span className="small muted">Записи, которые агент сохранил о тебе. Любую можно удалить. Партнёр их не видит.</span>
       </button>
       <MainButton text="Поговорить с агентом" onClick={() => push({ name: "chat" })} />
     </section>
