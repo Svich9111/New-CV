@@ -1,4 +1,5 @@
 import { BadEvent, SseParser, isChatHistory, parseEvent, type AcceptedEvent, type CrisisEvent, type RawEvent } from "./chat";
+import { isCoupleFeed, isDraft, isMessageOriginal, isPartnerMessage, parseDraftOutcome, type DraftResult } from "./couple";
 import { isMemoryList } from "./memory";
 import { errorText, type Op } from "./messages";
 import type {
@@ -9,6 +10,9 @@ import type {
   ChatSendRequest,
   ChatStreamDone,
   Couple,
+  CoupleFeed,
+  Draft,
+  ExportText,
   HelpContact,
   InviteCreated,
   InvitePreview,
@@ -16,6 +20,7 @@ import type {
   MemoryItem,
   MemoryList,
   OnboardingRequest,
+  PartnerMessage,
   Session,
 } from "./types";
 
@@ -65,6 +70,8 @@ export const TIMEOUTS = {
   chatStart: 45_000,
   /** Чат: тишина в потоке между событиями. Сервер шлёт комментарий-пинг раз в 15 с — три пропуска подряд = обрыв. */
   chatIdle: 45_000,
+  /** Черновик и «другой вариант»: ответ модели (схема, проверка безопасности) — дольше обычного. */
+  draft: 60_000,
 };
 
 /** Чем закончился поток ответа агента (завершающее событие контракта). */
@@ -95,7 +102,7 @@ interface RequestOptions {
   op: Op;
   timeoutMs?: number;
   /** Проверка вида успешного ответа: тело не того вида — `ApiError` `bad_response`, а не падение экрана. */
-  check?: (data: unknown) => boolean;
+  check?: (data: unknown, status: number) => boolean;
   /**
    * Контракт объявляет у пути ответ 204 без тела. Без этого флага 204 — `bad_response` (A8-1.5-D5): ни один
    * путь задачи 1.5 204 не отдаёт.
@@ -340,6 +347,108 @@ export class Api {
       if (e instanceof ApiError && e.status === 404 && e.code === "not_found") return "gone";
       throw e;
     }
+  }
+
+  /**
+   * Черновик сообщения партнёру по текущему разговору (`POST /drafts`, ФТ-07). 201 — `Draft`, 200 — кризисный
+   * протокол (`DraftCrisis`, черновика нет, ТЗ §9.3); статус и `kind` должны совпасть (201 с `kind: crisis` и 200 с
+   * `kind: draft` — `bad_response`). `replyTo` — id входящего, на которое пишется ответ («Ответить с агентом»).
+   * Ничего не отправляет партнёру: отправка — только `draftSend` по нажатию «Отправить» (ТЗ §2 п.2).
+   */
+  async draftCreate(replyTo: string | null = null): Promise<DraftResult> {
+    let result: DraftResult | null = null;
+    await this.call<unknown>("POST", "/drafts", {
+      body: replyTo ? { reply_to_id: replyTo } : {},
+      op: "draftCreate",
+      timeoutMs: this.timeouts.draft,
+      check: (data, status) => {
+        result = parseDraftOutcome(data, isHelpContact);
+        return result !== null && (status === 201 ? result.kind === "draft" : status === 200 && result.kind === "crisis");
+      },
+    });
+    return result as unknown as DraftResult;
+  }
+
+  /** Свой черновик (`GET /drafts/{id}`) — перечитать после 409 `version_conflict`. */
+  draftGet(id: string): Promise<Draft> {
+    return this.call<Draft>("GET", `/drafts/${encodeURIComponent(id)}`, { op: "draftGet", check: isDraft });
+  }
+
+  /** Правка автора (`PATCH /drafts/{id}`): текст как есть и версия, которую автор правил. Успех — версия +1. */
+  draftPatch(id: string, text: string, expectedVersion: number): Promise<Draft> {
+    return this.call<Draft>("PATCH", `/drafts/${encodeURIComponent(id)}`, {
+      body: { text, expected_version: expectedVersion },
+      op: "draftPatch",
+      check: isDraft,
+    });
+  }
+
+  /** «Другой вариант» (`POST /drafts/{id}/regenerate`): 200 `Draft` (версия +1) или кризис (прежний не изменён). */
+  async draftRegenerate(id: string, wish?: string): Promise<DraftResult> {
+    let result: DraftResult | null = null;
+    await this.call<unknown>("POST", `/drafts/${encodeURIComponent(id)}/regenerate`, {
+      body: wish ? { wish } : {},
+      op: "draftRegenerate",
+      timeoutMs: this.timeouts.draft,
+      check: (data, status) => {
+        result = parseDraftOutcome(data, isHelpContact);
+        return status === 200 && result !== null;
+      },
+    });
+    return result as unknown as DraftResult;
+  }
+
+  /** «Не отправлять» (`POST /drafts/{id}/reject`): 204, повтор для отклонённого — тоже 204. */
+  async draftReject(id: string): Promise<void> {
+    await this.call<undefined>("POST", `/drafts/${encodeURIComponent(id)}/reject`, {
+      op: "draftReject",
+      allowNoContent: true,
+      check: () => false,
+    });
+  }
+
+  /**
+   * «Отправить» (`POST /drafts/{id}/send`) — единственный путь сообщения к партнёру (ФТ-08). `expectedVersion` —
+   * версия, которую автор видел на экране. Успех — только 202 `PartnerMessage` своего сообщения в `processing`.
+   * Вызывает его только экран черновика по нажатию «Отправить».
+   */
+  draftSend(id: string, expectedVersion: number): Promise<PartnerMessage> {
+    return this.call<PartnerMessage>("POST", `/drafts/${encodeURIComponent(id)}/send`, {
+      body: { expected_version: expectedVersion },
+      op: "draftSend",
+      check: (data, status) =>
+        status === 202 && isPartnerMessage(data) && data.direction === "outgoing" && data.status === "processing",
+    });
+  }
+
+  /**
+   * Страница ленты пары (`GET /couple/messages`, от новых к старым). 422 по курсору разбирает вызывающий: лента
+   * начинается с первой страницы.
+   */
+  coupleMessages(opts: { cursor?: string | null; limit?: number } = {}): Promise<CoupleFeed> {
+    const q = new URLSearchParams();
+    if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+    if (opts.cursor) q.set("cursor", opts.cursor);
+    const qs = q.toString();
+    return this.call<CoupleFeed>("GET", "/couple/messages" + (qs ? `?${qs}` : ""), { op: "coupleMessages", check: isCoupleFeed });
+  }
+
+  /** «Показать оригинал» (`GET /couple/messages/{id}/original`, ФТ-10): получателю — с фиксацией просмотра. */
+  async messageOriginal(id: string): Promise<ExportText> {
+    const r = await this.call<{ text: ExportText }>("GET", `/couple/messages/${encodeURIComponent(id)}/original`, {
+      op: "messageOriginal",
+      check: isMessageOriginal,
+    });
+    return r.text;
+  }
+
+  /** Отметить полученное прочитанным (`POST /couple/messages/{id}/read`): 204, повтор — тоже 204. */
+  async messageRead(id: string): Promise<void> {
+    await this.call<undefined>("POST", `/couple/messages/${encodeURIComponent(id)}/read`, {
+      op: "messageRead",
+      allowNoContent: true,
+      check: () => false,
+    });
   }
 
   /**
@@ -605,7 +714,7 @@ export class Api {
         if (opts.allowNoContent) return undefined as T;
         throw new ApiError(res.status, "bad_response", errorText("bad_response", undefined, undefined, opts.op));
       }
-      if (!parsed || (opts.check && !opts.check(data))) {
+      if (!parsed || (opts.check && !opts.check(data, res.status))) {
         throw new ApiError(res.status, "bad_response", errorText("bad_response", undefined, undefined, opts.op));
       }
       return data as T;

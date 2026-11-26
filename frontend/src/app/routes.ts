@@ -7,6 +7,9 @@ export type Route =
   | { name: "paired" }
   | { name: "chat" }
   | { name: "memory" }
+  /** Черновик сообщения партнёру; `replyTo` — id входящего, на которое пишется ответ (АР-56, Б-30). */
+  | { name: "draft"; replyTo: string | null }
+  | { name: "messages" }
   | { name: "underage" }
   | { name: "help" };
 

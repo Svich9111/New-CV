@@ -2,6 +2,7 @@ import { createContext, useContext } from "react";
 import type { Api } from "../api/client";
 import type { InviteCreated, Me } from "../api/types";
 import type { ChatSession } from "../chat/session";
+import type { CoupleSession } from "../couple/session";
 import type { Route } from "./routes";
 
 /** Приглашение, которое человек нажал «Принять» до онбординга: после онбординга оно принимается. */
@@ -41,10 +42,14 @@ export interface AppState {
   onboardingDraft: OnboardingDraft | null;
   /** Личный чат с агентом — на всю сессию: уход в «Помощь» и «Назад» не обрывают ответ и не стирают ввод. */
   chat: ChatSession;
+  /** Черновик, контекст ответа, оригиналы и отметки «прочитано» — на всю сессию, только в памяти (задача 3.4). */
+  couple: CoupleSession;
   setOnboardingDraft(d: OnboardingDraft | null): void;
   push(route: Route): void;
   /** Заменить весь стек: после шага, к которому возвращаться нельзя (онбординг пройден, пара создана). */
   reset(route: Route): void;
+  /** Заменить верхний экран: «Назад» после него ведёт туда же, куда вёл бы с заменённого (черновик → лента). */
+  replace(route: Route): void;
   back(): void;
   canGoBack: boolean;
 }

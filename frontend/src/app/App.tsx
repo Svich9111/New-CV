@@ -3,8 +3,11 @@ import { Api, ApiError } from "../api/client";
 import { errorText } from "../api/messages";
 import type { InviteCreated, Me } from "../api/types";
 import { ChatSession } from "../chat/session";
+import { CoupleSession } from "../couple/session";
 import { AuthError } from "../screens/AuthError";
 import { Chat } from "../screens/Chat";
+import { Draft } from "../screens/Draft";
+import { Messages } from "../screens/Messages";
 import { Help } from "../screens/Help";
 import { Incoming } from "../screens/Incoming";
 import { Memory } from "../screens/Memory";
@@ -78,6 +81,10 @@ function Screen({ route, api }: { route: Route; api: Api }) {
       return <Chat />;
     case "memory":
       return <Memory />;
+    case "draft":
+      return <Draft replyTo={route.replyTo} />;
+    case "messages":
+      return <Messages />;
     case "underage":
       return <Underage />;
     case "help":
@@ -113,6 +120,7 @@ function Session({
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [onboardingDraft, setOnboardingDraft] = useState<OnboardingDraft | null>(null);
   const [chat] = useState(() => new ChatSession(api));
+  const [couple] = useState(() => new CoupleSession());
   useEffect(() => {
     chat.open();
     return () => chat.close();
@@ -130,6 +138,7 @@ function Session({
 
   const push = useCallback((r: Route) => setStack((s) => [...s, r]), []);
   const reset = useCallback((r: Route) => setStack([r]), []);
+  const replace = useCallback((r: Route) => setStack((s) => [...s.slice(0, -1), r]), []);
   const back = useCallback(() => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s)), []);
 
   const route = stack.length > 0 ? stack[stack.length - 1] : null;
@@ -152,12 +161,14 @@ function Session({
         onboardingDraft,
         setOnboardingDraft,
         chat,
+        couple,
         push,
         reset,
+        replace,
         back,
         canGoBack,
       },
-    [api, me, invite, shared, pendingAccept, inviteError, onboardingDraft, chat, push, reset, back, canGoBack],
+    [api, me, invite, shared, pendingAccept, inviteError, onboardingDraft, chat, couple, push, reset, replace, back, canGoBack],
   );
 
   if (!state || !route) {

@@ -111,6 +111,11 @@ export interface ChatState {
   live: string;
   /** Последний итог обмена — для тактильного отклика экрана. */
   outcome: { seq: number; kind: "done" | "crisis" | "failed" } | null;
+  /**
+   * Агент готов предложить черновик (`done.suggest_draft`, задача 3.4): кнопка «Подготовить сообщение» выделяется.
+   * Сбрасывается новой репликой и кризисом. Сам черновик — только по нажатию человека.
+   */
+  suggestDraft: boolean;
 }
 
 export interface ChatSessionOptions {
@@ -151,6 +156,7 @@ const initial = (): ChatState => ({
   limit: null,
   live: "",
   outcome: null,
+  suggestDraft: false,
 });
 
 const textOf = (m: ChatMessage): string | null => (typeof m.text === "string" ? m.text : null);
@@ -412,10 +418,16 @@ export class ChatSession {
     this.turn = { key, text, cmid, waits: 0, before };
     this.set((s) => ({
       input: "",
+      suggestDraft: false,
       items: [...s.items, { key, id: null, author: "owner", text, cmid, status: { kind: "sending" } }],
     }));
     void this.exchange(key);
     return true;
+  }
+
+  /** Предложение подготовить сообщение использовано (черновик отправлен): кнопка больше не выделяется. */
+  dismissSuggest(): void {
+    if (this.state.suggestDraft) this.set({ suggestDraft: false });
   }
 
   /** «Остановить»: поток закрывается, сервер отменяет вызовы модели; недописанный ответ не сохраняется. */
@@ -530,7 +542,12 @@ export class ChatSession {
           .filter((it) => it.key === replyKey || it.id !== id)
           .map((it) => (it.key === replyKey ? { ...it, id, replyTo, partial: undefined } : it)),
       }));
-      this.set({ phase: "idle", live: shown ? `Ответ агента: ${shown}` : "Агент ответил.", outcome: this.next("done") });
+      this.set({
+        phase: "idle",
+        live: shown ? `Ответ агента: ${shown}` : "Агент ответил.",
+        outcome: this.next("done"),
+        suggestDraft: outcome.data.suggest_draft === true,
+      });
       return;
     }
     if (outcome.kind === "crisis") {
@@ -547,6 +564,7 @@ export class ChatSession {
         ],
         live: `Ответ агента: ${text} Ниже — контакты помощи.`,
         outcome: this.next("crisis"),
+        suggestDraft: false,
       }));
       return;
     }

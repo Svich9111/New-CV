@@ -336,6 +336,33 @@ describe("m-8: «Помощь» на каждом экране (по всем м
         return r;
       },
     },
+    // Задача 3.4: черновик и лента пары (дополнение; прежние строки не менялись).
+    draft: {
+      h1: "Черновик",
+      open: async () => {
+        const server = new FakeServer().onboarded().pendingCouple();
+        server.partnerAccepts();
+        server.addChat("owner", "Мне обидно из-за отменённого ужина");
+        const r = renderApp({ server });
+        await heading("Вы пара");
+        await r.pressMain();
+        await heading("Твой агент");
+        await r.user.click(await screen.findByRole("button", { name: "Подготовить сообщение" }));
+        await screen.findByLabelText("Текст сообщения партнёру");
+        return r;
+      },
+    },
+    messages: {
+      h1: "Сообщения пары",
+      open: async () => {
+        const server = new FakeServer().onboarded().pendingCouple();
+        server.partnerAccepts();
+        const r = renderApp({ server });
+        await heading("Вы пара");
+        await r.user.click(screen.getByRole("button", { name: /Сообщения пары/ }));
+        return r;
+      },
+    },
     underage: {
       h1: "Сервис доступен только с 18 лет",
       open: async () => {

@@ -35,3 +35,11 @@ export type ChatErrorCode = Schemas["ChatErrorCode"];
 export type MemoryType = Schemas["MemoryType"];
 export type MemoryItem = Schemas["MemoryItem"];
 export type MemoryList = Json<paths["/memory"]["get"]["responses"][200]>;
+
+export type Draft = Schemas["Draft"];
+export type DraftCrisis = Schemas["DraftCrisis"];
+export type DraftOutcome = Schemas["DraftOutcome"];
+export type PartnerMessage = Schemas["PartnerMessage"];
+export type ExportText = Schemas["ExportText"];
+export type CoupleFeed = Json<paths["/couple/messages"]["get"]["responses"][200]>;
+export type MessageOriginal = Json<paths["/couple/messages/{message_id}/original"]["get"]["responses"][200]>;

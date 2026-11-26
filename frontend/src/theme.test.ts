@@ -57,10 +57,14 @@ describe("Токены дизайна (ТЗ §8; смена дизайна по�
     }
   });
 
-  test("красный акцент — только главная кнопка и сердце (знак близости), не ошибки", () => {
+  test("красный акцент — только главная кнопка, сердце (знак близости) и линия карточки партнёра (§8), не ошибки", () => {
     const css = stripComments(app);
     const rules = [...css.matchAll(/([^{}]+)\{([^}]*)\}/g)].filter((m) => m[2].includes("var(--accent)"));
     const selectors = rules.map((m) => m[1].trim());
-    expect(selectors).toEqual([".heart", ".main-button"]);
+    // 3.4: добавлена `.partner-card` — «белая карточка с красной линией слева» (ТЗ §8); у неё красная только линия.
+    expect(selectors).toEqual([".heart", ".main-button", ".partner-card"]);
+    const card = rules.find((m) => m[1].trim() === ".partner-card")![2];
+    expect(card.match(/var\(--accent\)/g)).toHaveLength(1);
+    expect(card).toMatch(/border-left:\s*4px solid var\(--accent\)/);
   });
 });

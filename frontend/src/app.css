@@ -302,3 +302,46 @@ fieldset.field { border: 0; padding: 0; margin-left: 0; margin-right: 0; min-wid
 .confirm__q { flex: 1 0 100%; margin: 0; }
 .confirm .btn { flex: 1 1 120px; }
 .btn--fill { background: var(--text); color: var(--bg); border-color: var(--text); }
+
+/* Черновик, лента пары, «Подготовить сообщение» (задача 3.4; стиль прототипа 0.6, ждёт Г1).
+   Красный — только линия карточки партнёра (ТЗ §8); ошибки и «не доставлено» — нейтрально. */
+.draft-text { min-height: 220px; resize: vertical; line-height: 1.5; font-size: var(--font-size-msg); }
+.crisis--page { border-top: 0; margin-top: 0; padding-top: 0; }
+.crisis__text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.prepare { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.prepare .btn--block { margin-bottom: 0; }
+.prepare__reply, .prepare__hint, .prepare__none { margin: 0 0 4px; }
+.prepare__none { text-align: center; }
+.feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 14px; }
+.feed__item { display: flex; flex-direction: column; }
+.feed__item--out { align-items: flex-end; }
+.sent {
+  max-width: 92%;
+  background: var(--own-bg);
+  color: var(--own-text);
+  border-radius: var(--radius-msg);
+  border-bottom-right-radius: var(--radius-msg-tail);
+  padding: 12px 14px;
+}
+.sent__text { white-space: pre-wrap; overflow-wrap: anywhere; display: block; }
+.sent__status { display: block; font-size: var(--font-size-meta); margin-top: 6px; opacity: .85; }
+.feed__note { margin: 6px 0 0; text-align: right; }
+.feed__withheld { align-self: stretch; margin-top: 8px; padding: 12px 14px; border: 1px solid var(--text); border-radius: var(--radius-sm); }
+.feed__withheld p { margin: 0 0 8px; }
+.feed__withheld .crisis { margin-top: 8px; }
+.partner-card {
+  background: var(--card-bg);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+}
+.partner-card__head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: var(--font-size-tiny); color: var(--text-muted); }
+.partner-card__text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--font-size-msg); margin-bottom: 10px; }
+.partner-card .badge { margin-top: 0; color: var(--text); font-weight: 600; }
+.partner-card .btn-row { margin-bottom: 0; }
+.original { display: block; border-top: 1px dashed var(--line); margin-top: 8px; padding-top: 10px; }
+.original__label { display: block; font-size: var(--font-size-meta); font-weight: 600; color: var(--text-muted); margin-bottom: 4px; }
+.original__text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.empty { text-align: center; padding: 32px 12px; color: var(--text-muted); }
+.unread { font-weight: 600; }

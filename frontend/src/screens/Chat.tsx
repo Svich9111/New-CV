@@ -3,6 +3,7 @@ import { useApp } from "../app/store";
 import { MAX_TEXT, isBlank, visibleItems, type ChatItem, type ChatSession, type ChatState } from "../chat/session";
 import { DOUBLE_TAP_MS } from "../telegram/MainButton";
 import { useTelegram } from "../telegram/context";
+import { formatMoment } from "../ui/format";
 import { Heading } from "../ui/Heading";
 import { Loading, Notice } from "../ui/Notice";
 import { HelpContacts } from "./Help";
@@ -160,9 +161,12 @@ function MessageText({ text }: { text: string | null }) {
  * дневной лимит со временем. Разговор приватен — это сказано на экране (принцип 4).
  */
 export function Chat() {
-  const { chat, push } = useApp();
+  const { chat, couple, me, push } = useApp();
   const tg = useTelegram();
   const state = useChat(chat);
+  // Контекст ответа («Ответить с агентом», АР-56) живёт в сессии пары: экран перерисовывается при его смене.
+  useSyncExternalStore(couple.subscribe, couple.getVersion);
+  const reply = couple.reply;
   const inputId = useId();
   const counterId = useId();
   const end = useRef<HTMLDivElement>(null);
@@ -414,6 +418,38 @@ export function Chat() {
           <button type="button" className="btn btn--ghost chat-new" onClick={toEnd}>
             К новым <span aria-hidden="true">↓</span>
           </button>
+        )}
+        {me.has_active_couple ? (
+          <div className="prepare" data-prepare>
+            {reply && (
+              <p className="prepare__reply small" data-reply-to={reply.id}>
+                <span>Ответ на сообщение партнёра от {formatMoment(reply.sentAt)}.</span>{" "}
+                <button type="button" className="help-line__more" onClick={() => couple.setReply(null)}>
+                  Не отвечать на него
+                </button>
+              </p>
+            )}
+            {state.suggestDraft && (
+              <p className="prepare__hint small" data-suggest>
+                Агент предлагает подготовить сообщение партнёру.
+              </p>
+            )}
+            <button
+              type="button"
+              className={`btn btn--block ${state.suggestDraft ? "btn--fill" : "btn--ghost"} prepare__btn`}
+              disabled={state.phase !== "idle"}
+              onClick={() => {
+                tg.impact("light");
+                push({ name: "draft", replyTo: reply?.id ?? null });
+              }}
+            >
+              {reply ? "Подготовить ответ" : "Подготовить сообщение"}
+            </button>
+          </div>
+        ) : (
+          <p className="prepare__none small muted" data-prepare-none>
+            Пара ещё не создана — отправлять сообщения партнёру можно будет после неё.
+          </p>
         )}
         <div className="composer">
           <label htmlFor={inputId} className="visually-hidden">
