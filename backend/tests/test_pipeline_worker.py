@@ -1150,3 +1150,26 @@ def test_pipeline_process_stops_gracefully_on_sigterm() -> None:
         out = proc.communicate(timeout=10)[0]
     assert code == 0, out[-2000:]
     assert "SIGTERM received" in out and "pipeline worker stopped" in out
+
+
+def test_compose_stop_grace_covers_model_timeout_and_write() -> None:
+    """Б-88: после SIGTERM Docker ждёт ``stop_grace_period`` (по умолчанию 10 с) и шлёт SIGKILL.
+    Начатое сообщение ограничено тайм-аутом конвейера и окном записи исхода (оба — от аренды по
+    умолчанию ``FEELINGS_PIPELINE_LEASE_S``): срок у ``worker-pipeline`` в обоих compose не
+    меньше аренды — Docker не убьёт процесс посреди модели, сообщение не обработается дважды."""
+    import re
+    from pathlib import Path
+
+    import yaml
+
+    lease_s = float(Settings().pipeline_lease_s)
+    cfg = PipelineSettings(lease=timedelta(seconds=lease_s))
+    need = max(cfg.timeout_s, cfg.write_window_s, lease_s)
+    root = Path(__file__).resolve().parents[2]
+    for path in (root / "infra" / "docker-compose.yml",
+                 root / "infra" / "deploy" / "docker-compose.prod.yml"):  # fmt: skip
+        svc = yaml.safe_load(path.read_text(encoding="utf-8"))["services"]["worker-pipeline"]
+        m = re.fullmatch(r"(?:(\d+)m)?(?:(\d+)s)?", str(svc["stop_grace_period"]))
+        assert m is not None and m.group(0), path
+        grace = int(m.group(1) or 0) * 60 + int(m.group(2) or 0)
+        assert grace >= need, (path, grace, need)

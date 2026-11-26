@@ -19,9 +19,24 @@ x-backend: &backend
   env_file:
     - path: ../.env
       required: false
-  # Ошибка конфигурации (нет ключей, OPENROUTER_API_KEY) повторяется при каждом старте — не
-  # больше 5 перезапусков, затем контейнер остаётся остановленным (docker compose logs worker-memory).
+  # Ошибка настройки (нет ключей, OPENROUTER_API_KEY, набор промптов) — выход с кодом 78
+  # (EX_CONFIG, Б-90): не больше 5 перезапусков, затем контейнер остаётся Exited (78) — причина в
+  # docker compose logs <воркер>. Временная недоступность OpenRouter при старте — повтор в процессе
+  # без выхода (контейнер Up, unhealthy). Стенд — unless-stopped (deploy/docker-compose.prod.yml).
   restart: "on-failure:5"
+
+# Живость воркера — пульс (Б-85, app.workers.health): метка последнего успешного прохода цикла;
+# unhealthy — пульс старше --max-age, пауза из-за ошибки настройки или ожидание при старте.
+x-worker-health: &worker-health
+  test: ["CMD", "python", "-m", "app.workers.health", "--max-age", "120"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 30s
+
+x-worker-health-fast: &worker-health-fast
+  <<: *worker-health
+  test: ["CMD", "python", "-m", "app.workers.health", "--max-age", "60"]
 
 services:
   postgres:
@@ -81,6 +96,7 @@ services:
       FEELINGS_ENV: dev
       FEELINGS_WORKER_DATABASE_URL: postgresql+asyncpg://feelings_worker_login:${FEELINGS_WORKER_DB_PASSWORD:-}@postgres:5432/feelings
       FEELINGS_REDIS_URL: redis://redis:6379/0
+    healthcheck: *worker-health
     depends_on: &worker-deps
       db-roles: { condition: service_completed_successfully }
       redis: { condition: service_started }
@@ -90,6 +106,7 @@ services:
     <<: *backend
     command: ["python", "-m", "app.workers.kb"]
     environment: *worker-env
+    healthcheck: *worker-health
     depends_on: *worker-deps
 
   # Воркер конвейера входящего (3.2): отправленные сообщения → безопасность, тон, адаптация →
@@ -101,6 +118,9 @@ services:
       <<: *worker-env
       # Набор промптов (АР-45): локально — прототип v0; в production — только прогнанный набор.
       FEELINGS_PIPELINE_PROMPT_SET: ${FEELINGS_PIPELINE_PROMPT_SET:-v0}
+    # Б-88: начатые сообщения дорабатываются до записи исхода — срок не меньше аренды (180 с).
+    stop_grace_period: 200s
+    healthcheck: *worker-health-fast
     depends_on: *worker-deps
 
   # Воркер уведомлений (3.5): доставленные сообщения → уведомление получателю в Telegram без
@@ -112,17 +132,8 @@ services:
     environment: *worker-env
     # SIGTERM → начатый запрос к Bot API дорабатывается и отмечается (как на стенде, MAJOR-1).
     stop_grace_period: 30s
-    # Живость: процесс жив и роль входа воркера подключается к БД (как на стенде).
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import asyncio,os,asyncpg\nasync def main():\n    url = os.environ['FEELINGS_WORKER_DATABASE_URL'].replace('+asyncpg', '', 1)\n    conn = await asyncio.wait_for(asyncpg.connect(url), 5)\n    await conn.fetchval('SELECT 1')\n    await conn.close()\nasyncio.run(main())"
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
+    # Живость — пульс (как на стенде): пауза из-за неверного токена (401/404) — unhealthy.
+    healthcheck: *worker-health-fast
     depends_on: *worker-deps
 
 volumes:

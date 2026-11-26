@@ -18,7 +18,10 @@
 
 - **429** — пауза всего воркера на ``retry_after`` (лимит общий на бота): новые не захватываются,
   начатые ждут и повторяют отправку в пределах своей аренды; пауза дольше окна — аренда снимается
-  досрочно с отсрочкой до конца паузы, попытка не расходуется (``pipeline_notify_release``, 0015);
+  досрочно с отсрочкой до конца паузы, попытка не расходуется (``pipeline_notify_release``, 0015).
+  То же после серии коротких 429 за один захват (каждый короче окна, но ``max_sends`` отправок
+  или окно аренды исчерпаны только ими, Б-91): долгий флуд-лимит из коротких пауз не расходует
+  попытки — иначе через ``max_attempts`` захватов уведомление помечалось бы без отправки;
 - **403** (бот заблокирован, пользователь деактивирован) и **400** (чат не найден и т. п.) —
   отметка без повторов: повтор ничего не изменит. 403 — штатный исход (INFO);
 - **401/404** (токен бота неверен) — ошибка настройки: пауза воркера, отметки нет; аренда снимается
@@ -32,12 +35,20 @@
 
 Предел попыток — в БД (``pipeline_claim_notify``: ``work_attempts ≥ p_max_attempts`` — отметка без
 выдачи). Попытку расходуют только сбои самого уведомления (сеть, 5xx, падение процесса); 429
-дольше окна и ошибка настройки бота — снятие аренды без расхода (``nw.release``).
+(дольше окна или серия коротких) и ошибка настройки бота — снятие аренды без расхода
+(``nw.release``).
 
 Остановка процесса (SIGTERM/SIGINT — ``docker stop``, выкладка; ``app.workers.signals``): новые
-уведомления не захватываются, повторы и ожидание паузы не начинаются (аренда истечёт — повтор
-другим процессом), начатый запрос к Telegram дорабатывается и отмечается. Время на это —
-``stop_grace_period`` сервиса в compose (не меньше тайм-аута запроса Bot API и отметки).
+уведомления не захватываются, повторы и ожидание паузы не начинаются, начатый запрос к Telegram
+дорабатывается и отмечается. Неотправленное (ждало повтора или конца 429) — аренда снимается
+сразу без расхода попытки (Б-88; отсрочка — остаток паузы 429, если она идёт, иначе 0):
+следующий процесс берёт его без ожидания конца аренды. Время на это — ``stop_grace_period``
+сервиса в compose (не меньше тайм-аута запроса Bot API и отметки).
+
+Пульс (Б-85, ``app.workers.health``): после каждого успешного прохода цикла (захват прошёл или
+не нужен) — ``ok`` (на паузе 429 — ``ok`` с причиной ``http_429``: лимит Telegram проходит сам);
+на паузе из-за неверного токена (401/404) — ``paused``: health check контейнера — unhealthy.
+БД отвергла роль входа (пароль, права) — ``ConfigError``, выход с кодом 78 (``startup``).
 
 Остаточный риск «ровно одного»: процесс убит SIGKILL (или БД недоступна дольше аренды) между
 успешной отправкой и отметкой — после истечения аренды уведомление уйдёт ещё раз.
@@ -69,8 +80,10 @@ from app.bot.notifications import NotificationKind, notify
 from app.repositories import notify_work as nw
 from app.repositories import users
 from app.repositories.notify_work import NotifyClaim
+from app.workers.health import Heartbeat
 from app.workers.pipeline import transient_db_error
 from app.workers.signals import stop_on_signals
+from app.workers.startup import raise_if_config_db_error, run_worker
 
 logger = logging.getLogger(__name__)
 
@@ -165,13 +178,18 @@ class NotifyWorker:
         webapp_url: str = "",
         settings: NotifySettings | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        heartbeat: Heartbeat | None = None,
     ) -> None:
         self.sm = worker_sm
         self.api = api
         self.webapp_url = webapp_url
         self.settings = settings or NotifySettings()
         self._sleep = sleep
+        self.heartbeat = heartbeat or Heartbeat(None)
         self._paused_until = 0.0  # time.monotonic()
+        # Пауза из-за ошибки настройки бота (401/404) — отдельно от 429: только она unhealthy.
+        self._config_paused_until = 0.0
+        self._config_reason: str | None = None
         self._stop: asyncio.Event | None = None  # остановка процесса (``run_forever``)
 
     # ----------------------------------------------------------------- пауза (429, настройка)
@@ -182,6 +200,22 @@ class NotifyWorker:
 
     def _pause_for(self, seconds: float) -> None:
         self._paused_until = max(self._paused_until, time.monotonic() + seconds)
+
+    @property
+    def config_paused(self) -> bool:
+        return time.monotonic() < self._config_paused_until
+
+    def _pause_left(self) -> float:
+        return max(self._paused_until - time.monotonic(), 0.0)
+
+    def _pulse(self) -> None:
+        """Пульс после успешного прохода цикла (Б-85)."""
+        if self.config_paused:
+            self.heartbeat.beat("paused", self._config_reason)
+        elif self.paused:
+            self.heartbeat.beat("ok", "http_429")
+        else:
+            self.heartbeat.beat("ok")
 
     @property
     def stopping(self) -> bool:
@@ -254,9 +288,10 @@ class NotifyWorker:
         cfg = self.settings
         pause = cfg.retry_pause_s
         last: str | None = None
+        only_429 = True  # все отправки этого захвата получили 429 (Б-91)
         for n in range(cfg.max_sends):
             if n and self.stopping:
-                raise _Leave("retry", last or "stopping")
+                raise self._stopping(last)
             wait = self._paused_until - time.monotonic()
             if wait > 0:
                 if time.monotonic() + wait >= deadline:
@@ -266,18 +301,30 @@ class NotifyWorker:
                     raise _Leave("retry", last or "paused", release_after=wait)
                 await self._nap(wait)
                 if self.stopping:
-                    raise _Leave("retry", last or "stopping")
+                    raise self._stopping(last)
             if deadline - time.monotonic() <= 0:
-                raise _Leave("retry", last or "deadline")
+                raise self._flooded(last) if n and only_429 else _Leave("retry", last or "deadline")
             last = await self._attempt(c, deadline)
             # Временный сбой: повтор с паузой (429 — пауза уже выставлена).
             if last != "http_429":
+                only_429 = False
                 left = deadline - time.monotonic()
                 if left <= pause:
                     raise _Leave("retry", last)
                 await self._nap(pause)
                 pause = min(pause * 2, cfg.retry_max_pause_s)
-        raise _Leave("retry", last)
+        raise self._flooded(last) if only_429 else _Leave("retry", last)
+
+    def _flooded(self, last: str | None) -> _Leave:
+        """Захват исчерпан одними 429 (каждый короче окна, Б-91): причина — лимит бота, а не
+        уведомление; аренда снимается с отсрочкой до конца паузы, попытка не расходуется."""
+        return _Leave("retry", last, release_after=self._pause_left())
+
+    def _stopping(self, last: str | None) -> _Leave:
+        """Остановка процесса до (повторной) отправки (Б-88): аренда снимается сразу, без
+        расхода попытки, — следующий процесс не ждёт конца аренды; идёт пауза 429 — отсрочка
+        на её остаток (лимит бота общий)."""
+        return _Leave("retry", last or "stopping", release_after=self._pause_left())
 
     async def _attempt(self, c: NotifyClaim, deadline: float) -> str:
         """Одна попытка: поиск чата получателя, затем ``sendMessage``. Известный исход —
@@ -324,6 +371,8 @@ class NotifyWorker:
             return reason
         if code in CONFIG_ERROR_CODES:
             self._pause_for(cfg.pause.total_seconds())
+            self._config_paused_until = time.monotonic() + cfg.pause.total_seconds()
+            self._config_reason = reason
             raise _Leave("paused", reason, release_after=cfg.pause.total_seconds())
         if code in UNREACHABLE_CODES:
             raise _Sent("blocked", reason)
@@ -385,8 +434,12 @@ class NotifyWorker:
                         claims = await nw.claim(
                             self.sm, lease=cfg.lease, max_attempts=cfg.max_attempts, limit=free
                         )
+                        self._pulse()
                     except Exception as exc:  # БД недоступна и т. п. — повтор после паузы
+                        raise_if_config_db_error(exc, name="notify worker")
                         logger.warning("notify worker claim failed: %s", type(exc).__name__)
+                else:  # пауза или все слоты заняты: цикл жив, захват не нужен
+                    self._pulse()
                 for c in claims:
                     task = asyncio.create_task(self._guard(c))
                     running.add(task)
@@ -413,6 +466,8 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
 
     install_log_redaction()  # токен бота в URL Bot API — из журналов httpx
     logging.getLogger("httpx").setLevel(logging.WARNING)  # без строки на каждый запрос
+    heartbeat = Heartbeat.from_env()
+    heartbeat.beat("starting")
     settings = get_settings()
     check_notify_config(settings)
     if not settings.webapp_url:
@@ -427,6 +482,7 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
             max_attempts=settings.notify_max_attempts,
             batch=settings.notify_batch,
         ),
+        heartbeat=heartbeat,
     )
     stop = asyncio.Event()
     try:
@@ -438,5 +494,4 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
 
 
 if __name__ == "__main__":  # pragma: no cover
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(_main())
+    run_worker(_main, name="notify worker")  # ошибка настройки — код выхода 78

@@ -435,6 +435,51 @@ async def test_429_longer_than_lease_deferred_without_attempt(
     assert len(tg.requests) == 2 and len(tg.sent) == 1
 
 
+async def test_long_flood_of_short_429_never_exhausts_attempts(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID]
+) -> None:
+    """Б-91 (ревью 3.5 р.2 MINOR-1): долгий флуд-лимит из коротких 429 (каждый короче окна
+    аренды) — за один захват ``max_sends`` отправок, все 429: аренда снимается сразу с отсрочкой
+    до конца паузы, попытка не расходуется. Захватов больше ``max_attempts`` — уведомление не
+    помечается без отправки; когда лимит прошёл — ровно одно уведомление, попытка 1."""
+    anna, igor, _ = pair
+    mid = await delivered(sessionmaker, engine, anna)
+    rounds, sends = 4, 3  # rounds > max_attempts
+    tg = FakeTg(*[tg_error(429, retry_after=2) for _ in range(rounds * sends)])
+    w = nworker(engine, tg, max_attempts=2, max_sends=sends)
+    for _ in range(rounds):
+        assert [(o.status, o.reason, o.attempts) for o in await w.run_once()] == [
+            ("retry", "http_429", 1)
+        ]
+        row = await _msg(engine, mid)
+        assert row is not None and row["notify_done_at"] is None
+        held, left_s, attempts = await _lease(engine, mid)
+        # Аренда снята с отсрочкой на остаток паузы (≤ retry_after), счётчик не вырос.
+        assert not held and left_s is not None and left_s <= 2.0 and attempts == 0
+        await _expire(engine, mid)  # отсрочка прошла
+        w._paused_until = 0.0  # пауза воркера прошла (фальшивый sleep не ждал)
+    out = await w.run_once()  # флуд-лимит кончился
+    await w.api.aclose()
+    assert [(o.status, o.attempts) for o in out] == [("sent", 1)]
+    assert len(tg.requests) == rounds * sends + 1 and len(tg.sent) == 1
+    assert_notification(tg.sent[0], await chat_of(engine, igor.user_id))
+
+
+async def test_short_429_then_network_failure_spends_attempt(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID]
+) -> None:
+    """Б-91, граница: в захвате был сбой самого уведомления (сеть/5xx) — не одни 429: попытка
+    засчитывается как прежде (аренда не снимается, повтор после её истечения)."""
+    anna, _igor, _ = pair
+    mid = await delivered(sessionmaker, engine, anna)
+    tg = FakeTg(tg_error(429, retry_after=1), tg_error(502), tg_error(429, retry_after=1))
+    w = nworker(engine, tg, max_sends=3)
+    assert statuses(await w.run_once()) == [("retry", "http_429")]
+    held, _left_s, attempts = await _lease(engine, mid)
+    assert held and attempts == 1
+    await w.api.aclose()
+
+
 @pytest.mark.parametrize(("code", "status"), [(403, "blocked"), (400, "rejected")])
 async def test_blocked_or_chat_not_found_marked_without_retry(
     sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID], code: int, status: str,
@@ -798,6 +843,51 @@ async def test_stop_does_not_start_retries(
     row = await _msg(engine, mid)
     assert row is not None and row["notify_done_at"] is None
     assert any("status=retry reason=http_502" in r.getMessage() for r in caplog.records)
+
+
+async def test_stop_releases_unsent_lease_without_attempt(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID]
+) -> None:
+    """Б-88: остановка до повторной отправки (после 5xx) — аренда неотправленного снимается
+    сразу (``pipeline_notify_release``, ``count_attempt=false``, отсрочка 0): новый процесс берёт
+    уведомление без ожидания конца аренды (2 мин), попытка не израсходована; ровно одно."""
+    anna, _igor, _ = pair
+    mid = await delivered(sessionmaker, engine, anna)
+    tg = FakeTg(tg_error(502), delay_s=0.3)
+    w = nworker(engine, tg)
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run_forever(poll_s=0.05, stop=stop))
+    await _until(lambda: len(tg.requests) == 1)
+    stop.set()
+    await asyncio.wait_for(task, 10)
+    await w.api.aclose()
+    held, left_s, attempts = await _lease(engine, mid)
+    assert not held and attempts == 0 and (left_s is None or left_s <= 1.0)
+    fresh = nworker(engine, tg)  # следующий процесс после выкладки — без _expire
+    out = await fresh.run_once()
+    await fresh.api.aclose()
+    assert [(o.status, o.attempts) for o in out] == [("sent", 1)]
+    assert len(tg.sent) == 1
+
+
+async def test_stop_during_429_pause_defers_by_remaining_pause(
+    sessionmaker: SM, engine: AsyncEngine, pair: tuple[P, P, uuid.UUID]
+) -> None:
+    """Б-88: остановка во время паузы 429 — аренда снимается без расхода попытки, но с
+    отсрочкой на остаток ``retry_after`` (лимит бота общий для всех процессов)."""
+    anna, _igor, _ = pair
+    mid = await delivered(sessionmaker, engine, anna)
+    tg = FakeTg(tg_error(429, retry_after=60))
+    w = nworker(engine, tg, sleep=asyncio.sleep)
+    stop = asyncio.Event()
+    task = asyncio.create_task(w.run_forever(poll_s=0.05, stop=stop))
+    await _until(lambda: len(tg.requests) == 1)
+    await asyncio.sleep(0.2)
+    stop.set()
+    await asyncio.wait_for(task, 5)
+    await w.api.aclose()
+    held, left_s, attempts = await _lease(engine, mid)
+    assert not held and attempts == 0 and left_s is not None and 50 < left_s <= 60
 
 
 async def test_stop_interrupts_429_pause(

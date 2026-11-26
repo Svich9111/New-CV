@@ -53,6 +53,20 @@
 Цикл процесса (``run_forever``) — непрерывный: до ``batch`` сообщений одновременно, свободный слот
 сразу занимается новым захватом (одно медленное сообщение не задерживает остальные, §10).
 
+Остановка (SIGTERM — ``docker stop``, выкладка; Б-88): новые сообщения не захватываются, начатые
+дорабатываются до записи исхода. Каждое начатое ограничено тайм-аутом конвейера
+(``timeout_s`` = аренда − 30 с) и окном записи исхода (аренда − 15 с от захвата), поэтому
+``stop_grace_period`` сервиса в compose — не меньше аренды (180 с по умолчанию): Docker не убьёт
+процесс посреди работы модели, и сообщение не обработается повторно после аренды. Снимать
+аренду при остановке не нужно: неотправленного к концу ожидания не остаётся, а обрыв запроса к
+модели означал бы оплаченный впустую вызов.
+
+Пульс (Б-85, ``app.workers.health``): после каждого успешного прохода цикла (захват прошёл или
+не нужен — все слоты заняты) — ``ok``; на паузе (выключатель АР-45 п.2) — ``paused`` с видом
+ошибки модели: health check контейнера — unhealthy. БД отвергла роль входа (пароль, права) —
+``ConfigError``, выход с кодом 78; модель недоступна при старте — повтор в процессе
+(``app.workers.startup``).
+
 Журнал — только исход, причина, вид ошибки и номер попытки: ни текстов, ни id (ТЗ §9.1 п.5).
 Уведомление получателю (3.5) — не здесь: доставленное попадает в очередь ``pipeline_claim_notify``
 (Б-47).
@@ -83,6 +97,8 @@ from app.core.crypto import DecryptionError, Keyring
 from app.db import sqlstate
 from app.repositories import pipeline_work as pw
 from app.repositories.pipeline_work import PipelineClaim, WithholdReason
+from app.workers.health import Heartbeat
+from app.workers.startup import raise_if_config_db_error, run_worker, startup_retry
 
 logger = logging.getLogger(__name__)
 
@@ -221,13 +237,16 @@ class PipelineWorker:
         models: AgentModels,
         prompt_set: PromptSet,
         settings: PipelineSettings | None = None,
+        heartbeat: Heartbeat | None = None,
     ) -> None:
         self.sm = worker_sm
         self.keys = keys
         self.models = models
         self.prompt_set = prompt_set
         self.settings = settings or PipelineSettings()
+        self.heartbeat = heartbeat or Heartbeat(None)
         self._paused_until = 0.0  # time.monotonic()
+        self._pause_kind: str | None = None
 
     # ----------------------------------------------------------------- выключатель (АР-45 п.2)
 
@@ -240,6 +259,14 @@ class PipelineWorker:
         if not self.paused:
             logger.error("pipeline paused: model %s, resume in %ds", kind, int(pause_s))
         self._paused_until = max(self._paused_until, time.monotonic() + pause_s)
+        self._pause_kind = kind
+
+    def _pulse(self) -> None:
+        """Пульс после успешного прохода цикла (Б-85): на паузе — ``paused`` (unhealthy)."""
+        if self.paused:
+            self.heartbeat.beat("paused", self._pause_kind)
+        else:
+            self.heartbeat.beat("ok")
 
     # ----------------------------------------------------------------- проход
 
@@ -423,8 +450,12 @@ class PipelineWorker:
                         claims = await pw.claim(
                             self.sm, lease=cfg.lease, max_attempts=cfg.max_attempts, limit=free
                         )
+                        self._pulse()
                     except Exception as exc:  # БД недоступна и т. п. — повтор после паузы
+                        raise_if_config_db_error(exc, name="pipeline worker")
                         logger.warning("pipeline worker claim failed: %s", type(exc).__name__)
+                else:  # пауза или все слоты заняты: цикл жив, захват не нужен
+                    self._pulse()
                 for c in claims:
                     task = asyncio.create_task(self._guard(c))
                     running.add(task)
@@ -444,6 +475,8 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
     from app.config import get_settings
     from app.workers.signals import stop_on_signals
 
+    heartbeat = Heartbeat.from_env()
+    heartbeat.beat("starting")
     settings = get_settings()
     if not settings.worker_database_url:
         raise ConfigError("FEELINGS_WORKER_DATABASE_URL не задан (роль входа воркера, Б-69)")
@@ -452,23 +485,34 @@ async def _main() -> None:  # pragma: no cover — запуск процесса
     # захватываются, начатые дорабатываются (``run_forever``); второй сигнал — сразу.
     stop = asyncio.Event()
     with stop_on_signals(stop, name="pipeline worker"):
-        await _run(settings, prompt_set, stop)
+        await _run(settings, prompt_set, stop, heartbeat)
     logger.info("pipeline worker stopped")
 
 
 async def _run(  # pragma: no cover — запуск процесса
-    settings: Settings, prompt_set: PromptSet, stop: asyncio.Event
+    settings: Settings, prompt_set: PromptSet, stop: asyncio.Event, heartbeat: Heartbeat
 ) -> None:
-    from app.ai.models import openrouter_models_async
+    from app.ai import models as ai_models
     from app.core.crypto import load_keyring
     from app.db import make_engine, make_sessionmaker
 
-    worker = PipelineWorker(
-        worker_sm=make_sessionmaker(make_engine(settings.worker_database_url)),
-        keys=load_keyring(settings),  # Б-42: ключи шифрования воркера — из окружения
-        models=await openrouter_models_async(
+    keys = load_keyring(settings)  # Б-42: ключи шифрования воркера — из окружения
+    # Каталог цен OpenRouter недоступен при старте — повтор в процессе, а не выход (Б-90).
+    models = await startup_retry(
+        lambda: ai_models.openrouter_models_async(
             settings.llm_writer_model, settings.llm_classifier_model
         ),
+        name="pipeline worker",
+        what="models",
+        heartbeat=heartbeat,
+        stop=stop,
+    )
+    if stop.is_set():
+        return
+    worker = PipelineWorker(
+        worker_sm=make_sessionmaker(make_engine(settings.worker_database_url)),
+        keys=keys,
+        models=models,  # type: ignore[arg-type]  # None — только в тестах процесса (заглушка)
         prompt_set=prompt_set,
         settings=PipelineSettings(
             lease=timedelta(seconds=settings.pipeline_lease_s),
@@ -476,10 +520,10 @@ async def _run(  # pragma: no cover — запуск процесса
             batch=settings.pipeline_batch,
             pause=timedelta(seconds=settings.pipeline_pause_s),
         ),
+        heartbeat=heartbeat,
     )
     await worker.run_forever(poll_s=settings.pipeline_poll_s, stop=stop)
 
 
 if __name__ == "__main__":  # pragma: no cover
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(_main())
+    run_worker(_main, name="pipeline worker")  # ошибка настройки — код выхода 78

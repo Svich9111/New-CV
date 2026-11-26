@@ -7,7 +7,13 @@
 векторы (эмбеддер; нет — без векторов) → одна транзакция: фрагменты, векторы, завершение.
 Сбой разбора — ``kb_fail_index(код)``; попыток больше ``max_attempts`` — ``attempts_exhausted``;
 ``NULL``/``false`` функций — работа брошена (аренду перехватили, материал удалён администратором).
-Журнал — id материала, статус, код, число фрагментов; текстов книг нет."""
+Журнал — id материала, статус, код, число фрагментов; текстов книг нет.
+
+Пульс (Б-85, ``app.workers.health``): после каждого успешного захвата и во время индексации —
+пока она в пределах аренды материала; БД недоступна или индексация зависла — пульс устаревает.
+БД отвергла роль входа — ``ConfigError``, выход с кодом 78; модель недоступна при старте —
+повтор в процессе; ключа OpenRouter нет — индексация без меток, как раньше
+(``app.workers.startup``)."""
 
 from __future__ import annotations
 
@@ -20,12 +26,15 @@ from typing import Literal
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ai.embeddings import Embedder, EmbeddingError, check_dim, check_model
+from app.ai.llm import LLMConfigError, LLMError
 from app.ai.models import AgentModels
 from app.kb.chunk import ChunkParams, split_chunks
 from app.kb.parse import ParseError, ParseLimits, parse, parse_isolated
 from app.kb.tag import tag_chunks
 from app.repositories import kb_work
 from app.repositories.kb_work import ChunkRow, IndexClaim, LeaseLost
+from app.workers.health import Heartbeat
+from app.workers.startup import TRANSIENT_LLM, raise_if_config_db_error, run_worker, startup_retry
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +70,9 @@ class KbWorker:
         models: AgentModels | None = None,
         embedder: Embedder | None = None,
         settings: KbSettings | None = None,
+        heartbeat: Heartbeat | None = None,
     ) -> None:
+        self.heartbeat = heartbeat or Heartbeat(None)
         self.sm = worker_sm
         self.models = models
         self.embedder = embedder
@@ -69,11 +80,14 @@ class KbWorker:
 
     async def run_once(self) -> list[IndexOutcome]:
         out = []
-        for claim in await kb_work.claim_index(
+        claims = await kb_work.claim_index(
             self.sm, lease=self.settings.lease, limit=self.settings.batch
-        ):
+        )
+        self.heartbeat.beat("ok")
+        for claim in claims:
             try:
-                result = await self.index(claim)
+                async with self.heartbeat.working(self.settings.lease.total_seconds()):
+                    result = await self.index(claim)
             except Exception as exc:  # сбой одной задачи не останавливает проход
                 logger.warning("kb index %s failed: %s", claim.document_id, type(exc).__name__)
                 result = IndexOutcome("error", "internal")
@@ -143,6 +157,7 @@ class KbWorker:
             try:
                 done = await self.run_once()
             except Exception as exc:
+                raise_if_config_db_error(exc, name="kb worker")
                 logger.warning("kb worker pass failed: %s", type(exc).__name__)
                 done = []
             if not done:
@@ -153,27 +168,47 @@ class KbWorker:
 
 
 async def _main() -> None:  # pragma: no cover — запуск процесса (нужна роль входа воркера)
-    from app.ai.models import openrouter_models_async
+    from app.ai import models as ai_models
     from app.config import ConfigError, get_settings
     from app.db import make_engine, make_sessionmaker
+    from app.workers.signals import stop_on_signals
 
+    heartbeat = Heartbeat.from_env()
+    heartbeat.beat("starting")
     settings = get_settings()
     if not settings.worker_database_url:
         raise ConfigError("FEELINGS_WORKER_DATABASE_URL не задан (роль входа воркера, Б-69)")
-    try:
-        models: AgentModels | None = await openrouter_models_async(
-            settings.llm_writer_model, settings.llm_classifier_model
+
+    async def load_models() -> AgentModels | None:
+        try:
+            return await ai_models.openrouter_models_async(
+                settings.llm_writer_model, settings.llm_classifier_model
+            )
+        except LLMConfigError:  # без ключа — метки пустые, индексация идёт
+            logger.warning("kb worker: no model key, indexing without tags")
+            return None
+        except LLMError as exc:  # модель не найдена, ключ отклонён — тоже без меток
+            if isinstance(exc, TRANSIENT_LLM):
+                raise  # недоступность при старте — повтор (startup_retry)
+            logger.warning("kb worker: model %s, indexing without tags", exc.kind)
+            return None
+
+    stop = asyncio.Event()
+    with stop_on_signals(stop, name="kb worker"):
+        models = await startup_retry(
+            load_models, name="kb worker", what="models", heartbeat=heartbeat, stop=stop
         )
-    except Exception:  # без ключа — метки пустые, индексация идёт
-        models = None
-    worker = KbWorker(
-        worker_sm=make_sessionmaker(make_engine(settings.worker_database_url)),
-        models=models,
-        embedder=None,  # модель эмбеддингов не выбрана (Б-66)
-    )
-    await worker.run_forever()
+        if stop.is_set():
+            return
+        worker = KbWorker(
+            worker_sm=make_sessionmaker(make_engine(settings.worker_database_url)),
+            models=models,
+            embedder=None,  # модель эмбеддингов не выбрана (Б-66)
+            heartbeat=heartbeat,
+        )
+        await worker.run_forever(stop=stop)
+    logger.info("kb worker stopped")
 
 
 if __name__ == "__main__":  # pragma: no cover
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(_main())
+    run_worker(_main, name="kb worker")  # ошибка настройки — код выхода 78

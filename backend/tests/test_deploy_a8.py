@@ -930,3 +930,82 @@ def test_backup_partial_file_private_while_dumping(shim: dict[str, str], source_
         time.sleep(0.05)
     assert proc.wait(timeout=60) == 0
     assert seen and all(m & 0o077 == 0 for m in seen), [oct(m) for m in seen]
+
+
+# =========================================================================== пульс и код 78 (A7)
+
+WORKERS = ("worker-memory", "worker-kb", "worker-pipeline", "worker-notify")
+FAST_WORKERS = ("worker-pipeline", "worker-notify")  # цикл раз в секунду
+
+
+def _max_age(test: list[str]) -> float:
+    assert test[:4] == ["CMD", "python", "-m", "app.workers.health"], test
+    assert test[4] == "--max-age", test
+    return float(test[5])
+
+
+@pytest.mark.parametrize("path", [COMPOSE_FILE, ROOT / "infra" / "docker-compose.yml"])
+def test_worker_healthchecks_use_heartbeat(path: Path) -> None:
+    """Б-85: health check всех четырёх воркеров в обоих compose — пульс
+    (``python -m app.workers.health``), а не подключение к БД: зависший цикл, недоступная БД и
+    пауза из-за ошибки настройки видны как unhealthy. Предел возраста пульса — больше периода
+    цикла (память и БЗ — 30 с, конвейер и уведомления — 1 с) и меньше, чем «зависание»."""
+    svcs = yaml.safe_load(path.read_text(encoding="utf-8"))["services"]
+    for name in WORKERS:
+        hc = svcs[name]["healthcheck"]
+        age = _max_age(hc["test"])
+        assert (30 < age <= 60) if name in FAST_WORKERS else (60 < age <= 180), (name, age)
+        assert hc.get("start_period") and hc.get("interval") and hc.get("retries"), name
+    raw = path.read_text(encoding="utf-8")
+    assert "asyncpg.connect" not in raw  # прежняя проверка подключением не осталась
+
+
+def test_heartbeat_file_on_worker_tmpfs(compose: dict) -> None:
+    """Пульс — в ``/tmp`` контейнера: на стенде корень только для чтения, ``/tmp`` — tmpfs
+    (без тома: пульс не переживает контейнер и не виден другим сервисам)."""
+    from app.workers.health import DEFAULT_HEARTBEAT_FILE, HEARTBEAT_ENV
+
+    assert DEFAULT_HEARTBEAT_FILE.startswith("/tmp/")
+    for name in WORKERS:
+        svc = compose["services"][name]
+        assert svc.get("read_only") is True and "/tmp" in svc["tmpfs"], name
+        assert HEARTBEAT_ENV not in (svc.get("environment") or {}), name
+
+
+def test_worker_restart_policy_documents_exit_78(compose: dict) -> None:
+    """Б-90: ошибка настройки — код 78 (EX_CONFIG). Docker не фильтрует перезапуск по коду, а
+    счётчик on-failure:N не сбрасывается — поэтому unless-stopped; как отличить 78 от временной
+    недоступности, описано в compose и DEPLOY §4."""
+    from app.workers.startup import EX_CONFIG
+
+    assert EX_CONFIG == 78
+    raw = COMPOSE_FILE.read_text(encoding="utf-8")
+    head = raw.split("x-worker-restart:", 1)[0].rsplit("\n\n", 1)[1]
+    assert "78" in head and "EX_CONFIG" in head
+    doc = (ROOT / "docs" / "DEPLOY.md").read_text(encoding="utf-8")
+    sec4 = doc.split("## 4.", 1)[1].split("\n## 5.", 1)[0]
+    for needle in ("Restarting (78)", "EX_CONFIG", "unhealthy", "app.workers.health", "waiting",
+                   "paused"):  # fmt: skip
+        assert needle in sec4, needle
+
+
+@pytest.mark.skipif(DOCKER is None, reason="нет docker CLI — проверка только статически")
+def test_worker_heartbeat_and_grace_resolved_by_compose(tmp_path: Path) -> None:
+    """``docker compose config`` раскрывает якоря: пульс у всех воркеров, срок остановки
+    конвейера ≥ аренды (Б-88), у уведомлений — 30 с."""
+    _gen(tmp_path)
+    env_file = tmp_path / ".env"
+    _set_env(env_file, MANUAL | {"FEELINGS_SECRETS_DIR": str(tmp_path / "secrets")})
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FEELINGS_", "OPENROUTER"))}
+    r = subprocess.run(
+        [DOCKER or "docker", "compose", "-p", "a7static", "-f", str(COMPOSE_FILE), "--env-file",
+         str(env_file), "config", "--format", "json"],
+        env=env, capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    svcs = json.loads(r.stdout)["services"]
+    for name in WORKERS:
+        _max_age(svcs[name]["healthcheck"]["test"])
+    assert svcs["worker-pipeline"]["stop_grace_period"] == "3m20s"
+    assert Settings().pipeline_lease_s <= 200
+    assert svcs["worker-notify"]["stop_grace_period"] == "30s"

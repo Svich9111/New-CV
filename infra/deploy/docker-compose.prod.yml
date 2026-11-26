@@ -55,27 +55,34 @@ x-backend: &backend
   cap_drop: ["ALL"]
   restart: unless-stopped
 
-# Перезапуск воркеров (тест 0.8, A8-0.8-D3): unless-stopped, а не on-failure:5. Воркер при старте
-# обращается к OpenRouter (цены моделей); кратковременный сбой сети/DNS при загрузке сервера после
-# пяти быстрых перезапусков оставлял контейнер остановленным — конвейер входящего и память стояли
-# до ручного `dc up`. Docker сам увеличивает паузу между перезапусками (до 1 минуты), так что
-# постоянная ошибка настройки (нет ключа, неверный набор промптов) не крутится вхолостую, а видна
-# в `dc ps` как Restarting и в `dc logs <воркер>` — DEPLOY §4. Отличать ошибку настройки от
-# временной недоступности по коду выхода — в коде воркеров (предложение A3, тест 0.8 D3).
+# Перезапуск воркеров (тест 0.8, A8-0.8-D3; Б-90): unless-stopped, а не on-failure:N. Коды выхода
+# воркера (app.workers.startup):
+#   78 (EX_CONFIG) — ошибка настройки (нет/неверная переменная, ключи, набор промптов, модель
+#        отклонила ключ, БД отвергла роль входа): CRITICAL-строка с именем переменной, без значений;
+#        `dc ps` — Restarting (78). Перезапуск не поможет — правка .env и `dc up -d <воркер>`;
+#   0  — штатная остановка (SIGTERM); прочие — непредвиденный сбой (перезапуск нужен).
+# Временная недоступность при старте (OpenRouter, сеть/DNS) — повтор в процессе, без выхода:
+# контейнер Up (unhealthy), пульс `waiting`. Docker не умеет не перезапускать по коду выхода, а
+# счётчик on-failure:N не сбрасывается — редкие сбои за месяцы оставили бы воркер остановленным.
+# Поэтому unless-stopped: ошибка настройки повторяется с растущей паузой Docker (до 1 минуты) и
+# видна по коду 78 — DEPLOY §4.
 x-worker-restart: &worker-restart unless-stopped
 
-# Живость воркера: процесс жив (PID 1 контейнера) и его роль входа подключается к БД. Зависание
-# цикла без выхода так не видно — для этого нужен файл-пульс в самом воркере (предложение A3).
+# Живость воркера — пульс (Б-85, app.workers.health): метка последнего успешного прохода цикла в
+# /tmp (tmpfs контейнера). Unhealthy: пульс старше --max-age (цикл завис, БД недоступна), пауза из-за
+# ошибки настройки (модель, токен бота) или ожидание при старте. В файле — время, состояние и вид
+# причины; ни текстов, ни id. Память и БЗ проходят цикл раз в 30 с — запас 120 с.
 x-worker-health: &worker-health
-  test:
-    - CMD
-    - python
-    - -c
-    - "import asyncio,os,asyncpg\nasync def main():\n    url = os.environ['FEELINGS_WORKER_DATABASE_URL'].replace('+asyncpg', '', 1)\n    conn = await asyncio.wait_for(asyncpg.connect(url), 5)\n    await conn.fetchval('SELECT 1')\n    await conn.close()\nasyncio.run(main())"
+  test: ["CMD", "python", "-m", "app.workers.health", "--max-age", "120"]
   interval: 30s
   timeout: 10s
   retries: 3
-  start_period: 20s
+  start_period: 30s
+
+# Конвейер и уведомления проходят цикл каждую секунду — пульс старше 60 с уже сбой.
+x-worker-health-fast: &worker-health-fast
+  <<: *worker-health
+  test: ["CMD", "python", "-m", "app.workers.health", "--max-age", "60"]
 
 # Подключения собираются здесь из паролей ролей (адреса — внутренняя сеть compose).
 x-urls:
@@ -221,7 +228,11 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?задайте OPENROUTER_API_KEY}
       # Набор промптов конвейера (АР-26, АР-45): v0 — только staging; без значения не стартует.
       FEELINGS_PIPELINE_PROMPT_SET: ${FEELINGS_PIPELINE_PROMPT_SET:?задайте FEELINGS_PIPELINE_PROMPT_SET (АР-45)}
-    healthcheck: *worker-health
+    # Б-88: SIGTERM → начатые сообщения дорабатываются до записи исхода. Каждое ограничено тайм-аутом
+    # конвейера (аренда − 30 с) и окном записи (аренда − 15 с от захвата); аренда по умолчанию 180 с
+    # (FEELINGS_PIPELINE_LEASE_S) — срок не меньше аренды с запасом. Меняете аренду — меняйте и срок.
+    stop_grace_period: 200s
+    healthcheck: *worker-health-fast
     networks: [data, egress]
     depends_on:
       postgres: { condition: service_healthy }
@@ -241,7 +252,7 @@ services:
       FEELINGS_WORKER_DATABASE_URL: *worker-db
       FEELINGS_TELEGRAM_BOT_TOKEN: ${FEELINGS_TELEGRAM_BOT_TOKEN:?задайте FEELINGS_TELEGRAM_BOT_TOKEN}
       FEELINGS_WEBAPP_URL: https://${FEELINGS_DOMAIN}/
-    healthcheck: *worker-health
+    healthcheck: *worker-health-fast
     networks: [data, egress]
     depends_on:
       postgres: { condition: service_healthy }
