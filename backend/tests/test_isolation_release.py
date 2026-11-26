@@ -70,7 +70,7 @@ from tests._isolation_kit import (
     su,
 )
 from tests._isolation_set import ISOLATION_MIN
-from tests.conftest import BACKEND_DIR, TEST_FP
+from tests.conftest import BACKEND_DIR, TEST_FP, isolation_set_problems
 from tests.test_chat_a8 import KEYS, _pmsg
 from tests.test_chat_api_a8 import call, stream_ok
 from tests.test_notify_worker import NEW_MESSAGE_TEXT, FakeTg, chat_of, nworker
@@ -321,37 +321,78 @@ async def _private_db_texts(env: Env, who: Person) -> str:
     return "\n".join(out)
 
 
-async def browse(env: Env, p: Person, s: Secrets) -> None:
-    """Каждый канал API, доступный человеку, включая попытки по чужим id."""
+async def browse(
+    env: Env,
+    p: Person,
+    rec: Rec,
+    *,
+    messages: tuple[uuid.UUID, ...] = (),
+    unread: tuple[uuid.UUID, ...] = (),
+    drafts: list[uuid.UUID] | tuple[uuid.UUID, ...] = (),
+    memory: list[uuid.UUID] | tuple[uuid.UUID, ...] = (),
+) -> None:
+    """Каждый канал API, доступный человеку, включая попытки по чужим id (ТЗ §7): оригиналы
+    ``messages``; «прочитано» ``unread`` (недоставленные/чужие — 404); чужие черновики — чтение,
+    правка, «не отправлять», «другой вариант», «Отправить» (404); чужая память — удаление (404).
+    Ни одна попытка по чужому id не доходит до модели (``rec`` — модели этого человека)."""
     for path in ("/me", "/couple", "/couple/messages", "/memory", "/chat/messages", "/me/export",
                  "/couple/subscription", "/help/contacts"):  # fmt: skip
         await env.req(p, "GET", path)
-    for mid in (s.msg_approved, s.msg_withheld, s.msg_processing):
+    for mid in messages:
         await env.req(p, "GET", f"/couple/messages/{mid}/original")
-    for did in s.drafts:
-        assert (await env.req(p, "GET", f"/drafts/{did}")).status_code == 404
-        assert (await env.req(p, "POST", f"/drafts/{did}/send",
-                              json={"expected_version": 1})).status_code == 404  # fmt: skip
-    for item in s.memory:
+    calls = len(rec.calls)
+    for mid in unread:
+        r = await env.req(p, "POST", f"/couple/messages/{mid}/read")
+        assert r.status_code == 404, (p.label, mid, r.status_code)
+    for did in drafts:
+        for method, path, body in (
+            ("GET", f"/drafts/{did}", None),
+            ("PATCH", f"/drafts/{did}", {"text": "Чужая правка", "expected_version": 1}),
+            ("POST", f"/drafts/{did}/reject", None),
+            ("POST", f"/drafts/{did}/regenerate", {"wish": "мягче"}),
+            ("POST", f"/drafts/{did}/send", {"expected_version": 1}),
+        ):
+            r = await env.req(p, method, path, json=body)
+            assert r.status_code == 404, (p.label, method, path, r.status_code)
+    for item in memory:
         assert (await env.req(p, "DELETE", f"/memory/{item}")).status_code == 404
+    assert len(rec.calls) == calls, "попытка по чужому id дошла до модели"
+
+
+def browse_author(env: Env, p: Person, rec: Rec, s: Secrets) -> Any:
+    """Попытки по id автора: оригиналы трёх сообщений, «прочитано» остановленного и ждущего,
+    все черновики и записи памяти автора."""
+    return browse(env, p, rec, messages=(s.msg_approved, s.msg_withheld, s.msg_processing),
+                  unread=(s.msg_withheld, s.msg_processing), drafts=s.drafts, memory=s.memory)  # fmt: skip
 
 
 @pytest.mark.parametrize("direction", ["anna_to_igor", "igor_to_anna"])
 async def test_end_to_end_no_leak_on_any_channel(
     env: Env, caplog: pytest.LogCaptureFixture, direction: str
 ) -> None:
-    """Критерий RoadMap 4.3 и §12 п.3; ТЗ §2 п.4, §6, §6.1, §6.2, §6.3 п.5, §9.1 п.5, §9.2 п.1:
+    """Критерий RoadMap 4.3 и §12 п.3; ТЗ §2 п.4, §6, §6.1, §6.2, §6.3 п.5, §7, §9.1 п.5, §9.2 п.1:
     ни одна метка личного автора (кроме одобренного оригинала и доставленной версии) не доходит
     до партнёра ни по одному каналу — API, входы моделей и эмбеддера, бот, журналы,
-    ``audit_log``/``safety_events``, выгрузка; бывший партнёр и посторонняя не видят ни одной."""
+    ``audit_log``/``safety_events``, выгрузка; бывший партнёр автора (с историей распавшейся
+    пары) и посторонняя не видят ни одной; история автора с бывшим не доходит до нового партнёра;
+    личное получателя, вызванное этим сообщением (чат о входящем, неотправленный ответ и «другой
+    вариант» к нему), не доходит обратно до автора."""
     caplog.set_level(logging.DEBUG)
     anna = await env.enter("Анна")
     igor = await env.enter("Игорь")
-    pavel = await env.enter("Павел")  # бывший партнёр Анны
+    pavel = await env.enter("Павел")  # бывший партнёр автора (в обоих направлениях)
     olga = await env.enter("Ольга")  # посторонняя
-    await pair_up(env.engine, anna, pavel, "dissolved")
-    couple = await pair_up(env.engine, anna, igor)
     a, b = (anna, igor) if direction == "anna_to_igor" else (igor, anna)
+    # Распавшаяся пара автора с Павлом — с доставленной историей в обе стороны (ревью р.1 MINOR-8).
+    ex_couple = await pair_up(env.engine, a, pavel, "dissolved")
+    hist = {k: mark(k) for k in ("OLDOUT", "OLDIN")}
+    async with env.engine.begin() as c:
+        long_ago = datetime.now(UTC) - timedelta(days=30)
+        await _pmsg(c, ex_couple, (a.uid, a.agent), pavel.uid, f"Давнее {hist['OLDOUT']}",
+                    "delivered", long_ago, for_recipient=f"Давнее {hist['OLDOUT']}")  # fmt: skip
+        await _pmsg(c, ex_couple, (pavel.uid, pavel.agent), a.uid, f"Ответ {hist['OLDIN']}",
+                    "delivered", long_ago + GAP, for_recipient=f"Ответ {hist['OLDIN']}")  # fmt: skip
+    couple = await pair_up(env.engine, anna, igor)
     rec_a, emb_a = Rec("author"), RecEmbedder()
     s = await author_private(env, a, b, couple, rec_a, emb_a)
 
@@ -386,7 +427,7 @@ async def test_end_to_end_no_leak_on_any_channel(
     # ---- получатель: чат, память, черновик ответа, лента, выгрузка, сжатие
     rec_b, emb_b = Rec("recipient"), RecEmbedder()
     env.act(rec_b, emb_b)
-    own_b = {k: mark(k) for k in ("BCHAT", "BCHATTWO", "BCHATTHREE")}
+    own_b = {k: mark(k) for k in ("BCHAT", "BCHATTWO", "BCHATTHREE", "BREPLY", "BREPLYTWO")}
     await env.chat(b, f"Получил сообщение, обсудим: {own_b['BCHAT']}")
     await env.chat(b, f"Что мне ответить? {own_b['BCHATTWO']}")
     await _backdate_chat(env.engine, b)
@@ -402,10 +443,14 @@ async def test_end_to_end_no_leak_on_any_channel(
     await env.chat(b, f"Помоги подготовить ответ. {own_b['BCHATTHREE']}")
     for _ in range(2):  # 10 реплик > порога 7 — фоновое сжатие истории получателя
         await env.chat(b, "Продолжим разговор.")
+    # Неотправленный ответ на это входящее и «другой вариант» — личное получателя.
+    rec_b.draft_texts += [f"Ответ: {own_b['BREPLY']}", f"Другой вариант: {own_b['BREPLYTWO']}"]
     r = await env.req(b, "POST", "/drafts", json={"reply_to_id": str(s.msg_approved)})
     assert r.status_code == 201, r.text
     reply = r.json()
-    assert (await env.req(b, "POST", f"/drafts/{reply['id']}/regenerate")).status_code == 200
+    assert own_b["BREPLY"] in reply["text"]
+    r = await env.req(b, "POST", f"/drafts/{reply['id']}/regenerate")
+    assert r.status_code == 200 and own_b["BREPLYTWO"] in r.text, r.text
     feed = (await env.req(b, "GET", "/couple/messages")).json()
     incoming = [i for i in feed["items"] if i["direction"] == "incoming"]
     assert [i["id"] for i in incoming] == [str(s.msg_approved)]  # остановленного и processing нет
@@ -420,29 +465,57 @@ async def test_end_to_end_no_leak_on_any_channel(
     cdone = await mem_ai.run_compaction(env.sm, KEYS, TEST_FP, rec_b.models(), comp, embedder=emb_b)
     assert cdone.status == "done", cdone
     await env.rt.drain()
-    await browse(env, b, s)
+    await browse_author(env, b, rec_b, s)
     assert any(c["role"] == "summary" for c in rec_b.calls)  # сжатие истории получателя прошло
     assert {"dialog_stream", "draft", "memory_extract", "profile_summary"} <= set(rec_b.roles())
+    b_memory = [r[0] for r in await su(env.engine, "SELECT id FROM memory_items WHERE agent_id = :a",
+                                       a=b.agent)]  # fmt: skip
+    b_drafts = [uuid.UUID(reply["id"])]
 
-    # ---- бывший партнёр и посторонняя: чат (свой агент) и все каналы API
+    # ---- обратно к автору: личное получателя об этом сообщении (ревью р.1 MINOR-5)
+    rec_a2, emb_a2 = Rec("author_after"), RecEmbedder()
+    env.act(rec_a2, emb_a2)
+    await env.chat(a, "Как думаешь, что партнёр ответит?")
+    await _draft(env, a, rec_a2, "Ещё одно сообщение партнёру.")
+    await browse(env, a, rec_a2, drafts=b_drafts, memory=b_memory)
+    assert any(c["role"] == "dialog_stream" for c in rec_a2.calls)
+
+    # ---- бывший партнёр автора и посторонняя: чат (свой агент) и все каналы API
     rec_x, emb_x = Rec("ex_outsider"), RecEmbedder()
     env.act(rec_x, emb_x)
     for p in (pavel, olga):
         await env.chat(p, f"Своё: {mark('OTHER')}")
-        await browse(env, p, s)
+        await browse_author(env, p, rec_x, s)
+        await browse(env, p, rec_x, unread=(s.msg_approved,), drafts=b_drafts, memory=b_memory)
 
     # ---- проверки: получатель
-    forbidden = s.forbidden
+    forbidden = s.forbidden | set(hist.values())
     to_b = "\n".join(env.seen[b.label])
     assert forbidden & marks_in(to_b) == set(), "API получателю"
     assert forbidden & marks_in(rec_b.text()) == set(), "входы модели получателя"
     assert forbidden & marks_in("\n".join(emb_b.inputs)) == set(), "входы эмбеддера получателя"
     assert forbidden & marks_in(await _private_db_texts(env, b)) == set(), "личное получателя в БД"
     assert s.m["APPROVED"] in to_b and s.m["ADAPTED"] in to_b  # одобренное — дошло
-    # ---- бывший партнёр и посторонняя — ни одной метки автора
+    # ---- обратно: автор не видит ничего личного получателя
+    b_private = set(own_b.values())
+    to_a = "\n".join(env.seen[a.label])
+    assert b_private & marks_in(to_a) == set(), "API автору"
+    assert b_private & marks_in(rec_a.text() + rec_a2.text()) == set(), "входы модели автора"
+    assert b_private & marks_in("\n".join(emb_a.inputs + emb_a2.inputs)) == set(), "эмбеддер автора"
+    assert b_private & marks_in(await _private_db_texts(env, a)) == set(), "личное автора в БД"
+    assert own_b["BREPLYTWO"] in await _private_db_texts(env, b)  # ответ действительно заведён
+    # ---- бывший партнёр и посторонняя — ни одной метки автора и получателя
+    every = set(s.m.values()) | b_private
     for p in (pavel, olga):
-        assert set(s.m.values()) & marks_in("\n".join(env.seen[p.label])) == set(), p.label
-    assert set(s.m.values()) & marks_in(rec_x.text() + "\n".join(emb_x.inputs)) == set()
+        assert every & marks_in("\n".join(env.seen[p.label])) == set(), p.label
+    assert every & marks_in(rec_x.text() + "\n".join(emb_x.inputs)) == set()
+    assert set(hist.values()) & marks_in("\n".join(env.seen[olga.label])) == set()
+    # ---- чужие попытки ничего не изменили: черновики автора — в прежнем статусе и версии
+    drafts_now = {r.id: (r.status, r.version) for r in await su(
+        env.engine, "SELECT id, status::text AS status, version FROM message_drafts "
+        "WHERE id = ANY(:d)", d=[*s.drafts, *b_drafts])}  # fmt: skip
+    assert drafts_now[s.drafts[0]] == ("draft", 1) and drafts_now[s.drafts[1]][0] == "rejected"
+    assert drafts_now[b_drafts[0]] == ("draft", 2)
     # ---- журналы (ни одной метки — даже одобренной: §9.1 п.5) и audit_log/safety_events
     assert marks_in(caplog.text) == set(), "журналы"
     rows = await su(env.engine, "SELECT * FROM audit_log") + await su(env.engine,
@@ -452,6 +525,7 @@ async def test_end_to_end_no_leak_on_any_channel(
     a_export = (await env.req(a, "GET", "/me/export")).text
     for k in ("CHAT", "SUMMARY", "PROFILE", "DRAFT", "REJECTED", "WITHHELD", "PROCESSING", "FACT"):
         assert s.m[k] in a_export, k
+    assert hist["OLDOUT"] in a_export  # история с бывшим — у автора есть (контроль меток)
     assert s.m["DELETED"] not in a_export  # удалённое не возвращается (ФТ-13)
     assert s.m["CHAT"] in rec_a.text()  # метки действительно уходили в модель автора
 
@@ -507,26 +581,84 @@ SECURITY_DEFINER: dict[str, str] = {
 ROLES = ("feelings_app", "feelings_api", "feelings_worker", "feelings_admin", "feelings_billing")
 
 
-async def test_completeness_guard_tables_match_schema(engine: AsyncEngine) -> None:
-    """Карточка п.7, ТЗ §7, §9.2 п.4: каждая таблица схемы классифицирована; каждая таблица со
-    столбцом владельца — в перечне личных; у каждой личной включён RLS и есть политика."""
-    async with engine.connect() as c:
-        tables = {r[0] for r in await c.execute(text(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"))}  # fmt: skip
-        owned = {r[0] for r in await c.execute(text(
-            "SELECT DISTINCT table_name FROM information_schema.columns WHERE table_schema = "
-            "'public' AND column_name = ANY(:c)"), {"c": list(OWNER_COLUMNS)})}  # fmt: skip
-        rls = {r[0]: (r[1], r[2]) for r in await c.execute(text(
-            "SELECT c.relname, c.relrowsecurity, (SELECT count(*) FROM pg_policy p "
-            "WHERE p.polrelid = c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid = "
-            "c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r'"))}  # fmt: skip
-    assert tables == set(PRIVATE_TABLES) | REFERENCE_TABLES, "новая таблица не классифицирована"
-    assert owned <= set(PRIVATE_TABLES), (
-        f"личная таблица вне перечня: {owned - set(PRIVATE_TABLES)}"
-    )
+# Системные схемы; любые другие отношения (таблицы, представления, материализованные
+# представления, внешние таблицы) классифицируются стражем (ревью р.1 MINOR-9).
+_SYSTEM_SCHEMAS = (
+    "n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_toast%' "
+    "AND n.nspname NOT LIKE 'pg\\_temp\\_%'"
+)
+# Представления и материализованные представления выполняются с правами владельца и обходят RLS
+# личных таблиц: сейчас их нет; новое — сюда только с проверкой изоляции, иначе страж красный.
+VIEWS: dict[str, str] = {}
+
+
+async def _schema_problems(c: Any) -> list[str]:
+    """Расхождения схемы с перечнем: отношение вне ``public`` или неизвестное; представление
+    вне ``VIEWS``; отношение со столбцом владельца вне перечня личных; личная без RLS/политики."""
+    rels = (await c.execute(text(
+        "SELECT n.nspname AS sch, c.relname AS name, c.relkind::text AS kind, c.relrowsecurity AS rls, "
+        "(SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS pol FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p', 'v', 'm', "
+        f"'f') AND {_SYSTEM_SCHEMAS}"))).all()  # fmt: skip
+    owned = {(r[0], r[1]) for r in await c.execute(text(
+        "SELECT DISTINCT a.attrelid::regclass::text, c.relname FROM pg_attribute a JOIN pg_class c "
+        "ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE "
+        f"a.attnum > 0 AND NOT a.attisdropped AND a.attname = ANY(:c) AND {_SYSTEM_SCHEMAS} "
+        "AND c.relkind IN ('r', 'p', 'v', 'm', 'f')"), {"c": list(OWNER_COLUMNS)})}  # fmt: skip
+    known = set(PRIVATE_TABLES) | REFERENCE_TABLES
+    out: list[str] = []
+    for r in rels:
+        full = f"{r.sch}.{r.name}"
+        if r.kind in ("v", "m"):
+            if r.sch != "public" or r.name not in VIEWS:
+                out.append(f"представление вне перечня: {full}")
+        elif r.sch != "public" or r.name not in known:
+            out.append(f"отношение не классифицировано: {full} ({r.kind})")
+    for qual, name in owned:
+        if name not in PRIVATE_TABLES and name not in VIEWS:
+            out.append(f"личное отношение вне перечня: {qual}")
+    tables = {r.name: r for r in rels if r.sch == "public" and r.kind in ("r", "p")}
     for t in PRIVATE_TABLES:
-        enabled, policies = rls[t]
-        assert enabled and policies >= 1, f"{t}: RLS выключен или нет политики"
+        if t not in tables:
+            out.append(f"{t}: нет в схеме")
+        elif not (tables[t].rls and tables[t].pol >= 1):
+            out.append(f"{t}: RLS выключен или нет политики")
+    missing = {t for t in known if t not in tables}
+    if missing:
+        out.append(f"нет в схеме: {sorted(missing)}")
+    return out
+
+
+async def test_completeness_guard_tables_match_schema(engine: AsyncEngine) -> None:
+    """Карточка п.7, ТЗ §7, §9.2 п.4: каждое отношение схемы (таблицы, представления, в любой
+    несистемной схеме) классифицировано; отношение со столбцом владельца — в перечне личных; у
+    каждой личной включён RLS и есть политика."""
+    async with engine.connect() as c:
+        assert await _schema_problems(c) == []
+
+
+async def test_completeness_guard_catches_view_and_foreign_schema(engine: AsyncEngine) -> None:
+    """Самопроверка стража (ревью р.1 MINOR-9): представление поверх личной таблицы, таблица в
+    другой схеме со столбцом владельца и новая таблица в ``public`` — красный. DDL — в
+    откатываемой транзакции тестовой БД (роли не меняются)."""
+    async with engine.connect() as c:
+        tx = await c.begin()
+        try:
+            await c.execute(text("CREATE VIEW a8_probe_view AS SELECT id, telegram_id FROM users"))
+            await c.execute(text("CREATE MATERIALIZED VIEW a8_probe_mat AS SELECT 1 AS x"))
+            await c.execute(text("CREATE SCHEMA a8_probe"))
+            await c.execute(text("CREATE TABLE a8_probe.notes (user_id uuid)"))
+            await c.execute(text("CREATE TABLE a8_probe_plain (x int)"))
+            problems = "\n".join(await _schema_problems(c))
+        finally:
+            await tx.rollback()
+    for needle in ("представление вне перечня: public.a8_probe_view",
+                   "представление вне перечня: public.a8_probe_mat",
+                   "отношение не классифицировано: a8_probe.notes",
+                   "личное отношение вне перечня: a8_probe.notes",
+                   "отношение не классифицировано: public.a8_probe_plain",
+                   "личное отношение вне перечня: a8_probe_view"):  # fmt: skip
+        assert needle in problems, problems
 
 
 async def test_completeness_guard_functions_match_schema(engine: AsyncEngine) -> None:
@@ -537,8 +669,12 @@ async def test_completeness_guard_functions_match_schema(engine: AsyncEngine) ->
         rows = (await c.execute(text(
             "SELECT p.oid, p.proname, has_function_privilege('public', p.oid, 'EXECUTE') AS pub "
             "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-            "WHERE n.nspname = 'public' AND p.prosecdef"))).all()  # fmt: skip
+            f"WHERE {_SYSTEM_SCHEMAS} AND p.prosecdef"))).all()  # fmt: skip
         assert sorted(r.proname for r in rows) == sorted(SECURITY_DEFINER), "перечень функций"
+        schemas = {r[0] for r in await c.execute(text(
+            "SELECT DISTINCT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = "
+            f"p.pronamespace WHERE {_SYSTEM_SCHEMAS} AND p.prosecdef"))}  # fmt: skip
+        assert schemas == {"public"}, schemas
         for r in rows:
             assert r.pub is False, r.proname
             who = {role for role in ROLES if (await c.execute(text(
@@ -600,10 +736,22 @@ PROBE = "A8_ISOLATION_GUARD_PROBE"
 
 
 def test_guard_probe() -> None:
-    """Проба для стража шага CI: в обычном прогоне проходит; с ``A8_ISOLATION_GUARD_PROBE=skip``
-    — пропускается (так выглядел бы тест, которому «не хватило БД»)."""
-    if os.environ.get(PROBE) == "skip":
+    """Проба для стража шага CI: в обычном прогоне проходит; с ``A8_ISOLATION_GUARD_PROBE``:
+    ``skip`` — пропуск (так выглядел бы тест, которому «не хватило БД»); ``xfail_call`` —
+    ``pytest.xfail()`` в теле; ``xfail_lax``/``xfail_strict`` — падение под нестрогим/строгим
+    маркером (маркер вешается ниже, только при этом значении)."""
+    probe = os.environ.get(PROBE)
+    if probe == "skip":
         pytest.skip("проба стража: пропуск")
+    if probe == "xfail_call":
+        pytest.xfail("проба стража: xfail в теле")
+    assert probe not in ("xfail_lax", "xfail_strict"), "проба стража: известный дефект"
+
+
+if os.environ.get(PROBE) in ("xfail_lax", "xfail_strict"):
+    test_guard_probe = pytest.mark.xfail(
+        reason="проба стража", strict=os.environ.get(PROBE) == "xfail_strict"
+    )(test_guard_probe)
 
 
 def _run_release(*args: str, probe: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -620,16 +768,27 @@ def _run_release(*args: str, probe: str | None = None) -> subprocess.CompletedPr
 @pytest.mark.parametrize(
     ("args", "probe", "code", "says"),
     [
-        (("--isolation-min=1",), None, 0, "пропущено 0"),
+        (("--isolation-min=1",), None, 0, "пропущено 0, xfail 0"),
         (("--isolation-min=1",), "skip", 1, "ПРОПУЩЕН (сборка красная)"),
         (("--isolation-min=2",), None, 4, "нужно не меньше 2"),
+        (("--isolation-min=1",), "xfail_lax", 4, "xfail без strict=True"),
+        (("--isolation-min=1",), "xfail_call", 1, "pytest.xfail() без strict (сборка красная)"),
+        (("--isolation-min=1",), "xfail_strict", 0, "пропущено 0, xfail 1"),
     ],
-    ids=["green", "skip_is_red", "too_few_is_red"],
+    ids=[
+        "green",
+        "skip_is_red",
+        "too_few_is_red",
+        "lax_xfail_is_red",
+        "xfail_call_is_red",
+        "strict_xfail_is_counted",
+    ],
 )
 def test_release_step_guard(args: tuple[str, ...], probe: str | None, code: int, says: str) -> None:
     """Карточка п.1, ТЗ §9.2 п.4: шаг CI ``pytest -m isolation --isolation-min=N`` красный, если
-    хоть один тест набора пропущен (skip) или собрано меньше N; без пропусков — зелёный. (0
-    собранных — штатный код pytest 5, тоже красный.)"""
+    хоть один тест набора пропущен (skip), собрано меньше N, есть xfail без ``strict=True`` или
+    ``pytest.xfail()`` в теле; строгий xfail (известный дефект) — считается и печатается; без
+    пропусков — зелёный. (0 собранных — штатный код pytest 5, тоже красный.)"""
     r = _run_release(*args, probe=probe)
     out = r.stdout + r.stderr
     assert r.returncode == code, out[-2000:]
@@ -640,3 +799,19 @@ def test_isolation_set_size_is_fixed() -> None:
     """Число N в шаге CI совпадает с зафиксированным в ``tests/_isolation_set.py`` (карточка)."""
     ci = (BACKEND_DIR.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert f"--isolation-min={ISOLATION_MIN}" in ci
+
+
+def test_isolation_set_matches_full_collection() -> None:
+    """Ревью р.1 MAJOR-1, MINOR-10: перечень сверяется с **полным** сбором (подпроцесс, обычный
+    режим) — каждая запись собирает ровно своё число тестов, всего тестов набора —
+    ``ISOLATION_MIN``. Переименование или удаление одного теста под записью — красный и в
+    обычном полном прогоне, а не только в шаге выпуска."""
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+         "-m", "isolation"],
+        cwd=BACKEND_DIR, capture_output=True, text=True, timeout=300, check=False,
+    )  # fmt: skip
+    assert r.returncode == 0, (r.stdout + r.stderr)[-2000:]
+    ids = [line.strip() for line in r.stdout.splitlines() if "::" in line]
+    assert isolation_set_problems(ids, len(ids)) == []
+    assert "tests/test_isolation_release.py::test_isolation_set_matches_full_collection" in ids

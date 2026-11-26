@@ -97,7 +97,14 @@ def _encryption_keys_env(monkeypatch: pytest.MonkeyPatch) -> None:
 # Маркер ``isolation`` на существующих тестах — по перечню ``tests/_isolation_set.py`` (без правки
 # их файлов); новые ``test_isolation_release*.py`` помечены сами. ``--isolation-min=N`` — режим
 # шага CI (ТЗ §9.2 п.4): собрано меньше N тестов набора или хоть один пропущен (skip) — сборка
-# красная; xfail(strict=True) — известные дефекты, считаются и печатаются отдельно.
+# красная; xfail — только ``strict=True`` маркером (нестрогий маркер и ``pytest.xfail()`` в теле
+# или фикстуре — красный).
+#
+# Сверка перечня (запись собрала ровно своё число тестов, всего — ``ISOLATION_MIN``) — только в
+# режиме выпуска, где собирается весь каталог: в обычном режиме выборочный запуск (id теста,
+# ``--lf``, ``--sw``) собирает часть файла, и сверка дала бы ложную ошибку (ревью 4.3 р.1
+# MAJOR-1). Между выпусками перечень сверяет с полным сбором тест
+# ``test_isolation_release.py::test_isolation_set_matches_full_collection`` (подпроцессом).
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -109,35 +116,68 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+_ISOLATION_STATS: dict[str, list[str]] = {
+    "selected": [],
+    "skipped": [],
+    "xfailed": [],
+    "xfail_call": [],
+    "aborted": [],
+}
+
+
 def _isolation_match(nodeid: str, entry: str) -> bool:
     if entry.endswith(("::", "_")):
         return nodeid.startswith(entry)
     return nodeid == entry or nodeid.startswith(entry + "[")
 
 
+def isolation_set_problems(nodeids: list[str], marked: int) -> list[str]:
+    """Расхождения перечня с полным сбором: запись собрала не своё число тестов; всего тестов
+    набора не ``ISOLATION_MIN``. Общая для режима выпуска и теста сверки."""
+    from tests._isolation_set import ISOLATION_MIN, ISOLATION_SET
+
+    out: list[str] = []
+    for entry, want in ISOLATION_SET.items():
+        got = sum(1 for n in nodeids if _isolation_match(n, entry))
+        if got != want:
+            out.append(f"{entry}: собрано {got}, в перечне {want}")
+    if marked != ISOLATION_MIN:
+        out.append(f"всего тестов набора {marked}, ISOLATION_MIN = {ISOLATION_MIN}")
+    return out
+
+
+def _lax_xfail(item: pytest.Item) -> bool:
+    default = bool(item.config.getini("xfail_strict"))
+    return any(not m.kwargs.get("strict", default) for m in item.iter_markers("xfail"))
+
+
 @pytest.hookimpl(tryfirst=True)  # до отбора по -m: маркер должен быть уже проставлен
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     from tests._isolation_set import ISOLATION_SET
 
-    used: set[str] = set()
-    files = {item.nodeid.split("::", 1)[0] for item in items}
     for item in items:
-        for entry in ISOLATION_SET:
-            if _isolation_match(item.nodeid, entry):
-                item.add_marker(pytest.mark.isolation)
-                used.add(entry)
-    release = config.getoption("--isolation-min") is not None
-    stale = [e for e in ISOLATION_SET if e not in used and (release or e.split("::")[0] in files)]
-    if stale:
-        raise pytest.UsageError(f"tests/_isolation_set.py: записи ничего не собрали: {stale}")
-
-
-_ISOLATION_STATS: dict[str, list[str]] = {"selected": [], "skipped": [], "xfailed": []}
+        if any(_isolation_match(item.nodeid, entry) for entry in ISOLATION_SET):
+            item.add_marker(pytest.mark.isolation)
+    if config.getoption("--isolation-min") is None:
+        return
+    marked = [i for i in items if i.get_closest_marker("isolation")]
+    problems = isolation_set_problems([i.nodeid for i in items], len(marked))
+    lax = [i.nodeid for i in marked if _lax_xfail(i)]
+    # pytest вызывает pytest_collection_finish и после ошибки здесь (finally): помечаем, чтобы
+    # его проверка не заслонила эту причину.
+    _ISOLATION_STATS["aborted"] = ["yes"] if problems or lax else []
+    if problems:
+        raise pytest.UsageError(
+            "tests/_isolation_set.py не совпадает со сбором: " + "; ".join(problems)
+        )
+    lax = [i.nodeid for i in marked if _lax_xfail(i)]
+    if lax:
+        raise pytest.UsageError(f"набор isolation: xfail без strict=True: {lax}")
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
     need = session.config.getoption("--isolation-min")
-    if need is None:
+    if need is None or _ISOLATION_STATS["aborted"]:
         return
     selected = [i.nodeid for i in session.items if i.get_closest_marker("isolation")]
     _ISOLATION_STATS["selected"] = selected
@@ -146,6 +186,16 @@ def pytest_collection_finish(session: pytest.Session) -> None:
             f"набор isolation: собрано {len(selected)} из {len(session.items)} выбранных, "
             f"нужно не меньше {need} и только тесты набора (-m isolation)"
         )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) -> Any:
+    yield
+    if item.config.getoption("--isolation-min") is None:
+        return
+    # pytest.xfail() в теле или фикстуре прячет падение без strict — в режиме выпуска красный.
+    if call.excinfo is not None and call.excinfo.errisinstance(pytest.xfail.Exception):
+        _ISOLATION_STATS["xfail_call"].append(item.nodeid)
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
@@ -157,7 +207,8 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if session.config.getoption("--isolation-min") is None:
         return
-    if _ISOLATION_STATS["skipped"] and exitstatus == pytest.ExitCode.OK:
+    bad = _ISOLATION_STATS["skipped"] or _ISOLATION_STATS["xfail_call"]
+    if bad and exitstatus == pytest.ExitCode.OK:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
@@ -171,6 +222,10 @@ def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pyte
     )
     for nodeid in s["skipped"]:
         terminalreporter.write_line(f"isolation: ПРОПУЩЕН (сборка красная): {nodeid}", red=True)
+    for nodeid in s["xfail_call"]:
+        terminalreporter.write_line(
+            f"isolation: pytest.xfail() без strict (сборка красная): {nodeid}", red=True
+        )
 
 
 # Фикстура world (пара Анна и Игорь, посторонняя Ольга) доступна всем модулям тестов.

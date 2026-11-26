@@ -11,11 +11,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
+from fastapi.routing import iter_route_contexts
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.routing import BaseRoute, Mount
 
+from app.bot.webhook import WEBHOOK_PATH
 from app.main import app
 from tests._isolation_kit import mark, marks_in
 from tests.test_admin_kb_api import DOCS, Env, book, env, upload  # noqa: F401 — фикстура env
@@ -69,10 +74,28 @@ async def test_admin_cannot_execute_user_or_worker_functions(engine: AsyncEngine
     assert err is not None and "permission denied for function" in err, (fn, err)
 
 
+def _route_paths(routes: Sequence[BaseRoute], prefix: str = "") -> set[str]:
+    """Пути всех маршрутов приложения, включая скрытые из схемы (``include_in_schema=False``),
+    подключённые маршрутизаторы и ``Mount`` — по ``app.routes`` (``iter_route_contexts`` FastAPI
+    разворачивает подключённые маршрутизаторы), а не по ``app.openapi()`` (ревью р.1 MINOR-4)."""
+    out: set[str] = set()
+    for ctx in iter_route_contexts(routes):
+        route = ctx.original_route
+        if isinstance(route, Mount):
+            out |= _route_paths(route.routes, prefix + route.path)
+        else:
+            out.add(prefix + str(ctx.path))
+    return out
+
+
 def test_admin_routes_are_known() -> None:
     """Страж маршрутов ``/admin/*`` (карточка п.6): сейчас — только база знаний (2.6). Новый путь
-    (``/admin/metrics``, ``/admin/prompts`` — 2.8) — добавить сюда и в проверку «без текстов»."""
-    admin = {p for p in app.openapi()["paths"] if "/admin" in p}
+    (``/admin/metrics``, ``/admin/prompts`` — 2.8), в т.ч. скрытый из схемы, — добавить сюда и в
+    проверку «без текстов». Самопроверка: скрытый из схемы путь вебхука бота страж видит."""
+    paths = _route_paths(app.routes)
+    hidden = f"/api/v1{WEBHOOK_PATH}"
+    assert hidden in paths and hidden not in app.openapi()["paths"]
+    admin = {p for p in paths if "/admin" in p}
     assert admin == {"/api/v1/admin/kb/documents", "/api/v1/admin/kb/documents/{document_id}"}
 
 

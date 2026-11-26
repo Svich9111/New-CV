@@ -44,9 +44,15 @@ jobs:
       # строкой сборки, на каждый PR и push в main. Красный, если собрано меньше N тестов набора
       # (N — tests/_isolation_set.py, ISOLATION_MIN), 0 собранных (код pytest 5) или хоть один
       # пропущен (skip: «нет БД» ≠ зелёный). Перечень тестов — tests/_isolation_set.py.
+      # xfail — только strict=True (нестрогий маркер или pytest.xfail() в теле — красный).
       - name: Isolation release set (pytest -m isolation)
-        run: cd backend && uv run --locked pytest -m isolation -q --isolation-min=349
-      - run: make backend-test
+        id: isolation
+        run: cd backend && uv run --locked pytest -m isolation -q --isolation-min=354
+      # Полный прогон — и при красном наборе изоляции (другие падения видны в той же сборке);
+      # не идёт, если раньше упал линтер или запуск БД (шаг набора тогда пропущен). Итог задачи
+      # красный, если красен любой шаг.
+      - if: ${{ !cancelled() && (success() || steps.isolation.outcome == 'failure') }}
+        run: make backend-test
 
   frontend:
     runs-on: ubuntu-latest
