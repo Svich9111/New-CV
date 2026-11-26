@@ -25,6 +25,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.db import user_scope
+from tests._billing import alembic_on, migration_module
 from tests.conftest import BACKEND_DIR, TEST_DATABASE_URL, alembic
 from tests.test_account_export_db import HEAD
 from tests.test_couple_functions import (
@@ -1617,3 +1618,404 @@ async def test_r2_invoice_limit_parallel_burst_both_partners(
     assert sorted(r["reused"] for r in got) == [False] + [True] * 9
     assert len({r["invoice_id"] for r in got}) == 1
     assert await _su(engine, open_now, c=couple) == 20
+
+
+# =========================================================================== раунд 3 (0020)
+#
+# Ревью 4.4 э.1 р.2 MAJOR-1 / A8-4.4-D3 (страж ``migrations/billing_guard.py``), MAJOR-2 (оплаченные
+# дни после возврата). Всё — в откатываемых транзакциях суперпользователя: роли кластера и данные
+# не меняются (CLAUDE.md). Внутри одной транзакции ``now()`` постоянен — периоды задаются точно
+# относительно него, а зачисление (под ``SET LOCAL ROLE feelings_billing``) видит тот же ``now()``.
+
+GUARD_R3 = migration_module("billing_guard.py")
+DAY = 86400
+
+
+async def _r3_now(c: Any) -> datetime:
+    return (await c.execute(text("SELECT now()"))).scalar_one()  # type: ignore[no-any-return]
+
+
+async def _r3_period(
+    c: Any, couple: uuid.UUID, payer: uuid.UUID, start: int, end: int, status: str = "active"
+) -> None:
+    """Период пары [now()+start, now()+end] (секунды) — в транзакции теста."""
+    plan = "trial" if status == "trial" else "month"
+    await c.execute(
+        text(
+            "INSERT INTO subscriptions (couple_id, payer_id, plan, status, period_start, period_end) "
+            "VALUES (:c, :p, :plan, CAST(:st AS subscription_status), "
+            "now() + make_interval(secs => :s), now() + make_interval(secs => :e))"
+        ),
+        {"c": couple, "p": payer, "plan": plan, "st": status, "s": start, "e": end},
+    )
+
+
+async def _r3_credit(c: Any, inv: uuid.UUID, tg: int) -> dict[str, Any]:
+    """Зачисление в транзакции теста так, как его делает бот (роль платежей, пустой user_id)."""
+    await c.execute(text("SET LOCAL ROLE feelings_billing"))
+    await c.execute(text("SELECT set_config('app.user_id', '', true)"))
+    row = (
+        (
+            await c.execute(
+                text(CREDIT), {"i": inv, "tg": tg, "amount": 250, "cur": "XTR", "ch": _charge()}
+            )
+        )
+        .mappings()
+        .one()
+    )
+    await c.execute(text("RESET ROLE"))
+    return dict(row)
+
+
+def _r3_uncovered(start: float, end: float, others: list[tuple[float, float]]) -> float:
+    """Сколько секунд из [start, end] не покрыто другими периодами (их объединением)."""
+    covered = 0.0
+    cur = start
+    for s, e in sorted(others):
+        s, e = max(s, cur), min(e, end)
+        if e > s:
+            covered += e - s
+            cur = e
+    return (end - start) - covered
+
+
+# (периоды пары до оплаты: (начало, конец, статус) в секундах от now(); ожидаемые начало и конец
+# нового 30-дневного периода).
+R3_BOUNDARY = {
+    "touching_natural_end": ([(30 * DAY, 60 * DAY, "active")], 0, 30 * DAY),
+    "one_second_overlap": ([(30 * DAY - 1, 60 * DAY, "active")], 0, 60 * DAY + 1),
+    "future_starts_1s_after_now": ([(1, 30 * DAY, "active")], 0, 60 * DAY - 1),
+    "two_inside_and_third_in_extension": (
+        [
+            (5 * DAY, 10 * DAY, "active"),
+            (20 * DAY, 25 * DAY, "active"),
+            (38 * DAY, 50 * DAY, "active"),
+        ],
+        0,
+        52 * DAY,
+    ),
+    "overlapping_futures": (
+        [(5 * DAY, 15 * DAY, "active"), (10 * DAY, 20 * DAY, "active")],
+        0,
+        45 * DAY,
+    ),
+    "canceled_future_ignored": ([(5 * DAY, 10 * DAY, "canceled")], 0, 30 * DAY),
+    "long_future": ([(29 * DAY, 400 * DAY, "active")], 0, 401 * DAY),
+    "review_example_refunded_current": (
+        [(-10 * DAY, 20 * DAY, "canceled"), (20 * DAY, 50 * DAY, "active")],
+        0,
+        60 * DAY,
+    ),
+    "gap_after_current_then_future": (
+        [(-DAY, 10 * DAY, "active"), (20 * DAY, 40 * DAY, "active")],
+        10 * DAY,
+        60 * DAY,
+    ),
+    "contiguous_chain_no_gap": (
+        [(-DAY, 10 * DAY, "active"), (10 * DAY, 20 * DAY, "active")],
+        20 * DAY,
+        50 * DAY,
+    ),
+    "future_trial_inside": ([(5 * DAY, 12 * DAY, "trial")], 0, 37 * DAY),
+    "refund_everything_future_gone": (
+        [(-5 * DAY, 25 * DAY, "canceled"), (25 * DAY, 55 * DAY, "canceled")],
+        0,
+        30 * DAY,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(R3_BOUNDARY))
+async def test_r3_credit_boundaries_keep_paid_days_exact(
+    sessionmaker: SM, engine: AsyncEngine, case: str
+) -> None:
+    """АР-50 п.4, ревью р.2 MAJOR-2 (0020), ТЗ §11 п.1: граничные разрывы после возврата — новый
+    период начинается в конце непрерывного доступа от ``now()`` и длится, пока не наберёт ровно 30
+    дней, не покрытых другими (``trial``/``active``) периодами; касание без перекрытия — без
+    продления; ``canceled`` не учитываются. Точность — до микросекунды (один ``now()``)."""
+    periods, exp_start, exp_end = R3_BOUNDARY[case]
+    a, _b, couple = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    tg = await _tg_id(engine, a)
+    async with engine.connect() as c:
+        tx = await c.begin()
+        now = await _r3_now(c)
+        for s, e, st in periods:
+            await _r3_period(c, couple, a, s, e, st)
+        row = await _r3_credit(c, inv, tg)
+        assert row["result"] == "credited", case
+        start, end = (
+            await c.execute(
+                text("SELECT period_start, period_end FROM subscriptions WHERE id = :s"),
+                {"s": row["subscription_id"]},
+            )
+        ).one()
+        assert start == now + timedelta(seconds=exp_start), case
+        assert end == row["period_end"] == now + timedelta(seconds=exp_end), case
+        live = [(float(s), float(e)) for s, e, st in periods if st != "canceled"]
+        paid = _r3_uncovered(float(exp_start), float(exp_end), live)
+        assert paid == 30 * DAY, (case, paid)
+        await tx.rollback()
+    assert await _subs_count(engine, couple) == 0
+
+
+async def test_r3_upgrade_downgrade_upgrade_switches_credit_rule(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """head (0020) → 0019 → head → 0019 → head в одной откатываемой транзакции, пример ревью
+    (P1 [-10 д, +20 д] возвращён, P2 [+20, +50]): под 0020 оплата — [now, +60], под 0019 —
+    [now, +30] (правило 0019), после повторного upgrade снова [now, +60]; страж исполняется на
+    каждом шаге, версия в конце — голова, функции бота — только у ``feelings_billing``."""
+    a, _b, couple = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    tg = await _tg_id(engine, a)
+    ends: list[tuple[str, timedelta]] = []
+    async with engine.connect() as c:
+        tx = await c.begin()
+        now = await _r3_now(c)
+        await _r3_period(c, couple, a, -10 * DAY, 20 * DAY, "canceled")
+        await _r3_period(c, couple, a, 20 * DAY, 50 * DAY, "active")
+        for step in ("head", "0019", "head", "0019", "head"):
+            if step == "0019":
+                await c.run_sync(alembic_on, "downgrade", "0019")
+            elif ends:
+                await c.run_sync(alembic_on, "upgrade", "head")
+            version = (await c.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+            await c.execute(text("SAVEPOINT pay"))
+            row = await _r3_credit(c, inv, tg)
+            ends.append((str(version), row["period_end"] - now))
+            await c.execute(text("ROLLBACK TO SAVEPOINT pay"))
+        assert ends == [
+            (HEAD, timedelta(days=60)),
+            ("0019", timedelta(days=30)),
+            (HEAD, timedelta(days=60)),
+            ("0019", timedelta(days=30)),
+            (HEAD, timedelta(days=60)),
+        ]
+        assert await _r2_state(c) == (HEAD, False, True, "f,f,f,f,f,f,f")
+        await c.execute(text(GUARD_R3.GUARD_SQL))
+        await tx.rollback()
+    assert await _subs_count(engine, couple) == 0
+
+
+# --------------------------------------------------------------------------- страж: обходы
+
+# Подготовка в откатываемой транзакции; ожидаемая остановка — часть сообщения стража.
+R3_GUARD_STOPS = {
+    "api_admin_only_on_bot_login": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+            "GRANT feelings_billing_login TO feelings_api WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ],
+        "роли приложения: feelings_api",
+    ),
+    "api_set_on_bot_login": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+            "GRANT feelings_billing_login TO feelings_api WITH INHERIT FALSE, SET TRUE",
+        ],
+        "роли приложения: feelings_api",
+    ),
+    "stranger_set_on_bot_login": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+            "CREATE ROLE a8r3_y LOGIN NOINHERIT",
+            "GRANT feelings_billing_login TO a8r3_y WITH INHERIT FALSE, SET TRUE",
+        ],
+        "не только роль входа бота: a8r3_y",
+    ),
+    "worker_usage_three_levels": (
+        [
+            "CREATE ROLE a8r3_l1 NOLOGIN",
+            "CREATE ROLE a8r3_l2 NOLOGIN",
+            "GRANT feelings_billing TO a8r3_l1 WITH INHERIT TRUE, SET FALSE",
+            "GRANT a8r3_l1 TO a8r3_l2 WITH INHERIT TRUE, SET FALSE",
+            "GRANT a8r3_l2 TO feelings_worker WITH INHERIT TRUE, SET FALSE",
+        ],
+        "роли приложения: feelings_worker",
+    ),
+    "stranger_set_via_set_only_chain": (
+        [
+            "CREATE ROLE a8r3_l1 NOLOGIN NOINHERIT",
+            "GRANT feelings_billing TO a8r3_l1 WITH INHERIT FALSE, SET TRUE",
+            "CREATE ROLE a8r3_z LOGIN NOINHERIT",
+            "GRANT a8r3_l1 TO a8r3_z WITH INHERIT FALSE, SET TRUE",
+        ],
+        "не только роль входа бота: a8r3_l1, a8r3_z",
+    ),
+    "bot_login_in_predefined": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+            "GRANT pg_read_all_data TO feelings_billing_login",
+        ],
+        "входит в другие роли: pg_read_all_data",
+    ),
+    "billing_in_predefined": (
+        ["GRANT pg_write_all_data TO feelings_billing"],
+        "член других ролей: pg_write_all_data",
+    ),
+    "bot_login_superuser": (
+        ["CREATE ROLE feelings_billing_login LOGIN SUPERUSER"],
+        "роль входа бота feelings_billing_login входит в другие роли",
+    ),
+    "renamed_stranger_as_bot_login_in_app": (
+        [
+            "CREATE ROLE a8r3_r LOGIN NOINHERIT",
+            "GRANT feelings_app TO a8r3_r WITH INHERIT FALSE, SET TRUE",
+            "GRANT feelings_billing TO a8r3_r WITH INHERIT FALSE, SET TRUE",
+            "ALTER ROLE a8r3_r RENAME TO feelings_billing_login",
+        ],
+        "входит в другие роли: feelings_app",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(R3_GUARD_STOPS))
+async def test_r3_guard_stops_bypass_attempts(engine: AsyncEngine, case: str) -> None:
+    """АР-50 п.7, ревью р.2 MAJOR-1 (0020): попытки обойти страж — ADMIN/SET у ролей приложения
+    через роль входа бота, посторонний с SET на роль входа бота, USAGE через три уровня,
+    цепочка только из SET, встроенные роли, суперпользователь и переименование под имя роли
+    входа бота — ``alembic upgrade head`` (страж из env.py) останавливается. Откат."""
+    setup, stop = R3_GUARD_STOPS[case]
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for sql in setup:
+            await c.execute(text(sql))
+        await c.execute(text("SAVEPOINT g"))
+        with pytest.raises(DBAPIError) as ei:
+            await c.run_sync(alembic_on, "upgrade", "head")
+        assert stop in str(ei.value.orig), (case, str(ei.value.orig))
+        await c.execute(text("ROLLBACK TO SAVEPOINT g"))
+        await tx.rollback()
+    await _r3_no_leftovers(engine)
+
+
+# ADMIN у роли, которая не является владельцем схемы: страж пропускает, а роль затем выдаёт себе
+# (или роли API) SET на ``feelings_billing``. (подготовка, эскалация от имени роли, кто получает SET)
+R3_ADMIN_HOLES = {
+    "other_login_admin_only": (
+        [
+            "CREATE ROLE a8r3_wlogin LOGIN NOINHERIT",
+            "GRANT feelings_billing TO a8r3_wlogin WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ],
+        ("a8r3_wlogin", "GRANT feelings_billing TO a8r3_wlogin WITH INHERIT FALSE, SET TRUE"),
+        "a8r3_wlogin",
+    ),
+    "login_inherits_admin_of_group": (
+        [
+            "CREATE ROLE a8r3_grp NOLOGIN NOINHERIT",
+            "GRANT feelings_billing TO a8r3_grp WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+            "CREATE ROLE a8r3_login LOGIN INHERIT",
+            "GRANT a8r3_grp TO a8r3_login WITH INHERIT TRUE, SET FALSE",
+        ],
+        (
+            "a8r3_login",
+            "GRANT feelings_billing TO a8r3_login WITH INHERIT FALSE, SET TRUE GRANTED BY a8r3_grp",
+        ),
+        "a8r3_login",
+    ),
+    "bot_login_with_admin_grants_api": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH ADMIN TRUE, INHERIT FALSE, "
+            "SET TRUE",
+        ],
+        (
+            "feelings_billing_login",
+            "GRANT feelings_billing TO feelings_api WITH INHERIT FALSE, SET TRUE",
+        ),
+        "feelings_api",
+    ),
+    "stranger_admin_on_bot_login": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+            "CREATE ROLE a8r3_x LOGIN NOINHERIT",
+            "GRANT feelings_billing_login TO a8r3_x WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ],
+        ("a8r3_x", "GRANT feelings_billing_login TO a8r3_x WITH INHERIT FALSE, SET TRUE"),
+        "a8r3_x",
+    ),
+}
+
+
+async def _r3_no_leftovers(engine: AsyncEngine) -> None:
+    async with engine.connect() as c:
+        left = await c.execute(
+            text(
+                "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'a8r3\\_%' "
+                "OR rolname = 'feelings_billing_login'"
+            )
+        )
+        assert left.scalar() == 0
+        members = await c.execute(
+            text(
+                "SELECT count(*) FROM pg_auth_members m WHERE m.roleid = "
+                "to_regrole('feelings_billing') OR m.member = to_regrole('feelings_billing')"
+            )
+        )
+        assert members.scalar() == 0
+        await c.execute(text(GUARD_R3.GUARD_SQL))
+
+
+@pytest.mark.parametrize("case", list(R3_ADMIN_HOLES))
+async def test_r3_admin_holders_escalate_and_next_run_catches(
+    engine: AsyncEngine, case: str
+) -> None:
+    """К A8-4.4-D4 — что даёт пропущенный ADMIN: страж сейчас пропускает подготовку; роль с
+    ADMIN (прямо, по наследованию от группы, роль входа бота с ADMIN, ADMIN на роль входа бота)
+    сама выдаёт SET на ``feelings_billing`` себе или ``feelings_api``. Следующий запуск стража
+    это ловит — окно открыто до следующего ``alembic upgrade``. Откат."""
+    setup, (actor, escalate), target = R3_ADMIN_HOLES[case]
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for sql in setup:
+            await c.execute(text(sql))
+        await c.execute(text(GUARD_R3.GUARD_SQL))  # пропущено (см. D4)
+        assert not await c.scalar(
+            text("SELECT pg_has_role(:r, 'feelings_billing', 'SET')"), {"r": target}
+        )
+        await c.execute(text(f"SET LOCAL ROLE {actor}"))
+        await c.execute(text(escalate))
+        await c.execute(text("RESET ROLE"))
+        assert await c.scalar(
+            text("SELECT pg_has_role(:r, 'feelings_billing', 'SET')"), {"r": target}
+        ), case
+        await c.execute(text("SAVEPOINT g"))
+        with pytest.raises(DBAPIError):
+            await c.execute(text(GUARD_R3.GUARD_SQL))
+        await c.execute(text("ROLLBACK TO SAVEPOINT g"))
+        await tx.rollback()
+    await _r3_no_leftovers(engine)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="A8-4.4-D4: страж допускает ADMIN без SET/INHERIT у любой роли (и ADMIN у роли входа "
+    "бота, и любое членство в роли входа бота), а АР-50 п.7 допускает его только у владельца "
+    "схемы: такая роль выдаёт себе или feelings_api SET на feelings_billing без суперпользователя",
+)
+@pytest.mark.parametrize("case", list(R3_ADMIN_HOLES))
+async def test_r3_guard_stops_admin_outside_schema_owner(engine: AsyncEngine, case: str) -> None:
+    """АР-50 п.7 («ADMIN без SET/INHERIT у владельца схемы допустим»): ADMIN у посторонней роли
+    входа, унаследованный от группы, ADMIN у роли входа бота, ADMIN на роль входа бота —
+    ожидается остановка ``alembic upgrade head``. Откат."""
+    setup, _escalation, _target = R3_ADMIN_HOLES[case]
+    stopped = False
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for sql in setup:
+            await c.execute(text(sql))
+        await c.execute(text("SAVEPOINT g"))
+        try:
+            await c.run_sync(alembic_on, "upgrade", "head")
+        except DBAPIError:
+            stopped = True
+            await c.execute(text("ROLLBACK TO SAVEPOINT g"))
+        await tx.rollback()
+    await _r3_no_leftovers(engine)
+    assert stopped, case
