@@ -56,16 +56,19 @@ function useReached(at: number | undefined, now: () => number): boolean {
 
 /**
  * Подпись реплики под дневным лимитом (429): до конца окна — без повтора; после окна (по `Retry-After`) —
- * «Повторить» тем же ключом: агент ответит на эту же сохранённую реплику (АР-51, MINOR-N5).
+ * «Повторить» тем же ключом: агент ответит на эту же сохранённую реплику (АР-51, MINOR-N5). Повтор — только у
+ * реплики последнего обмена (A8-2.2-D8): у прежней после окна подпись без кнопки.
  */
-function LimitedCaption({ item, chat, phase, retryAt, onRetry }: {
+function LimitedCaption({ item, chat, phase, retryAt, last, onRetry }: {
   item: ChatItem;
   chat: ChatSession;
   phase: ChatState["phase"];
   retryAt: number | undefined;
+  last: boolean;
   onRetry: () => void;
 }) {
-  const ready = useReached(retryAt, chat.now);
+  const ready = useReached(last ? retryAt : undefined, chat.now);
+  if (!last) return <span className="msg__meta">Сохранено. Ответа на это сообщение нет — был дневной лимит.</span>;
   if (!ready) return <span className="msg__meta">Сохранено. Ответа пока нет — лимит на сегодня.</span>;
   return (
     <div className="msg__fail">
@@ -105,15 +108,20 @@ function OwnerCaption({
     if (phase !== "waiting") return null;
     return <span className="msg__meta">Отправляем…</span>;
   }
-  if (st.kind === "limited") return <LimitedCaption item={item} chat={chat} phase={phase} retryAt={st.retryAt} onRetry={onRetry} />;
+  // Повтор — только у реплики последнего обмена (A8-2.2-D8, D9): у прежней подпись остаётся, кнопки нет.
+  const last = chat.canRetry(item.key);
+  if (st.kind === "limited")
+    return <LimitedCaption item={item} chat={chat} phase={phase} retryAt={st.retryAt} last={last} onRetry={onRetry} />;
   const saved =
     st.kind === "unsent" ? "Не отправлено." : st.kind === "unanswered" ? "Сообщение сохранено, ответа нет." : "";
-  const retry = st.kind === "unknown" || st.retry;
+  const retry = last && (st.kind === "unknown" || st.retry);
+  const again = !last && (st.kind === "unsent" || st.kind === "unknown") ? " Его можно написать заново." : "";
   return (
     <div className="msg__fail" role="alert">
       <span>
         <span className="visually-hidden">Ошибка: </span>
         {st.note} {saved}
+        {again}
       </span>
       {retry && (
         <button

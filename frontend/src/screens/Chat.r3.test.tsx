@@ -1,8 +1,8 @@
 /**
  * A4, задача 2.2, раунд 3 — экран чата: «Повторить» у реплики под лимитом после окна (MINOR-N5), реплика из
- * пробелов по правилам сервера не отправляется (A8-2.2-D6). ФТ-05; ТЗ §8, §10; АР-51. Тексты выдуманные.
+ * пробелов по правилам сервера не отправляется (A8-2.2-D6); повтор — только у последнего обмена (A8-2.2-D8, D9). ФТ-05; ТЗ §8, §10; АР-51. Тексты выдуманные.
  */
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { FakeServer } from "../test/fakeApi";
 import { heading, renderApp, type Rendered } from "../test/renderApp";
 
@@ -51,6 +51,56 @@ describe("Лимит 429: «Повторить» после окна (MINOR-N5)"
     expect(server.chat.filter((m) => m.author === "owner")).toHaveLength(1);
     expect(screen.queryByText(/На сегодня лимит сообщений агенту исчерпан/)).toBeNull();
     expect(screen.queryByRole("button", { name: "Повторить" })).toBeNull();
+  });
+});
+
+const bubbleOf = (text: string) =>
+  [...list().querySelectorAll<HTMLElement>(":scope > li")].find((li) => li.querySelector(".msg__text")?.textContent === text)!;
+
+async function say(r: Rendered, text: string) {
+  await r.user.type(input(), text);
+  await r.user.click(sendBtn());
+}
+
+describe("Повтор — только у последнего обмена (A8-2.2-D8, D9)", () => {
+  test("прежняя реплика под лимитом после окна: подпись «был дневной лимит», без «можно повторить» и кнопки", async () => {
+    const server = pairedServer();
+    server.reply({ status: 429, body: { code: "rate_limited", message: "x" }, headers: { "Retry-After": "1" } });
+    const r = await openChat(server);
+    await say(r, "Первая");
+    await screen.findByText("Сохранено. Ответа пока нет — лимит на сегодня.");
+    await act(() => new Promise<void>((ok) => setTimeout(ok, 1200)));
+    await within(bubbleOf("Первая")).findByRole("button", { name: "Повторить" });
+    await say(r, "Вторая");
+    await waitFor(() => expect(texts()).toEqual(["owner:Первая", "owner:Вторая", "agent:Слышу тебя."]));
+    const first = bubbleOf("Первая");
+    expect(within(first).getByText("Сохранено. Ответа на это сообщение нет — был дневной лимит.")).toBeInTheDocument();
+    expect(within(first).queryByText(/можно повторить/)).toBeNull();
+    expect(within(first).queryByRole("button")).toBeNull();
+    expect(server.calls("POST", "/chat/messages")).toHaveLength(2);
+  });
+
+  test("две реплики «Не отправлено»: у прежней — подпись и «написать заново» без кнопки; у последней повтор работает", async () => {
+    const server = pairedServer();
+    server.failNetwork("POST", "/chat/messages");
+    const r = await openChat(server);
+    await say(r, "Первая");
+    await within(bubbleOf("Первая")).findByText(/Не отправлено/);
+    server.failNetwork("POST", "/chat/messages");
+    await say(r, "Вторая");
+    await within(bubbleOf("Вторая")).findByText(/Не отправлено/);
+    const first = bubbleOf("Первая");
+    expect(within(first).getByText(/Не отправлено\. Его можно написать заново\./)).toBeInTheDocument();
+    expect(within(first).queryByRole("button", { name: /Отправить ещё раз|Повторить|Проверить/ })).toBeNull();
+    const retry = within(bubbleOf("Вторая")).getByRole("button", { name: "Отправить ещё раз" });
+    const before = server.calls("POST", "/chat/messages").length;
+    await r.user.click(retry);
+    await waitFor(() => expect(texts()).toEqual(["owner:Первая", "owner:Вторая", "agent:Слышу тебя."]));
+    const calls = server.calls("POST", "/chat/messages");
+    expect(calls).toHaveLength(before + 1);
+    expect(keyOf(calls[before].body)).toBe(keyOf(calls[before - 1].body));
+    expect((calls[before].body as { text: string }).text).toBe("Вторая");
+    expect(server.chat.filter((m) => m.author === "owner").map((m) => m.text)).toEqual(["Вторая"]);
   });
 });
 

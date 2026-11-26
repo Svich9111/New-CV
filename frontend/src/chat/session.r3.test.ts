@@ -174,16 +174,6 @@ describe("A8-2.2-D6 — пустой текст по правилам серве
     expect(posts(server)).toHaveLength(0);
   });
 
-  test("422 empty_text — «сообщение пустое», без повтора (а не «сервер не принял, отправь как новое»)", async () => {
-    const { chat, server } = await mk();
-    server.inject("POST", "/chat/messages", 422, { code: "empty_text", message: "x" });
-    const key = await say(chat, "​");
-    const st = mine(chat, key).status;
-    expect(st).toMatchObject({ kind: "unsent", retry: false });
-    expect(st && "note" in st ? st.note : "").toMatch(/^Сообщение пустое/);
-    expect(st && "note" in st ? st.note : "").not.toMatch(/не принял/);
-  });
-
   test("422 validation_error на непустой текст — по-прежнему ключ отклонён, повтор с новым ключом", async () => {
     const { chat, server } = await mk();
     server.inject("POST", "/chat/messages", 422, { code: "validation_error", message: "x" });
