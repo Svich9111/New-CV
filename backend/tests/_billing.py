@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+import importlib.util
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from types import ModuleType
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -28,7 +31,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from app.db import user_scope
-from tests.conftest import TEST_DATABASE_URL
+from tests.conftest import BACKEND_DIR, TEST_DATABASE_URL
 
 BILLING_ROLE = "feelings_billing"
 BOT_CALL_MARK = "app_bot_payment_"
@@ -60,3 +63,32 @@ def scope_for(
     if uid is None and BOT_CALL_MARK in sql:
         return billing_scope()
     return user_scope(sm, uid)
+
+
+def alembic_on(sync_conn: Any, *args: str) -> None:
+    """Команда Alembic на **этом** соединении, внутри уже открытой транзакции теста (env.py берёт
+    ``config.attributes['connection']``) — всё откатывается вместе с ней (роли кластера не
+    меняются, CLAUDE.md). Без файла ini: env.py не вызывает ``fileConfig`` и не трогает журналы
+    процесса тестов (как ``_r2_alembic`` A8)."""
+    import argparse
+
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config()
+    cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    cfg.cmd_opts = argparse.Namespace(x=[f"db_url={TEST_DATABASE_URL}"])
+    cfg.attributes["connection"] = sync_conn
+    getattr(command, args[0])(cfg, *args[1:])
+
+
+def migration_module(filename: str) -> ModuleType:
+    """Модуль ревизии (или ``migrations/billing_guard.py``) по имени файла."""
+    base = BACKEND_DIR / "migrations"
+    path = base / filename if (base / filename).exists() else base / "versions" / filename
+    spec = importlib.util.spec_from_file_location(f"_test_mig_{path.stem}", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"не найден модуль: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod

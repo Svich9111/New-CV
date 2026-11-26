@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -22,8 +24,9 @@ from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.db import user_scope
-from tests._billing import billing_scope, scope_for
-from tests.conftest import alembic
+from tests._billing import alembic_on, billing_scope, migration_module, scope_for
+from tests.conftest import BACKEND_DIR, TEST_DATABASE_URL, alembic
+from tests.test_account_export_db import HEAD
 from tests.test_couple_functions import (
     ACCEPT,
     LEAVE,
@@ -733,15 +736,35 @@ async def test_billing_role_is_the_only_bot_context(sessionmaker: SM, engine: As
                 await s.execute(text(reset))
                 await s.execute(text(CREDIT), {**pre, "ch": _charge()})
         assert _sqlstate(ei.value) == "42501", reset
-    # Ошибочно выданный EXECUTE другой роли: отказ даёт сама функция (role ≠ feelings_billing).
+    # Роль платежей, app.user_id не uuid (ревью р.2 MINOR-4): 22P02 из app_uid(), ничего не
+    # зачислено (проверка ниже — 0 периодов).
+    for sql, params in ((PRECHECK, pre), (CREDIT, {**pre, "ch": _charge()})):
+        with pytest.raises(DBAPIError) as ei:
+            async with billing_scope() as s:
+                await s.execute(text("SELECT set_config('app.user_id', 'garbage', true)"))
+                await s.execute(text(sql), params)
+        assert _sqlstate(ei.value) == "22P02", sql
+    # Ошибочно выданный EXECUTE другой роли: отказ даёт сама функция (role ≠ feelings_billing) —
+    # во всех четырёх функциях бота (ревью р.2 MINOR-3).
+    calls = (
+        (PRECHECK, pre),
+        (CREDIT, {**pre, "ch": _charge()}),
+        (REFUNDED, {"ch": _charge()}),
+        (LOOKUP, {"ch": _charge()}),
+    )
+    assert len(calls) == len(BOT_FUNCS)
     async with engine.connect() as c:
         tx = await c.begin()
         for f in BOT_FUNCS:
             await c.execute(text(f"GRANT EXECUTE ON FUNCTION {f} TO feelings_worker"))
         await c.execute(text("SET LOCAL ROLE feelings_worker"))
-        with pytest.raises(DBAPIError) as ei:
-            await c.execute(text(PRECHECK), pre)
-        assert _sqlstate(ei.value) == "42501" and "billing role only" in str(ei.value.orig)
+        for sql, params in calls:
+            await c.execute(text("SAVEPOINT call"))
+            with pytest.raises(DBAPIError) as ei:
+                await c.execute(text(sql), params)
+            assert _sqlstate(ei.value) == "42501", sql
+            assert "billing role only" in str(ei.value.orig), sql
+            await c.execute(text("ROLLBACK TO SAVEPOINT call"))
         await tx.rollback()
     assert (
         await _su(engine, "SELECT count(*) FROM subscriptions WHERE couple_id = :c", c=couple) == 0
@@ -751,9 +774,11 @@ async def test_billing_role_is_the_only_bot_context(sessionmaker: SM, engine: As
 async def test_payment_after_refund_gap_starts_now_and_status(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
-    """АР-50 п.4 (0019; A8-4.4-D1, ревью MINOR-4): P1 [now, +30] и P2 [+30, +60], возврат P1 —
-    доступа нет до начала P2, статус — ``canceled`` по P1 (будущий P2 не «истёк»); новая оплата
-    начинается сейчас (конец непрерывного доступа = now()), доступ сразу и до конца P2."""
+    """АР-50 п.4 (0019; A8-4.4-D1, ревью MINOR-4; 0020 — ревью р.2 MAJOR-2): P1 [now, +30] и
+    P2 [+30, +60], возврат P1 — доступа нет до начала P2, статус — ``canceled`` по P1 (будущий P2
+    не «истёк»); новая оплата начинается сейчас (конец непрерывного доступа = now()), доступ сразу.
+    P2 начинается внутри нового периода — конец нового продлевается на длину P2 (30 оплаченных
+    дней не теряются): доступ до now() + 60 дней; P2 не сдвигается."""
     a, b, couple = await _couple(sessionmaker, engine)
     inv = await _invoice(sessionmaker, a)
     ch1 = _charge()
@@ -770,18 +795,303 @@ async def test_payment_after_refund_gap_starts_now_and_status(
     p3 = await _credit(sessionmaker, engine, inv, a, _charge())
     after = datetime.now(UTC)
     assert p3["result"] == "credited"
-    assert before + timedelta(days=30) <= p3["period_end"] <= after + timedelta(days=30, seconds=5)
+    assert before + timedelta(days=60) <= p3["period_end"] <= after + timedelta(days=60, seconds=5)
+    start = await _su(
+        engine, "SELECT period_start FROM subscriptions WHERE id = :s", s=p3["subscription_id"]
+    )
+    assert before - timedelta(seconds=5) <= start <= after
     for who in (a, b):
         assert await _call(sessionmaker, who, HAS_ACCESS) is True
         st = await _one(sessionmaker, who, STATUS)
-        assert (st["status"], st["period_end"]) == ("active", p2["period_end"])
+        assert (st["status"], st["period_end"]) == ("active", p3["period_end"])
     # Следующие периоды не сдвигаются (АР-50 п.4): P2 — с прежними датами.
     assert await _su(
         engine, "SELECT period_end FROM subscriptions WHERE id = :s", s=p2["subscription_id"]
     ) == p2["period_end"]  # fmt: skip
-    p4 = await _credit(sessionmaker, engine, inv, b, _charge())  # оплата в цепочке — после P2
-    assert p4["period_end"] == p2["period_end"] + timedelta(days=30)
+    p4 = await _credit(sessionmaker, engine, inv, b, _charge())  # оплата в цепочке — после неё
+    assert p4["period_end"] == p3["period_end"] + timedelta(days=30)
     assert await _subs_count_active(engine, couple) == 3
+
+
+async def _paid_days_from_now(engine: AsyncEngine, couple: uuid.UUID) -> timedelta:
+    """Длина непрерывного доступа пары от now() (по цепочке периодов)."""
+    until = await _su(engine, "SELECT subscription_covered_until(:c, now()) - now()", c=couple)
+    return until if until is not None else timedelta(0)
+
+
+@pytest.mark.parametrize(
+    ("gap_days", "expected_days"),
+    [
+        (20, 60),  # пример ревью: P1 [-10, +20] возвращён, P2 [+20, +50] → 20 + 30 (P2) + 10
+        (5, 60),  # разрыв 5 дней: 5 + 30 (P2) + 25
+        (30, 60),  # разрыв ровно в период: P3 встык к P2 — без перекрытия
+        (45, 30),  # разрыв длиннее периода: P3 [now, +30], P2 — позже, отдельно
+    ],
+)
+async def test_payment_in_short_refund_gap_keeps_paid_days(
+    sessionmaker: SM, engine: AsyncEngine, gap_days: int, expected_days: int
+) -> None:
+    """Ревью 4.4 р.2 MAJOR-2 (0020, АР-50 п.4): возвращён текущий P1, оплаченный P2 начинается
+    через ``gap_days``; оплата 30 дней даёт 30 дней доступа сверх P2 — ни дня не теряется: конец
+    нового периода продлевается на длину будущих периодов, начавшихся внутри него. P2 не
+    меняется; доступ — сразу."""
+    a, b, couple = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    ch1 = _charge()
+    p1 = await _credit(sessionmaker, engine, inv, a, ch1)
+    p2 = await _credit(sessionmaker, engine, inv, b, _charge())
+    await _su(
+        engine,
+        "UPDATE subscriptions SET period_start = now() - interval '10 days', "
+        "period_end = now() + make_interval(days => :g) WHERE id = :s",
+        g=gap_days,
+        s=p1["subscription_id"],
+    )
+    await _su(
+        engine,
+        "UPDATE subscriptions SET period_start = now() + make_interval(days => :g), "
+        "period_end = now() + make_interval(days => :g + 30) WHERE id = :s",
+        g=gap_days,
+        s=p2["subscription_id"],
+    )
+    await _one(sessionmaker, None, REFUNDED, ch=ch1)
+    assert await _call(sessionmaker, a, HAS_ACCESS) is False
+    p2_dates = await _su(
+        engine,
+        "SELECT period_start::text || '|' || period_end::text FROM subscriptions WHERE id = :s",
+        s=p2["subscription_id"],
+    )
+    before = datetime.now(UTC)
+    p3 = await _credit(sessionmaker, engine, inv, a, _charge())
+    after = datetime.now(UTC)
+    assert p3["result"] == "credited"
+    for who in (a, b):
+        assert await _call(sessionmaker, who, HAS_ACCESS) is True
+    span = timedelta(days=expected_days)
+    covered = await _paid_days_from_now(engine, couple)
+    assert span - timedelta(seconds=10) <= covered <= span + timedelta(seconds=1), covered
+    # Время доступа сверх оплаченного P2 — ровно 30 дней (с точностью до секунд теста).
+    own = covered - (timedelta(days=30) if gap_days < 45 else timedelta(0))
+    assert timedelta(days=30) - timedelta(seconds=10) <= own <= timedelta(days=30, seconds=1)
+    assert before + span - timedelta(seconds=5) <= p3["period_end"] <= after + span
+    st = await _one(sessionmaker, b, STATUS)
+    assert (st["status"], st["has_access"]) == ("active", True)
+    assert st["period_end"] == p3["period_end"]  # P3 кончается позже P2 или P2 — после разрыва
+    assert await _su(
+        engine,
+        "SELECT period_start::text || '|' || period_end::text FROM subscriptions WHERE id = :s",
+        s=p2["subscription_id"],
+    ) == p2_dates  # fmt: skip
+    assert await _subs_count_active(engine, couple) == 2
+
+
+# --------------------------------------------------------------------------- 0020: страж роли
+
+GUARD = migration_module("billing_guard.py")
+M20 = migration_module("0020_billing_guard_chat_fixes.py")
+
+# (подготовка в откатываемой транзакции, ожидаемая остановка: часть сообщения или None).
+GUARD_CASES = {
+    "billing_member_of_admin": (["GRANT feelings_admin TO feelings_billing"], "член других ролей"),
+    "app": (
+        ["GRANT feelings_billing TO feelings_app"],
+        "роли приложения: feelings_api, feelings_app",
+    ),
+    "api_set_only": (
+        ["GRANT feelings_billing TO feelings_api WITH INHERIT FALSE, SET TRUE"],
+        "роли приложения: feelings_api",
+    ),
+    "worker": (["GRANT feelings_billing TO feelings_worker"], "роли приложения: feelings_worker"),
+    "admin_admin_only": (
+        ["GRANT feelings_billing TO feelings_admin WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"],
+        "роли приложения: feelings_admin",
+    ),
+    "nested_via_group": (
+        [
+            "CREATE ROLE a1g_mid NOLOGIN",
+            "GRANT feelings_billing TO a1g_mid",
+            "GRANT a1g_mid TO feelings_api",
+        ],
+        "роли приложения: feelings_api",
+    ),
+    "other_login_set": (
+        [
+            "CREATE ROLE a1g_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO a1g_login WITH INHERIT FALSE, SET TRUE",
+        ],
+        "не только роль входа бота: a1g_login",
+    ),
+    "other_group_usage": (
+        ["CREATE ROLE a1g_grp NOLOGIN", "GRANT feelings_billing TO a1g_grp WITH SET FALSE"],
+        "не только роль входа бота: a1g_grp",
+    ),
+    "owner_with_set": (
+        [
+            "CREATE ROLE a1g_owner LOGIN CREATEROLE",
+            "GRANT feelings_billing TO a1g_owner WITH ADMIN TRUE, INHERIT FALSE, SET TRUE",
+        ],
+        "не только роль входа бота: a1g_owner",
+    ),
+    "bot_login_in_app": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+            "GRANT feelings_app TO feelings_billing_login",
+        ],
+        "роль входа бота feelings_billing_login входит в другие роли: feelings_app",
+    ),
+    "bot_login": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+        ],
+        None,
+    ),
+    "owner_admin_only": (
+        [
+            "CREATE ROLE a1g_owner LOGIN CREATEROLE",
+            "GRANT feelings_billing TO a1g_owner WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ],
+        None,
+    ),
+    "clean": ([], None),
+}
+
+
+@pytest.mark.parametrize("case", list(GUARD_CASES))
+async def test_billing_guard_stops_migrations(engine: AsyncEngine, case: str) -> None:
+    """Ревью 4.4 р.2 MAJOR-1, A8-4.4-D3 (0020, ``migrations/billing_guard.py``): страж
+    останавливает любой запуск Alembic (здесь — ``upgrade head`` на голове: миграций нет, страж
+    из env.py всё равно исполняется; и ``downgrade 0019`` → ``upgrade head`` — страж внутри 0020),
+    если ``feelings_billing`` член другой роли, если в неё входят роли приложения (в т.ч. через
+    вложенную роль и только с ADMIN), если стать ею может кто-то, кроме роли входа бота
+    ``feelings_billing_login`` и суперпользователей, или если роль входа бота — член другой роли.
+    Роль входа бота и ADMIN владельца схемы без SET — допустимы. Всё — в откатываемой транзакции
+    (роли кластера не меняются)."""
+    setup, stop = GUARD_CASES[case]
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for sql in setup:
+            await c.execute(text(sql))
+        for steps in ((("upgrade", "head"),), (("downgrade", "0019"), ("upgrade", "head"))):
+            await c.execute(text("SAVEPOINT guard"))
+            if stop is None:
+                for step in steps:
+                    await c.run_sync(alembic_on, *step)
+                await c.execute(text(GUARD.GUARD_SQL))
+            else:
+                with pytest.raises(DBAPIError) as ei:
+                    for step in steps:
+                        await c.run_sync(alembic_on, *step)
+                assert stop in str(ei.value.orig), (case, steps, str(ei.value.orig))
+                await c.execute(text("ROLLBACK TO SAVEPOINT guard"))
+                with pytest.raises(DBAPIError):
+                    await c.execute(text(GUARD.GUARD_SQL))
+                await c.execute(text("ROLLBACK TO SAVEPOINT guard"))
+            version = (await c.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+            assert version == HEAD, (case, steps)
+        await tx.rollback()
+    async with engine.connect() as c:
+        assert (await c.execute(text("SELECT version_num FROM alembic_version"))).scalar() == HEAD
+        left = await c.execute(
+            text(
+                "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'a1g\\_%' "
+                "OR rolname = 'feelings_billing_login'"
+            )
+        )
+        assert left.scalar() == 0
+        await c.execute(text(GUARD.GUARD_SQL))  # после отката — снова чисто
+
+
+def test_bot_bodies_markers_and_role_check_are_verified() -> None:
+    """Ревью 4.4 р.2 MINOR-3 (0020): сборка тел проверяет, что маркеры ``--…--`` подставлены и в
+    функции бота есть проверка роли платежей; собранные тела 0020 — с ней."""
+    with pytest.raises(RuntimeError, match="маркеры"):
+        M20.checked("BEGIN\n--SERVICE_ONLY--\nEND", bot=False)
+    with pytest.raises(RuntimeError, match="проверки роли"):
+        M20.checked("BEGIN\nRETURN;\nEND", bot=True)
+    with pytest.raises(RuntimeError, match="маркеры"):
+        M20.expand("--USER_KNOWN--\n--NEW_MARKER--", M20._markers(), bot=False)
+    status, credit = M20.upgrade_sql()
+    assert "billing role only" in credit and "billing role only" not in status
+    assert not M20.MARKER.search(status + credit)
+
+
+async def test_bot_function_bodies_in_db(engine: AsyncEngine) -> None:
+    """MINOR-3: на голове в каждой из четырёх ``app_bot_payment_*`` — проверка роли платежей; ни
+    в одной функции схемы нет незаменённых маркеров."""
+    async with engine.connect() as c:
+        rows = (
+            await c.execute(
+                text(
+                    "SELECT p.proname, position('billing role only' IN p.prosrc) > 0 AS checked "
+                    "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    "WHERE n.nspname = 'public' AND p.proname LIKE 'app\\_bot\\_payment\\_%' "
+                    "ORDER BY 1"
+                )
+            )
+        ).all()
+        assert [(r.proname, r.checked) for r in rows] == [
+            (f"app_bot_payment_{n}", True) for n in ("credit", "lookup", "precheck", "refunded")
+        ]
+        left = (
+            await c.execute(
+                text(
+                    "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    "WHERE n.nspname = 'public' AND p.prosrc ~ '--[A-Z_]+--'"
+                )
+            )
+        ).scalar()
+        assert left == 0
+        await c.execute(text(M20.CHECK_BODIES_SQL))
+
+
+async def test_status_of_new_active_couple_while_old_period_serves(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Ревью 4.4 р.2 MINOR-1 (0020): оплаченный период распавшейся пары дослуживает (доступ есть,
+    §11 п.6), но у пользователя уже **активная** новая пара — статус её собственный: без периодов
+    ``none``, с пробным — ``trial``, пробный кончился — ``expired`` (экран предложит оплату новой
+    паре); ``has_access`` — true (дослуживание), ``paid_by_me`` — по новой паре (NULL). Новый
+    партнёр — тот же статус, но без доступа."""
+    a, _b, _old = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    paid = await _credit(sessionmaker, engine, inv, a, _charge())
+    await _call(sessionmaker, a, LEAVE)
+    new = uuid.UUID(str(await _call(sessionmaker, a, "SELECT app_create_couple()")))
+    st = await _one(sessionmaker, a, STATUS)  # ожидающая пара — статус дослуживаемого периода
+    assert (st["status"], st["period_end"], st["couple_status"]) == (
+        "active", paid["period_end"], "pending",
+    )  # fmt: skip
+    token = uuid.uuid4().bytes + uuid.uuid4().bytes
+    await _call(sessionmaker, a, "SELECT app_issue_invite(:h)", h=token)
+    c = await _user(engine, "Кира")
+    await _call(sessionmaker, c, ACCEPT, h=token)
+    expect = {"couple_id": new, "couple_status": "active", "plan": None, "period_end": None,
+              "trial_ends_at": None, "trial_used": False, "paid_by_me": None}  # fmt: skip
+    for who, access in ((a, True), (c, False)):
+        st = await _one(sessionmaker, who, STATUS)
+        assert st == {**expect, "status": "none", "has_access": access}, who
+    trial = await _one(sessionmaker, a, TRIAL, d=7)
+    st = await _one(sessionmaker, a, STATUS)
+    assert (st["status"], st["period_end"], st["has_access"]) == (
+        "trial",
+        trial["period_end"],
+        True,
+    )
+    await _su(
+        engine,
+        "UPDATE subscriptions SET period_start = now() - interval '8 days', "
+        "period_end = now() - interval '1 day' WHERE couple_id = :c",
+        c=new,
+    )
+    ended = await _su(engine, "SELECT period_end FROM subscriptions WHERE couple_id = :c", c=new)
+    for who, access in ((a, True), (c, False)):
+        st = await _one(sessionmaker, who, STATUS)
+        assert st == {
+            **expect, "status": "expired", "plan": "trial", "period_end": ended,
+            "trial_ends_at": ended, "trial_used": True, "has_access": access,
+        }, who  # fmt: skip
 
 
 async def _subs_count_active(engine: AsyncEngine, couple: uuid.UUID) -> int:
@@ -1023,3 +1333,15 @@ async def test_migration_0019_reversible(
     ) == subs  # fmt: skip
     assert await _rows(sessionmaker, None, LOOKUP, ch=_charge()) == []
     alembic("check")
+
+
+def test_offline_sql_carries_billing_guard() -> None:
+    """MAJOR-1: в SQL офлайн-режима (``alembic upgrade 0019:0020 --sql``) страж есть дважды — из
+    env.py (каждый запуск) и внутри 0020."""
+    out = subprocess.run(  # noqa: S603 — фиксированная команда
+        [sys.executable, "-m", "alembic", "-x", f"db_url={TEST_DATABASE_URL}", "upgrade",
+         "0019:0020", "--sql"],
+        cwd=BACKEND_DIR, check=True, capture_output=True, text=True,
+    ).stdout  # fmt: skip
+    assert out.count("DO $guard$") == 2, out[:400]
+    assert out.index("DO $guard$") < out.index("ALTER TABLE conversation_messages")

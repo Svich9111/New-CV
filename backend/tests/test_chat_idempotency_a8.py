@@ -672,12 +672,7 @@ CONSTRAINTS_0018 = (
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-2.2-D5: имена CHECK 0018 удвоены соглашением ck_%(table_name)s_ "
-    "(ck_conversation_messages_ck_conversation_messages_owner_b5e5) — проверка отсутствия "
-    "по имени в test_migration_0018_reversible ничего не проверяет",
-)
+# A8-2.2-D5 исправлен в 0020 (2.2 р.2, A1): xfail снят, тело не менялось.
 async def test_0018_check_constraint_names(engine: AsyncEngine) -> None:
     """Имена CHECK 0018 — как в описании миграции и в тесте A1 (``ck_conversation_messages_
     owner_only_fields``/``…_agent_only_fields``), как у CHECK 0017 (``ck_payments_…``)."""

@@ -270,7 +270,8 @@ class ConversationMessage(Base):
 
     Сверх §7 (АР-51, миграция 0018): ключ идемпотентности реплики владельца
     (``client_message_id``), аренда ответа на неё и отметка лимита; у ответа агента — реплика,
-    на которую он отвечает (``reply_to_id``, тот же диалог), и флаг кризисного протокола."""
+    на которую он отвечает (``reply_to_id``, тот же диалог), и флаг кризисного протокола.
+    Миграция 0020: отметка «события безопасности по реплике записаны» (``safety_recorded``)."""
 
     __tablename__ = "conversation_messages"
     __table_args__ = (
@@ -300,7 +301,7 @@ class ConversationMessage(Base):
         ),
         CheckConstraint(
             "author = 'owner' OR (client_message_id IS NULL AND reply_lease_until IS NULL "
-            "AND NOT limit_charged)",
+            "AND NOT limit_charged AND NOT safety_recorded)",
             name="owner_only_fields",
         ),
         CheckConstraint(
@@ -320,6 +321,10 @@ class ConversationMessage(Base):
     crisis: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_text("false"))
     reply_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     limit_charged: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=sa_text("false")
+    )
+    # 0020 (АР-51, ревью 2.2 р.2 MINOR-N1): события безопасности по реплике владельца записаны.
+    safety_recorded: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=sa_text("false")
     )
 

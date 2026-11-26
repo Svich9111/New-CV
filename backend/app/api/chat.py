@@ -203,20 +203,30 @@ class ChatRuntime:
         self._compressing[conversation_id] = self.spawn(run())
 
     async def drain(self) -> None:
-        """Дождаться фоновых задач (тесты)."""
+        """Дождаться фоновых задач (тесты). ``gather`` из уже завершённых задач завершается
+        синхронно, не отдавая управление циклу, — а задача уходит из ``background`` обратным
+        вызовом, который цикл ещё должен выполнить; ``sleep(0)`` даёт ему выполниться (иначе
+        цикл ``while`` без единой уступки — зависание)."""
         while self.background:
             await asyncio.gather(*list(self.background), return_exceptions=True)
+            await asyncio.sleep(0)
 
     def record_safety_events(
-        self, sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID, types: Sequence[str]
+        self,
+        sm: async_sessionmaker[AsyncSession],
+        user_id: uuid.UUID,
+        types: Sequence[str],
+        turn_id: uuid.UUID | None = None,
     ) -> asyncio.Task[None]:
         """Запись ``safety_events`` (только типы) фоновой задачей: уход клиента её не отменяет,
-        остановка сервиса её дожидается (§9.3 «событие фиксируется»)."""
+        остановка сервиса её дожидается (§9.3 «событие фиксируется»). ``turn_id`` — реплика
+        владельца: по уже отмеченной реплике события повторно не пишутся (0020, АР-51)."""
 
         async def write() -> None:
             try:
                 await asyncio.wait_for(
-                    chat_repo.record_safety_events(sm, user_id, types), SAFETY_EVENTS_TIMEOUT_S
+                    chat_repo.record_safety_events(sm, user_id, types, turn_id=turn_id),
+                    SAFETY_EVENTS_TIMEOUT_S,
                 )
             except Exception as exc:
                 logger.error("chat: safety events not recorded: %s", type(exc).__name__)
@@ -231,11 +241,12 @@ class ChatRuntime:
         sm: async_sessionmaker[AsyncSession],
         user_id: uuid.UUID,
         turn: chat_repo.OwnerTurn | None,
-    ) -> None:
+    ) -> asyncio.Task[None] | None:
         """Снять аренду ответа (АР-51) фоновой задачей: отмена запроса (уход клиента) её не
-        отменяет; сбой — аренда истечёт по сроку, в журнал — только имя ошибки."""
+        отменяет; сбой — аренда истечёт по сроку, в журнал — только имя ошибки. Задачу можно
+        дождаться (``_LeaseRelease.wait``) — тогда немедленный повтор не застанет аренду."""
         if turn is None or turn.lease is None:
-            return
+            return None
         message_id, lease = turn.message_id, turn.lease
 
         async def release() -> None:
@@ -247,7 +258,7 @@ class ChatRuntime:
             except Exception as exc:
                 logger.warning("chat: reply lease not released: %s", type(exc).__name__)
 
-        self.spawn(release())
+        return self.spawn(release())
 
     async def aclose(self) -> None:
         """Остановка сервиса: записи ``safety_events`` дожидаются (не дольше
@@ -258,6 +269,34 @@ class ChatRuntime:
         if writes:
             _, late = await asyncio.wait(writes, timeout=SAFETY_EVENTS_TIMEOUT_S)
             await _cancel_and_wait(*late)
+
+
+@dataclass
+class _LeaseRelease:
+    """Снятие аренды ответа одной задачей на запрос (АР-51; ревью 2.2 р.2 MINOR-N2, A8 О-1).
+
+    ``start`` — запустить (повторно — та же задача), синхронно, из любого места, в том числе из
+    ``finally`` ответа после отмены производителя; ``wait`` — запустить и дождаться (не дольше
+    ``LEASE_RELEASE_TIMEOUT_S``), не отменяя задачу при отмене ожидающего: так аренда снята до
+    конца потока и до ответа 429, и немедленный повтор не получает 409."""
+
+    rt: ChatRuntime
+    sm: async_sessionmaker[AsyncSession]
+    user_id: uuid.UUID
+    turn: chat_repo.OwnerTurn | None
+    _task: asyncio.Task[None] | None = None
+    _started: bool = False
+
+    def start(self) -> asyncio.Task[None] | None:
+        if not self._started:
+            self._started = True
+            self._task = self.rt.release_lease(self.sm, self.user_id, self.turn)
+        return self._task
+
+    async def wait(self) -> None:
+        task = self.start()
+        if task is not None:
+            await asyncio.wait({task}, timeout=LEASE_RELEASE_TIMEOUT_S)
 
 
 def runtime(request: Request) -> ChatRuntime:
@@ -325,12 +364,26 @@ async def until_disconnect[T](receive: Receive, coro: Coroutine[Any, Any, T]) ->
 class EventStreamResponse(StreamingResponse):
     """Поток SSE, который пишет задача-производитель ``producer(emit)``. Между событиями дольше
     ``keepalive_s`` — строка-комментарий. Клиент ушёл (``http.disconnect`` или ошибка записи) —
-    производитель отменяется и дожидается (вызовы модели отменены)."""
+    производитель отменяется и дожидается (вызовы модели отменены).
 
-    def __init__(self, producer: Callable[[Emit], Awaitable[None]], keepalive_s: float) -> None:
+    ``before_end`` — дождаться после производителя, до закрытия потока (снятие аренды ответа:
+    повтор сразу после завершающего события её не застаёт, A8 О-1); ``on_close`` — вызывается
+    всегда при выходе из ответа, в том числе если производитель отменён, не успев начаться
+    (ошибка записи заголовков; ревью 2.2 р.2 MINOR-N2)."""
+
+    def __init__(
+        self,
+        producer: Callable[[Emit], Awaitable[None]],
+        keepalive_s: float,
+        *,
+        before_end: Callable[[], Awaitable[None]] | None = None,
+        on_close: Callable[[], object] | None = None,
+    ) -> None:
         super().__init__((), media_type="text/event-stream", headers=SSE_HEADERS)
         self._producer = producer
         self._keepalive_s = keepalive_s
+        self._before_end = before_end
+        self._on_close = on_close
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -341,6 +394,8 @@ class EventStreamResponse(StreamingResponse):
         async def run() -> None:
             try:
                 await self._producer(emit)
+                if self._before_end is not None:
+                    await self._before_end()
             finally:
                 queue.put_nowait(None)
 
@@ -369,7 +424,11 @@ class EventStreamResponse(StreamingResponse):
         except OSError:
             return  # ASGI 2.4: запись в закрытое соединение
         finally:
-            await _cancel_and_wait(getter, gone, producer)
+            try:
+                await _cancel_and_wait(getter, gone, producer)
+            finally:
+                if self._on_close is not None:
+                    self._on_close()
 
     @staticmethod
     async def _body(send: Send, chunk: str) -> None:
@@ -520,8 +579,6 @@ class _Reply:
     turn_id: uuid.UUID | None = None
     # Тело события ``accepted`` — только при ключе ``client_message_id`` (АР-51).
     accepted: dict[str, Any] | None = None
-    # Реплика с ключом: аренда снимается по завершении потока любым исходом.
-    turn: chat_repo.OwnerTurn | None = None
 
     def _err(self, code: str = "internal", message: str | None = None) -> dict[str, Any]:
         return _error_payload(code, message, no_verdict=self.prep.no_verdict)
@@ -541,7 +598,6 @@ class _Reply:
             if out.event is None:
                 await self._final(emit, "error", self._err())
         finally:
-            self.rt.release_lease(self.sm, self.user_id, self.turn)
             logger.info(
                 "chat reply: event=%s code=%s screen_ms=%s first_delta_ms=%s total_ms=%s "
                 "models=%s fallback=%s",
@@ -642,7 +698,7 @@ class _Reply:
         событие ждёт её не дольше ``SAFETY_EVENTS_WAIT_S``, чтобы медленная БД не задерживала
         контакты."""
         events = self.prep.safety_write or self.rt.record_safety_events(
-            self.sm, self.user_id, ev.safety_events
+            self.sm, self.user_id, ev.safety_events, self.turn_id
         )
         message_id: uuid.UUID | None = None
         if self.conversation_id is not None:
@@ -734,7 +790,7 @@ async def post_message(
     except ClientGone:
         logger.info("chat reply: event=client_gone stage=prepare")
         return Response(status_code=CLIENT_CLOSED)
-    _record_crisis_now(rt, sm, user_id, prep)
+    _record_crisis_now(rt, sm, user_id, prep, turn_id)
     # АР-34 п.1: кризис или нет вердикта второй линии — 429 не отдаётся, реплика засчитывается.
     force = prep.crisis or prep.no_verdict
     decision = await rt.acquire(user_id, settings.chat_daily_limit, force=force)
@@ -777,7 +833,9 @@ async def _post_keyed(
     новой реплики не создаёт: ответ сохранён — он же потоком (``_replay``); реплика без ответа —
     ответ на неё (контекст — до неё); ответ готовит другой запрос — 409 ``conflict_retry``;
     под ключом другой текст — 422. Дальше — тот же порядок, что без ключа; лимит за реплику
-    засчитывается один раз (``limit_charged``). Аренда ответа снимается на любом исходе."""
+    засчитывается один раз (``limit_charged``); событие безопасности по реплике — тоже один раз
+    (``safety_recorded``, 0020). Аренда ответа снимается на любом исходе — до ответа 429 и до
+    конца потока (``_LeaseRelease``)."""
     started = time.monotonic()
     try:
         turn = await chat_repo.accept_owner_turn(
@@ -802,6 +860,7 @@ async def _post_keyed(
         return EventStreamResponse(lambda emit: _replay(emit, turn, key), settings.chat_keepalive_s)
     replayed = turn.state == "unanswered"
     text = turn.text if turn.text is not None else body
+    lease = _LeaseRelease(rt, sm, user_id, turn)
     handed = False
     try:
         try:
@@ -821,7 +880,7 @@ async def _post_keyed(
         except ClientGone:
             logger.info("chat reply: event=client_gone stage=prepare")
             return Response(status_code=CLIENT_CLOSED)
-        _record_crisis_now(rt, sm, user_id, prep)
+        _record_crisis_now(rt, sm, user_id, prep, turn.message_id)
         if not turn.limit_charged:
             force = prep.crisis or prep.no_verdict  # АР-34 п.1
             decision = await rt.acquire(user_id, settings.chat_daily_limit, force=force)
@@ -839,13 +898,14 @@ async def _post_keyed(
             _Outcome(started),
             turn.message_id,
             _accepted(turn.message_id, key, replayed=replayed),
-            turn,
         )
         handed = True
-        return EventStreamResponse(reply.produce, settings.chat_keepalive_s)
+        return EventStreamResponse(
+            reply.produce, settings.chat_keepalive_s, before_end=lease.wait, on_close=lease.start
+        )
     finally:
         if not handed:
-            rt.release_lease(sm, user_id, turn)
+            await lease.wait()
 
 
 async def _mark_charged(
@@ -891,12 +951,17 @@ def _conflict(message: str) -> JSONResponse:
 
 
 def _record_crisis_now(
-    rt: ChatRuntime, sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID, prep: _Prepared
+    rt: ChatRuntime,
+    sm: async_sessionmaker[AsyncSession],
+    user_id: uuid.UUID,
+    prep: _Prepared,
+    turn_id: uuid.UUID | None = None,
 ) -> None:
     """Кризис второй линии — событие безопасности записывается сразу после вердикта, до потока:
-    клиент, ушедший до первого байта, его не отменит (ревью р.2 MINOR-3)."""
+    клиент, ушедший до первого байта, его не отменит (ревью р.2 MINOR-3). ``turn_id`` — реплика
+    владельца: по ней события пишутся один раз (повтор с ключом, 0020)."""
     if prep.crisis and prep.screen is not None:
-        prep.safety_write = rt.record_safety_events(sm, user_id, prep.screen.crisis_types)
+        prep.safety_write = rt.record_safety_events(sm, user_id, prep.screen.crisis_types, turn_id)
 
 
 async def _unsaved_turn(

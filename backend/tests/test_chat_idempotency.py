@@ -653,9 +653,248 @@ async def test_logs_have_no_texts_or_keys(
             assert body not in dump and reply not in dump and str(key) not in dump
 
 
+# --------------------------------------------------------------------------- 2.2 р.2 (0020)
+
+
+async def _safety_count(engine: AsyncEngine, user_id: uuid.UUID) -> int:
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text("SELECT count(*) FROM safety_events WHERE user_id = :u"), {"u": user_id}
+        )
+        return int(res.scalar_one())
+
+
+async def test_repeat_after_unsaved_crisis_reply_records_one_safety_event(
+    env: Env, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ревью 2.2 р.2 MINOR-N1 (0020, АР-51): кризис, ответ протокола не сохранился — реплика без
+    ответа; повтор с тем же ключом снова даёт ``crisis`` с контактами, но второго события
+    безопасности на ту же реплику нет (отметка ``safety_recorded`` в одной транзакции с
+    записью). Другая кризисная реплика — своё событие."""
+    env.use(stub(category="self_harm"))
+    anna = await _person(env.client)
+    real = chat_repo.add_message
+
+    async def no_crisis_save(*args: Any, **kw: Any) -> Any:
+        if kw.get("crisis"):
+            raise RuntimeError("db down")
+        return await real(*args, **kw)
+
+    monkeypatch.setattr(chat_repo, "add_message", no_crisis_save)
+    key, body = uuid.uuid4(), mark("crisis")
+    _, first = await send(env, anna, body, key)
+    assert names(first) == ["accepted", "crisis"] and first[-1][1]["message_id"] is None
+    await env.rt.drain()
+    assert await _safety_count(engine, anna.id) == 1
+    _, again = await send(env, anna, body, key)  # ответ снова не сохраняется
+    assert names(again) == ["accepted", "crisis"] and again[0][1]["replayed"] is True
+    await env.rt.drain()
+    assert await _safety_count(engine, anna.id) == 1
+    monkeypatch.undo()
+    _, third = await send(env, anna, body, key)  # теперь сохраняется
+    assert names(third) == ["accepted", "crisis"] and third[-1][1]["message_id"] is not None
+    await env.rt.drain()
+    assert await _safety_count(engine, anna.id) == 1
+    async with engine.connect() as conn:
+        flags = (
+            await conn.execute(
+                text(
+                    "SELECT author::text, safety_recorded FROM conversation_messages "
+                    "WHERE client_message_id = :k OR reply_to_id = :i ORDER BY created_at"
+                ),
+                {"k": key, "i": uuid.UUID(first[0][1]["message_id"])},
+            )
+        ).all()
+    assert [tuple(r) for r in flags] == [("owner", True), ("agent", False)]
+    _, other = await send(env, anna, mark("crisis-2"), uuid.uuid4())
+    assert names(other)[-1] == "crisis"
+    await env.rt.drain()
+    assert await _safety_count(engine, anna.id) == 2
+
+
+async def test_concurrent_safety_records_for_one_turn_write_once(
+    env: Env, engine: AsyncEngine
+) -> None:
+    """N1: две одновременные записи событий по одной реплике (повтор и первый запрос) — одно
+    событие; без реплики (``turn_id`` нет) — пишутся, как раньше."""
+    anna = await _person(env.client)
+    env.use(stub(chunks=[LLMUnavailable("down")]))
+    await send(env, anna, "Привет", uuid.uuid4())
+    await env.rt.drain()
+    (turn,) = await rows(engine, anna.id)
+    got = await asyncio.gather(
+        *(
+            chat_repo.record_safety_events(env.sm, anna.id, ["self_harm"], turn_id=turn["id"])
+            for _ in range(4)
+        )
+    )
+    assert sorted(got) == [0, 0, 0, 1]
+    assert await chat_repo.record_safety_events(env.sm, anna.id, ["self_harm"]) == 1
+    assert await _safety_count(engine, anna.id) == 2
+
+
+def _asgi_scope(user: U) -> dict[str, Any]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": API,
+        "raw_path": API.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"test"),
+            (b"authorization", f"Bearer {user.token}".encode()),
+            (b"content-type", b"application/json"),
+        ],
+        "server": ("test", 80),
+        "client": ("127.0.0.1", 12345),
+    }
+
+
+async def test_lease_released_when_producer_cancelled_before_start(
+    env: Env, engine: AsyncEngine
+) -> None:
+    """Ревью 2.2 р.2 MINOR-N2: запись заголовков ответа падает (клиент ушёл между возвратом ответа
+    и первой записью) — задача-производитель отменяется, не начавшись; аренда всё равно снимается
+    (``on_close`` ответа), повтор сразу отвечает на ту же реплику, без 409."""
+    p = stub()
+    env.use(p)
+    anna = await _person(env.client)
+    key = uuid.uuid4()
+    body = json.dumps({"text": "Привет", "client_message_id": str(key)}).encode()
+    sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}  # pragma: no cover
+
+    async def send_(message: MutableMapping[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            raise OSError("connection closed")
+
+    await asyncio.wait_for(app(_asgi_scope(anna), receive, send_), 5)
+    assert p.stream_requests == []  # производитель не начинал
+    await env.rt.drain()
+    db = await rows(engine, anna.id)
+    assert [r["author"] for r in db] == ["owner"] and db[0]["reply_lease_until"] is None
+    _, events = await send(env, anna, "Привет", key)
+    assert names(events)[-1] == "done" and events[0][1]["replayed"] is True
+
+
+async def test_lease_is_released_before_response_ends(env: Env, engine: AsyncEngine) -> None:
+    """A8 О-1: аренда снимается до ответа 429 и до конца потока (а не фоном после) — повтор
+    сразу после ответа, без ожидания фоновых задач, не застаёт её: 429 снова 429, ответ
+    с ошибкой модели — повтор отвечает, а не 409."""
+    env.box.limit = 1
+    anna = await _person(env.client)
+    await send(env, anna, "первая", uuid.uuid4())
+    key = uuid.uuid4()
+    for _ in range(3):
+        resp, _ = await send(env, anna, "вторая", key)
+        _error(resp, 429, "rate_limited")
+        assert all(r["reply_lease_until"] is None for r in await rows(engine, anna.id))
+    env.box.limit = 5
+    env.use(stub(chunks=[LLMUnavailable("down")]))
+    k2 = uuid.uuid4()
+    _, failed = await send(env, anna, "третья", k2)
+    assert names(failed)[-1] == "error"
+    assert all(r["reply_lease_until"] is None for r in await rows(engine, anna.id))
+    env.use(stub())
+    _, events = await send(env, anna, "третья", k2)
+    assert names(events)[-1] == "done" and events[0][1]["replayed"] is True
+
+
+async def test_repeat_of_turn_inside_summary_is_internal_error_charged_once(
+    env: Env, engine: AsyncEngine
+) -> None:
+    """Ревью 2.2 р.2 MINOR-N3 (АР-51 (б), вопрос 2 оператору): реплика X без ответа уже вошла в
+    сводку (отметка сводки позже X) — повтор X: ``accepted`` (``replayed``) и ``error`` ``internal``,
+    модель ответа не вызывается; лимит за X засчитан один раз — второй повтор 429 не получает, а
+    новая реплика после исчерпания — 429."""
+    env.box.limit = 1
+    anna = await _person(env.client)
+    await send(env, anna, mark("w"), uuid.uuid4())  # лимит 1 израсходован
+    kx, x = uuid.uuid4(), mark("x")
+    resp, _ = await send(env, anna, x, kx)
+    _error(resp, 429, "rate_limited")  # X сохранена, лимит за неё не засчитан
+    env.box.limit = 3
+    _, later = await send(env, anna, mark("y"), uuid.uuid4())  # засчитано 2
+    assert names(later)[-1] == "done"
+    db = await rows(engine, anna.id)
+    async with engine.connect() as conn:
+        last = (
+            await conn.execute(
+                text(
+                    "SELECT m.conversation_id, m.created_at, m.id FROM conversation_messages m "
+                    "WHERE m.id = :i"
+                ),
+                {"i": db[-1]["id"]},
+            )
+        ).one()
+    saved = await chat_repo.save_history_summary(
+        env.sm,
+        env.keys,
+        anna.id,
+        last.conversation_id,
+        chat_repo.HistorySummary(mark("summary"), last.created_at, last.id),
+        expected_through_id=None,
+    )
+    assert saved
+    p = stub()
+    env.use(p)
+    _, again = await send(env, anna, x, kx)  # засчитано 3 (= лимит)
+    assert names(again) == ["accepted", "error"] and again[0][1]["replayed"] is True
+    assert again[-1][1]["code"] == "internal"
+    assert p.stream_requests == []
+    resp, twice = await send(env, anna, x, kx)  # уже засчитан — не 429
+    assert resp.status_code == 200 and names(twice) == ["accepted", "error"]
+    assert p.stream_requests == []
+    resp, _ = await send(env, anna, mark("z"), uuid.uuid4())
+    _error(resp, 429, "rate_limited")
+    charged = [r for r in await rows(engine, anna.id) if r["client_message_id"] == kx]
+    assert len(charged) == 1 and charged[0]["limit_charged"] is True
+
+
 # --------------------------------------------------------------------------- обратимость 0018
 
-NEW_COLUMNS = {"client_message_id", "reply_to_id", "crisis", "reply_lease_until", "limit_charged"}
+NEW_COLUMNS = {
+    "client_message_id",
+    "reply_to_id",
+    "crisis",
+    "reply_lease_until",
+    "limit_charged",
+    "safety_recorded",
+}
+CONSTRAINTS_AT_HEAD = [
+    "ck_conversation_messages_agent_only_fields",
+    "ck_conversation_messages_owner_only_fields",
+    "fk_conversation_messages_reply_to_id_conversation_messages",
+    "uq_conversation_messages_conversation_id_id",
+]
+
+
+async def _constraints(c: Any) -> list[str]:
+    """Ограничения 0018/0020: по именам головы и 0018 (удвоенный префикс) и любые CHECK."""
+    res = await c.execute(
+        text(
+            "SELECT conname FROM pg_constraint WHERE conrelid = "
+            "'conversation_messages'::regclass AND (contype = 'c' OR conname IN ("
+            "'uq_conversation_messages_conversation_id_id', "
+            "'fk_conversation_messages_reply_to_id_conversation_messages', "
+            "'ck_conversation_messages_owner_only_fields', "
+            "'ck_conversation_messages_agent_only_fields', "
+            "'ck_conversation_messages_ck_conversation_messages_owner_b5e5', "
+            "'ck_conversation_messages_ck_conversation_messages_agent_afa2')) ORDER BY 1"
+        )
+    )
+    return [r[0] for r in res]
 
 
 async def _columns(engine: AsyncEngine) -> set[str]:
@@ -686,28 +925,23 @@ async def test_migration_0018_reversible(
     )
     async with engine.connect() as c:
         before = (await c.execute(text(dump_sql), {"u": anna.id})).scalar_one()
+        # A8-2.2-D5 (0020): на голове ограничения — ровно с этими именами (иначе проверка
+        # отсутствия ниже ничего бы не проверяла).
+        assert await _constraints(c) == CONSTRAINTS_AT_HEAD
     try:
         alembic("downgrade", "0017")
         await engine.dispose()
         assert NEW_COLUMNS.isdisjoint(await _columns(engine))
         async with engine.connect() as c:
             assert (await c.execute(text(dump_sql), {"u": anna.id})).scalar_one() == before
-            left = (
-                await c.execute(
-                    text(
-                        "SELECT count(*) FROM pg_constraint WHERE conrelid = "
-                        "'conversation_messages'::regclass AND conname IN ("
-                        "'uq_conversation_messages_conversation_id_id', "
-                        "'fk_conversation_messages_reply_to_id_conversation_messages', "
-                        "'ck_conversation_messages_owner_only_fields', "
-                        "'ck_conversation_messages_agent_only_fields')"
-                    )
-                )
-            ).scalar_one()
-            assert left == 0
+            # Ни имён головы, ни имён, которые давал 0018 (удвоенный префикс), ни любого CHECK
+            # по колонкам 0018.
+            assert await _constraints(c) == []
         alembic("upgrade", "head")
         await engine.dispose()
         assert NEW_COLUMNS <= await _columns(engine)
+        async with engine.connect() as c:
+            assert await _constraints(c) == CONSTRAINTS_AT_HEAD
         alembic("check")
     finally:
         alembic("upgrade", "head")

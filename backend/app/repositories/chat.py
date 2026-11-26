@@ -995,14 +995,35 @@ async def set_memory_embedding(
 
 
 async def record_safety_events(
-    sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID, types: Iterable[str]
+    sm: async_sessionmaker[AsyncSession],
+    user_id: uuid.UUID,
+    types: Iterable[str],
+    *,
+    turn_id: uuid.UUID | None = None,
 ) -> int:
     """События кризисного протокола — только тип, без текста (ТЗ §9.3). ``types`` — строки
-    ``crisis.CrisisType``; неизвестные пропускаются. Партнёру ничего не сообщается."""
+    ``crisis.CrisisType``; неизвестные пропускаются. Партнёру ничего не сообщается.
+
+    ``turn_id`` — реплика владельца, по которой события (0020, АР-51; ревью 2.2 р.2 MINOR-N1):
+    отметка ``safety_recorded`` ставится в той же транзакции; уже отмеченная (или чужая,
+    удалённая) реплика — событий не пишется (0): повтор с тем же ключом второго события на ту же
+    реплику не даёт, в том числе при одновременных запросах (строка реплики блокируется)."""
     values = list(dict.fromkeys(SAFETY_EVENT_TYPES[t] for t in types if t in SAFETY_EVENT_TYPES))
     if not values:
         return 0
     async with user_scope(sm, user_id) as s:
+        if turn_id is not None:
+            marked = await s.execute(
+                text(
+                    "UPDATE conversation_messages m SET safety_recorded = true "
+                    "FROM conversations c JOIN agents a ON a.id = c.agent_id "
+                    "WHERE m.id = :i AND c.id = m.conversation_id AND a.user_id = :u "
+                    "AND m.author = 'owner' AND NOT m.safety_recorded RETURNING m.id"
+                ),
+                {"i": turn_id, "u": user_id},
+            )
+            if marked.one_or_none() is None:
+                return 0
         for value in values:
             await s.execute(
                 text(

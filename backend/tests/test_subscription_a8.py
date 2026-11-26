@@ -1335,12 +1335,6 @@ async def test_r2_existing_role_with_dangerous_attribute_stops_0019(
         assert await _r2_state(c) == (HEAD, False, True, "f,f,f,f,f,f,f")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-4.4-D3: 0019 проверяет атрибуты существующей feelings_billing, но не членства: "
-    "если роль приложения (feelings_api/feelings_app) уже член feelings_billing, миграция "
-    "проходит, и сессия пользователя делает SET ROLE feelings_billing — граница п.7 снята",
-)
 @pytest.mark.parametrize("member", ["feelings_api", "feelings_app"])
 async def test_r2_existing_role_with_app_member_stops_0019(
     sessionmaker: SM, engine: AsyncEngine, member: str
@@ -1432,11 +1426,15 @@ async def test_r2_downgrade_upgrade_switches_period_rule_and_keeps_dates(
     assert (st["status"], st["period_end"]) == ("canceled", p1["period_end"])
     before = datetime.now(UTC)
     p4 = await _credit(sessionmaker, engine, inv, b, _charge())
-    assert before + timedelta(days=30) <= p4["period_end"] <= datetime.now(UTC) + timedelta(days=30)
+    # 0020 (ревью 4.4 р.2 MAJOR-2; правка A1 — на проверку A8): P2 и период «старого правила»
+    # (60 дней подряд) начинаются внутри нового периода — его конец продлевается на них, 30
+    # оплаченных дней не теряются: доступ до now() + 90 дней (было: перекрытие терялось).
+    span = timedelta(days=90)
+    assert before + span <= p4["period_end"] <= datetime.now(UTC) + span
     for who in (a, b):
         assert await _call(sessionmaker, who, HAS_ACCESS) is True
     st = await _one(sessionmaker, a, STATUS)
-    assert (st["status"], st["period_end"]) == ("active", old_rule["period_end"])
+    assert (st["status"], st["period_end"]) == ("active", p4["period_end"])
     with pytest.raises(DBAPIError) as ei:
         async with user_scope(sessionmaker, None) as s:
             await s.execute(text(LOOKUP), {"ch": ch1})
@@ -1474,7 +1472,7 @@ async def test_r2_refund_all_but_future_then_two_payments(
 ) -> None:
     """P1, P2, P3 подряд; возврат P1 и P2 — разрыв до начала P3: доступа нет, статус по
     последнему начавшемуся — ``canceled`` с концом P1 (не «истёк» с будущей датой); оплата —
-    сразу [now, +30], затем вторая — в оставшийся разрыв [+30, +60], цепочка до конца P3."""
+    сразу [now, +30], затем вторая — с конца P4 через P3 (0020: продлена на длину P3)."""
     a, b, _c = await _couple(sessionmaker, engine)
     inv = await _invoice(sessionmaker, a)
     ch1, ch2 = _charge(), _charge()
@@ -1493,9 +1491,12 @@ async def test_r2_refund_all_but_future_then_two_payments(
     assert abs(p4["period_end"] - p1["period_end"]) < timedelta(seconds=30)
     assert (await _one(sessionmaker, a, STATUS))["period_end"] == p4["period_end"]
     p5 = await _credit(sessionmaker, engine, inv, a, _charge())
-    assert p5["period_end"] == p4["period_end"] + timedelta(days=30)
+    # 0020 (ревью 4.4 р.2 MAJOR-2; правка A1 — на проверку A8): P5 встаёт после P4, P3 начинается
+    # внутри P5 (на время, прошедшее между оплатами P1 и P4), — конец P5 продлевается на длину P3,
+    # ни секунды оплаченного не теряется (было: P5 = P4 + 30 дней, перекрытие с P3 терялось).
+    assert p5["period_end"] == p3["period_end"] + (p4["period_end"] - p1["period_end"])
     st = await _one(sessionmaker, a, STATUS)
-    assert (st["status"], st["period_end"]) == ("active", p3["period_end"])
+    assert (st["status"], st["period_end"]) == ("active", p5["period_end"])
     assert p5["period_end"] > p2["period_end"] - timedelta(seconds=30)
 
 

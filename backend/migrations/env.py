@@ -1,7 +1,9 @@
 """Alembic env. Адрес БД — из FEELINGS_DATABASE_URL или параметра -x db_url=... (CLAUDE.md: без секретов в репозитории)."""
 
 import asyncio
+import importlib.util
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import pool
@@ -25,15 +27,32 @@ config.set_main_option("sqlalchemy.url", db_url)
 target_metadata = Base.metadata
 
 
+def _billing_guard_sql() -> str:
+    """Страж роли платежей (``migrations/billing_guard.py``; АР-50 п.7, ревью 4.4 р.2 MAJOR-1):
+    исполняется при **каждом** запуске Alembic до миграций, в той же транзакции."""
+    path = Path(__file__).with_name("billing_guard.py")
+    spec = importlib.util.spec_from_file_location("_feelings_billing_guard", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"не найден страж роли платежей: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return str(mod.GUARD_SQL)
+
+
+BILLING_GUARD_SQL = _billing_guard_sql()
+
+
 def run_migrations_offline() -> None:
     context.configure(url=db_url, target_metadata=target_metadata, literal_binds=True)
     with context.begin_transaction():
+        context.execute(BILLING_GUARD_SQL)
         context.run_migrations()
 
 
 def do_run_migrations(connection: Connection) -> None:
     context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
+        context.execute(BILLING_GUARD_SQL)
         context.run_migrations()
 
 
