@@ -27,8 +27,11 @@ export type OwnerStatus =
   | { kind: "answered" }
   /** Сервер реплику не сохранил — повтор безопасен. */
   | { kind: "unsent"; note: string; retry: boolean }
-  /** Реплика сохранена, ответа агента нет. */
-  | { kind: "unanswered"; note: string; retry: boolean }
+  /**
+   * Реплика сохранена, ответа агента нет. `help` — ответ модели не получен событием `error` (в том числе отказ):
+   * под подписью строка о помощи со 112 (АР-34 п.2) — это могла быть нераспознанная реплика человека в кризисе.
+   */
+  | { kind: "unanswered"; note: string; retry: boolean; help?: boolean }
   /** Не удалось узнать, сохранилась ли реплика (нет связи и после сбоя). Повтор сначала проверит историю. */
   | { kind: "unknown"; note: string }
   /** Дневной лимит (429): реплика сохранена, агент ответит после окна. */
@@ -113,6 +116,8 @@ export class ChatSession {
   private started = false;
   /** Последний обмен: локальный ключ реплики владельца и её текст. */
   private turn: { key: string; text: string } | null = null;
+  /** Нужен перезапуск истории после 422 по курсору; подпись «загрузить заново» — когда он удастся (Б-62). */
+  private restartPending = false;
 
   constructor(private readonly api: Api) {}
 
@@ -167,9 +172,11 @@ export class ChatSession {
   /**
    * Первая страница истории. `restart` — после 422 по курсору: прежние старые страницы сброшены, история
    * начинается заново (контракт, Б-62). Сохраняются локальные реплики, которых сервер не подтвердил, и
-   * контакты помощи под кризисными ответами (по id).
+   * контакты помощи под кризисными ответами (по id), а также реплика идущего обмена и её ответ (422 по старой
+   * странице может прийти посреди отправки). Если перезапуск сам не удался, подпись появится после удачного повтора.
    */
   private async loadFirst(restart: boolean): Promise<void> {
+    if (restart) this.restartPending = true;
     this.set({ history: "loading", historyError: null, olderError: null });
     let page: ChatHistory;
     try {
@@ -181,14 +188,19 @@ export class ChatSession {
     this.set((s) => {
       const crisisById = new Map(s.items.filter((it) => it.id && it.crisis).map((it) => [it.id, it.crisis]));
       const server = chronological(page).map((it) => (crisisById.has(it.id) ? { ...it, crisis: crisisById.get(it.id) } : it));
+      const live = s.phase !== "idle" && this.turn ? this.turn.key : null;
       const pendingLocal = s.items.filter(
-        (it) => it.id === null && (it.status?.kind === "unsent" || it.status?.kind === "unknown"),
+        (it) =>
+          (it.id === null && (it.status?.kind === "unsent" || it.status?.kind === "unknown")) ||
+          (live !== null && (it.key === live || (it.key === `${live}-reply` && it.id === null))),
       );
+      const restarted = restart || this.restartPending || s.restarted;
+      this.restartPending = false;
       return {
         items: [...server, ...pendingLocal],
         cursor: page.next_cursor,
         history: "loaded",
-        restarted: restart || s.restarted,
+        restarted,
       };
     });
   }
@@ -327,7 +339,7 @@ export class ChatSession {
     // `error`: реплика сохранена (контракт), показанные куски не сохранены — помечаются прерванными.
     this.patchItem(replyKey, { partial: "interrupted" });
     const note = chatErrorText(outcome.code);
-    this.patchItem(key, { status: { kind: "unanswered", note, retry: true } });
+    this.patchItem(key, { status: { kind: "unanswered", note, retry: true, help: true } });
     this.set({ phase: "idle", live: "", outcome: this.next("failed") });
   }
 
@@ -427,9 +439,11 @@ export class ChatSession {
         : result === "unanswered"
           ? { kind: "unanswered", note, retry: true }
           : { kind: "unsent", note: `${note} Сообщение не сохранилось.`, retry: true };
+    // Реплики, которые уже пришли перезагрузкой истории посреди обмена (422 по курсору), встают в `tail` — не дважды.
+    const freshIds = new Set(fresh.map((it) => it.id));
     this.set((s) => {
       const keep = s.items
-        .filter((it) => it.key !== key && !(answered && it.key === `${key}-reply`))
+        .filter((it) => it.key !== key && !(answered && it.key === `${key}-reply`) && !(it.id && freshIds.has(it.id)))
         .map((it) => (ids.has(it.key) ? { ...it, id: ids.get(it.key) as string } : it));
       const tail = fresh.map((it, i) => (i === ownerAt ? { ...it, key, status } : it));
       if (ownerAt < 0) {

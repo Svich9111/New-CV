@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useSyncExternalStore, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent } from "react";
 import { useApp } from "../app/store";
 import { MAX_TEXT, visibleItems, type ChatItem, type ChatSession, type ChatState } from "../chat/session";
 import { DOUBLE_TAP_MS } from "../telegram/MainButton";
@@ -9,6 +9,25 @@ import { HelpContacts } from "./Help";
 
 /** С какой длины показывать счётчик символов. */
 const COUNTER_FROM = 3500;
+/** Окно ближе этого к низу ленты — лента «прилипла» и следует за новыми репликами. */
+const STICK_PX = 48;
+/** Зазор между последним пузырём и закреплённым полем ввода при прокрутке. */
+const GAP_PX = 12;
+
+/**
+ * Строка о помощи под ошибкой ответа агента (АР-34 п.2, ТЗ §9.3): ответа модели нет — это могла быть
+ * нераспознанная реплика человека в кризисе, поэтому номер и переход в «Помощь» — прямо здесь.
+ */
+function HelpLine({ onHelp }: { onHelp: () => void }) {
+  return (
+    <span className="help-line">
+      Если тебе сейчас опасно или очень тяжело — звони <a href="tel:112">112</a>.{" "}
+      <button type="button" className="help-line__more" onClick={onHelp}>
+        Все контакты помощи
+      </button>
+    </span>
+  );
+}
 
 const SEND_ICON = (
   <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -21,7 +40,19 @@ function useChat(chat: ChatSession): ChatState {
 }
 
 /** Подпись под репликой владельца: что с ней (ТЗ §8 — состояние словами, не цветом) и повтор. */
-function OwnerCaption({ item, chat, phase }: { item: ChatItem; chat: ChatSession; phase: ChatState["phase"] }) {
+function OwnerCaption({
+  item,
+  chat,
+  phase,
+  onRetry,
+  onHelp,
+}: {
+  item: ChatItem;
+  chat: ChatSession;
+  phase: ChatState["phase"];
+  onRetry: () => void;
+  onHelp: () => void;
+}) {
   const st = item.status;
   if (!st || st.kind === "answered") return null;
   if (st.kind === "sending") {
@@ -43,11 +74,15 @@ function OwnerCaption({ item, chat, phase }: { item: ChatItem; chat: ChatSession
           type="button"
           className="btn btn--ghost msg__retry"
           disabled={phase !== "idle"}
-          onClick={() => void chat.retry(item.key)}
+          onClick={() => {
+            onRetry();
+            void chat.retry(item.key);
+          }}
         >
           {st.kind === "unsent" ? "Отправить ещё раз" : st.kind === "unknown" ? "Проверить и повторить" : "Повторить"}
         </button>
       )}
+      {st.kind === "unanswered" && st.help && <HelpLine onHelp={onHelp} />}
     </div>
   );
 }
@@ -77,6 +112,16 @@ export function Chat() {
   const inputId = useId();
   const counterId = useId();
   const end = useRef<HTMLDivElement>(null);
+  const screenRef = useRef<HTMLElement>(null);
+  const list = useRef<HTMLOListElement>(null);
+  const bottom = useRef<HTMLDivElement>(null);
+  /** Лента у низа — следует за новым. Считается по прокрутке человека, то есть до роста пузыря. */
+  const follow = useRef(true);
+  /** Прокрутить к концу при следующей отрисовке, даже если человек читает выше: своя отправка или повтор. */
+  const force = useRef(false);
+  const lastCrisis = useRef(state.outcome?.kind === "crisis" ? state.outcome.seq : 0);
+  /** Человек читает выше, а внизу появилось новое — кнопка «К новым». */
+  const [behind, setBehind] = useState(false);
   const lastOutcome = useRef(state.outcome?.seq ?? 0);
   // «Остановить» появляется на месте «Отправить»: второе касание двойного нажатия не должно остановить ответ.
   const sentAt = useRef(0);
@@ -95,12 +140,85 @@ export function Chat() {
 
   const items = visibleItems(state.items);
   const last = items[items.length - 1];
-  // Новая реплика и куски ответа — лента прокручивается к концу (если человек не листает историю выше).
+
+  /** Высота закреплённого низа (поле ввода, «Помощь») — отступ прокрутки, чтобы пузырь не уходил под него. */
+  const bottomHeight = useCallback(() => bottom.current?.getBoundingClientRect().height ?? 0, []);
+  const syncBottom = useCallback(() => {
+    screenRef.current?.style.setProperty("--chat-bottom-h", `${Math.ceil(bottomHeight())}px`);
+  }, [bottomHeight]);
+
+  /** К концу ленты: последний пузырь (и уведомление о лимите) — над полем ввода. */
+  const toEnd = useCallback(() => {
+    syncBottom();
+    end.current?.scrollIntoView?.({ block: "end" });
+    follow.current = true;
+    setBehind(false);
+  }, [syncBottom]);
+
+  /**
+   * Кризис — всегда в зоне видимости (ТЗ §9.3): ответ протокола с блоком «Помощь рядом» целиком над полем ввода,
+   * а если он не помещается — блок помощи с начала (номера, 112).
+   */
+  const toCrisis = useCallback(() => {
+    syncBottom();
+    const li = list.current?.lastElementChild;
+    const block = li?.querySelector(".crisis");
+    const room = window.innerHeight - bottomHeight() - 2 * GAP_PX;
+    if (!li || !block || li.getBoundingClientRect().height <= room) {
+      toEnd();
+      return;
+    }
+    block.scrollIntoView?.({ block: "start" });
+  }, [bottomHeight, syncBottom, toEnd]);
+
+  // Прокрутка человека: у низа — лента следует за новым; ушёл выше читать — не дёргаем.
+  useEffect(() => {
+    const onScroll = () => {
+      const doc = document.documentElement;
+      follow.current = doc.scrollHeight - (window.scrollY + window.innerHeight) <= STICK_PX;
+      if (follow.current) setBehind(false);
+    };
+    // Клавиатура телефона и поворот меняют высоту окна: прилипшая лента остаётся у низа.
+    const onResize = () => {
+      if (follow.current) toEnd();
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onResize);
+    let ro: ResizeObserver | undefined;
+    if (typeof ResizeObserver === "function" && bottom.current) {
+      ro = new ResizeObserver(() => {
+        syncBottom();
+        if (follow.current) end.current?.scrollIntoView?.({ block: "end" });
+      });
+      ro.observe(bottom.current);
+    }
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onResize);
+      ro?.disconnect();
+    };
+  }, [syncBottom, toEnd]);
+
+  // Новая реплика, начало и куски ответа, кризис, лимит — прокрутка по правилам выше.
+  const crisisSeq = state.outcome?.kind === "crisis" ? state.outcome.seq : 0;
+  const lastKey = last?.key;
+  const lastText = last?.text;
+  const lastStatus = last?.status?.kind;
   useLayoutEffect(() => {
-    const doc = document.documentElement;
-    const nearBottom = window.innerHeight + window.scrollY >= doc.scrollHeight - 160;
-    if (nearBottom) end.current?.scrollIntoView?.({ block: "end" });
-  }, [items.length, last?.text, state.phase]);
+    if (crisisSeq !== lastCrisis.current) {
+      lastCrisis.current = crisisSeq;
+      force.current = false;
+      toCrisis();
+      return;
+    }
+    if (force.current || follow.current) {
+      force.current = false;
+      toEnd();
+      return;
+    }
+    if (lastKey !== undefined) setBehind(true);
+    // Подгрузка более ранних сообщений сверху конец ленты не меняет — она сюда не попадает.
+  }, [lastKey, lastText, lastStatus, state.phase, state.limit, crisisSeq, toEnd, toCrisis]);
 
   const inFlight = state.phase === "waiting" || state.phase === "streaming";
   const canSend =
@@ -109,7 +227,10 @@ export function Chat() {
   const send = () => {
     if (!canSend) return;
     tg.impact("light");
-    if (chat.send()) sentAt.current = Date.now();
+    if (chat.send()) {
+      sentAt.current = Date.now();
+      force.current = true;
+    }
   };
 
   const stop = () => {
@@ -127,7 +248,7 @@ export function Chat() {
   };
 
   return (
-    <section className="chat-screen" data-screen="chat">
+    <section className="chat-screen" data-screen="chat" ref={screenRef}>
       <Heading>Твой агент</Heading>
       <p className="chat-privacy small muted">
         Этот разговор видишь только ты. Партнёр и его агент его не видят — им уходит только то, что ты отправишь
@@ -172,7 +293,7 @@ export function Chat() {
         </p>
       )}
 
-      <ol className="chat" aria-label="Переписка с агентом">
+      <ol className="chat" aria-label="Переписка с агентом" ref={list}>
         {items.map((it) => (
           <li
             key={it.key}
@@ -182,7 +303,19 @@ export function Chat() {
           >
             <span className="visually-hidden">{it.author === "owner" ? "Ты: " : "Агент: "}</span>
             <MessageText text={it.text} />
-            {it.author === "owner" ? <OwnerCaption item={it} chat={chat} phase={state.phase} /> : <AgentCaption item={it} />}
+            {it.author === "owner" ? (
+              <OwnerCaption
+                item={it}
+                chat={chat}
+                phase={state.phase}
+                onRetry={() => {
+                  force.current = true;
+                }}
+                onHelp={() => push({ name: "help" })}
+              />
+            ) : (
+              <AgentCaption item={it} />
+            )}
             {it.crisis && (
               <section className="crisis" aria-label="Контакты помощи">
                 <h2 className="crisis__title">Помощь рядом</h2>
@@ -210,8 +343,9 @@ export function Chat() {
         <Notice>
           <b>На сегодня лимит сообщений агенту исчерпан.</b>{" "}
           {state.limit ? `Агент снова ответит ${state.limit}.` : "Агент снова ответит завтра."} Твоё сообщение
-          сохранено. Если тебе сейчас опасно или очень тяжело — всё равно напиши: в этом случае агент ответит и сверх
-          лимита, а контакты помощи доступны всегда.
+          сохранено. Если тебе сейчас опасно или очень тяжело — всё равно напиши: на такое сообщение тебе ответят и
+          сверх лимита и подскажут, куда обратиться. Экстренная помощь — <a href="tel:112">112</a>, контакты помощи
+          доступны всегда.
         </Notice>
       )}
 
@@ -219,9 +353,14 @@ export function Chat() {
       <div className="visually-hidden" role="status" aria-live="polite" data-live>
         {state.live}
       </div>
-      <div ref={end} />
+      <div ref={end} className="chat-end" />
 
-      <div className="chat-bottom">
+      <div className="chat-bottom" ref={bottom}>
+        {behind && (
+          <button type="button" className="btn btn--ghost chat-new" onClick={toEnd}>
+            К новым <span aria-hidden="true">↓</span>
+          </button>
+        )}
         <div className="composer">
           <label htmlFor={inputId} className="visually-hidden">
             Сообщение агенту

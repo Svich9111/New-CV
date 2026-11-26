@@ -377,7 +377,7 @@ describe("A8 2.2 — 429 и Retry-After (ТЗ §10; контракт RateLimited
 
   // A8-2.2-D1: огромный Retry-After (число цифрами, проходит /^\d+$/) — дата за пределом Date: на экране
   // «Invalid Date после Invalid Date (через … ч)». Ожидается: понятный текст без «Invalid Date» (ТЗ §10, §8).
-  test.fails("A8-2.2-D1: огромный Retry-After — без «Invalid Date» в тексте лимита", () => {
+  test("A8-2.2-D1: огромный Retry-After — без «Invalid Date» в тексте лимита", () => {
     const now = new Date(2026, 10, 26, 12, 0, 0).getTime();
     const t = limitUntilText(99_999_999_999_999, now);
     expect(t).not.toMatch(/Invalid|NaN/);

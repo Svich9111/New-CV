@@ -57,7 +57,9 @@ const CHAT_SEND: Record<string, string> = {
   validation_error: "Сообщение пустое или длиннее 4000 символов — поправь и отправь снова.",
   conflict_retry: "Сообщение не сохранилось из-за сбоя. Отправь его ещё раз.",
   rate_limited: "На сегодня лимит сообщений агенту исчерпан.",
-  refusal: "Агент не смог ответить на это сообщение. Попробуй сказать иначе или повтори.",
+  // Под подписью любой ошибки `error` экран добавляет строку о помощи со 112 (АР-34 п.2): отказ может быть
+  // репликой человека в кризисе, которую не распознали.
+  refusal: "Агент не смог ответить на это сообщение. Можно повторить.",
   unavailable: "Агент сейчас недоступен. Попробуй ещё раз чуть позже.",
   quota: "Агент временно недоступен по техническим причинам. Попробуй позже.",
   bad_output: "Ответ агента пришёл с ошибкой. Попробуй ещё раз.",
@@ -105,14 +107,22 @@ export function chatErrorText(code: string): string {
   return CHAT_SEND[code] ?? CHAT_SEND.internal;
 }
 
+/** Дальше этого срока дата лимита пишется с годом, без «через N ч». */
+const YEAR_MS = 366 * 86_400_000;
+
 /**
  * Когда снова можно писать агенту после дневного лимита (429, `Retry-After`): время на часах устройства и
- * сколько ждать — «после 00:00 (через 3 ч.)», «завтра после 09:30 (через 12 ч.)».
+ * сколько ждать — «после 00:00 (через 3 ч.)», «завтра после 09:30 (через 12 ч.)». Срок дальше года — дата с
+ * годом; срок за пределами дат (огромный `Retry-After`) — «позже», без «Invalid Date».
  */
 export function limitUntilText(retryAfter: number, now: number = Date.now()): string {
   const at = new Date(now + retryAfter * 1000);
-  const today = new Date(now);
+  if (!Number.isFinite(retryAfter) || retryAfter < 0 || Number.isNaN(at.getTime())) return "позже";
   const time = at.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  if (at.getTime() - now > YEAR_MS) {
+    return `${at.toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" })} после ${time}`;
+  }
+  const today = new Date(now);
   const dayDiff = Math.round(
     (new Date(at.getFullYear(), at.getMonth(), at.getDate()).getTime() -
       new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()) /

@@ -398,7 +398,7 @@ describe("A8 2.2 — лимит 429 на экране (ТЗ §10)", () => {
   });
 
   // A8-2.2-D1 на экране: огромный Retry-After — «Агент снова ответит Invalid Date после Invalid Date …».
-  test.fails("A8-2.2-D1: Retry-After огромный — на экране нет «Invalid Date»", async () => {
+  test("A8-2.2-D1: Retry-After огромный — на экране нет «Invalid Date»", async () => {
     const server = pairedServer();
     server.reply({ status: 429, body: { code: "rate_limited", message: "x" }, headers: { "Retry-After": "99999999999999" } });
     const r = await openChat(server);
@@ -447,7 +447,7 @@ describe("A8 2.2 — курсор и 422 на экране (Б-62)", () => {
   // прошёл — подписи «Переписку пришлось загрузить заново…» нет: `loadFirst(true)` выходит по ошибке до
   // `restarted: true`, а повтор идёт с `restart = false`. Лента молча стала короче (было 40, стало 30).
   // Ожидается подпись (карточка, критерий 1; Б-62).
-  test.fails("A8-2.2-D3: после 422 → 503 → повтор подпись «Переписку пришлось загрузить заново» есть", async () => {
+  test("A8-2.2-D3: после 422 → 503 → повтор подпись «Переписку пришлось загрузить заново» есть", async () => {
     const server = pairedServer().seedChat(40);
     flaky(server);
     const r = await openChat(server);
@@ -508,7 +508,7 @@ describe("A8 2.2 — новая реплика и кризис видны без
   // блок «Помощь рядом» с tel:112 остаются ниже закреплённого поля ввода; к тому же `scrollIntoView` метки
   // конца ставит последний пузырь под закреплённый `.chat-bottom` (sticky). Ожидается: после своей отправки и
   // при кризисе лента прокручивается к новому пузырю (карточка: «контакты помощи … сразу на экране»).
-  test.fails("A8-2.2-D4: своя отправка и кризис прокручивают ленту к концу, даже если окно не у самого низа", async () => {
+  test("A8-2.2-D4: своя отправка и кризис прокручивают ленту к концу, даже если окно не у самого низа", async () => {
     const server = pairedServer().seedChat(10);
     server.reply({ steps: [crisis("Ответ протокола.")] });
     const r = await openChat(server);

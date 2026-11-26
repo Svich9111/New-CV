@@ -207,7 +207,16 @@ fieldset.field { border: 0; padding: 0; margin-left: 0; margin-right: 0; min-wid
 .msg__meta { display: block; font-size: var(--font-size-meta); opacity: .75; margin-top: 4px; }
 .msg__fail { display: flex; flex-direction: column; gap: 8px; font-size: var(--font-size-small); margin-top: 6px; }
 .msg__retry { align-self: flex-start; color: var(--own-text); border-color: var(--own-text); }
-.crisis { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+.crisis { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); scroll-margin-top: 12px; }
+/* Номер помощи в уведомлении (лимит) — цветом текста, не цветом ссылки браузера. */
+.note a { color: inherit; font-weight: 700; text-decoration: underline; text-underline-offset: 3px; }
+/* Строка о помощи под ошибкой ответа (АР-34 п.2): цвет пузыря, без красного. */
+.help-line { display: block; }
+.help-line a, .help-line__more { color: inherit; font-weight: 700; text-decoration: underline; text-underline-offset: 3px; }
+.help-line__more { border: 0; background: transparent; padding: 4px 0; font-size: inherit; }
+/* Прокрутка к концу ленты: последний пузырь — над закреплённым полем ввода (высоту ставит экран). */
+.chat-end { scroll-margin-bottom: calc(var(--chat-bottom-h, 0px) + 12px); }
+.chat-new { align-self: center; margin-bottom: 8px; min-height: var(--tap); padding: 6px 16px; background: var(--bg); }
 .crisis__title { font-size: var(--font-size-lead); margin: 4px 0 4px; }
 .chat-bottom {
   position: sticky;

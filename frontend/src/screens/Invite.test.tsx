@@ -75,6 +75,7 @@ describe("Приглашение — инициатор (ФТ-03, ТЗ §4.1 п.
     expect(await screen.findByText(/Ты и Игорь теперь на связи/)).toBeInTheDocument();
     // 2.2: «Вы пара» — главный экран; главное действие — вход в чат с агентом (а не кнопка экрана приглашения).
     expect(r.tg!.main.text).toBe("Поговорить с агентом");
+    expect(r.tg!.main.visible).toBe(true);
     expect(r.tg!.haptics).toContain("notify:success");
   });
 
