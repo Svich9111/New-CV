@@ -9,6 +9,7 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import text
@@ -90,6 +91,86 @@ def _encryption_keys_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FEELINGS_ENCRYPTION_KEYS", TEST_ENCRYPTION_KEYS)
     monkeypatch.setenv("FEELINGS_ENCRYPTION_KEY_ID", "t1")
     monkeypatch.setenv("FEELINGS_MEMORY_FINGERPRINT_KEY", TEST_FINGERPRINT_KEY)
+
+
+# ---------------------------------------------------------------- набор выпуска «изоляция» (4.3)
+# Маркер ``isolation`` на существующих тестах — по перечню ``tests/_isolation_set.py`` (без правки
+# их файлов); новые ``test_isolation_release*.py`` помечены сами. ``--isolation-min=N`` — режим
+# шага CI (ТЗ §9.2 п.4): собрано меньше N тестов набора или хоть один пропущен (skip) — сборка
+# красная; xfail(strict=True) — известные дефекты, считаются и печатаются отдельно.
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--isolation-min",
+        type=int,
+        default=None,
+        help="4.3: не меньше N тестов с маркером isolation и ни одного пропуска",
+    )
+
+
+def _isolation_match(nodeid: str, entry: str) -> bool:
+    if entry.endswith(("::", "_")):
+        return nodeid.startswith(entry)
+    return nodeid == entry or nodeid.startswith(entry + "[")
+
+
+@pytest.hookimpl(tryfirst=True)  # до отбора по -m: маркер должен быть уже проставлен
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    from tests._isolation_set import ISOLATION_SET
+
+    used: set[str] = set()
+    files = {item.nodeid.split("::", 1)[0] for item in items}
+    for item in items:
+        for entry in ISOLATION_SET:
+            if _isolation_match(item.nodeid, entry):
+                item.add_marker(pytest.mark.isolation)
+                used.add(entry)
+    release = config.getoption("--isolation-min") is not None
+    stale = [e for e in ISOLATION_SET if e not in used and (release or e.split("::")[0] in files)]
+    if stale:
+        raise pytest.UsageError(f"tests/_isolation_set.py: записи ничего не собрали: {stale}")
+
+
+_ISOLATION_STATS: dict[str, list[str]] = {"selected": [], "skipped": [], "xfailed": []}
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    need = session.config.getoption("--isolation-min")
+    if need is None:
+        return
+    selected = [i.nodeid for i in session.items if i.get_closest_marker("isolation")]
+    _ISOLATION_STATS["selected"] = selected
+    if len(selected) < need or len(selected) != len(session.items):
+        raise pytest.UsageError(
+            f"набор isolation: собрано {len(selected)} из {len(session.items)} выбранных, "
+            f"нужно не меньше {need} и только тесты набора (-m isolation)"
+        )
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if report.skipped:
+        key = "xfailed" if hasattr(report, "wasxfail") else "skipped"
+        _ISOLATION_STATS[key].append(report.nodeid)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if session.config.getoption("--isolation-min") is None:
+        return
+    if _ISOLATION_STATS["skipped"] and exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
+    if config.getoption("--isolation-min") is None:
+        return
+    s = _ISOLATION_STATS
+    terminalreporter.write_line(
+        f"isolation: собрано {len(s['selected'])} (минимум {config.getoption('--isolation-min')}), "
+        f"пропущено {len(s['skipped'])}, xfail {len(s['xfailed'])}"
+    )
+    for nodeid in s["skipped"]:
+        terminalreporter.write_line(f"isolation: ПРОПУЩЕН (сборка красная): {nodeid}", red=True)
 
 
 # Фикстура world (пара Анна и Игорь, посторонняя Ольга) доступна всем модулям тестов.

@@ -40,6 +40,12 @@ jobs:
       # test_login_roles.py запускает infra/db/roles.sql настоящим psql (нужен ≥ 15, \getenv).
       - run: psql --version
       - run: make backend-lint
+      # ТЗ §9.2 п.4 (задача 4.3): изоляция агентов и устойчивость к инструкциям — отдельной
+      # строкой сборки, на каждый PR и push в main. Красный, если собрано меньше N тестов набора
+      # (N — tests/_isolation_set.py, ISOLATION_MIN), 0 собранных (код pytest 5) или хоть один
+      # пропущен (skip: «нет БД» ≠ зелёный). Перечень тестов — tests/_isolation_set.py.
+      - name: Isolation release set (pytest -m isolation)
+        run: cd backend && uv run --locked pytest -m isolation -q --isolation-min=349
       - run: make backend-test
 
   frontend:
