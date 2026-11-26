@@ -36,7 +36,7 @@ def _billing_guard_sql() -> str:
         raise RuntimeError(f"не найден страж роли платежей: {path}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return str(mod.GUARD_SQL)
+    return str(mod.MIGRATION_GUARD_SQL)
 
 
 BILLING_GUARD_SQL = _billing_guard_sql()

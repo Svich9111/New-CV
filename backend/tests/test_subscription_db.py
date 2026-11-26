@@ -746,7 +746,7 @@ async def test_billing_role_is_the_only_bot_context(sessionmaker: SM, engine: As
         assert _sqlstate(ei.value) == "22P02", sql
     # Ошибочно выданный EXECUTE другой роли: отказ даёт сама функция (role ≠ feelings_billing) —
     # во всех четырёх функциях бота (ревью р.2 MINOR-3).
-    calls = (
+    calls: tuple[tuple[str, dict[str, Any]], ...] = (
         (PRECHECK, pre),
         (CREDIT, {**pre, "ch": _charge()}),
         (REFUNDED, {"ch": _charge()}),
@@ -824,7 +824,10 @@ async def _paid_days_from_now(engine: AsyncEngine, couple: uuid.UUID) -> timedel
     [
         (20, 60),  # пример ревью: P1 [-10, +20] возвращён, P2 [+20, +50] → 20 + 30 (P2) + 10
         (5, 60),  # разрыв 5 дней: 5 + 30 (P2) + 25
-        (30, 60),  # разрыв ровно в период: P3 встык к P2 — без перекрытия
+        # разрыв ровно в период: P2 начинается не ровно в конце P3, а на доли секунды раньше
+        # (``now()`` более раннего UPDATE), поэтому P3 продлевается на P2 — итог тот же 60 дней.
+        # Ровную границу ``v_next = v_finish`` проверяет test_credit_future_at_exact_finish_*.
+        (30, 60),
         (45, 30),  # разрыв длиннее периода: P3 [now, +30], P2 — позже, отдельно
     ],
 )
@@ -947,10 +950,133 @@ GUARD_CASES = {
         ],
         None,
     ),
+    # Ревью р.3 N1, A8-4.4-D4: ADMIN без SET/INHERIT — только у владельца схемы public
+    # (``nspowner``; при ``pg_database_owner`` — владелец базы) и у роли, исполняющей миграции.
     "owner_admin_only": (
         [
             "CREATE ROLE a1g_owner LOGIN CREATEROLE",
             "GRANT feelings_billing TO a1g_owner WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+            "ALTER SCHEMA public OWNER TO a1g_owner",
+        ],
+        None,
+    ),
+    "db_owner_admin_only": (
+        [
+            "CREATE ROLE a1g_owner LOGIN CREATEROLE",
+            "GRANT feelings_billing TO a1g_owner WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+            "DO $$BEGIN EXECUTE format('ALTER DATABASE %I OWNER TO a1g_owner', "
+            "current_database()); END$$",
+        ],
+        None,
+    ),
+    "db_owner_admin_on_bot_login": (
+        [
+            "CREATE ROLE a1g_owner LOGIN CREATEROLE",
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+            "GRANT feelings_billing TO a1g_owner WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+            "GRANT feelings_billing_login TO a1g_owner WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+            "DO $$BEGIN EXECUTE format('ALTER DATABASE %I OWNER TO a1g_owner', "
+            "current_database()); END$$",
+        ],
+        None,
+    ),
+    "stranger_admin_only": (
+        [
+            "CREATE ROLE a1g_owner LOGIN CREATEROLE",
+            "GRANT feelings_billing TO a1g_owner WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ],
+        "не только у роли входа бота и владельца схемы: a1g_owner",
+    ),
+    "stranger_inherits_owner_admin": (
+        [
+            "CREATE ROLE a1g_owner NOLOGIN NOINHERIT",
+            "GRANT feelings_billing TO a1g_owner WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+            "ALTER SCHEMA public OWNER TO a1g_owner",
+            "CREATE ROLE a1g_login LOGIN INHERIT",
+            "GRANT a1g_owner TO a1g_login",
+        ],
+        "не только у роли входа бота и владельца схемы: a1g_login",
+    ),
+    "stranger_admin_only_on_bot_login": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "CREATE ROLE a1g_login LOGIN NOINHERIT",
+            "GRANT feelings_billing_login TO a1g_login WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+        ],
+        "не только у роли входа бота и владельца схемы: a1g_login",
+    ),
+    "bot_login_admin_option": (
+        [
+            "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+            "GRANT feelings_billing TO feelings_billing_login WITH ADMIN TRUE, INHERIT FALSE, "
+            "SET TRUE",
+        ],
+        "feelings_billing_login может выдавать feelings_billing (ADMIN OPTION)",
+    ),
+    # Б-97, A8 R5: роль входа бота — LOGIN NOINHERIT без особых прав.
+    **{
+        f"bot_login_{attr.lower()}": (
+            [
+                "CREATE ROLE feelings_billing_login LOGIN NOINHERIT",
+                f"ALTER ROLE feelings_billing_login {attr}",
+                "GRANT feelings_billing TO feelings_billing_login WITH INHERIT FALSE, SET TRUE",
+            ],
+            "feelings_billing_login имеет INHERIT или особые права",
+        )
+        for attr in ("INHERIT", "CREATEROLE", "CREATEDB", "BYPASSRLS")
+    },
+    "bot_login_superuser": (
+        ["CREATE ROLE feelings_billing_login LOGIN SUPERUSER"],
+        "feelings_billing_login входит в другие роли: она суперпользователь",
+    ),
+    # A8 R6: у feelings_billing — только EXECUTE на функции бота и USAGE на public.
+    "billing_select_table": (
+        ["GRANT SELECT ON users TO feelings_billing"],
+        "лишние права или объекты: SELECT ON users",
+    ),
+    "billing_select_column": (
+        ["GRANT SELECT (id) ON users TO feelings_billing"],
+        "лишние права или объекты: SELECT (id) ON users",
+    ),
+    "billing_sequence": (
+        [
+            "CREATE SEQUENCE a1g_seq",
+            "GRANT USAGE ON SEQUENCE a1g_seq TO feelings_billing",
+        ],
+        "лишние права или объекты: USAGE ON a1g_seq",
+    ),
+    "billing_owns_table": (
+        ["CREATE TABLE a1g_tab (id int)", "ALTER TABLE a1g_tab OWNER TO feelings_billing"],
+        "лишние права или объекты: OWNER OF a1g_tab",
+    ),
+    "billing_user_function": (
+        ["GRANT EXECUTE ON FUNCTION app_has_access() TO feelings_billing"],
+        "лишние права или объекты: EXECUTE ON FUNCTION app_has_access()",
+    ),
+    "billing_bot_function_grant_option": (
+        [f"GRANT EXECUTE ON FUNCTION {BOT_FUNCS[3]} TO feelings_billing WITH GRANT OPTION"],
+        "лишние права или объекты: EXECUTE ON FUNCTION app_bot_payment_lookup",
+    ),
+    "billing_create_on_public": (
+        ["GRANT CREATE ON SCHEMA public TO feelings_billing"],
+        "лишние права или объекты: CREATE ON SCHEMA public",
+    ),
+    "billing_default_privileges": (
+        ["ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO feelings_billing"],
+        "лишние права или объекты: DEFAULT PRIVILEGES SELECT (r)",
+    ),
+    "billing_temp_on_database": (
+        [
+            "DO $$BEGIN EXECUTE format('GRANT TEMP ON DATABASE %I TO feelings_billing', "
+            "current_database()); END$$"
+        ],
+        "лишние права или объекты: TEMPORARY ON DATABASE",
+    ),
+    "billing_connect_ok": (
+        [
+            "DO $$BEGIN EXECUTE format('GRANT CONNECT ON DATABASE %I TO feelings_billing', "
+            "current_database()); END$$"
         ],
         None,
     ),
@@ -965,9 +1091,11 @@ async def test_billing_guard_stops_migrations(engine: AsyncEngine, case: str) ->
     из env.py всё равно исполняется; и ``downgrade 0019`` → ``upgrade head`` — страж внутри 0020),
     если ``feelings_billing`` член другой роли, если в неё входят роли приложения (в т.ч. через
     вложенную роль и только с ADMIN), если стать ею может кто-то, кроме роли входа бота
-    ``feelings_billing_login`` и суперпользователей, или если роль входа бота — член другой роли.
-    Роль входа бота и ADMIN владельца схемы без SET — допустимы. Всё — в откатываемой транзакции
-    (роли кластера не меняются)."""
+    ``feelings_billing_login`` и суперпользователей, если роль входа бота — член другой роли, с
+    ``INHERIT``/особыми правами или с ADMIN OPTION, если членство (в т.ч. только ADMIN) в роли
+    платежей или в роли входа бота есть у кого-то, кроме владельца схемы, и если у роли платежей
+    лишние права или объекты (р.3: N1, A8-4.4-D4, R5, R6). Роль входа бота и ADMIN владельца схемы
+    (или базы) без SET — допустимы. Всё — в откатываемой транзакции (роли кластера не меняются)."""
     setup, stop = GUARD_CASES[case]
     async with engine.connect() as c:
         tx = await c.begin()
@@ -978,7 +1106,7 @@ async def test_billing_guard_stops_migrations(engine: AsyncEngine, case: str) ->
             if stop is None:
                 for step in steps:
                     await c.run_sync(alembic_on, *step)
-                await c.execute(text(GUARD.GUARD_SQL))
+                await c.execute(text(GUARD.MIGRATION_GUARD_SQL))
             else:
                 with pytest.raises(DBAPIError) as ei:
                     for step in steps:
@@ -986,7 +1114,7 @@ async def test_billing_guard_stops_migrations(engine: AsyncEngine, case: str) ->
                 assert stop in str(ei.value.orig), (case, steps, str(ei.value.orig))
                 await c.execute(text("ROLLBACK TO SAVEPOINT guard"))
                 with pytest.raises(DBAPIError):
-                    await c.execute(text(GUARD.GUARD_SQL))
+                    await c.execute(text(GUARD.MIGRATION_GUARD_SQL))
                 await c.execute(text("ROLLBACK TO SAVEPOINT guard"))
             version = (await c.execute(text("SELECT version_num FROM alembic_version"))).scalar()
             assert version == HEAD, (case, steps)
@@ -1000,7 +1128,150 @@ async def test_billing_guard_stops_migrations(engine: AsyncEngine, case: str) ->
             )
         )
         assert left.scalar() == 0
-        await c.execute(text(GUARD.GUARD_SQL))  # после отката — снова чисто
+        await c.execute(text(GUARD.MIGRATION_GUARD_SQL))  # после отката — снова чисто
+
+
+async def test_billing_guard_allows_admin_of_migration_runner(engine: AsyncEngine) -> None:
+    """Ревью р.3 N1: ADMIN без SET/INHERIT у роли, исполняющей миграции (``current_user``), страж
+    пропускает; та же роль с ADMIN у постороннего — остановка; ADMIN правила 7–8 — только в
+    ``MIGRATION_GUARD_SQL`` (``GUARD_SQL`` — кто уже может стать ролью платежей). Откат."""
+    async with engine.connect() as c:
+        tx = await c.begin()
+        await c.execute(text("CREATE ROLE a1g_runner LOGIN NOINHERIT"))
+        await c.execute(
+            text("GRANT feelings_billing TO a1g_runner WITH ADMIN TRUE, INHERIT FALSE, SET FALSE")
+        )
+        await c.execute(text(GUARD.GUARD_SQL))
+        await c.execute(text("SAVEPOINT g"))
+        with pytest.raises(DBAPIError) as ei:
+            await c.execute(text(GUARD.MIGRATION_GUARD_SQL))
+        assert "владельца схемы: a1g_runner" in str(ei.value.orig)
+        await c.execute(text("ROLLBACK TO SAVEPOINT g"))
+        await c.execute(text("SET LOCAL ROLE a1g_runner"))
+        await c.execute(text(GUARD.MIGRATION_GUARD_SQL))
+        await c.execute(text("RESET ROLE"))
+        await tx.rollback()
+    async with engine.connect() as c:
+        left = await c.execute(text("SELECT count(*) FROM pg_roles WHERE rolname LIKE 'a1g\\_%'"))
+        assert left.scalar() == 0
+
+
+# --------------------------------------------------------------------------- 0020: граница и откат
+
+# (будущие периоды пары [начало, конец] в днях от now(); ожидаемый конец 30-дневной оплаты).
+EXACT_FINISH = {
+    # Будущий период начинается ровно в «естественном» конце (v_next = v_finish): без продления.
+    "natural_finish": ([(30, 60)], 30),
+    # Ровно в продлённом конце: первый внутри продлевает до 35, второй (с 35) — уже нет.
+    "extended_finish": ([(10, 15), (35, 50)], 35),
+    # Два будущих периода с разрывом между ними — два прохода цикла.
+    "two_futures_with_gap": ([(5, 10), (20, 25)], 40),
+}
+
+
+@pytest.mark.parametrize("case", list(EXACT_FINISH))
+async def test_credit_future_at_exact_finish_does_not_extend(
+    sessionmaker: SM, engine: AsyncEngine, case: str
+) -> None:
+    """Ревью 4.4 р.3 N3 (0020, АР-50 п.4): граница цикла «продлить конец» — период, начинающийся
+    ровно в конце нового (``v_next = v_finish``, выход по ``>=``), конец не продлевает; несколько
+    будущих периодов с разрывом — по проходу на каждый. Всё в одной транзакции (один ``now()``,
+    точность до микросекунды); зачисление — как у бота (роль платежей, пустой ``app.user_id``)."""
+    futures, exp_days = EXACT_FINISH[case]
+    a, _b, couple = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    tg = await _tg_id(engine, a)
+    async with engine.connect() as c:
+        tx = await c.begin()
+        now = (await c.execute(text("SELECT now()"))).scalar_one()
+        for start, end in futures:
+            await c.execute(
+                text(
+                    "INSERT INTO subscriptions (couple_id, payer_id, plan, status, period_start, "
+                    "period_end) VALUES (:c, :p, 'month', 'active', "
+                    "now() + make_interval(days => :s), now() + make_interval(days => :e))"
+                ),
+                {"c": couple, "p": a, "s": start, "e": end},
+            )
+        await c.execute(text("SET LOCAL ROLE feelings_billing"))
+        await c.execute(text("SELECT set_config('app.user_id', '', true)"))
+        row = (
+            (
+                await c.execute(
+                    text(CREDIT),
+                    {"i": inv, "tg": tg, "amount": 250, "cur": "XTR", "ch": _charge()},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        await c.execute(text("RESET ROLE"))
+        assert row["result"] == "credited", case
+        start_end = (
+            await c.execute(
+                text("SELECT period_start, period_end FROM subscriptions WHERE id = :s"),
+                {"s": row["subscription_id"]},
+            )
+        ).one()
+        assert start_end == (now, now + timedelta(days=exp_days)), case
+        await tx.rollback()
+    assert await _subs_count_active(engine, couple) == 0
+
+
+CHANGED_0020 = ("app_subscription_status()", BOT_FUNCS[1])
+
+
+async def _changed_0020_state(engine: AsyncEngine) -> dict[str, tuple[Any, ...]]:
+    """Сигнатура → (тело, определение, ACL, SECURITY DEFINER, настройки, владелец)."""
+    out: dict[str, tuple[Any, ...]] = {}
+    async with engine.connect() as conn:
+        for sig in CHANGED_0020:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT p.prosrc, pg_get_functiondef(p.oid), p.proacl::text, p.prosecdef, "
+                        "p.proconfig, pg_get_userbyid(p.proowner) "
+                        "FROM pg_proc p WHERE p.oid = to_regprocedure(:f)"
+                    ),
+                    {"f": sig},
+                )
+            ).one()
+            out[sig] = tuple(row)
+    return out
+
+
+async def test_migration_0020_reversible_restores_functions_exactly(
+    engine: AsyncEngine, app_engine: AsyncEngine
+) -> None:
+    """Ревью 4.4 р.3 N2: downgrade 0020 восстанавливает ``app_subscription_status`` и
+    ``app_bot_payment_credit`` точно как их создаёт 0019 (тело, определение, ACL, SECURITY
+    DEFINER, ``search_path``, владелец). Эталон — состояние, собранное настоящими миграциями
+    (head → 0018 → 0019); тела 0019 совпадают со сборкой ``M20._sql_0019()``; снова upgrade —
+    тела 0020 (``M20.upgrade_sql()``) и прежнее состояние головы; ``alembic check`` чист."""
+    head_state = await _changed_0020_state(engine)
+    built_19, built_20 = M20._sql_0019(), M20.upgrade_sql()
+    for (sig, (body, *_rest)), stmt in zip(head_state.items(), built_20, strict=True):
+        assert body in stmt, sig
+    try:
+        alembic("downgrade", "0018")
+        alembic("upgrade", "0019")
+        await engine.dispose()
+        ref_19 = await _changed_0020_state(engine)
+        for (sig, (body, *_rest)), stmt in zip(ref_19.items(), built_19, strict=True):
+            assert body in stmt, sig
+            assert body != head_state[sig][0], sig
+        alembic("upgrade", "0020")
+        await engine.dispose()
+        assert await _changed_0020_state(engine) == head_state
+        alembic("downgrade", "0019")
+        await engine.dispose()
+        assert await _changed_0020_state(engine) == ref_19
+    finally:
+        alembic("upgrade", "head")
+        await engine.dispose()
+        await app_engine.dispose()
+    alembic("check")
+    assert await _changed_0020_state(engine) == head_state
 
 
 def test_bot_bodies_markers_and_role_check_are_verified() -> None:

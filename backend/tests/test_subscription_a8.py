@@ -1993,12 +1993,8 @@ async def test_r3_admin_holders_escalate_and_next_run_catches(
     await _r3_no_leftovers(engine)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-4.4-D4: страж допускает ADMIN без SET/INHERIT у любой роли (и ADMIN у роли входа "
-    "бота, и любое членство в роли входа бота), а АР-50 п.7 допускает его только у владельца "
-    "схемы: такая роль выдаёт себе или feelings_api SET на feelings_billing без суперпользователя",
-)
+# A8-4.4-D4 исправлен в страже (4.4 р.3, A1: правила 7–8, ``MIGRATION_GUARD_SQL``): xfail снят,
+# тело не менялось.
 @pytest.mark.parametrize("case", list(R3_ADMIN_HOLES))
 async def test_r3_guard_stops_admin_outside_schema_owner(engine: AsyncEngine, case: str) -> None:
     """АР-50 п.7 («ADMIN без SET/INHERIT у владельца схемы допустим»): ADMIN у посторонней роли
