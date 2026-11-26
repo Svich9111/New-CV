@@ -83,8 +83,21 @@ function Screen({ route, api }: { route: Route; api: Api }) {
  * До входа и после — один и тот же каркас (`Frame`) в одном месте дерева: при переходе «Входим…» → первый
  * экран ссылка «Помощь» и кнопка «Назад» не пересоздаются (фокус и нажатие не теряются).
  */
-function Session({ api, tg, boot, onRetry }: { api: Api; tg: TelegramApi; boot: Boot; onRetry: () => void }) {
-  const [helpBeforeLogin, setHelpBeforeLogin] = useState(false);
+function Session({
+  api,
+  tg,
+  boot,
+  onRetry,
+  help,
+}: {
+  api: Api;
+  tg: TelegramApi;
+  boot: Boot;
+  onRetry: () => void;
+  /** «Помощь» была открыта до запуска (ждали SDK): сессия начинается с неё. */
+  help: boolean;
+}) {
+  const [helpBeforeLogin, setHelpBeforeLogin] = useState(help);
   const [me, setMe] = useState<Me | null>(null);
   const [stack, setStack] = useState<Route[]>([]);
   const [invite, setInvite] = useState<InviteCreated | null>(null);
@@ -94,10 +107,13 @@ function Session({ api, tg, boot, onRetry }: { api: Api; tg: TelegramApi; boot: 
   const [onboardingDraft, setOnboardingDraft] = useState<OnboardingDraft | null>(null);
 
   // Вход завершился: первый экран по онбордингу, паре и startapp. Вычисляется при отрисовке (состояние из
-  // свойства), поэтому промежуточного кадра без экрана нет.
+  // свойства), поэтому промежуточного кадра без экрана нет. Если человек открыл «Помощь» до окончания входа,
+  // она остаётся на месте, а «Назад» ведёт на первый экран (ТЗ §9.3, n-6).
   if (boot.kind === "ready" && me === null) {
+    const first = initialRoute(boot.me, tg.startParam);
     setMe(boot.me);
-    setStack([initialRoute(boot.me, tg.startParam)]);
+    setStack(helpBeforeLogin ? [first, { name: "help" }] : [first]);
+    if (helpBeforeLogin) setHelpBeforeLogin(false);
   }
 
   const push = useCallback((r: Route) => setStack((s) => [...s, r]), []);
@@ -259,8 +275,22 @@ class Boundary extends Component<{ api: Api; onRestart: () => void; children: Re
 export type SdkWait = "waiting" | "failed";
 
 /** Без SDK: «Открой в Telegram» (или ожидание SDK внутри Telegram) и «Помощь» (публичный путь, без входа). */
-function Outside({ api, sdk }: { api: Api; sdk?: SdkWait }) {
-  const [help, setHelp] = useState(false);
+function Outside({
+  api,
+  sdk,
+  initialHelp,
+  onHelp,
+}: {
+  api: Api;
+  sdk?: SdkWait;
+  initialHelp: boolean;
+  onHelp?: (open: boolean) => void;
+}) {
+  const [help, setHelpState] = useState(initialHelp);
+  const setHelp = (open: boolean) => {
+    setHelpState(open);
+    onHelp?.(open);
+  };
   const screen =
     sdk === "waiting" ? <WaitingForTelegram /> : sdk === "failed" ? <TelegramUnavailable /> : <OpenInTelegram />;
   return (
@@ -274,7 +304,21 @@ function Outside({ api, sdk }: { api: Api; sdk?: SdkWait }) {
  * Корень Mini App. Вход по initData (ФТ-01) → экран по состоянию онбординга, пары и `startapp`.
  * Вне Telegram (нет initData) запросов входа нет — только «Открой в Telegram» и «Помощь».
  */
-export function App({ tg, api, sdk }: { tg: TelegramApi; api: Api; sdk?: SdkWait }) {
+export function App({
+  tg,
+  api,
+  sdk,
+  help = false,
+  onHelp,
+}: {
+  tg: TelegramApi;
+  api: Api;
+  sdk?: SdkWait;
+  /** Приложение перезапущено (пришёл SDK), а «Помощь» была открыта: открыть сразу её (ТЗ §9.3). */
+  help?: boolean;
+  /** Сообщает запуску, открыта ли «Помощь» на экране без SDK, — чтобы перезапуск её сохранил. */
+  onHelp?: (open: boolean) => void;
+}) {
   const [boot, setBoot] = useState<Boot>({ kind: "loading" });
   const started = useRef(false);
   const [generation, setGeneration] = useState(0);
@@ -295,7 +339,13 @@ export function App({ tg, api, sdk }: { tg: TelegramApi; api: Api; sdk?: SdkWait
   }, [tg, login]);
 
   // Новое поколение (перезапуск из запасного экрана) — новая сессия с нуля: стек, черновики, «Помощь» до входа.
-  const body = tg.inside ? <Session api={api} tg={tg} boot={boot} onRetry={login} /> : <Outside api={api} sdk={sdk} />;
+  // «Помощь» из прошлого запуска открывается только в первом поколении, перезапуск с запасного экрана — с нуля.
+  const startHelp = help && generation === 0;
+  const body = tg.inside ? (
+    <Session api={api} tg={tg} boot={boot} onRetry={login} help={startHelp} />
+  ) : (
+    <Outside api={api} sdk={sdk} initialHelp={startHelp} onHelp={onHelp} />
+  );
 
   const restart = useCallback(() => {
     setGeneration((g) => g + 1);

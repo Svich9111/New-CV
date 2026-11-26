@@ -64,10 +64,14 @@ describe("A8 р.3 · D6: отказ show() после onClick() — обрабо
   });
 });
 
-describe("A8 р.3 · D6: повторное падение — статичный экран без цикла (ТЗ §9.3)", () => {
-  // Без подмены модулей: getComputedStyle бросает. MainButton экрана читает токены цвета в
-  // layout-эффекте и падает (запросы по роли — с hidden: true, чтобы Testing Library не звала getComputedStyle); MainButton «Перезапустить» запасного экрана — тоже. Второй рубеж — статичный экран.
-  test("упал экран и запасной экран — tel:112 ссылкой, конечное число попыток; «Перезапустить» при том же сбое — снова статичный экран", async () => {
+describe("A8 р.3 · D6: сбой getComputedStyle — кнопка в странице, экран не падает (ТЗ §8, §9.3)", () => {
+  // Обращён A4 (р.4) по замечанию A8 р.3 №3: прежде MainButton читал токены цвета вне withMain, сбой
+  // getComputedStyle ронял экран и запасной экран и уводил в LastResort. Теперь токены читаются под защитой:
+  // нативная кнопка скрыта, дальше — кнопка в странице, экраны не падают. Каскад «упал экран и запасной экран →
+  // статичный минимум без цикла» по-прежнему проверяется в App.boundary.test.tsx (D6, упал и запасной экран).
+  // Запросы по роли — с hidden: true, нажатия — click() элемента: иначе Testing Library и user-event сами зовут
+  // getComputedStyle у <html> и падают на подменённом сбое.
+  test("getComputedStyle бросает — «Твой личный агент» с кнопкой в странице, нативная скрыта, сбой не повторяется", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const real = globalThis.getComputedStyle.bind(globalThis);
     const broken = { on: false, calls: 0 };
@@ -81,25 +85,26 @@ describe("A8 р.3 · D6: повторное падение — статичны�
     const server = new FakeServer();
     // Сбой включён до запуска: тема применяется под защитой (start), а «Входим…» токенов цвета не читает.
     broken.on = true;
-    const r = renderApp({ server });
-    expect(await screen.findByText(/Приложение не может показать экран/)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "112", hidden: true })).toHaveAttribute("href", "tel:112");
+    const tg = fakeTelegram();
+    renderApp({ server, tg });
+    expect(await screen.findByRole("heading", { level: 1, name: "Твой личный агент", hidden: true })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Что-то пошло не так", hidden: true })).toBeNull();
+    expect(screen.queryByText(/Приложение не может показать экран/)).toBeNull();
+    expect(tg.main.visible).toBe(false);
+    // После первого отказа нативная кнопка больше не пробуется — и токены цвета не читаются снова.
     const calls = broken.calls;
+    expect(calls).toBeGreaterThan(0);
     expect(calls).toBeLessThanOrEqual(10);
     await act(async () => new Promise((res) => setTimeout(res, 100)));
     expect(broken.calls).toBe(calls);
 
-    const logins = server.calls("POST", "/auth/telegram").length;
-    await r.user.click(screen.getByRole("button", { name: "Перезапустить", hidden: true }));
-    expect(await screen.findByText(/Приложение не может показать экран/)).toBeInTheDocument();
-    expect(server.calls("POST", "/auth/telegram")).toHaveLength(logins + 1);
-    await act(async () => new Promise((res) => setTimeout(res, 100)));
-    expect(broken.calls - calls).toBeLessThanOrEqual(10);
-
+    await act(async () => screen.getByRole("button", { name: "Далее", hidden: true }).click());
+    expect(await screen.findByRole("heading", { level: 1, name: "Что приватно", hidden: true })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Что-то пошло не так", hidden: true })).toBeNull();
+    expect(tg.main.visible).toBe(false);
+    expect(broken.calls).toBe(calls);
+    expect(screen.getByRole("button", { name: "Помощь и контакты служб поддержки", hidden: true })).toBeInTheDocument();
     broken.on = false;
-    await r.user.click(screen.getByRole("button", { name: "Перезапустить", hidden: true }));
-    expect(await heading("Твой личный агент")).toBeInTheDocument();
-    expect(screen.queryByText(/Приложение не может показать экран/)).toBeNull();
   });
 });
 

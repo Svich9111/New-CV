@@ -15,11 +15,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  cleanup();
-  delete document.documentElement.dataset.theme;
-  delete (window as { Telegram?: unknown }).Telegram;
-  localStorage.clear();
-  sessionStorage.clear();
+  // Тесты сборки (окружение node, без DOM) проверяют только консоль.
+  if (typeof document !== "undefined") {
+    cleanup();
+    delete document.documentElement.dataset.theme;
+    delete (window as { Telegram?: unknown }).Telegram;
+    localStorage.clear();
+    sessionStorage.clear();
+  }
   const out = calls.splice(0);
   expect(out, "вывод в консоль").toEqual([]);
 });

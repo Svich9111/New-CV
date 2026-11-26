@@ -11,6 +11,7 @@
       страницу пустой: приложение ждёт SDK не дольше SDK_WAIT_MS (src/telegram/webapp.ts), а внутри Telegram
       (в адресе есть tgWebAppData) — до загрузки скрипта. Отметку «загрузился / не загрузился» (data-state)
       ставит внешний sdk-state.js, подключённый до SDK: в разметке нет встроенных обработчиков и стилей (CSP).
+      Путь от корня — файл из public/: при сборке Vite подставляет base (src/indexHtml.base.test.ts).
     -->
     <script src="/sdk-state.js"></script>
     <script id="telegram-web-app-sdk" async src="https://telegram.org/js/telegram-web-app.js"></script>

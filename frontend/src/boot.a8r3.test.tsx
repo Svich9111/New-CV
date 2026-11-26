@@ -130,17 +130,27 @@ describe("A8 р.3 · гонки загрузки SDK (n-2, n-3)", () => {
     expect(server.calls("POST", "/auth/telegram")).toHaveLength(1);
   });
 
-  test("SDK загрузился во время ожидания, пока была открыта «Помощь» — вход и обычный экран, без запасного", async () => {
+  // Обращён A4 (р.4) по замечанию A8 р.3 №1 и n-6 A6: прежде после прихода SDK «Помощь» закрывалась и
+  // показывался первый экран. Теперь «Помощь» остаётся (ТЗ §9.3), а «Назад» ведёт на первый экран.
+  test("SDK загрузился во время ожидания, пока была открыта «Помощь» — вход, «Помощь» на месте, «Назад» → первый экран", async () => {
     forgedHash();
     const server = await start();
     await screen.findByText(/Загружаем «Чувства AI»…/);
     await act(async () => screen.getByRole("button", { name: "Помощь и контакты служб поддержки" }).click());
     await screen.findByRole("link", { name: "112" });
-    window.Telegram = { WebApp: fakeTelegram().webApp };
+    const tg = fakeTelegram();
+    window.Telegram = { WebApp: tg.webApp };
     settle("loaded");
-    expect(await screen.findByRole("heading", { level: 1, name: "Твой личный агент" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Что-то пошло не так" })).toBeNull();
+    await act(async () => new Promise((r) => setTimeout(r, 30)));
     expect(server.calls("POST", "/auth/telegram")).toHaveLength(1);
+    expect(screen.getByRole("heading", { level: 1, name: "Помощь" })).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: "112" })).toHaveAttribute("href", "tel:112");
+    expect(screen.queryByRole("heading", { name: "Что-то пошло не так" })).toBeNull();
+    expect(tg.back.visible).toBe(true);
+    await act(async () => tg.back.click());
+    expect(await screen.findByRole("heading", { level: 1, name: "Твой личный агент" })).toBeInTheDocument();
+    expect(tg.back.visible).toBe(false);
+    expect(screen.getByRole("button", { name: "Помощь и контакты служб поддержки" })).toBeInTheDocument();
   });
 });
 

@@ -89,6 +89,13 @@ export function safely(fn: () => void): boolean {
 /** Скрипт SDK в index.html грузится асинхронно — страница и «Помощь» не ждут telegram.org. */
 export const SDK_SCRIPT_ID = "telegram-web-app-sdk";
 export const SDK_WAIT_MS = 4_000;
+/**
+ * Внутри Telegram «Загружаем…» показывается не дольше этого срока, затем — «Не получилось связаться» с
+ * «Попробовать снова». Нужен, когда событие ошибки скрипта уже не придёт: SDK упал до запуска приложения, а
+ * sdk-state.js не выполнился и не отметил это (n-7), или запрос к telegram.org повис. Поздний `load` всё равно
+ * запускает приложение с SDK.
+ */
+export const SDK_GIVE_UP_MS = 15_000;
 
 /**
  * Дождаться SDK Telegram: он уже загружен, или скрипт загрузился, или не загрузился, или вышел срок.
@@ -118,13 +125,20 @@ export function sdkScriptState(win: Window = window): "loaded" | "failed" | "pen
   return state === "loaded" || state === "failed" ? state : "pending";
 }
 
-/** Скрипт SDK загрузился или упал позже срока ожидания: `cb` вызывается один раз. Возвращает отписку. */
-export function onSdkScriptSettled(win: Window, cb: () => void): () => void {
+/** Чем закончилась загрузка скрипта SDK после срока ожидания: `load` или `error` самого тега. */
+export type SdkSettled = "load" | "error";
+
+/**
+ * Скрипт SDK загрузился или упал позже срока ожидания: `cb` вызывается один раз с типом события. Тип события
+ * берётся из самого события, а не из `data-state`: если sdk-state.js не выполнился (404, блокировка, выкладка
+ * не в корень), ошибка загрузки SDK всё равно видна (n-7). Возвращает отписку.
+ */
+export function onSdkScriptSettled(win: Window, cb: (event: SdkSettled) => void): () => void {
   const script = win.document.getElementById(SDK_SCRIPT_ID);
   if (!script) return () => undefined;
-  const done = () => {
+  const done = (e: Event) => {
     off();
-    cb();
+    cb(e.type === "error" ? "error" : "load");
   };
   const off = () => {
     script.removeEventListener("load", done);

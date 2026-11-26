@@ -68,10 +68,11 @@ export function MainButton({ text, onClick, disabled = false, progress = false }
   useLayoutEffect(() => {
     if (!wa) return;
     const active = !disabled;
-    // Недоступная кнопка выглядит серой: состояние видно не только по отсутствию реакции.
-    const color = cssToken(active ? "--accent" : "--disabled-bg");
-    const textColor = cssToken(active ? "--on-accent" : "--disabled-text");
     const ok = tg.withMain((mb) => {
+      // Недоступная кнопка выглядит серой: состояние видно не только по отсутствию реакции.
+      // Токены читаются под той же защитой: сбой getComputedStyle даёт кнопку в странице, а не падение экрана.
+      const color = cssToken(active ? "--accent" : "--disabled-bg");
+      const textColor = cssToken(active ? "--on-accent" : "--disabled-text");
       mb.setText(text);
       if (color && textColor) mb.setParams?.({ color, text_color: textColor });
       if (active) mb.enable();
