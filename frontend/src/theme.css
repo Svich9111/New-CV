@@ -1,4 +1,9 @@
-/* Палитра — ТЗ, раздел 8. Красный — только акцент главного действия и близости, не ошибки. */
+/* Токены дизайна — единственное место, где заданы цвета, шрифты, размеры и скругления.
+   Палитра — ТЗ §8 (стиль прототипа 0.6; макеты ждут утверждения оператором на гейте Г1).
+   Смена дизайна после Г1 — правка этого файла; app.css использует только var(--…).
+   Красный --accent — только главное действие (MainButton) и знаки близости; не для ошибок. */
+
+/* --- Базовые токены (совпадают с frontend/prototype/styles.css — проверка prototype/check.mjs) --- */
 :root {
   --bg: #ffffff;
   --bg-secondary: #f5f3f1;
@@ -6,11 +11,56 @@
   --accent: #e11d2e;
   --radius: 16px;
 }
-/* Тёмная тема следует теме Telegram (ТЗ §8): Mini App SDK выставляет data-theme на <html>
-   по Telegram.WebApp.colorScheme (задача 1.5). prefers-color-scheme — запасной вариант вне Telegram. */
+/* Тёмная тема следует теме Telegram (ТЗ §8): TelegramApi.applyTheme() ставит data-theme на <html>
+   по Telegram.WebApp.colorScheme. prefers-color-scheme — запасной вариант вне Telegram. */
 :root[data-theme="dark"] { --bg: #000000; --bg-secondary: #1a1a1a; --text: #ffffff; }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) { --bg: #000000; --bg-secondary: #1a1a1a; --text: #ffffff; }
 }
-body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; }
-.screen { padding: 24px 16px; }
+
+/* --- Производные токены (значения прототипа 0.6) --- */
+:root {
+  --text-muted: #5f5a55;
+  --line: #e6e2de;
+  --card-bg: #ffffff;
+  --on-accent: #ffffff;
+  --disabled-bg: #d9d5d1;
+  --disabled-text: #5f5a55;
+
+  --font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-size: 16px;
+  --font-size-lead: 18px;
+  --font-size-small: 14px;
+  --font-size-tiny: 13px;
+  --font-size-h1: 28px;
+  --font-size-h2: 20px;
+  --font-size-main: 17px;
+  --font-size-art: 40px;
+  --line-height: 1.45;
+
+  --radius-sm: 12px;
+  --radius-main: 14px;
+  --radius-art: 28px;
+  --radius-pill: 999px;
+
+  --gutter: 16px;
+  --tap: 44px;
+  --main-height: 52px;
+}
+:root[data-theme="dark"] {
+  --text-muted: #a8a29d;
+  --line: #2c2c2c;
+  --card-bg: #111111;
+  --disabled-bg: #2c2c2c;
+  --disabled-text: #a8a29d;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --text-muted: #a8a29d;
+    --line: #2c2c2c;
+    --card-bg: #111111;
+    --disabled-bg: #2c2c2c;
+    --disabled-text: #a8a29d;
+  }
+}
