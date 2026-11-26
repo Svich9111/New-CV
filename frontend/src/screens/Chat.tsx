@@ -82,7 +82,7 @@ function OwnerCaption({
           {st.kind === "unsent" ? "Отправить ещё раз" : st.kind === "unknown" ? "Проверить и повторить" : "Повторить"}
         </button>
       )}
-      {st.kind === "unanswered" && st.help && <HelpLine onHelp={onHelp} />}
+      {(st.kind === "unanswered" || st.kind === "unsent") && st.help && <HelpLine onHelp={onHelp} />}
     </div>
   );
 }

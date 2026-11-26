@@ -32,6 +32,7 @@ const bubbles = () =>
 const texts = () => bubbles().map((li) => `${li.dataset.author}:${li.querySelector(".msg__text")?.textContent}`);
 const live = () => document.querySelector("[data-live]") as HTMLElement;
 const posts = (r: Rendered) => r.server.calls("POST", "/chat/messages");
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 async function type(r: Rendered, text: string) {
   await r.user.clear(input());
@@ -194,7 +195,7 @@ describe("Отправка и поток ответа", () => {
     await r.user.clear(input());
     await r.user.type(input(), "Строка 1{Shift>}{Enter}{/Shift}Строка 2{Enter}");
     await waitFor(() => expect(posts(r)).toHaveLength(1));
-    expect(posts(r)[0].body).toEqual({ text: "Строка 1\nСтрока 2" });
+    expect(posts(r)[0].body).toEqual({ text: "Строка 1\nСтрока 2", client_message_id: expect.stringMatching(UUID) });
   });
 
   test("двойное нажатие (второе касание попадает в «Остановить» на том же месте) и Enter во время ответа — одна реплика, ответ не остановлен", async () => {
@@ -290,8 +291,12 @@ describe("Отмена, обрыв и повтор без дубля репли�
     await r.user.click(screen.getByRole("button", { name: "Повторить" }));
     await waitFor(() => expect(texts()).toEqual(["owner:Помоги", "agent:Вот ответ."]));
     expect(screen.queryByText("Ответ прервался и не сохранён.")).toBeNull();
-    // Сервер хранит обе попытки (контракт); на экране — одна реплика, и при новом открытии тоже.
-    expect(server.chat.map((m) => `${m.author}:${m.text}`)).toEqual(["owner:Помоги", "owner:Помоги", "agent:Вот ответ."]);
+    // Повтор — с тем же ключом (АР-51): сервер новой реплики не создал, ответ привязан к первой.
+    const keys = posts(r).map((p) => (p.body as { client_message_id: string }).client_message_id);
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+    expect(server.chat.map((m) => `${m.author}:${m.text}`)).toEqual(["owner:Помоги", "agent:Вот ответ."]);
+    expect(server.chat[1].reply_to).toBe(server.chat[0].id);
     await r.pressBack();
     await heading("Вы пара");
   });

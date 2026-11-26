@@ -1,4 +1,4 @@
-import { BadEvent, SseParser, isChatHistory, parseEvent, type CrisisEvent, type RawEvent } from "./chat";
+import { BadEvent, SseParser, isChatHistory, parseEvent, type AcceptedEvent, type CrisisEvent, type RawEvent } from "./chat";
 import { errorText, type Op } from "./messages";
 import type {
   ApiErrorBody,
@@ -75,6 +75,13 @@ export interface ChatSendOptions {
   signal?: AbortSignal;
   /** Очередной кусок ответа агента (`delta`). */
   onDelta(text: string): void;
+  /**
+   * Ключ идемпотентности реплики (АР-51): новый на каждую новую реплику, тот же — при её повторе. С ключом
+   * первое событие потока — `accepted` (до него `delta`/`done` — поток не по контракту, `bad_response`).
+   */
+  clientMessageId?: string;
+  /** Реплика владельца принята (`accepted`): её id — для сверки по id, а не по тексту. */
+  onAccepted?(a: AcceptedEvent): void;
 }
 
 interface RequestOptions {
@@ -305,8 +312,9 @@ export class Api {
 
   /**
    * Реплика владельца и потоковый ответ агента (`POST /chat/messages`, SSE). До потока — те же правила, что у
-   * остальных запросов: 401 — один повторный вход и один повтор, 409 `conflict_retry` — один повтор (ничего не
-   * сохранено, АР-24), прочие коды — `ApiError` (429 — с `Retry-After`).
+   * остальных запросов: 401 — один повторный вход и один повтор, 409 `conflict_retry` — один немедленный повтор
+   * (тем же телом, с тем же ключом), прочие коды — `ApiError` (429 — с `Retry-After`). С ключом 409 значит и
+   * «ответ на эту реплику ещё готовит другой запрос» (АР-51) — что делать дальше, решает `ChatSession`.
    *
    * После ответа 200 реплика владельца уже сохранена (контракт). Ошибки потока — `ApiError` со статусом 200:
    * `aborted` (остановил человек), `stream_broken` (соединение закрылось без завершающего события),
@@ -314,7 +322,7 @@ export class Api {
    * `ApiError(0, "aborted")`: сохранена ли реплика, неизвестно.
    */
   async chatSend(text: string, opts: ChatSendOptions): Promise<ChatOutcome> {
-    const body: ChatSendRequest = { text };
+    const body: ChatSendRequest = opts.clientMessageId ? { text, client_message_id: opts.clientMessageId } : { text };
     const open = async () => {
       try {
         return await this.openStream("/chat/messages", body, opts.signal);
@@ -412,11 +420,23 @@ export class Api {
     const parser = new SseParser();
     const decoder = new TextDecoder();
     let outcome: ChatOutcome | null = null;
+    const key = opts.clientMessageId;
+    // С ключом `accepted` — первое и единственное (АР-51). Кризис принимается и без него: помощь — всегда (§9.3).
+    let accepted = !key;
     const handle = (events: RawEvent[]) => {
       for (const raw of events) {
         if (outcome) return;
+        // Без ключа события `accepted` по контракту нет — незнакомое для этого запроса, пропускается.
+        if (raw.event === "accepted" && !key) continue;
         const ev = parseEvent(raw, isHelpContact);
         if (!ev) continue;
+        if (ev.event === "accepted") {
+          if (accepted || ev.data.clientMessageId !== key) throw new BadEvent();
+          accepted = true;
+          opts.onAccepted?.(ev.data);
+          continue;
+        }
+        if (!accepted && (ev.event === "delta" || ev.event === "done")) throw new BadEvent();
         if (ev.event === "delta") opts.onDelta(ev.text);
         else if (ev.event === "done") outcome = { kind: "done", data: ev.data };
         else if (ev.event === "crisis") outcome = { kind: "crisis", data: ev.data };

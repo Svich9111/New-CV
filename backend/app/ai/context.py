@@ -264,11 +264,13 @@ async def build_context(
     budget: ContextBudget | None = None,
     prompt_set: PromptSet = V0,
     for_draft: bool = False,
+    upto: chat.FeedPosition | None = None,
 ) -> BuiltContext:
     """Контекст агента владельца для ответа на реплику ``query`` (её текст уже сохранён в
     диалоге). Ошибки: ``chat.OwnerGone`` (нет владельца/агента), ``LookupError`` (диалог не
     свой), ``ValueError`` (последняя реплика — не владельца). Ошибка эмбеддинга не роняет
-    сборку: память — по свежести (``stats.embedding_error``)."""
+    сборку: память — по свежести (``stats.embedding_error``). ``upto`` — реплика ``query``
+    сохранена раньше (повтор с ключом, АР-51): реплики диалога после неё в контекст не идут."""
     budget = budget or ContextBudget()
     system = system_prompt("dialog", prompt_set)
     vector: list[float] | None = None
@@ -288,6 +290,7 @@ async def build_context(
         memory_limit=budget.memory_items,
         turns_limit=turns_read_limit(budget.max_chars),
         pair_limit=budget.pair_candidates,
+        upto=upto,
     )
     fragments: list[KnowledgeFragment] = []
     if knowledge is not None and budget.knowledge_items > 0:

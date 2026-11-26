@@ -17,6 +17,12 @@
    затем ровно одно из ``done`` / ``crisis`` / ``error``. Ответ агента сохраняется до
    завершающего события; склейка ``delta`` — ровно сохранённый текст.
 
+С ключом идемпотентности ``client_message_id`` (АР-51; ``_post_keyed``) шаг 2 —
+``chat.accept_owner_turn``: повтор с тем же ключом новой реплики не создаёт (ответ сохранён — он
+же потоком без модели и лимита; реплика без ответа — ответ на неё; ответ готовит другой запрос —
+409 ``conflict_retry``; под ключом другой текст — 422), первое событие потока — ``accepted``.
+Без ключа — всё как раньше (``accepted`` не отдаётся).
+
 Отключение клиента (и на шагах 3–4, и во время потока) отменяет все вызовы модели и дожидается
 их: шаги 3–4 идут задачей, которую снимает наблюдатель ``http.disconnect``; поток — задача-
 производитель, которую отменяет ответ ``EventStreamResponse``, а ``aclosing`` закрывает
@@ -77,6 +83,7 @@ KEEPALIVE_LINE = ": keep-alive\n\n"
 # ``internal`` (АР-32 п.4).
 ERROR_CODES = frozenset({"refusal", "unavailable", "quota", "bad_output"})
 INTERNAL_MESSAGE = "Не получилось ответить — попробуйте ещё раз. Ваше сообщение сохранено."
+CONFLICT_MESSAGE = "Не получилось с первого раза — повторите, пожалуйста"
 RATE_LIMITED_MESSAGE = "На сегодня лимит сообщений агенту исчерпан — продолжим завтра"
 # Служебный код журнала доступа (как у nginx): клиент ушёл до начала ответа, тело никто не
 # прочтёт. В контракте его нет — клиент его не видит (ревью 2.1 э.2 MINOR-7; объявление — A1).
@@ -88,6 +95,11 @@ LIMIT_STORE_TIMEOUT_S = 0.5  # Redis отвечает за миллисекун�
 LIMIT_STORE_COOLDOWN_S = 30.0  # «выключатель»: после сбоя столько не ходим в Redis (АР-34)
 SAFETY_EVENTS_TIMEOUT_S = 10.0  # запись safety_events в фоне — не дольше
 SAFETY_EVENTS_WAIT_S = 1.0  # сколько кризисное событие ждёт этой записи (контакты не задерживать)
+# Аренда ответа на реплику с ключом (АР-51): дольше любого ответа модели; сбойный процесс
+# отпускает реплику по этому сроку, штатно аренда снимается по завершении запроса.
+REPLY_LEASE_S = 300.0
+LEASE_RELEASE_TIMEOUT_S = 10.0
+BUSY_MESSAGE = "Ответ на это сообщение ещё готовится — повторите через несколько секунд"
 CURSOR_DOMAIN = b"feelings/chat-cursor/v1\x00"
 
 Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -115,6 +127,7 @@ class ChatRuntime:
     limit_fallback: MemoryDailyLimit = field(default_factory=MemoryDailyLimit)
     limit_timeout_s: float = LIMIT_STORE_TIMEOUT_S
     limit_cooldown_s: float = LIMIT_STORE_COOLDOWN_S
+    reply_lease_s: float = REPLY_LEASE_S
     background: set[asyncio.Task[Any]] = field(default_factory=set)
     safety_writes: set[asyncio.Task[None]] = field(default_factory=set)
     _models_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -212,6 +225,29 @@ class ChatRuntime:
         self.safety_writes.add(task)
         task.add_done_callback(self.safety_writes.discard)
         return task
+
+    def release_lease(
+        self,
+        sm: async_sessionmaker[AsyncSession],
+        user_id: uuid.UUID,
+        turn: chat_repo.OwnerTurn | None,
+    ) -> None:
+        """Снять аренду ответа (АР-51) фоновой задачей: отмена запроса (уход клиента) её не
+        отменяет; сбой — аренда истечёт по сроку, в журнал — только имя ошибки."""
+        if turn is None or turn.lease is None:
+            return
+        message_id, lease = turn.message_id, turn.lease
+
+        async def release() -> None:
+            try:
+                await asyncio.wait_for(
+                    chat_repo.release_reply_lease(sm, user_id, message_id, lease),
+                    LEASE_RELEASE_TIMEOUT_S,
+                )
+            except Exception as exc:
+                logger.warning("chat: reply lease not released: %s", type(exc).__name__)
+
+        self.spawn(release())
 
     async def aclose(self) -> None:
         """Остановка сервиса: записи ``safety_events`` дожидаются (не дольше
@@ -372,9 +408,11 @@ async def _prepare(
     user_id: uuid.UUID,
     conversation_id: uuid.UUID,
     body: str,
+    upto: FeedPosition | None = None,
 ) -> _Prepared:
     """Шаг 3: модели, сборка контекста §6.1 и классификатор. Ошибка сборки не лишает реплику
-    второй линии: классификатор видит хотя бы её саму (кризисный ответ — всегда, §9.3)."""
+    второй линии: классификатор видит хотя бы её саму (кризисный ответ — всегда, §9.3).
+    ``upto`` — ответ на реплику, сохранённую раньше (повтор с ключом): контекст — до неё."""
     out = _Prepared()
     try:
         out.models = await rt.agent_models(settings)
@@ -393,6 +431,7 @@ async def _prepare(
             knowledge=rt.knowledge,
             budget=rt.budget,
             prompt_set=rt.prompt_set,
+            upto=upto,
         )
     except OwnerGone as exc:
         raise unauthorized() from exc
@@ -477,6 +516,12 @@ class _Reply:
     body: str
     prep: _Prepared
     out: _Outcome
+    # Реплика владельца, на которую отвечаем (``reply_to`` ответа); None — не сохранена.
+    turn_id: uuid.UUID | None = None
+    # Тело события ``accepted`` — только при ключе ``client_message_id`` (АР-51).
+    accepted: dict[str, Any] | None = None
+    # Реплика с ключом: аренда снимается по завершении потока любым исходом.
+    turn: chat_repo.OwnerTurn | None = None
 
     def _err(self, code: str = "internal", message: str | None = None) -> dict[str, Any]:
         return _error_payload(code, message, no_verdict=self.prep.no_verdict)
@@ -485,6 +530,8 @@ class _Reply:
         """Производитель потока SSE (``EventStreamResponse``): ровно одно завершающее событие."""
         out = self.out
         try:
+            if self.accepted is not None:
+                await emit("accepted", self.accepted)
             await self._stream(emit)
         except asyncio.CancelledError:
             out.event = out.event or "cancelled"
@@ -494,6 +541,7 @@ class _Reply:
             if out.event is None:
                 await self._final(emit, "error", self._err())
         finally:
+            self.rt.release_lease(self.sm, self.user_id, self.turn)
             logger.info(
                 "chat reply: event=%s code=%s screen_ms=%s first_delta_ms=%s total_ms=%s "
                 "models=%s fallback=%s",
@@ -572,7 +620,13 @@ class _Reply:
             await self._final(emit, "error", self._err())
             return
         message_id = await chat_repo.add_message(
-            self.sm, self.keys, self.user_id, self.conversation_id, "agent", text
+            self.sm,
+            self.keys,
+            self.user_id,
+            self.conversation_id,
+            "agent",
+            text,
+            reply_to=self.turn_id,
         )
         if message_id is None:  # владелец удалён во время ответа (Б-44)
             await self._final(emit, "error", self._err())
@@ -594,7 +648,14 @@ class _Reply:
         if self.conversation_id is not None:
             try:
                 message_id = await chat_repo.add_message(
-                    self.sm, self.keys, self.user_id, self.conversation_id, "agent", ev.text
+                    self.sm,
+                    self.keys,
+                    self.user_id,
+                    self.conversation_id,
+                    "agent",
+                    ev.text,
+                    reply_to=self.turn_id,
+                    crisis=True,
                 )
             except Exception as exc:
                 logger.error("chat: crisis reply not saved: %s", type(exc).__name__)
@@ -652,8 +713,11 @@ async def post_message(
 ) -> Response:
     rt = runtime(request)
     started = time.monotonic()
+    key = payload.client_message_id
+    if key is not None:
+        return await _post_keyed(request, rt, payload.text, key, user_id, sm, keys, settings)
     try:
-        conversation_id, _ = await chat_repo.add_owner_turn(sm, keys, user_id, payload.text)
+        conversation_id, turn_id = await chat_repo.add_owner_turn(sm, keys, user_id, payload.text)
     except OwnerGone as exc:
         raise unauthorized() from exc
     except DBAPIError as exc:
@@ -675,14 +739,155 @@ async def post_message(
     force = prep.crisis or prep.no_verdict
     decision = await rt.acquire(user_id, settings.chat_daily_limit, force=force)
     if not decision.allowed:
-        logger.info("chat reply: event=rate_limited")
-        return JSONResponse(
-            status_code=429,
-            content={"code": "rate_limited", "message": RATE_LIMITED_MESSAGE},
-            headers={"Retry-After": str(decision.retry_after_s), "Cache-Control": "no-store"},
-        )
-    reply = _Reply(rt, sm, keys, user_id, conversation_id, payload.text, prep, _Outcome(started))
+        return _rate_limited(decision)
+    reply = _Reply(
+        rt, sm, keys, user_id, conversation_id, payload.text, prep, _Outcome(started), turn_id
+    )
     return EventStreamResponse(reply.produce, settings.chat_keepalive_s)
+
+
+def _rate_limited(decision: LimitDecision) -> JSONResponse:
+    logger.info("chat reply: event=rate_limited")
+    return JSONResponse(
+        status_code=429,
+        content={"code": "rate_limited", "message": RATE_LIMITED_MESSAGE},
+        headers={"Retry-After": str(decision.retry_after_s), "Cache-Control": "no-store"},
+    )
+
+
+def _accepted(message_id: uuid.UUID | None, key: uuid.UUID, *, replayed: bool) -> dict[str, Any]:
+    return {
+        "message_id": str(message_id) if message_id is not None else None,
+        "client_message_id": str(key),
+        "replayed": replayed,
+    }
+
+
+async def _post_keyed(
+    request: Request,
+    rt: ChatRuntime,
+    body: str,
+    key: uuid.UUID,
+    user_id: uuid.UUID,
+    sm: async_sessionmaker[AsyncSession],
+    keys: Keyring,
+    settings: Settings,
+) -> Response:
+    """Реплика с ключом идемпотентности ``client_message_id`` (АР-51). Повтор с тем же ключом
+    новой реплики не создаёт: ответ сохранён — он же потоком (``_replay``); реплика без ответа —
+    ответ на неё (контекст — до неё); ответ готовит другой запрос — 409 ``conflict_retry``;
+    под ключом другой текст — 422. Дальше — тот же порядок, что без ключа; лимит за реплику
+    засчитывается один раз (``limit_charged``). Аренда ответа снимается на любом исходе."""
+    started = time.monotonic()
+    try:
+        turn = await chat_repo.accept_owner_turn(
+            sm, keys, user_id, body, key, lease_s=rt.reply_lease_s
+        )
+    except OwnerGone as exc:
+        raise unauthorized() from exc
+    except DBAPIError as exc:
+        # 23505 — одновременная вставка того же ключа (страховка индекса 0018): как 40P01.
+        if sqlstate(exc) in RETRYABLE_SQLSTATES or sqlstate(exc) == "23505":
+            return _conflict(CONFLICT_MESSAGE)
+        return await _unsaved_turn(request, rt, settings, sm, keys, user_id, body, exc, key=key)
+    except Exception as exc:
+        return await _unsaved_turn(request, rt, settings, sm, keys, user_id, body, exc, key=key)
+    if turn.state == "busy":
+        logger.info("chat reply: event=busy")
+        return _conflict(BUSY_MESSAGE)
+    if turn.state == "mismatch":
+        raise AppError(422, "validation_error", "Проверьте данные")
+    if turn.state == "answered":
+        logger.info("chat reply: event=replayed")
+        return EventStreamResponse(lambda emit: _replay(emit, turn, key), settings.chat_keepalive_s)
+    replayed = turn.state == "unanswered"
+    text = turn.text if turn.text is not None else body
+    handed = False
+    try:
+        try:
+            prep = await until_disconnect(
+                request.receive,
+                _prepare(
+                    rt,
+                    settings,
+                    sm,
+                    keys,
+                    user_id,
+                    turn.conversation_id,
+                    text,
+                    turn.position if replayed else None,
+                ),
+            )
+        except ClientGone:
+            logger.info("chat reply: event=client_gone stage=prepare")
+            return Response(status_code=CLIENT_CLOSED)
+        _record_crisis_now(rt, sm, user_id, prep)
+        if not turn.limit_charged:
+            force = prep.crisis or prep.no_verdict  # АР-34 п.1
+            decision = await rt.acquire(user_id, settings.chat_daily_limit, force=force)
+            if not decision.allowed:
+                return _rate_limited(decision)
+            await _mark_charged(sm, user_id, turn.message_id)
+        reply = _Reply(
+            rt,
+            sm,
+            keys,
+            user_id,
+            turn.conversation_id,
+            text,
+            prep,
+            _Outcome(started),
+            turn.message_id,
+            _accepted(turn.message_id, key, replayed=replayed),
+            turn,
+        )
+        handed = True
+        return EventStreamResponse(reply.produce, settings.chat_keepalive_s)
+    finally:
+        if not handed:
+            rt.release_lease(sm, user_id, turn)
+
+
+async def _mark_charged(
+    sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID, message_id: uuid.UUID
+) -> None:
+    """Отметка «лимит засчитан» (АР-32, АР-51). Сбой отметки ответ не блокирует: повтор тогда
+    засчитается ещё раз (в журнал — только имя ошибки)."""
+    try:
+        await chat_repo.mark_limit_charged(sm, user_id, message_id)
+    except Exception as exc:
+        logger.warning("chat: limit mark not saved: %s", type(exc).__name__)
+
+
+async def _replay(emit: Emit, turn: chat_repo.OwnerTurn, key: uuid.UUID) -> None:
+    """Повтор с ключом, ответ уже сохранён (АР-51): ``accepted`` (``replayed: true``), затем
+    обычный ответ — ``delta`` с сохранённым текстом целиком и ``done`` (``suggest_draft`` не
+    хранится — false) или, для ответа кризисного протокола, ``crisis`` с контактами. Модель не
+    вызывается, лимит не расходуется."""
+    reply = turn.reply
+    await emit("accepted", _accepted(turn.message_id, key, replayed=True))
+    if reply is None or reply.text is None:
+        await emit("error", _error_payload("internal", None))
+    elif reply.crisis:
+        payload = {
+            "message_id": str(reply.id),
+            "text": reply.text,
+            "replace": False,
+            "contacts": help_contacts(),
+        }
+        await emit("crisis", payload)
+    else:
+        if reply.text:
+            await emit("delta", {"text": reply.text})
+        await emit("done", {"message_id": str(reply.id), "suggest_draft": False})
+
+
+def _conflict(message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"code": "conflict_retry", "message": message},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _record_crisis_now(
@@ -703,6 +908,8 @@ async def _unsaved_turn(
     user_id: uuid.UUID,
     body: str,
     error: Exception,
+    *,
+    key: uuid.UUID | None = None,
 ) -> Response:
     """Реплику владельца сохранить не удалось (не 409 и не «владельца нет»; ревью MINOR-1):
     классификатор — по самой реплике; кризис — поток из одного ``crisis`` с
@@ -719,7 +926,8 @@ async def _unsaved_turn(
     # указанием на помощь (АР-34 п.2, A8-E2): ответ модели без сохранённой реплики не нужен.
     _record_crisis_now(rt, sm, user_id, prep)
     await rt.acquire(user_id, settings.chat_daily_limit, force=True)
-    reply = _Reply(rt, sm, keys, user_id, None, body, prep, _Outcome(started))
+    accepted = _accepted(None, key, replayed=False) if key is not None else None
+    reply = _Reply(rt, sm, keys, user_id, None, body, prep, _Outcome(started), None, accepted)
     return EventStreamResponse(reply.produce, settings.chat_keepalive_s)
 
 
@@ -783,6 +991,9 @@ async def get_messages(
             author="owner" if r.author == "owner" else "agent",
             text=r.text if r.text is not None else UnavailableText(reason=r.unavailable),
             created_at=r.created_at,
+            client_message_id=r.client_message_id if r.author == "owner" else None,
+            reply_to=r.reply_to_id if r.author == "agent" else None,
+            crisis=r.crisis and r.author == "agent",
         )
         for r in rows
     ]

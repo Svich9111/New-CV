@@ -101,7 +101,11 @@ describe("A8 2.2 — двойная отправка (карточка: одна
     await waitFor(() => expect(sendBtn()).toBeEnabled());
     await r.user.keyboard("{Enter}");
     await waitFor(() => expect(posts(r)).toHaveLength(2));
-    expect(posts(r)[1].body).toEqual({ text: "Вторая" });
+    // АР-51: в теле, кроме текста, — ключ новой реплики (свой, не ключ первой).
+    expect(posts(r)[1].body).toEqual({ text: "Вторая", client_message_id: expect.any(String) });
+    expect((posts(r)[1].body as { client_message_id: string }).client_message_id).not.toBe(
+      (posts(r)[0].body as { client_message_id: string }).client_message_id,
+    );
   });
 
   test("Enter при наборе IME (isComposing) не отправляет", async () => {

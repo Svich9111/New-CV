@@ -310,6 +310,7 @@ def test_chat_stream_contract() -> None:
         for ref in stream["content"]["text/event-stream"]["schema"]["oneOf"]
     }
     assert {name: set(s["required"]) for name, s in events.items()} == {
+        "accepted": {"message_id", "client_message_id", "replayed"},  # АР-51, только с ключом
         "delta": {"text"},
         "done": {"message_id", "suggest_draft"},
         "crisis": {"message_id", "text", "replace", "contacts"},
@@ -329,7 +330,9 @@ def test_chat_stream_contract() -> None:
     responses = post["responses"]
     assert {"200", "401", "402", "403", "409", "422", "429"} <= set(responses)
     assert responses["403"] == {"$ref": "#/components/responses/OnboardingRequired"}
-    assert responses["409"] == {"$ref": "#/components/responses/ConflictRetry"}
+    # АР-51: 409 — и конфликт транзакции (АР-24), и «ответ на реплику с ключом ещё готовится».
+    assert set(_example_codes(responses["409"])) == {"conflict_retry"}
+    assert "client_message_id" in responses["409"]["description"]
     assert "Не отдаётся до этапа 4" in responses["402"]["description"]
     limited = _resolve(spec, responses["429"])
     assert limited["headers"]["Retry-After"]["required"] is True
@@ -344,6 +347,30 @@ def test_chat_stream_contract() -> None:
     message = schemas["ChatMessage"]
     assert message["properties"]["author"]["enum"] == ["owner", "agent"]
     assert message["properties"]["text"]["$ref"] == "#/components/schemas/ExportText"
+
+
+def test_chat_idempotency_contract() -> None:
+    """2.2 р.1 (АР-51): ключ идемпотентности в теле, `accepted` с id реплики, в истории — ключ,
+    связь ответа с репликой и флаг кризиса; без ключа тело прежнее (ключ не обязателен)."""
+    spec = _spec()
+    schemas = spec["components"]["schemas"]
+    post = spec["paths"]["/chat/messages"]["post"]
+    body = post["requestBody"]["content"]["application/json"]["schema"]
+    assert body["required"] == ["text"] and body["additionalProperties"] is False
+    key = body["properties"]["client_message_id"]
+    assert key["type"] == ["string", "null"] and key["format"] == "uuid"
+    accepted = schemas["ChatStreamAccepted"]
+    assert accepted["x-sse-event"] == "accepted"
+    assert accepted["properties"]["message_id"]["type"] == ["string", "null"]
+    assert accepted["properties"]["client_message_id"]["format"] == "uuid"
+    assert accepted["properties"]["replayed"]["type"] == "boolean"
+    assert "Идемпотентность" in post["description"] and "АР-51" in post["description"]
+    message = schemas["ChatMessage"]
+    assert {"client_message_id", "reply_to", "crisis"} <= set(message["required"])
+    assert message["properties"]["crisis"]["type"] == "boolean"
+    for name in ("client_message_id", "reply_to"):
+        assert message["properties"][name]["type"] == ["string", "null"]
+        assert message["properties"][name]["format"] == "uuid"
 
 
 # --- 3.1: черновики (АР-40) ------------------------------------------------------------------

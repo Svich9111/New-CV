@@ -91,12 +91,21 @@ describe("parseEvent — строгая проверка событий", () => 
 });
 
 describe("isChatMessage / isChatHistory — вид истории по контракту", () => {
-  const msg = { id: "00000000-0000-4000-9000-000000000001", author: "owner", text: "Привет", created_at: "2026-11-20T10:00:00Z" };
+  const msg = {
+    id: "00000000-0000-4000-9000-000000000001",
+    author: "owner",
+    text: "Привет",
+    created_at: "2026-11-20T10:00:00Z",
+    client_message_id: null,
+    reply_to: null,
+    crisis: false,
+  };
+  const agent = { ...msg, id: "00000000-0000-4000-9000-000000000002", author: "agent" };
 
   test("граничные корректные: UnavailableText, next_cursor null и строка, пустой список", () => {
     expect(isChatMessage(msg)).toBe(true);
     for (const reason of ["format", "unknown_key", "auth", "encoding", "context"]) {
-      expect(isChatMessage({ ...msg, author: "agent", text: { unavailable: true, reason } })).toBe(true);
+      expect(isChatMessage({ ...agent, text: { unavailable: true, reason } })).toBe(true);
     }
     expect(isChatHistory({ items: [], next_cursor: null })).toBe(true);
     expect(isChatHistory({ items: [msg], next_cursor: "c.1.0" })).toBe(true);
@@ -115,9 +124,73 @@ describe("isChatMessage / isChatHistory — вид истории по конт�
     ];
     for (const m of bad) expect(isChatMessage(m), JSON.stringify(m)).toBe(false);
     expect(isChatHistory({ items: [msg] })).toBe(false);
+    expect(isChatHistory({ items: [msg, { ...msg, crisis: undefined }], next_cursor: null })).toBe(false);
     expect(isChatHistory({ items: [msg], next_cursor: "" })).toBe(false);
     expect(isChatHistory({ items: [msg], next_cursor: 5 })).toBe(false);
     expect(isChatHistory({ items: {}, next_cursor: null })).toBe(false);
     expect(isChatHistory([msg])).toBe(false);
+  });
+});
+
+describe("ChatMessage — связь реплик (АР-51)", () => {
+  const base = { id: "00000000-0000-4000-9000-000000000001", text: "Привет", created_at: "2026-11-20T10:00:00Z" };
+  const KEY = "5f0c1e8a-3b7d-4c2e-9a1f-0d4b6e8c2a71";
+  const owner = { ...base, author: "owner", client_message_id: KEY, reply_to: null, crisis: false };
+  const agent = { ...base, author: "agent", client_message_id: null, reply_to: base.id, crisis: true };
+
+  test("корректные: ключ у реплики владельца (и null — без ключа), связь и кризис у ответа (и null/false — до 0018)", () => {
+    expect(isChatMessage(owner)).toBe(true);
+    expect(isChatMessage({ ...owner, client_message_id: null })).toBe(true);
+    expect(isChatMessage(agent)).toBe(true);
+    expect(isChatMessage({ ...agent, reply_to: null, crisis: false })).toBe(true);
+  });
+
+  test("новые поля обязательны и проверяются по виду; ключ — только у владельца, связь и кризис — только у агента", () => {
+    const bad = [
+      { ...owner, client_message_id: undefined },
+      { ...owner, client_message_id: "" },
+      { ...owner, client_message_id: 7 },
+      { ...owner, reply_to: undefined },
+      { ...owner, crisis: undefined },
+      { ...owner, crisis: "false" },
+      { ...owner, reply_to: base.id },
+      { ...owner, crisis: true },
+      { ...agent, reply_to: "" },
+      { ...agent, reply_to: 1 },
+      { ...agent, client_message_id: KEY },
+      { ...agent, crisis: 1 },
+    ];
+    for (const m of bad) expect(isChatMessage(m), JSON.stringify(m)).toBe(false);
+  });
+});
+
+describe("parseEvent — accepted (АР-51)", () => {
+  const KEY = "5f0c1e8a-3b7d-4c2e-9a1f-0d4b6e8c2a71";
+  const acc = (data: unknown) => parseEvent(ev("accepted", data), isHelpContact);
+
+  test("корректное: id реплики или null (сохранить не удалось), ключ, replayed", () => {
+    expect(acc({ message_id: "m1", client_message_id: KEY, replayed: false })).toEqual({
+      event: "accepted",
+      data: { messageId: "m1", clientMessageId: KEY, replayed: false },
+    });
+    expect(acc({ message_id: null, client_message_id: KEY, replayed: true })).toEqual({
+      event: "accepted",
+      data: { messageId: null, clientMessageId: KEY, replayed: true },
+    });
+  });
+
+  test("не того вида — поток испорчен (BadEvent)", () => {
+    for (const d of [
+      { client_message_id: KEY, replayed: false },
+      { message_id: "", client_message_id: KEY, replayed: false },
+      { message_id: "m1", replayed: false },
+      { message_id: "m1", client_message_id: "", replayed: false },
+      { message_id: "m1", client_message_id: KEY },
+      { message_id: "m1", client_message_id: KEY, replayed: "true" },
+      "{не json",
+      [],
+    ]) {
+      expect(() => acc(d), JSON.stringify(d)).toThrow(BadEvent);
+    }
   });
 });

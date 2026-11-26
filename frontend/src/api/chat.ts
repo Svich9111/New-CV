@@ -3,7 +3,8 @@
  * истории и разбор потока Server-Sent Events ответа агента.
  *
  * Поток: `event: <имя>` + `data: <JSON в одну строку>` + пустая строка; строки-комментарии (`:`) —
- * поддержание соединения; ноль или больше `delta`, затем ровно одно из `done`, `crisis`, `error`.
+ * поддержание соединения; `accepted` первым (только если запрос был с `client_message_id`, АР-51), ноль или
+ * больше `delta`, затем ровно одно из `done`, `crisis`, `error`.
  * Тексты реплик здесь только разбираются — никуда не пишутся и не журналируются.
  */
 import type { ChatErrorCode, ChatHistory, ChatMessage, ChatStreamDone, HelpContact } from "./types";
@@ -21,16 +22,30 @@ export function isExportText(v: unknown): boolean {
   );
 }
 
-/** `ChatMessage`: id, автор из перечня, текст или отметка недоступности, время создания — разбираемая дата. */
+const idOrNull = (v: unknown): boolean => v === null || nonEmpty(v);
+
+/**
+ * `ChatMessage`: id, автор из перечня, текст или отметка недоступности, время создания — разбираемая дата;
+ * связь реплик (АР-51): `client_message_id`, `reply_to` — непустая строка или `null`, `crisis` — булево, все три
+ * обязательны. По контракту ключ бывает только у реплики владельца, связь и кризисный флаг — только у ответа агента.
+ */
 export function isChatMessage(v: unknown): v is ChatMessage {
-  return (
-    isObject(v) &&
-    nonEmpty(v.id) &&
-    (v.author === "owner" || v.author === "agent") &&
-    isExportText(v.text) &&
-    isStr(v.created_at) &&
-    !Number.isNaN(Date.parse(v.created_at))
-  );
+  if (
+    !(
+      isObject(v) &&
+      nonEmpty(v.id) &&
+      (v.author === "owner" || v.author === "agent") &&
+      isExportText(v.text) &&
+      isStr(v.created_at) &&
+      !Number.isNaN(Date.parse(v.created_at)) &&
+      idOrNull(v.client_message_id) &&
+      idOrNull(v.reply_to) &&
+      typeof v.crisis === "boolean"
+    )
+  ) {
+    return false;
+  }
+  return v.author === "owner" ? v.reply_to === null && v.crisis === false : v.client_message_id === null;
 }
 
 /** Страница истории: `items` — массив `ChatMessage`, `next_cursor` — непустая строка или `null`. */
@@ -120,7 +135,16 @@ export interface CrisisEvent {
   contacts: HelpContact[];
 }
 
+/** Реплика владельца принята (АР-51): `messageId` — её id, `null` — сохранить не удалось. */
+export interface AcceptedEvent {
+  messageId: string | null;
+  clientMessageId: string;
+  /** Реплика под этим ключом была сохранена раньше (повтор): новой не создано. */
+  replayed: boolean;
+}
+
 export type StreamEvent =
+  | { event: "accepted"; data: AcceptedEvent }
   | { event: "delta"; text: string }
   | { event: "done"; data: ChatStreamDone }
   | { event: "crisis"; data: CrisisEvent }
@@ -144,7 +168,7 @@ function contactsOf(v: unknown, isContact: (c: unknown) => c is HelpContact): He
 }
 
 /**
- * Событие по контракту. `delta` и `done` не того вида — `BadEvent` (испорченный поток). Кризис принимается
+ * Событие по контракту. `accepted`, `delta` и `done` не того вида — `BadEvent` (испорченный поток). Кризис принимается
  * всегда, даже испорченный: помощь показывается при любом виде события (ТЗ §9.3). `error` не того вида или с
  * незнакомым кодом — `internal` (контракт: «незнакомый код клиент показывает как internal»).
  * Незнакомое имя события — `null` (пропускается).
@@ -152,6 +176,19 @@ function contactsOf(v: unknown, isContact: (c: unknown) => c is HelpContact): He
 export function parseEvent(raw: RawEvent, isContact: (c: unknown) => c is HelpContact): StreamEvent | null {
   const data = parseJson(raw.data);
   switch (raw.event) {
+    case "accepted":
+      if (
+        !isObject(data) ||
+        !idOrNull(data.message_id) ||
+        !nonEmpty(data.client_message_id) ||
+        typeof data.replayed !== "boolean"
+      ) {
+        throw new BadEvent();
+      }
+      return {
+        event: "accepted",
+        data: { messageId: data.message_id as string | null, clientMessageId: data.client_message_id, replayed: data.replayed },
+      };
     case "delta":
       if (!isObject(data) || !nonEmpty(data.text)) throw new BadEvent();
       return { event: "delta", text: data.text };

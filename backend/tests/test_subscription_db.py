@@ -1,10 +1,12 @@
-"""4.4, этап 1 (A1): подписка на пару, пробный период, счета и платежи Telegram Stars — миграция
-0017.
+"""4.4, этап 1 (A1): подписка на пару, пробный период, счета и платежи Telegram Stars — миграции
+0017 и 0019 (раунд 1: роль платежей ``feelings_billing``, начало периода после возврата, статус
+после распада, предел счетов под блокировкой).
 
 ФТ-19; ТЗ §7 (``subscriptions``, ``payments``), §11 п.1–7; DECISIONS.md Д6, Д9, АР-13, АР-23,
 АР-38, АР-50. Данные заводит суперпользователь (``engine``), действия — под ролью входа
 приложения (``sessionmaker`` + ``user_scope``): функции пользователя — с ``app.user_id``, функции
-бота — в служебном контексте (``user_scope(…, None)``). Платежи Telegram — заглушки: выдуманные
+бота — в служебном контексте бота: роль ``feelings_billing`` и пустой ``app.user_id`` (0019;
+помощники с ``uid=None`` — ``tests/_billing.py``). Платежи Telegram — заглушки: выдуманные
 ``telegram_payment_charge_id``, ни одного обращения к Telegram. Данные выдуманные (CLAUDE.md)."""
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.db import user_scope
+from tests._billing import billing_scope, scope_for
 from tests.conftest import alembic
 from tests.test_couple_functions import (
     ACCEPT,
@@ -60,6 +63,7 @@ INTERNAL_FUNCS = (
     "subscription_user_has_access(uuid)",
 )
 ROLES = ("feelings_app", "feelings_api", "feelings_worker", "feelings_admin", "public")
+BILLING = "feelings_billing"
 MONTH = {"plan": "month", "amount": 250, "days": 30, "ttl": timedelta(hours=1)}
 
 
@@ -67,7 +71,8 @@ MONTH = {"plan": "month", "amount": 250, "days": 30, "ttl": timedelta(hours=1)}
 
 
 async def _rows(sm: SM, uid: uuid.UUID | None, sql: str, **params: Any) -> list[dict[str, Any]]:
-    async with user_scope(sm, uid) as s:
+    # uid=None и функция бота — роль feelings_billing (0019, tests/_billing.py).
+    async with scope_for(sm, uid, sql) as s:
         return [dict(r) for r in (await s.execute(text(sql), params)).mappings()]
 
 
@@ -119,20 +124,25 @@ def _charge() -> str:
 
 
 async def test_function_rights_and_search_path(engine: AsyncEngine) -> None:
-    """EXECUTE — только ``feelings_app`` (служебные функции — без ролей); SECURITY DEFINER с
-    ``search_path = public, pg_temp``; прямой записи в подписки и платежи у ролей нет."""
+    """EXECUTE функций пользователя — только ``feelings_app``, функций бота — только
+    ``feelings_billing`` (0019), служебных — ни у кого; SECURITY DEFINER с ``search_path = public,
+    pg_temp``; прямой записи в подписки и платежи у ролей нет."""
     async with engine.connect() as c:
 
         async def can(role: str, f: str) -> bool:
             q = text("SELECT has_function_privilege(:r, :f, 'EXECUTE')")
             return bool((await c.execute(q, {"r": role, "f": f})).scalar_one())
 
-        for f in USER_FUNCS + BOT_FUNCS:
+        for f in USER_FUNCS:
             assert await can("feelings_app", f), f
-            for role in ROLES[1:]:
+            for role in (*ROLES[1:], BILLING):
+                assert not await can(role, f), (role, f)
+        for f in BOT_FUNCS:
+            assert await can(BILLING, f), f
+            for role in ROLES:
                 assert not await can(role, f), (role, f)
         for f in INTERNAL_FUNCS:
-            for role in ROLES:
+            for role in (*ROLES, BILLING):
                 assert not await can(role, f), (role, f)
         rows = await c.execute(
             text(
@@ -150,7 +160,7 @@ async def test_function_rights_and_search_path(engine: AsyncEngine) -> None:
         assert seen == len(USER_FUNCS + BOT_FUNCS + INTERNAL_FUNCS)
         for table in ("subscriptions", "payments"):
             for priv in ("INSERT", "UPDATE", "DELETE"):
-                for role in ROLES[:4]:
+                for role in (*ROLES[:4], BILLING):
                     q = text("SELECT has_table_privilege(:r, :t, :p)")
                     assert not (
                         await c.execute(q, {"r": role, "t": table, "p": priv})
@@ -576,7 +586,9 @@ async def test_dissolution_keeps_paid_access_until_period_end(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
     """§11 п.6: после выхода оплаченный период дослуживает обоим (личный чат), пробный —
-    нет; текущей пары нет — статус ``none``; оплата после распада — ``couple_ended``."""
+    нет; оплата после распада — ``couple_ended``. Статус без текущей пары (и с новой ожидающей
+    парой) показывает дослуживаемый период: ``active``, тариф и его конец (0019, ревью MINOR-3);
+    счёт распавшейся пары — FC001 (ревью MINOR-11 (в))."""
     a, b, couple = await _couple(sessionmaker, engine)
     await _one(sessionmaker, a, TRIAL, d=7)
     inv = await _invoice(sessionmaker, a)
@@ -588,7 +600,19 @@ async def test_dissolution_keeps_paid_access_until_period_end(
     for who in (a, b):
         assert await _call(sessionmaker, who, HAS_ACCESS) is True
         st = await _one(sessionmaker, who, STATUS)
-        assert (st["status"], st["couple_id"], st["has_access"]) == ("none", None, True)
+        assert st == {
+            "couple_id": None, "couple_status": None, "status": "active", "plan": "month",
+            "period_end": paid["period_end"], "trial_ends_at": None, "trial_used": False,
+            "paid_by_me": who == b, "has_access": True,
+        }  # fmt: skip
+        await _fails(sessionmaker, who, "FC001", INVOICE, **MONTH)
+    # Новая ожидающая пара у b: статус по-прежнему показывает дослуживаемый период.
+    pending_b = await _call(sessionmaker, b, "SELECT app_create_couple()")
+    st = await _one(sessionmaker, b, STATUS)
+    assert (st["couple_id"], st["couple_status"], st["status"], st["period_end"]) == (
+        uuid.UUID(str(pending_b)), "pending", "active", paid["period_end"],
+    )  # fmt: skip
+    await _call(sessionmaker, b, LEAVE)
     # Новая пара — свой пробный период (АР-50, вопрос о злоупотреблении).
     _c, _new, token = await _pending(sessionmaker, engine, "Вера")
     await _call(sessionmaker, a, ACCEPT, h=token)
@@ -660,6 +684,211 @@ async def test_credit_waits_for_partner_account_deletion_without_deadlock(
     assert await _call(sessionmaker, a, HAS_ACCESS) is True
 
 
+# --------------------------------------------------------------------------- 0019: роль платежей
+
+
+async def test_billing_role_is_the_only_bot_context(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """АР-50 п.7 (0019; ревью MINOR-2, A8-4.4-D2): ``feelings_billing`` — NOLOGIN NOINHERIT без
+    членств и прав на таблицы; функции бота — только под ней и с пустым ``app.user_id``; роль
+    с ошибочно выданным EXECUTE (здесь — ``feelings_worker`` в откатываемой транзакции) получает
+    42501 от проверки внутри функции; сессия пользователя после RESET — 42501 (EXECUTE нет)."""
+    attrs = await _su(
+        engine,
+        "SELECT concat_ws(',', rolcanlogin, rolinherit, rolsuper, rolcreaterole, rolcreatedb, "
+        "rolreplication, rolbypassrls) FROM pg_roles WHERE rolname = :r",
+        r=BILLING,
+    )
+    assert attrs == "f,f,f,f,f,f,f"
+    members = await _su(
+        engine,
+        "SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid IN (m.member, m.roleid) "
+        "JOIN pg_roles o ON o.oid = CASE WHEN r.oid = m.member THEN m.roleid ELSE m.member END "
+        "WHERE r.rolname = :r AND o.rolname LIKE 'feelings\\_%'",
+        r=BILLING,
+    )
+    assert members == 0
+    for table in ("subscriptions", "payments", "users", "couples", "audit_log"):
+        for priv in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            assert not await _su(
+                engine, "SELECT has_table_privilege(:r, :t, :p)", r=BILLING, t=table, p=priv
+            ), (table, priv)
+    a, _b, couple = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    tg = await _tg_id(engine, a)
+    pre = {"i": inv, "tg": tg, "amount": 250, "cur": "XTR"}
+    assert await _call(sessionmaker, None, PRECHECK, **pre) == "ok"  # роль платежей
+    with pytest.raises(ProgrammingError, match="permission denied"):
+        async with billing_scope() as s:
+            await s.execute(text("SELECT count(*) FROM payments"))
+    # Роль платежей с app.user_id — 42501 (контекст пользователя внутри роли бота).
+    with pytest.raises(DBAPIError) as ei:
+        async with billing_scope() as s:
+            await s.execute(text("SELECT set_config('app.user_id', :u, true)"), {"u": str(a)})
+            await s.execute(text(PRECHECK), pre)
+    assert _sqlstate(ei.value) == "42501"
+    # Сессия пользователя, сбросившая app.user_id, — 42501 до тела функции.
+    for reset in ("RESET app.user_id", "SELECT set_config('app.user_id', '', true)"):
+        with pytest.raises(DBAPIError) as ei:
+            async with user_scope(sessionmaker, a) as s:
+                await s.execute(text(reset))
+                await s.execute(text(CREDIT), {**pre, "ch": _charge()})
+        assert _sqlstate(ei.value) == "42501", reset
+    # Ошибочно выданный EXECUTE другой роли: отказ даёт сама функция (role ≠ feelings_billing).
+    async with engine.connect() as c:
+        tx = await c.begin()
+        for f in BOT_FUNCS:
+            await c.execute(text(f"GRANT EXECUTE ON FUNCTION {f} TO feelings_worker"))
+        await c.execute(text("SET LOCAL ROLE feelings_worker"))
+        with pytest.raises(DBAPIError) as ei:
+            await c.execute(text(PRECHECK), pre)
+        assert _sqlstate(ei.value) == "42501" and "billing role only" in str(ei.value.orig)
+        await tx.rollback()
+    assert (
+        await _su(engine, "SELECT count(*) FROM subscriptions WHERE couple_id = :c", c=couple) == 0
+    )
+
+
+async def test_payment_after_refund_gap_starts_now_and_status(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """АР-50 п.4 (0019; A8-4.4-D1, ревью MINOR-4): P1 [now, +30] и P2 [+30, +60], возврат P1 —
+    доступа нет до начала P2, статус — ``canceled`` по P1 (будущий P2 не «истёк»); новая оплата
+    начинается сейчас (конец непрерывного доступа = now()), доступ сразу и до конца P2."""
+    a, b, couple = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    ch1 = _charge()
+    p1 = await _credit(sessionmaker, engine, inv, a, ch1)
+    p2 = await _credit(sessionmaker, engine, inv, b, _charge())
+    assert p2["period_end"] == p1["period_end"] + timedelta(days=30)
+    await _one(sessionmaker, None, REFUNDED, ch=ch1)
+    for who in (a, b):
+        st = await _one(sessionmaker, who, STATUS)
+        assert (st["status"], st["plan"], st["period_end"], st["has_access"]) == (
+            "canceled", "month", p1["period_end"], False,
+        )  # fmt: skip
+    before = datetime.now(UTC)
+    p3 = await _credit(sessionmaker, engine, inv, a, _charge())
+    after = datetime.now(UTC)
+    assert p3["result"] == "credited"
+    assert before + timedelta(days=30) <= p3["period_end"] <= after + timedelta(days=30, seconds=5)
+    for who in (a, b):
+        assert await _call(sessionmaker, who, HAS_ACCESS) is True
+        st = await _one(sessionmaker, who, STATUS)
+        assert (st["status"], st["period_end"]) == ("active", p2["period_end"])
+    # Следующие периоды не сдвигаются (АР-50 п.4): P2 — с прежними датами.
+    assert await _su(
+        engine, "SELECT period_end FROM subscriptions WHERE id = :s", s=p2["subscription_id"]
+    ) == p2["period_end"]  # fmt: skip
+    p4 = await _credit(sessionmaker, engine, inv, b, _charge())  # оплата в цепочке — после P2
+    assert p4["period_end"] == p2["period_end"] + timedelta(days=30)
+    assert await _subs_count_active(engine, couple) == 3
+
+
+async def _subs_count_active(engine: AsyncEngine, couple: uuid.UUID) -> int:
+    return int(
+        await _su(
+            engine,
+            "SELECT count(*) FROM subscriptions WHERE couple_id = :c AND status = 'active'",
+            c=couple,
+        )
+    )
+
+
+async def test_invoice_limit_holds_under_concurrency(sessionmaker: SM, engine: AsyncEngine) -> None:
+    """Ревью MINOR-5 (0019): при 19 действующих счетах два одновременных запроса партнёров с
+    разными условиями — один счёт и FC002, 21-го нет; с одинаковыми условиями — один счёт на
+    двоих (второй получает ``reused``)."""
+    a, b, couple = await _couple(sessionmaker, engine)
+    for n in range(19):
+        await _invoice(sessionmaker, a, amount=500 + n)
+
+    async def race(kw_a: dict[str, Any], kw_b: dict[str, Any]) -> list[Any]:
+        async with engine.connect() as holder:
+            tx = await holder.begin()
+            await holder.execute(
+                text("SELECT 1 FROM couples WHERE id = :c FOR UPDATE"), {"c": couple}
+            )
+            calls = [
+                asyncio.create_task(_one(sessionmaker, u, INVOICE, **{**MONTH, **kw}))
+                for u, kw in ((a, kw_a), (b, kw_b))
+            ]
+            await _wait_lock_waiters(engine, "app_subscription_create_invoice", 2)
+            await tx.rollback()
+        return list(await asyncio.gather(*calls, return_exceptions=True))
+
+    res = await race({"amount": 1}, {"amount": 2})
+    codes = sorted(str(_sqlstate(r)) if isinstance(r, DBAPIError) else "ok" for r in res)
+    assert codes == ["FC002", "ok"], res
+    open_now = "SELECT count(*) FROM payments WHERE couple_id = :c AND expires_at > now()"
+    assert await _su(engine, open_now, c=couple) == 20
+    # Один счёт освободился (истёк) — одинаковые условия у обоих: один новый, второй reused.
+    await _su(
+        engine,
+        "UPDATE payments SET expires_at = now() - interval '1 minute' WHERE couple_id = :c "
+        "AND amount = 500",
+        c=couple,
+    )
+    same = await race({"amount": 3}, {"amount": 3})
+    assert all(isinstance(r, dict) for r in same), same
+    assert sorted(r["reused"] for r in same) == [False, True]
+    assert same[0]["invoice_id"] == same[1]["invoice_id"]
+    assert await _su(engine, open_now, c=couple) == 20
+
+
+async def test_payments_columns_at_head(engine: AsyncEngine) -> None:
+    """Ревью MINOR-11 (а): колонки ``payments`` на голове — без id пользователя, Telegram ID,
+    ``provider_payment_charge_id`` и текстов (АР-50, §9.1 п.2)."""
+    cols = await _su(
+        engine,
+        "SELECT string_agg(column_name || ':' || data_type, ',' ORDER BY column_name) "
+        "FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'payments'",
+    )
+    assert cols == (
+        "amount:integer,couple_id:uuid,created_at:timestamp with time zone,"
+        "currency:character varying,expires_at:timestamp with time zone,id:uuid,"
+        "paid_at:timestamp with time zone,period_days:integer,plan:character varying,"
+        "provider:character varying,provider_charge_id:character varying,"
+        "refunded_at:timestamp with time zone,status:USER-DEFINED,subscription_id:uuid"
+    )
+
+
+@pytest.mark.parametrize("first", ["deletion", "credit"])
+async def test_credit_races_with_payer_account_deletion(
+    sessionmaker: SM, engine: AsyncEngine, first: str
+) -> None:
+    """Ревью MINOR-11 (б), АР-13/АР-38: зачисление и удаление аккаунта **самого плательщика** в
+    любом порядке — без 40P01; деньги зачислены (``couple_ended`` или ``credited``), после
+    удаления ``payer_id`` NULL, у партнёра — доступ по оплаченному периоду распавшейся пары."""
+    a, b, couple = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    tg = await _tg_id(engine, a)
+    charge = _charge()
+    credit_sql = dict(i=inv, tg=tg, amount=250, cur="XTR", ch=charge)
+    async with engine.connect() as holder:
+        tx = await holder.begin()
+        await holder.execute(text("SELECT 1 FROM couples WHERE id = :c FOR UPDATE"), {"c": couple})
+        if first == "deletion":
+            deleting = asyncio.create_task(_call(sessionmaker, a, DELETE))
+            await _wait_lock_waiters(engine, "app_delete_account", 1)
+            crediting = asyncio.create_task(_one(sessionmaker, None, CREDIT, **credit_sql))
+            await _wait_lock_waiters(engine, "app_bot_payment_credit", 1)
+        else:
+            crediting = asyncio.create_task(_one(sessionmaker, None, CREDIT, **credit_sql))
+            await _wait_lock_waiters(engine, "app_bot_payment_credit", 1)
+            deleting = asyncio.create_task(_call(sessionmaker, a, DELETE))
+            await _wait_lock_waiters(engine, "app_delete_account", 1)
+        await tx.rollback()
+    await deleting
+    res = await crediting
+    assert res["result"] == ("couple_ended" if first == "deletion" else "credited")
+    assert await _su(
+        engine, "SELECT payer_id FROM subscriptions WHERE id = :s", s=res["subscription_id"]
+    ) is None  # fmt: skip
+    assert await _su(engine, "SELECT count(*) FROM users WHERE id = :u", u=a) == 0
+    assert await _call(sessionmaker, b, HAS_ACCESS) is True
+    assert (await _one(sessionmaker, None, LOOKUP, ch=charge))["payer_telegram_id"] is None
+
+
 # --------------------------------------------------------------------------- обратимость
 
 
@@ -718,9 +947,79 @@ async def test_migration_0017_reversible(
         c=couple,
     ) == subs  # fmt: skip
     async with engine.connect() as c:
-        for f in USER_FUNCS + BOT_FUNCS:
-            q = text("SELECT has_function_privilege('feelings_app', :f, 'EXECUTE')")
-            assert (await c.execute(q, {"f": f})).scalar_one() is True, f
+        for funcs, role in ((USER_FUNCS, "feelings_app"), (BOT_FUNCS, BILLING)):
+            for f in funcs:
+                q = text("SELECT has_function_privilege(:r, :f, 'EXECUTE')")
+                assert (await c.execute(q, {"r": role, "f": f})).scalar_one() is True, f
     st = await _one(sessionmaker, a, STATUS)
     assert st["status"] == "trial"
+    alembic("check")
+
+
+async def test_migration_0019_reversible(
+    sessionmaker: SM, engine: AsyncEngine, app_engine: AsyncEngine
+) -> None:
+    """head → 0018 → head (0019): EXECUTE функций бота возвращается ``feelings_app`` и снова
+    уходит ``feelings_billing``; явный USAGE на схему у роли платежей снимается и возвращается; роль
+    остаётся (общая для кластера); периоды не меняются; ``alembic check`` чист."""
+    a, _b, couple = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    await _credit(sessionmaker, engine, inv, a, _charge())
+    subs = await _su(
+        engine,
+        "SELECT md5(string_agg(t::text, '|' ORDER BY id)) FROM "
+        "(SELECT * FROM subscriptions WHERE couple_id = :c) t",
+        c=couple,
+    )
+
+    async def rights() -> tuple[bool, bool, bool, bool]:
+        async with engine.connect() as c:
+            q = "SELECT has_function_privilege(:r, :f, 'EXECUTE')"
+            app = [
+                (await c.execute(text(q), {"r": "feelings_app", "f": f})).scalar_one()
+                for f in BOT_FUNCS
+            ]
+            bill = [
+                (await c.execute(text(q), {"r": BILLING, "f": f})).scalar_one() for f in BOT_FUNCS
+            ]
+            usage = (
+                await c.execute(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) x "
+                        "WHERE n.nspname = 'public' AND x.grantee = CAST(to_regrole(:r) AS oid) "
+                        "AND x.privilege_type = 'USAGE')"
+                    ),
+                    {"r": BILLING},
+                )
+            ).scalar_one()
+            role = (
+                await c.execute(
+                    text("SELECT count(*) FROM pg_roles WHERE rolname = :r"), {"r": BILLING}
+                )
+            ).scalar_one()
+            return all(app), any(bill), bool(usage), role == 1
+
+    assert await rights() == (False, True, True, True)
+    try:
+        alembic("downgrade", "0018")
+        await engine.dispose()
+        assert await rights() == (True, False, False, True)
+        # Под 0017 бот снова вызывается ролью приложения в служебном контексте.
+        async with user_scope(sessionmaker, None) as s:
+            got = (await s.execute(text(LOOKUP), {"ch": _charge()})).all()
+            assert got == []
+        alembic("upgrade", "head")
+        await engine.dispose()
+    finally:
+        alembic("upgrade", "head")
+        await engine.dispose()
+        await app_engine.dispose()
+    assert await rights() == (False, True, True, True)
+    assert await _su(
+        engine,
+        "SELECT md5(string_agg(t::text, '|' ORDER BY id)) FROM "
+        "(SELECT * FROM subscriptions WHERE couple_id = :c) t",
+        c=couple,
+    ) == subs  # fmt: skip
+    assert await _rows(sessionmaker, None, LOOKUP, ch=_charge()) == []
     alembic("check")

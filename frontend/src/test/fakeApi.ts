@@ -204,13 +204,26 @@ export class FakeServer {
     return this;
   }
 
-  addChat(author: ChatMessage["author"], text: ChatMessage["text"], id?: string): ChatMessage {
+  /**
+   * Запись истории. По умолчанию — как сохранённая до миграции 0018 (без ключа, без связи, `crisis: false`);
+   * `extra` задаёт `client_message_id`, `reply_to`, `crisis` (АР-51).
+   */
+  addChat(
+    author: ChatMessage["author"],
+    text: ChatMessage["text"],
+    id?: string,
+    extra: Partial<Pick<ChatMessage, "client_message_id" | "reply_to" | "crisis">> = {},
+  ): ChatMessage {
     const seq = ++this.chatSeq;
     const m: ChatMessage = {
       id: id ?? `00000000-0000-4000-9000-${String(seq).padStart(12, "0")}`,
       author,
       text,
       created_at: new Date(Date.UTC(2026, 10, 20, 10, 0, seq)).toISOString(),
+      client_message_id: null,
+      reply_to: null,
+      crisis: false,
+      ...extra,
     };
     this.chat.push(m);
     return m;
@@ -220,6 +233,34 @@ export class FakeServer {
     this.chatReplies.push(r);
     return this;
   }
+
+  /** Реплика владельца под ключом (АР-51). */
+  ownerByKey(cmid: string): ChatMessage | undefined {
+    return this.chat.find((m) => m.author === "owner" && m.client_message_id === cmid);
+  }
+
+  /** Ответ агента на реплику `ownerId` (`reply_to`). */
+  answerTo(ownerId: string): ChatMessage | undefined {
+    return this.chat.find((m) => m.author === "agent" && m.reply_to === ownerId);
+  }
+
+  /**
+   * Ответ на реплику `ownerId` «готовит другой запрос» (аренда, АР-51): следующие `times` запросов с её ключом
+   * получат 409 `conflict_retry` до потока.
+   */
+  leaseFor(ownerId: string, times: number): this {
+    this.leases.set(ownerId, times);
+    return this;
+  }
+
+  /** Аренда снята (другой запрос закончил). */
+  releaseLease(ownerId: string): this {
+    this.leases.delete(ownerId);
+    return this;
+  }
+
+  /** Аренды ответа: идущие потоки (`-1` — до конца потока) и заданные тестом (`leaseFor`, счётчик 409). */
+  private leases = new Map<string, number>();
 
   private chatHistory(q: URLSearchParams): Response {
     const limit = Number(q.get("limit") ?? 50);
@@ -251,31 +292,67 @@ export class FakeServer {
     return this.chat[i]?.id;
   }
 
+  /**
+   * `POST /chat/messages` по контракту АР-32 и АР-51. Без ключа — каждая попытка новая реплика, события
+   * `accepted` нет. С ключом: реплики нет — сохраняется с ключом, поток с `accepted` (`replayed: false`);
+   * под ключом другой текст — 422; ответ готовится (аренда) — 409; ответ сохранён — поток из сохранённого ответа
+   * без сценария; реплика без ответа — ответ на неё по следующему сценарию (`replayed: true`).
+   */
   private chatPost(body: unknown, signal: AbortSignal | null): Response {
-    const b = body as { text?: unknown };
-    if (typeof b?.text !== "string" || b.text.trim().length === 0 || b.text.length > 4000 || Object.keys(b).length !== 1) {
+    const b = body as { text?: unknown; client_message_id?: unknown };
+    const extraKeys = Object.keys(b ?? {}).filter((k) => k !== "text" && k !== "client_message_id");
+    const cmidOk = b?.client_message_id === undefined || b.client_message_id === null || (typeof b.client_message_id === "string" && UUID.test(b.client_message_id));
+    if (typeof b?.text !== "string" || b.text.trim().length === 0 || b.text.length > 4000 || extraKeys.length > 0 || !cmidOk) {
       return json(422, err("validation_error", "Проверьте данные"));
     }
+    const text = b.text;
+    const cmid = typeof b.client_message_id === "string" ? b.client_message_id : null;
+    let owner = cmid ? this.ownerByKey(cmid) : undefined;
+    const replayed = owner !== undefined;
+    if (owner) {
+      if (owner.text !== text) return json(422, err("validation_error", "Проверьте данные"));
+      const lease = this.leases.get(owner.id);
+      if (lease !== undefined) {
+        if (lease > 0) {
+          if (lease === 1) this.leases.delete(owner.id);
+          else this.leases.set(owner.id, lease - 1);
+        }
+        return json(409, err("conflict_retry", "Ответ на это сообщение ещё готовится — повторите через несколько секунд"));
+      }
+      const saved = this.answerTo(owner.id);
+      if (saved) return this.stream(replay(saved), signal, owner, { cmid: cmid!, replayed: true });
+    }
     const r = this.chatReplies.shift() ?? { steps: [delta("Слышу "), delta("тебя."), done()] };
+    const saveOwner = (): ChatMessage => owner ?? (owner = this.addChat("owner", text, undefined, { client_message_id: cmid }));
     if (r.dropResponse) {
       // Сервер сохранил реплику, а ответ до клиента не дошёл (обрыв связи до заголовков).
-      this.addChat("owner", b.text);
-      if (r.dropResponse === "answered") this.addChat("agent", "Ответ, который не дошёл.");
+      const o = saveOwner();
+      if (r.dropResponse === "answered") this.addChat("agent", "Ответ, который не дошёл.", undefined, { reply_to: o.id });
       throw new TypeError("Failed to fetch");
     }
     if (r.status && r.status !== 200) {
       // 409 `conflict_retry` — ничего не сохранено; 429/402/5xx — реплика владельца уже сохранена.
-      if (r.saveOwner ?? r.status !== 409) this.addChat("owner", b.text);
+      if (r.saveOwner ?? r.status !== 409) saveOwner();
       return json(r.status, r.body, r.headers);
     }
-    this.addChat("owner", b.text);
-    return this.stream(r, signal);
+    const o = r.ownerNotSaved && !owner ? null : saveOwner();
+    return this.stream(r, signal, o, cmid && !r.noAccepted ? { cmid, replayed } : null);
   }
 
-  private stream(r: ChatReply, signal: AbortSignal | null): Response {
+  private stream(r: ChatReply, signal: AbortSignal | null, owner: ChatMessage | null, accepted: { cmid: string; replayed: boolean } | null): Response {
     const enc = new TextEncoder();
-    const steps = r.steps ?? [];
+    const steps: SseStep[] = [
+      ...(accepted ? [{ event: "accepted", data: { message_id: owner?.id ?? null, client_message_id: accepted.cmid, replayed: accepted.replayed } }] : []),
+      ...(r.steps ?? []),
+    ];
     const addChat = this.addChat.bind(this);
+    const leases = this.leases;
+    const replyTo = owner?.id ?? null;
+    // Пока поток идёт, ответ на реплику «готовится»: повтор с её ключом получит 409 (АР-51).
+    if (owner && !leases.has(owner.id)) leases.set(owner.id, -1);
+    const release = () => {
+      if (owner && leases.get(owner.id) === -1) leases.delete(owner.id);
+    };
     const counter = { abort: () => (this.streamsAborted += 1) };
     let shown = "";
     let cancelled = false;
@@ -284,6 +361,7 @@ export class FakeServer {
     const onAbort = () => {
       if (!cancelled && !terminal) counter.abort();
       cancelled = true;
+      release();
     };
     signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -292,16 +370,16 @@ export class FakeServer {
       if ("comment" in st) return `: ${st.comment}\n\n`;
       if ("raw" in st) return st.raw;
       if ("saveAgent" in st) {
-        addChat("agent", st.saveAgent, st.id);
+        addChat("agent", st.saveAgent, st.id, { reply_to: replyTo });
         return null;
       }
       if ("event" in st) {
         const data = st.data as Record<string, unknown>;
         if (st.event === "delta" && typeof data?.text === "string") shown += data.text;
         if (st.event === "done" || st.event === "crisis" || st.event === "error") terminal = true;
-        if (st.event === "done" && typeof data?.message_id === "string" && st.save !== false) addChat("agent", shown, data.message_id);
+        if (st.event === "done" && typeof data?.message_id === "string" && st.save !== false) addChat("agent", shown, data.message_id, { reply_to: replyTo });
         if (st.event === "crisis" && typeof data?.text === "string" && typeof data?.message_id === "string" && st.save !== false)
-          addChat("agent", data.text, data.message_id);
+          addChat("agent", data.text, data.message_id, { reply_to: replyTo, crisis: true });
         return `event: ${st.event}\ndata: ${typeof st.data === "string" ? st.data : JSON.stringify(st.data)}\n\n`;
       }
       return null;
@@ -354,6 +432,7 @@ export class FakeServer {
         }
         if (cancelled) return;
         if (r.end === "hang") return;
+        release();
         if (r.end === "error") {
           fail();
           return;
@@ -445,12 +524,25 @@ export interface ChatReply {
   headers?: Record<string, string>;
   /** Сохраняет ли сервер реплику владельца при ответе `status` (по умолчанию — да, кроме 409). */
   saveOwner?: boolean;
+  /** Реплику сохранить не удалось: `accepted` с `message_id: null` (дальше по контракту — `crisis` или `error`). */
+  ownerNotSaved?: true;
+  /** Поток без `accepted`, хотя запрос был с ключом (не по контракту). */
+  noAccepted?: true;
   steps?: SseStep[];
   /** Как резать поток: по шагам (по умолчанию), целиком одним куском или по N байт. */
   chunk?: "whole" | number;
   /** После шагов: закрыть (по умолчанию), держать открытым или оборвать с ошибкой. */
   end?: "close" | "hang" | "error";
   contentType?: string;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Повтор по ключу, ответ уже сохранён: поток из сохранённого ответа (АР-51), без нового сохранения. */
+function replay(m: ChatMessage): ChatReply {
+  if (typeof m.text !== "string") return { steps: [errorEvent("internal")] };
+  if (m.crisis) return { steps: [{ ...crisis(m.text, { id: m.id, replace: false }), save: false }] };
+  return { steps: [delta(m.text), { ...done(m.id), save: false }] };
 }
 
 let agentSeq = 0;

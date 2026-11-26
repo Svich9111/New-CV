@@ -16,6 +16,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.db import user_scope
+from tests._billing import scope_for
 from tests.conftest import alembic
 
 _tg = itertools.count(7_000_000)
@@ -63,7 +64,8 @@ async def _user(engine: AsyncEngine, name: str, *, onboarded: bool = True) -> uu
 
 
 async def _call(sm: SM, uid: uuid.UUID | None, sql: str, **params: object) -> object:
-    async with user_scope(sm, uid) as s:
+    # uid=None и функция бота платежей — роль feelings_billing (0019, tests/_billing.py).
+    async with scope_for(sm, uid, sql) as s:
         return (await s.execute(text(sql), params)).scalar_one()
 
 

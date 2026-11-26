@@ -520,11 +520,7 @@ async def test_refund_of_last_period_keeps_earlier(sessionmaker: SM, engine: Asy
     assert p3["period_end"] == p1["period_end"] + timedelta(days=30)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-4.4-D1: после возврата не последнего периода оплаченный будущий период даёт "
-    "разрыв — статус 'expired', доступа нет, а новая оплата встаёт после будущего периода",
-)
+# A8-4.4-D1 исправлен в 0019 (4.4 р1, A1): xfail снят, тело не менялось.
 async def test_payment_in_refund_gap_gives_access_now(
     sessionmaker: SM, engine: AsyncEngine
 ) -> None:
@@ -587,11 +583,14 @@ async def test_trial_after_dissolution_and_new_couple(
 
 async def test_bot_functions_after_switching_user_id(sessionmaker: SM, engine: AsyncEngine) -> None:
     """Функции бота в сессии пользователя: смена ``app.user_id`` на другого пользователя или на
-    не-uuid внутри транзакции — по-прежнему отказ (42501 / 22P02), ничего не зачислено."""
+    не-uuid внутри транзакции — по-прежнему отказ (42501), ничего не зачислено.
+
+    4.4 р1 (A1): с 0019 EXECUTE функций бота у ``feelings_app`` нет — отказ 42501 до разбора
+    ``app.user_id``, поэтому и для не-uuid ожидается 42501 (было 22P02)."""
     a, b, couple = await _couple(sessionmaker, engine)
     inv = await _invoice(sessionmaker, a)
     tg = await _tg_id(engine, a)
-    for value, code in ((str(b), "42501"), (str(uuid.uuid4()), "42501"), ("garbage", "22P02")):
+    for value, code in ((str(b), "42501"), (str(uuid.uuid4()), "42501"), ("garbage", "42501")):
         with pytest.raises(DBAPIError) as ei:
             async with user_scope(sessionmaker, a) as s:
                 await s.execute(text("SELECT set_config('app.user_id', :v, true)"), {"v": value})
@@ -605,9 +604,11 @@ async def test_bot_functions_after_switching_user_id(sessionmaker: SM, engine: A
 
 async def test_reset_user_id_reaches_service_context(sessionmaker: SM, engine: AsyncEngine) -> None:
     """Предел защиты контекстом (АР-50 п.7, замечание A8-4.4-D2): код в сессии пользователя,
-    сделавший ``RESET app.user_id`` (или ``set_config(…, '')``), попадает в служебный контекст
-    бота. Тест фиксирует поведение; при выделении роли ``feelings_billing`` его нужно
-    перевернуть. Транзакция откатывается — ничего не зачисляется."""
+    сделавший ``RESET app.user_id`` (или ``set_config(…, '')``), в служебный контекст бота **не**
+    попадает. Транзакция откатывается — ничего не зачисляется.
+
+    4.4 р1 (A1): перевёрнут по смыслу — с 0019 функции бота исполняет только роль
+    ``feelings_billing``, у ``feelings_app`` EXECUTE нет: вместо ``ok`` ожидается 42501 (D2)."""
     a, _b, couple = await _couple(sessionmaker, engine)
     inv = await _invoice(sessionmaker, a)
     tg = await _tg_id(engine, a)
@@ -617,12 +618,11 @@ async def test_reset_user_id_reaches_service_context(sessionmaker: SM, engine: A
             await session.execute(text("SET LOCAL ROLE feelings_app"))
             await session.execute(text("SELECT set_config('app.user_id', :u, true)"), {"u": str(a)})
             await session.execute(text(reset))
-            code = (
+            with pytest.raises(DBAPIError) as ei:
                 await session.execute(
                     text(PRECHECK), {"i": inv, "tg": tg, "amount": 250, "cur": "XTR"}
                 )
-            ).scalar_one()
-            assert code == "ok", reset
+            assert _sqlstate(ei.value) == "42501", reset
             await tx.rollback()
     assert await _subs_count(engine, couple) == 0
 

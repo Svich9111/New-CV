@@ -55,6 +55,12 @@ INIT_OWNER_SQL = Path(
 
 pytestmark = pytest.mark.usefixtures("migrated_db")
 
+# Роли приложения для проверок прав базы и функций vector; feelings_billing — роль платежей (0019).
+APP_ROLES = (
+    "public", "feelings_app", "feelings_api", "feelings_worker", "feelings_admin",
+    "feelings_billing",
+)  # fmt: skip
+
 VECTOR_FUNCS = (
     "FROM pg_proc p JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid "
     "AND d.deptype = 'e' JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'vector'"
@@ -227,7 +233,7 @@ def test_init_owner_and_migrations_under_owner(owner: Owner) -> None:
     assert sql(f"SELECT datdba::regrole::text FROM pg_database WHERE datname = '{o.db}'") == o.name
 
     # Права уровня базы (0001, АР-10): ни у кого из приложения нет TEMPORARY и CREATE.
-    for role in ("public", "feelings_app", "feelings_api", "feelings_worker", "feelings_admin"):
+    for role in APP_ROLES:
         privs = sql(
             f"SELECT has_database_privilege('{role}', '{o.db}', 'TEMPORARY')::text || "
             f"has_database_privilege('{role}', '{o.db}', 'CREATE')::text || "
@@ -238,7 +244,7 @@ def test_init_owner_and_migrations_under_owner(owner: Owner) -> None:
     # Функции vector: EXECUTE только у владельца (и суперпользователя-владельца расширения).
     total = int(sql(f"SELECT count(*) {VECTOR_FUNCS}", conn=o.su()))
     assert total > 0
-    for role in ("public", "feelings_app", "feelings_api", "feelings_worker", "feelings_admin"):
+    for role in APP_ROLES:
         n = sql(
             f"SELECT count(*) {VECTOR_FUNCS} WHERE has_function_privilege('{role}', p.oid, 'EXECUTE')",
             conn=o.su(),

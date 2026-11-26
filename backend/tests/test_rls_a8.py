@@ -926,7 +926,10 @@ APP_FUNCS = [
     "app_has_access()",  # 0017
     "app_subscription_start_trial(integer)",  # 0017
     "app_subscription_create_invoice(character varying, integer, integer, interval)",  # 0017
-    # 0017: служебный контекст бота (app.user_id пуст) — pre_checkout, зачисление, возврат.
+]
+# 0017, задача 4.4: функции бота платежей (pre_checkout, зачисление, возврат); с 0019 (АР-50 п.7)
+# EXECUTE — только у feelings_billing, у feelings_app снят.
+BILLING_FUNCS = [
     "app_bot_payment_precheck(uuid, bigint, integer, character varying)",
     "app_bot_payment_credit(uuid, bigint, integer, character varying, character varying)",
     "app_bot_payment_refunded(character varying)",
@@ -975,12 +978,18 @@ async def test_definer_functions_executable_only_by_intended_roles(engine: Async
             return bool(row.scalar_one())
 
         for f in APP_FUNCS + PIPELINE_FUNCS:
-            for role in ("feelings_admin", "public"):
+            for role in ("feelings_admin", "feelings_billing", "public"):
                 assert not await can(role, f), (role, f)
         for f in ADMIN_FUNCS:
             assert await can("feelings_admin", f), f
-            for role in ("feelings_app", "feelings_api", "feelings_worker", "public"):
+            for role in ("feelings_app", "feelings_api", "feelings_worker", "feelings_billing"):
                 assert not await can(role, f), (role, f)
+            assert not await can("public", f), f
+        for f in BILLING_FUNCS:
+            assert await can("feelings_billing", f), f
+            for role in ("feelings_app", "feelings_api", "feelings_worker", "feelings_admin"):
+                assert not await can(role, f), (role, f)
+            assert not await can("public", f), f
         for f in APP_FUNCS:
             assert await can("feelings_app", f), f
             assert not await can("feelings_worker", f), f
@@ -997,7 +1006,9 @@ async def test_definer_functions_executable_only_by_intended_roles(engine: Async
             )
         )
         definers = rows.all()
-        assert len(definers) == len(APP_FUNCS) + len(PIPELINE_FUNCS) + len(ADMIN_FUNCS) - 1
+        assert len(definers) == (
+            len(APP_FUNCS) + len(PIPELINE_FUNCS) + len(ADMIN_FUNCS) + len(BILLING_FUNCS) - 1
+        )
         for name, cfg in definers:
             paths = [c for c in (cfg or []) if c.startswith("search_path=")]
             assert paths, name
@@ -1183,11 +1194,14 @@ async def test_roles_have_no_bypass_and_own_nothing(engine: AsyncEngine) -> None
             )
         )
         roles = {row[0]: tuple(row[1:]) for row in r}
-        assert set(roles) >= {"feelings_app", "feelings_api", "feelings_worker", "feelings_admin"}
+        assert set(roles) >= {
+            "feelings_app", "feelings_api", "feelings_worker", "feelings_admin", "feelings_billing",
+        }  # fmt: skip
         for name, (sup, bypass, _inherit, createrole, createdb) in roles.items():
             assert (sup, bypass, createrole, createdb) == (False, False, False, False), name
         assert roles["feelings_api"][2] is False  # NOINHERIT
-        for name in ("feelings_app", "feelings_worker", "feelings_admin"):
+        assert roles["feelings_billing"][2] is False  # NOINHERIT (0019, АР-50 п.7)
+        for name in ("feelings_app", "feelings_worker", "feelings_admin", "feelings_billing"):
             lg = await conn.execute(
                 text("SELECT rolcanlogin FROM pg_roles WHERE rolname = :r"), {"r": name}
             )
@@ -1197,7 +1211,7 @@ async def test_roles_have_no_bypass_and_own_nothing(engine: AsyncEngine) -> None
                 "SELECT r.rolname, g.rolname FROM pg_auth_members m "
                 "JOIN pg_roles r ON r.oid = m.member JOIN pg_roles g ON g.oid = m.roleid "
                 "WHERE r.rolname IN ('feelings_api', 'feelings_app', 'feelings_worker', "
-                "'feelings_admin')"
+                "'feelings_admin', 'feelings_billing') OR g.rolname = 'feelings_billing'"
             )
         )
         assert sorted(tuple(x) for x in member_of) == [("feelings_api", "feelings_app")]

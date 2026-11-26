@@ -25,6 +25,7 @@ export type ChatHistory = Json<paths["/chat/messages"]["get"]["responses"][200]>
 export type ChatSendRequest = NonNullable<
   paths["/chat/messages"]["post"]["requestBody"]
 >["content"]["application/json"];
+export type ChatStreamAccepted = Schemas["ChatStreamAccepted"];
 export type ChatStreamDelta = Schemas["ChatStreamDelta"];
 export type ChatStreamDone = Schemas["ChatStreamDone"];
 export type ChatStreamCrisis = Schemas["ChatStreamCrisis"];

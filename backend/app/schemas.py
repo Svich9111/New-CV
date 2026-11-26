@@ -306,13 +306,16 @@ def _not_blank(value: str) -> str:
 
 
 class ChatMessageRequest(BaseModel):
-    """Тело `POST /chat/messages`: только `text`, 1–4000 символов, не из одних пробелов."""
+    """Тело `POST /chat/messages`: `text`, 1–4000 символов, не из одних пробелов; необязательный
+    ключ идемпотентности `client_message_id` (uuid строкой, АР-51)."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     text: Annotated[
         str, StringConstraints(min_length=1, max_length=4000), AfterValidator(_not_blank)
     ]
+    # Строгий режим не принимает uuid строкой из JSON — только для этого поля он снят.
+    client_message_id: Annotated[uuid.UUID | None, Field(strict=False)] = None
 
 
 class ChatMessage(_Export):
@@ -320,6 +323,9 @@ class ChatMessage(_Export):
     author: Literal["owner", "agent"]
     text: ExportText
     created_at: datetime
+    client_message_id: uuid.UUID | None  # только у реплики владельца, отправленной с ключом
+    reply_to: uuid.UUID | None  # у ответа агента: реплика владельца, на которую он отвечает
+    crisis: bool  # ответ кризисного протокола (у реплик владельца — false)
 
 
 class ChatPage(_Export):

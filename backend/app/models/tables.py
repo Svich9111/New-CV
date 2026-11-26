@@ -18,6 +18,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     LargeBinary,
@@ -265,12 +266,46 @@ class Conversation(Base):
 
 
 class ConversationMessage(Base):
-    """§7 conversation_messages: id, conversation_id, автор, текст (зашифрован), время."""
+    """§7 conversation_messages: id, conversation_id, автор, текст (зашифрован), время.
+
+    Сверх §7 (АР-51, миграция 0018): ключ идемпотентности реплики владельца
+    (``client_message_id``), аренда ответа на неё и отметка лимита; у ответа агента — реплика,
+    на которую он отвечает (``reply_to_id``, тот же диалог), и флаг кризисного протокола."""
 
     __tablename__ = "conversation_messages"
     __table_args__ = (
         # Порядок реплик (created_at, id): сессии и отметки извлечения (0009), сводка (2.1).
         Index("ix_conversation_messages_conversation_order", "conversation_id", "created_at", "id"),
+        UniqueConstraint(
+            "conversation_id", "id", name="uq_conversation_messages_conversation_id_id"
+        ),
+        ForeignKeyConstraint(
+            ["conversation_id", "reply_to_id"],
+            ["conversation_messages.conversation_id", "conversation_messages.id"],
+            name="fk_conversation_messages_reply_to_id_conversation_messages",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "uq_conversation_messages_client_message_id",
+            "conversation_id",
+            "client_message_id",
+            unique=True,
+            postgresql_where=sa_text("client_message_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_conversation_messages_reply_to_id",
+            "reply_to_id",
+            unique=True,
+            postgresql_where=sa_text("reply_to_id IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "author = 'owner' OR (client_message_id IS NULL AND reply_lease_until IS NULL "
+            "AND NOT limit_charged)",
+            name="owner_only_fields",
+        ),
+        CheckConstraint(
+            "author = 'agent' OR (reply_to_id IS NULL AND NOT crisis)", name="agent_only_fields"
+        ),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -280,6 +315,13 @@ class ConversationMessage(Base):
     author: Mapped[str] = mapped_column(MessageAuthor, nullable=False)
     text_enc: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = created_at()
+    client_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    reply_to_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    crisis: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=sa_text("false"))
+    reply_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    limit_charged: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=sa_text("false")
+    )
 
 
 class MemoryItem(Base):

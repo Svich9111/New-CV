@@ -78,7 +78,11 @@ describe("A8 2.2 — сверка с историей: четыре исхода
     await chat.retry(it.key);
     await idle(chat);
     expect(posts(server)).toBe(2);
-    expect(owners(server, "Мне тревожно")).toBe(2); // сервер хранит обе попытки (АР-32)
+    // АР-51 (было по АР-32: «сервер хранит обе попытки», 2): повтор — с тем же ключом, новой реплики нет.
+    expect(owners(server, "Мне тревожно")).toBe(1);
+    const keys = server.calls("POST", "/chat/messages").map((c) => (c.body as { client_message_id?: string }).client_message_id);
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBe(keys[0]);
     expect(shown(chat.getSnapshot())).toEqual(["owner:Мне тревожно", "agent:Слышу тебя."]);
   });
 

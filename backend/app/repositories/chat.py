@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Literal
 
@@ -210,18 +210,23 @@ async def _turns_after(
     conversation_id: uuid.UUID,
     summary: HistorySummary | None,
     limit: int | None,
+    upto: FeedPosition | None = None,
 ) -> tuple[list[ConversationText], int]:
     """Реплики после отметки сводки, по порядку. ``limit`` — сколько **читаемых** (расшифрованных
     и непустых) реплик нужно с конца: нечитаемые строки места в бюджете не занимают и предел не
     съедают (тест A8-3) — чтение идёт страницами дальше назад, но не больше
     ``TURN_SCAN_FACTOR × limit`` строк (потерянный ключ, 4.7). → (реплики, сколько нечитаемых;
     если просмотр упёрся в потолок, а строки ещё есть, — +1 к потерям, сборка пишет её в
-    ``unavailable``)."""
+    ``unavailable``). ``upto`` — последняя реплика, которая войдёт (ответ на неё по повтору с
+    ключом, АР-51): более поздние реплики не берутся."""
     params: dict[str, object] = {"c": conversation_id, "u": user_id}
     after = ""
     if summary is not None and summary.through_at is not None:
         after = "AND (m.created_at, m.id) > (:ta, :ti) "
         params |= {"ta": summary.through_at, "ti": summary.through_id}
+    if upto is not None:
+        after += "AND (m.created_at, m.id) <= (:ua, :ui) "
+        params |= {"ua": upto.created_at, "ui": upto.id}
     sql = (
         "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at "  # noqa: S608 — фрагменты-константы, ввод — параметры
         "FROM conversation_messages m JOIN conversations c ON c.id = m.conversation_id "
@@ -432,16 +437,18 @@ async def read_context(
     memory_limit: int = 8,
     turns_limit: int | None = None,
     pair_limit: int = 20,
+    upto: FeedPosition | None = None,
 ) -> ContextRows:
     """Всё для контекста агента владельца — одной транзакцией (один снимок). ``OwnerGone`` —
-    владельца нет или нет агента; ``LookupError`` — диалог не свой."""
+    владельца нет или нет агента; ``LookupError`` — диалог не свой. ``upto`` — реплики диалога
+    не позже этой (см. ``_turns_after``)."""
     async with user_scope(sm, user_id) as s:
         owner, partner, agent_id, profile_blob = await _owner(s, user_id)
         own, summary, summary_lost = await _summary(s, keys, user_id, conversation_id)
         if not own:
             raise LookupError("диалог не найден среди своих")
         turns, turns_lost = await _turns_after(
-            s, keys, user_id, conversation_id, summary, turns_limit
+            s, keys, user_id, conversation_id, summary, turns_limit, upto
         )
         rejected: list[bool] = []
         memory, memory_lost = await _memory(
@@ -533,11 +540,18 @@ async def add_message(
     conversation_id: uuid.UUID,
     author: Author,
     body: str,
+    *,
+    reply_to: uuid.UUID | None = None,
+    crisis: bool = False,
 ) -> uuid.UUID | None:
     """Реплика в свой диалог (шифротекст). ``None`` — диалог не свой или владелец удалён
-    (Б-44: не ошибка). Реплику владельца API пишет **до** вызова модели (ТЗ §10)."""
+    (Б-44: не ошибка). Реплику владельца API пишет **до** вызова модели (ТЗ §10). У ответа
+    агента — ``reply_to`` (реплика владельца того же диалога; второй ответ на неё — 23505,
+    индекс 0018) и ``crisis`` — ответ кризисного протокола (АР-51)."""
     async with user_scope(sm, user_id) as s:
-        return await _insert_message(s, keys, user_id, conversation_id, author, body)
+        return await _insert_message(
+            s, keys, user_id, conversation_id, author, body, reply_to=reply_to, crisis=crisis
+        )
 
 
 async def _insert_message(
@@ -547,16 +561,56 @@ async def _insert_message(
     conversation_id: uuid.UUID,
     author: Author,
     body: str,
+    *,
+    reply_to: uuid.UUID | None = None,
+    crisis: bool = False,
+    client_message_id: uuid.UUID | None = None,
+    lease_s: float | None = None,
 ) -> uuid.UUID | None:
+    return (
+        await _insert_row(
+            s,
+            keys,
+            user_id,
+            conversation_id,
+            author,
+            body,
+            reply_to=reply_to,
+            crisis=crisis,
+            client_message_id=client_message_id,
+            lease_s=lease_s,
+        )
+    )[0]
+
+
+async def _insert_row(
+    s: AsyncSession,
+    keys: Keyring,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    author: Author,
+    body: str,
+    *,
+    reply_to: uuid.UUID | None = None,
+    crisis: bool = False,
+    client_message_id: uuid.UUID | None = None,
+    lease_s: float | None = None,
+) -> tuple[uuid.UUID | None, datetime | None, datetime | None]:
+    """→ (id, время создания, аренда ответа до) — ``(None, None, None)``, если диалог не свой."""
     if author not in ("owner", "agent"):
         raise ValueError("author")
     row_id = uuid.uuid4()
     res = await s.execute(
         text(
-            "INSERT INTO conversation_messages (id, conversation_id, author, text_enc) "
-            "SELECT :i, c.id, CAST(:au AS message_author), :t FROM conversations c "
+            "INSERT INTO conversation_messages (id, conversation_id, author, text_enc, "
+            "reply_to_id, crisis, client_message_id, reply_lease_until) "
+            "SELECT :i, c.id, CAST(:au AS message_author), :t, :rt, :cr, :k, "
+            "CASE WHEN CAST(:ls AS double precision) IS NULL THEN NULL "
+            "ELSE clock_timestamp() + make_interval(secs => CAST(:ls AS double precision)) END "
+            "FROM conversations c "
             "JOIN agents a ON a.id = c.agent_id JOIN users u ON u.id = a.user_id "
-            "WHERE c.id = :c AND a.user_id = :u AND u.deleted_at IS NULL RETURNING id"
+            "WHERE c.id = :c AND a.user_id = :u AND u.deleted_at IS NULL "
+            "RETURNING id, created_at, reply_lease_until"
         ),
         {
             "i": row_id,
@@ -564,11 +618,16 @@ async def _insert_message(
             "u": user_id,
             "au": author,
             "t": keys.seal(crypto.CONVERSATION_MESSAGE_TEXT, row_id, body),
+            "rt": reply_to,
+            "cr": crisis,
+            "k": client_message_id,
+            "ls": lease_s,
         },
     )
-    if res.one_or_none() is None:
-        return None
-    return row_id
+    row = res.one_or_none()
+    if row is None:
+        return None, None, None
+    return row_id, row.created_at, row.reply_lease_until
 
 
 async def add_owner_turn(
@@ -585,20 +644,191 @@ async def add_owner_turn(
     return conv, row_id
 
 
+@dataclass(frozen=True)
+class StoredReply:
+    """Сохранённый ответ агента на реплику владельца (повтор с ключом, АР-51)."""
+
+    id: uuid.UUID
+    text: str | None  # None — не расшифровался (код — ``unavailable``)
+    crisis: bool
+    unavailable: str | None = None
+
+
+TurnState = Literal["new", "unanswered", "answered", "busy", "mismatch"]
+
+
+@dataclass(frozen=True)
+class OwnerTurn:
+    """Реплика владельца с ключом идемпотентности ``client_message_id`` (АР-51):
+
+    - ``new`` — сохранена этим запросом; ``unanswered`` — была сохранена раньше, ответа нет,
+      никто его не готовит: аренда взята этим запросом. В обоих случаях ``lease`` — до какого
+      времени ответ готовит этот запрос (снять — ``release_reply_lease``);
+    - ``answered`` — ответ уже сохранён (``reply``); ``busy`` — ответ готовит другой запрос
+      (его аренда не истекла); ``mismatch`` — под этим ключом сохранён другой текст.
+
+    ``text`` — сохранённый текст реплики (на него и отвечать; ``None`` — не расшифровался)."""
+
+    state: TurnState
+    conversation_id: uuid.UUID
+    message_id: uuid.UUID
+    created_at: datetime
+    text: str | None
+    lease: datetime | None = None
+    limit_charged: bool = False
+    reply: StoredReply | None = None
+
+    @property
+    def position(self) -> FeedPosition:
+        return FeedPosition(self.created_at, self.message_id)
+
+
+_TURN_BY_KEY = (
+    "SELECT m.id, m.conversation_id, m.text_enc, m.created_at, m.limit_charged, "
+    "COALESCE(m.reply_lease_until > clock_timestamp(), false) AS busy, "
+    "r.id AS reply_id, r.text_enc AS reply_enc, r.crisis AS reply_crisis "
+    "FROM conversation_messages m JOIN conversations c ON c.id = m.conversation_id "
+    "JOIN agents a ON a.id = c.agent_id "
+    "LEFT JOIN conversation_messages r "
+    "ON r.reply_to_id = m.id AND r.conversation_id = m.conversation_id "
+    "WHERE a.user_id = :u AND m.author = 'owner' AND m.client_message_id = :k "
+    "ORDER BY m.created_at, m.id LIMIT 1"
+)
+
+
+async def accept_owner_turn(
+    sm: async_sessionmaker[AsyncSession],
+    keys: Keyring,
+    user_id: uuid.UUID,
+    body: str,
+    client_message_id: uuid.UUID,
+    *,
+    lease_s: float,
+) -> OwnerTurn:
+    """Реплика владельца с ключом идемпотентности (АР-51) — **одной** транзакцией (АР-24).
+
+    Строка агента владельца блокируется (``_conversation``: ``FOR NO KEY UPDATE``) до поиска
+    ключа, поэтому два одновременных запроса с одним ключом идут по очереди: второй видит
+    реплику первого (READ COMMITTED) и его аренду — ``busy``. Ключ ищется по **всем** диалогам
+    владельца (уникальность в пределах владельца); у другого человека тот же ключ — другая
+    реплика. ``OwnerGone`` — владельца или агента нет."""
+    async with user_scope(sm, user_id) as s:
+        conv = await _conversation(s, user_id)
+        row = (
+            await s.execute(text(_TURN_BY_KEY), {"u": user_id, "k": client_message_id})
+        ).one_or_none()
+        if row is None:
+            row_id, created, lease = await _insert_row(
+                s,
+                keys,
+                user_id,
+                conv,
+                "owner",
+                body,
+                client_message_id=client_message_id,
+                lease_s=lease_s,
+            )
+            if row_id is None or created is None:
+                raise OwnerGone
+            return OwnerTurn("new", conv, row_id, created, body, lease)
+        turn_id, turn_conv = _uuid(row.id), _uuid(row.conversation_id)
+        stored, _ = open_row(keys, crypto.CONVERSATION_MESSAGE_TEXT, turn_id, row.text_enc)
+        base = OwnerTurn(
+            "answered",
+            turn_conv,
+            turn_id,
+            row.created_at,
+            stored,
+            limit_charged=bool(row.limit_charged),
+        )
+        if stored is not None and stored != body:
+            return replace(base, state="mismatch")
+        if row.reply_id is not None:
+            reply_id = _uuid(row.reply_id)
+            reply, reason = open_row(
+                keys, crypto.CONVERSATION_MESSAGE_TEXT, reply_id, row.reply_enc
+            )
+            return replace(base, reply=StoredReply(reply_id, reply, bool(row.reply_crisis), reason))
+        if row.busy:
+            return replace(base, state="busy")
+        lease = (
+            await s.execute(
+                text(
+                    "UPDATE conversation_messages SET reply_lease_until = clock_timestamp() + "
+                    "make_interval(secs => CAST(:ls AS double precision)) "
+                    "WHERE id = :i RETURNING reply_lease_until"
+                ),
+                {"i": turn_id, "ls": lease_s},
+            )
+        ).scalar_one()
+        return replace(base, state="unanswered", lease=lease)
+
+
+async def release_reply_lease(
+    sm: async_sessionmaker[AsyncSession],
+    user_id: uuid.UUID,
+    message_id: uuid.UUID,
+    lease: datetime,
+) -> bool:
+    """Снять свою аренду ответа на реплику (запрос завершён любым исходом). Аренду, которую
+    после истечения взял другой запрос, не трогает (сравнение по значению)."""
+    async with user_scope(sm, user_id) as s:
+        res = await s.execute(
+            text(
+                "UPDATE conversation_messages m SET reply_lease_until = NULL "
+                "FROM conversations c JOIN agents a ON a.id = c.agent_id "
+                "WHERE m.id = :i AND c.id = m.conversation_id AND a.user_id = :u "
+                "AND m.reply_lease_until = :l RETURNING m.id"
+            ),
+            {"i": message_id, "u": user_id, "l": lease},
+        )
+        return res.one_or_none() is not None
+
+
+async def mark_limit_charged(
+    sm: async_sessionmaker[AsyncSession], user_id: uuid.UUID, message_id: uuid.UUID
+) -> bool:
+    """Отметить, что дневной лимит за реплику засчитан (АР-32): повтор с тем же ключом его
+    повторно не расходует."""
+    async with user_scope(sm, user_id) as s:
+        res = await s.execute(
+            text(
+                "UPDATE conversation_messages m SET limit_charged = true "
+                "FROM conversations c JOIN agents a ON a.id = c.agent_id "
+                "WHERE m.id = :i AND c.id = m.conversation_id AND a.user_id = :u "
+                "AND m.author = 'owner' RETURNING m.id"
+            ),
+            {"i": message_id, "u": user_id},
+        )
+        return res.one_or_none() is not None
+
+
 _PAGE_FIRST = (
-    "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at "
+    "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at, "
+    "m.client_message_id, m.reply_to_id, m.crisis "
     "FROM conversation_messages m JOIN conversations c ON c.id = m.conversation_id "
     "JOIN agents a ON a.id = c.agent_id JOIN users u ON u.id = a.user_id "
     "WHERE a.user_id = :u AND u.deleted_at IS NULL "
     "ORDER BY m.created_at DESC, m.id DESC LIMIT :n"
 )
 _PAGE_BEFORE = (
-    "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at "
+    "SELECT m.id, m.author::text AS author, m.text_enc, m.created_at, "
+    "m.client_message_id, m.reply_to_id, m.crisis "
     "FROM conversation_messages m JOIN conversations c ON c.id = m.conversation_id "
     "JOIN agents a ON a.id = c.agent_id JOIN users u ON u.id = a.user_id "
     "WHERE a.user_id = :u AND u.deleted_at IS NULL AND (m.created_at, m.id) < (:bt, :bi) "
     "ORDER BY m.created_at DESC, m.id DESC LIMIT :n"
 )
+
+
+@dataclass(frozen=True)
+class ChatRow(ConversationText):
+    """Реплика ленты личного чата: ключ клиента у реплики владельца, у ответа агента — реплика,
+    на которую он отвечает, и флаг кризисного протокола (АР-51)."""
+
+    client_message_id: uuid.UUID | None = None
+    reply_to_id: uuid.UUID | None = None
+    crisis: bool = False
 
 
 @dataclass(frozen=True)
@@ -616,7 +846,7 @@ async def read_chat_page(
     *,
     limit: int,
     before: FeedPosition | None = None,
-) -> tuple[list[ConversationText], bool]:
+) -> tuple[list[ChatRow], bool]:
     """Страница ленты личного чата владельца — реплики **всех** его диалогов от новых к старым
     (``created_at DESC, id DESC``), строго старше ``before``. → (реплики, есть ли старше).
     Нерасшифрованная строка не пропускается: ``text = None``, код — в ``unavailable``. Явный
@@ -630,11 +860,24 @@ async def read_chat_page(
         params |= {"bt": before.created_at, "bi": before.id}
     async with user_scope(sm, user_id) as s:
         rows = (await s.execute(text(sql), params)).all()
-    items: list[ConversationText] = []
+    items: list[ChatRow] = []
     for r in rows[:limit]:
         row_id = _uuid(r.id)
         body, reason = open_row(keys, crypto.CONVERSATION_MESSAGE_TEXT, row_id, r.text_enc)
-        items.append(ConversationText(row_id, r.author, body, r.created_at, reason))
+        items.append(
+            ChatRow(
+                row_id,
+                r.author,
+                body,
+                r.created_at,
+                reason,
+                client_message_id=None
+                if r.client_message_id is None
+                else _uuid(r.client_message_id),
+                reply_to_id=None if r.reply_to_id is None else _uuid(r.reply_to_id),
+                crisis=bool(r.crisis),
+            )
+        )
     return items, len(rows) > limit
 
 

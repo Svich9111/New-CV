@@ -26,7 +26,14 @@ from app.repositories.memory_work import worker_scope
 from tests.conftest import TEST_DATABASE_URL
 
 ROLES_SQL = Path(__file__).resolve().parents[2] / "infra" / "db" / "roles.sql"
-GROUP_ROLES = ("feelings_app", "feelings_worker", "feelings_admin", "feelings_api")
+# feelings_billing — роль платежей (0019, АР-50 п.7): roles.sql её пока не трогает (Б-97).
+GROUP_ROLES = (
+    "feelings_app",
+    "feelings_worker",
+    "feelings_admin",
+    "feelings_api",
+    "feelings_billing",
+)
 PASSWORD_ENVS = ("FEELINGS_WORKER_DB_PASSWORD", "FEELINGS_ADMIN_DB_PASSWORD")
 
 
