@@ -182,3 +182,6 @@ fieldset.field { border: 0; padding: 0; margin-left: 0; margin-right: 0; min-wid
 .contact__phone { display: inline-block; font-weight: 700; font-size: var(--font-size-lead); color: var(--text); text-underline-offset: 3px; padding: 4px 0; }
 .rules, .steps { padding-left: 20px; margin: 0 0 12px; }
 .rules li, .steps li { margin-bottom: 6px; }
+
+/* Текст в #root до запуска приложения (index.html): без встроенного style — CSP без 'unsafe-inline'. */
+.boot-placeholder { margin: 0; padding: var(--gutter); }

@@ -54,11 +54,13 @@ export function Onboarding() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /**
-   * Онбординг сохранён, а принять приглашение не удалось. Повтор только принимает приглашение (согласия
-   * второй раз не отправляются); `retry` — помогает ли повтор (сеть, 5xx, 429), иначе остаётся одно
-   * действие — «Продолжить без приглашения».
+   * Онбординг сохранён, а принять приглашение не удалось — режим хранится в сессии (`pendingAccept.failure`
+   * ставится только после успешного `PUT /me/onboarding`), поэтому переживает уход в «Помощь» и «Назад» (n-1).
+   * Повтор только принимает приглашение (согласия второй раз не отправляются); `retry` — помогает ли повтор
+   * (сеть, 5xx, 429), иначе остаётся одно действие — «Продолжить без приглашения».
    */
-  const [acceptFailed, setAcceptFailed] = useState<{ saved: Me; retry: boolean } | null>(null);
+  const acceptFailed = pending?.failure ?? null;
+  const shownError = error ?? (acceptFailed && !busy ? acceptFailed.text : null);
 
   const { setOnboardingDraft } = app;
   useEffect(() => {
@@ -91,9 +93,7 @@ export function Onboarding() {
     } catch (e) {
       setBusy(false);
       tg.notify("error");
-      setError(message(e));
-      const retry = isRetryable(e);
-      setAcceptFailed({ saved, retry });
+      app.setPendingAccept({ token, inviterName: pending?.inviterName ?? null, failure: { text: message(e), retry: isRetryable(e) } });
     }
   }
 
@@ -101,7 +101,7 @@ export function Onboarding() {
     if (!acceptFailed || !pending || busy) return;
     setBusy(true);
     setError(null);
-    await accept(acceptFailed.saved, pending.token);
+    await accept(app.me, pending.token);
   }
 
   async function submit() {
@@ -229,7 +229,7 @@ export function Onboarding() {
       {pending && !acceptFailed && (
         <p className="small muted">После этого шага {pending.inviterName ? `ты и ${pending.inviterName}` : "вы"} станете парой.</p>
       )}
-      {error && <Notice kind="error">{error}</Notice>}
+      {shownError && <Notice kind="error">{shownError}</Notice>}
       {acceptFailed && (
         <>
           <p className="small muted">Знакомство сохранено — заполнять заново не нужно.</p>

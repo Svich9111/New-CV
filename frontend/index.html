@@ -8,19 +8,15 @@
     <title>Чувства AI</title>
     <!--
       Официальный SDK Telegram Mini Apps. Загружается асинхронно, чтобы недоступный telegram.org не держал
-      страницу пустой: приложение ждёт SDK не дольше SDK_WAIT_MS (src/telegram/webapp.ts), а data-state
-      сообщает ему, что скрипт уже загрузился или не загрузился.
+      страницу пустой: приложение ждёт SDK не дольше SDK_WAIT_MS (src/telegram/webapp.ts), а внутри Telegram
+      (в адресе есть tgWebAppData) — до загрузки скрипта. Отметку «загрузился / не загрузился» (data-state)
+      ставит внешний sdk-state.js, подключённый до SDK: в разметке нет встроенных обработчиков и стилей (CSP).
     -->
-    <script
-      id="telegram-web-app-sdk"
-      async
-      src="https://telegram.org/js/telegram-web-app.js"
-      onload="this.dataset.state='loaded'"
-      onerror="this.dataset.state='failed'"
-    ></script>
+    <script src="/sdk-state.js"></script>
+    <script id="telegram-web-app-sdk" async src="https://telegram.org/js/telegram-web-app.js"></script>
   </head>
   <body>
-    <div id="root"><p style="padding: 16px; font-family: system-ui, sans-serif">Загружаем «Чувства AI»…</p></div>
+    <div id="root"><p class="boot-placeholder">Загружаем «Чувства AI»…</p></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

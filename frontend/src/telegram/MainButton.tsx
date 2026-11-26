@@ -1,6 +1,6 @@
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useTelegram, useThemeVersion } from "./context";
-import { cssToken } from "./webapp";
+import { cssToken, safely } from "./webapp";
 
 /** Второе касание в течение этого времени игнорируется — пока экран не успел показать «идёт запрос». */
 export const DOUBLE_TAP_MS = 500;
@@ -18,10 +18,13 @@ interface Props {
  * Вне Telegram (или в тестах без SDK) — запасная кнопка в странице с тем же поведением.
  * На экране одновременно не больше одной MainButton. Нативная кнопка обновляется в той же фиксации, что и
  * страница (layout-эффект): экран и кнопка Telegram не расходятся ни на кадр.
+ * Каждый вызов SDK защищён (`TelegramApi.withMain`): если метод нативной кнопки бросает, экран не падает —
+ * вместо неё рисуется запасная кнопка в странице (A8-1.5-D6).
  */
 export function MainButton({ text, onClick, disabled = false, progress = false }: Props) {
   const tg = useTelegram();
-  const wa = tg.webApp;
+  const [native, setNative] = useState(() => tg.nativeMain);
+  const wa = native ? tg.webApp : null;
   // Цвета кнопки — из токенов текущей темы: при смене темы на лету они перечитываются.
   const theme = useThemeVersion();
   const state = useRef({ onClick, blocked: disabled || progress });
@@ -42,31 +45,42 @@ export function MainButton({ text, onClick, disabled = false, progress = false }
 
   useLayoutEffect(() => {
     if (!wa) return;
-    const mb = wa.MainButton;
     const handler = () => press.current(() => tg.impact("light"));
-    mb.onClick(handler);
-    mb.show();
+    const ok = tg.withMain((mb) => {
+      mb.onClick(handler);
+      mb.show();
+    });
+    if (!ok) {
+      safely(() => wa.MainButton.offClick(handler));
+      setNative(false);
+      return;
+    }
     return () => {
-      mb.offClick(handler);
-      mb.hideProgress();
-      mb.hide();
+      // Снятие обработчика — отдельно от скрытия: отказ hide() не оставляет живой обработчик прошлого экрана.
+      safely(() => wa.MainButton.offClick(handler));
+      tg.withMain((mb) => {
+        mb.hideProgress();
+        mb.hide();
+      });
     };
   }, [wa, tg]);
 
   useLayoutEffect(() => {
     if (!wa) return;
-    const mb = wa.MainButton;
-    mb.setText(text);
     const active = !disabled;
     // Недоступная кнопка выглядит серой: состояние видно не только по отсутствию реакции.
     const color = cssToken(active ? "--accent" : "--disabled-bg");
     const textColor = cssToken(active ? "--on-accent" : "--disabled-text");
-    if (color && textColor) mb.setParams?.({ color, text_color: textColor });
-    if (active) mb.enable();
-    else mb.disable();
-    if (progress) mb.showProgress(false);
-    else mb.hideProgress();
-  }, [wa, text, disabled, progress, theme]);
+    const ok = tg.withMain((mb) => {
+      mb.setText(text);
+      if (color && textColor) mb.setParams?.({ color, text_color: textColor });
+      if (active) mb.enable();
+      else mb.disable();
+      if (progress) mb.showProgress(false);
+      else mb.hideProgress();
+    });
+    if (!ok) setNative(false);
+  }, [wa, tg, text, disabled, progress, theme]);
 
   if (wa) return null;
   return (

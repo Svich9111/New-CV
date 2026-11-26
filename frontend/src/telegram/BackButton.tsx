@@ -1,13 +1,15 @@
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useTelegram } from "./context";
+import { safely } from "./webapp";
 
 /**
- * Кнопка «Назад»: нативная BackButton Telegram (ТЗ §8); в старых клиентах и вне Telegram —
- * кнопка в шапке страницы. `onBack = null` — назад некуда, кнопка скрыта.
+ * Кнопка «Назад»: нативная BackButton Telegram (ТЗ §8); в старых клиентах, вне Telegram и если метод
+ * нативной кнопки отказал (A8-1.5-D6) — кнопка в шапке страницы. `onBack = null` — назад некуда, кнопка скрыта.
  */
 export function BackButton({ onBack }: { onBack: (() => void) | null }) {
   const tg = useTelegram();
-  const native = tg.nativeBack ? tg.webApp : null;
+  const [nativeOk, setNativeOk] = useState(() => tg.nativeBack);
+  const native = nativeOk ? tg.webApp : null;
   const ref = useRef(onBack);
   const visible = onBack !== null;
 
@@ -17,19 +19,25 @@ export function BackButton({ onBack }: { onBack: (() => void) | null }) {
 
   useLayoutEffect(() => {
     if (!native) return;
-    const bb = native.BackButton;
     if (!visible) {
-      bb.hide();
+      if (!tg.withBack((bb) => bb.hide())) setNativeOk(false);
       return;
     }
     const handler = () => ref.current?.();
-    bb.onClick(handler);
-    bb.show();
+    const ok = tg.withBack((bb) => {
+      bb.onClick(handler);
+      bb.show();
+    });
+    if (!ok) {
+      safely(() => native.BackButton.offClick(handler));
+      setNativeOk(false);
+      return;
+    }
     return () => {
-      bb.offClick(handler);
-      bb.hide();
+      safely(() => native.BackButton.offClick(handler));
+      tg.withBack((bb) => bb.hide());
     };
-  }, [native, visible]);
+  }, [native, tg, visible]);
 
   if (native || !visible) return null;
   return (

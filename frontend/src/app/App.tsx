@@ -7,7 +7,7 @@ import { Help } from "../screens/Help";
 import { Incoming } from "../screens/Incoming";
 import { Invite } from "../screens/Invite";
 import { Onboarding } from "../screens/Onboarding";
-import { OpenInTelegram } from "../screens/OpenInTelegram";
+import { OpenInTelegram, TelegramUnavailable, WaitingForTelegram } from "../screens/OpenInTelegram";
 import { Paired } from "../screens/Paired";
 import { Underage } from "../screens/Underage";
 import { Welcome } from "../screens/Welcome";
@@ -20,6 +20,8 @@ import type { Route } from "./routes";
 import { MainButton } from "../telegram/MainButton";
 import { Notice } from "../ui/Notice";
 import { AppContext, type AppState, type OnboardingDraft, type PendingAccept } from "./store";
+
+type Boot = { kind: "loading" } | { kind: "error"; error: ApiError } | { kind: "ready"; me: Me };
 
 /** Первый экран после входа. */
 export function initialRoute(me: Me, startParam: string | null): Route {
@@ -76,45 +78,80 @@ function Screen({ route, api }: { route: Route; api: Api }) {
   }
 }
 
-/** Вошедший пользователь: стек экранов и состояние сессии (только в памяти). */
-function Session({ api, tg, initialMe }: { api: Api; tg: TelegramApi; initialMe: Me }) {
-  const [me, setMe] = useState(initialMe);
-  const [stack, setStack] = useState<Route[]>(() => [initialRoute(initialMe, tg.startParam)]);
+/**
+ * Вход и сессия вошедшего пользователя: стек экранов и состояние сессии (только в памяти).
+ * До входа и после — один и тот же каркас (`Frame`) в одном месте дерева: при переходе «Входим…» → первый
+ * экран ссылка «Помощь» и кнопка «Назад» не пересоздаются (фокус и нажатие не теряются).
+ */
+function Session({ api, tg, boot, onRetry }: { api: Api; tg: TelegramApi; boot: Boot; onRetry: () => void }) {
+  const [helpBeforeLogin, setHelpBeforeLogin] = useState(false);
+  const [me, setMe] = useState<Me | null>(null);
+  const [stack, setStack] = useState<Route[]>([]);
   const [invite, setInvite] = useState<InviteCreated | null>(null);
   const [shared, setShared] = useState(false);
   const [pendingAccept, setPendingAccept] = useState<PendingAccept | null>(null);
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [onboardingDraft, setOnboardingDraft] = useState<OnboardingDraft | null>(null);
 
+  // Вход завершился: первый экран по онбордингу, паре и startapp. Вычисляется при отрисовке (состояние из
+  // свойства), поэтому промежуточного кадра без экрана нет.
+  if (boot.kind === "ready" && me === null) {
+    setMe(boot.me);
+    setStack([initialRoute(boot.me, tg.startParam)]);
+  }
+
   const push = useCallback((r: Route) => setStack((s) => [...s, r]), []);
   const reset = useCallback((r: Route) => setStack([r]), []);
   const back = useCallback(() => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s)), []);
 
-  const route = stack[stack.length - 1];
+  const route = stack.length > 0 ? stack[stack.length - 1] : null;
   const canGoBack = stack.length > 1;
 
-  const state = useMemo<AppState>(
-    () => ({
-      api,
-      me,
-      setMe,
-      invite,
-      setInvite,
-      shared,
-      setShared,
-      pendingAccept,
-      setPendingAccept,
-      inviteError,
-      setInviteError,
-      onboardingDraft,
-      setOnboardingDraft,
-      push,
-      reset,
-      back,
-      canGoBack,
-    }),
+  const state = useMemo<AppState | null>(
+    () =>
+      me && {
+        api,
+        me,
+        setMe,
+        invite,
+        setInvite,
+        shared,
+        setShared,
+        pendingAccept,
+        setPendingAccept,
+        inviteError,
+        setInviteError,
+        onboardingDraft,
+        setOnboardingDraft,
+        push,
+        reset,
+        back,
+        canGoBack,
+      },
     [api, me, invite, shared, pendingAccept, inviteError, onboardingDraft, push, reset, back, canGoBack],
   );
+
+  if (!state || !route) {
+    return (
+      <AppContext.Provider value={null}>
+        <Frame
+          onBack={helpBeforeLogin ? () => setHelpBeforeLogin(false) : null}
+          onHelp={helpBeforeLogin ? null : () => setHelpBeforeLogin(true)}
+        >
+          {helpBeforeLogin ? (
+            <Help api={api} />
+          ) : boot.kind === "error" ? (
+            <AuthError error={boot.error} onRetry={onRetry} />
+          ) : (
+            <section data-screen="loading">
+              <Heading>Чувства AI</Heading>
+              <Loading>Входим через Telegram…</Loading>
+            </section>
+          )}
+        </Frame>
+      </AppContext.Provider>
+    );
+  }
 
   return (
     <AppContext.Provider value={state}>
@@ -151,8 +188,47 @@ function Crashed({ api, onRestart }: { api: Api; onRestart: () => void }) {
 }
 
 /**
+ * Последний рубеж: упал сам запасной экран (или его «Помощь»). Статичная разметка без SDK, контекстов и
+ * запросов — текст, номер 112 ссылкой и перезапуск; повторно упасть здесь нечему, цикла нет (A8-1.5-D6).
+ */
+class LastResort extends Component<{ onRestart: () => void; children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <div className="app">
+        <main className="content">
+          <section data-screen="fatal">
+            <h1>Что-то пошло не так</h1>
+            <p role="alert">
+              Приложение не может показать экран. Введённое не отправлено. Закрой приложение и открой его снова.
+            </p>
+            <p>
+              Если тебе или кому-то рядом опасно — звони{" "}
+              <a className="contact__phone" href="tel:112">
+                112
+              </a>
+              . Это бесплатно и круглосуточно.
+            </p>
+            <button type="button" className="btn btn--block btn--ghost" onClick={this.props.onRestart}>
+              Перезапустить
+            </button>
+          </section>
+        </main>
+      </div>
+    );
+  }
+}
+
+/**
  * Граница ошибок: исключение при отрисовке экрана не оставляет пустую страницу без «Помощи».
- * Ошибка не журналируется (консоль не используется) и не показывается человеку как есть.
+ * Ошибка не журналируется (консоль не используется) и не показывается человеку как есть. Запасной экран
+ * обёрнут в `LastResort`: если упадёт и он, граница не перерисовывает его снова, а показывает статичный минимум.
  */
 class Boundary extends Component<{ api: Api; onRestart: () => void; children: ReactNode }, { crashed: boolean }> {
   state = { crashed: false };
@@ -161,28 +237,35 @@ class Boundary extends Component<{ api: Api; onRestart: () => void; children: Re
     return { crashed: true };
   }
 
+  private restart = () => {
+    this.setState({ crashed: false });
+    this.props.onRestart();
+  };
+
   render() {
     if (!this.state.crashed) return this.props.children;
     return (
-      <Crashed
-        api={this.props.api}
-        onRestart={() => {
-          this.setState({ crashed: false });
-          this.props.onRestart();
-        }}
-      />
+      <LastResort onRestart={this.restart}>
+        <Crashed api={this.props.api} onRestart={this.restart} />
+      </LastResort>
     );
   }
 }
 
-type Boot = { kind: "loading" } | { kind: "error"; error: ApiError } | { kind: "ready"; me: Me };
+/**
+ * SDK Telegram не пришёл к сроку, хотя Mini App открыт из Telegram (в адресе есть параметры запуска):
+ * `waiting` — скрипт ещё грузится, `failed` — не загрузился (см. boot.tsx, n-2).
+ */
+export type SdkWait = "waiting" | "failed";
 
-/** Вне Telegram: экран «Открой в Telegram» и «Помощь» (публичный путь, без входа). */
-function Outside({ api }: { api: Api }) {
+/** Без SDK: «Открой в Telegram» (или ожидание SDK внутри Telegram) и «Помощь» (публичный путь, без входа). */
+function Outside({ api, sdk }: { api: Api; sdk?: SdkWait }) {
   const [help, setHelp] = useState(false);
+  const screen =
+    sdk === "waiting" ? <WaitingForTelegram /> : sdk === "failed" ? <TelegramUnavailable /> : <OpenInTelegram />;
   return (
     <Frame onBack={help ? () => setHelp(false) : null} onHelp={help ? null : () => setHelp(true)}>
-      {help ? <Help api={api} /> : <OpenInTelegram />}
+      {help ? <Help api={api} /> : screen}
     </Frame>
   );
 }
@@ -191,9 +274,8 @@ function Outside({ api }: { api: Api }) {
  * Корень Mini App. Вход по initData (ФТ-01) → экран по состоянию онбординга, пары и `startapp`.
  * Вне Telegram (нет initData) запросов входа нет — только «Открой в Telegram» и «Помощь».
  */
-export function App({ tg, api }: { tg: TelegramApi; api: Api }) {
+export function App({ tg, api, sdk }: { tg: TelegramApi; api: Api; sdk?: SdkWait }) {
   const [boot, setBoot] = useState<Boot>({ kind: "loading" });
-  const [helpBeforeLogin, setHelpBeforeLogin] = useState(false);
   const started = useRef(false);
   const [generation, setGeneration] = useState(0);
 
@@ -212,33 +294,10 @@ export function App({ tg, api }: { tg: TelegramApi; api: Api }) {
     login();
   }, [tg, login]);
 
-  let body: ReactNode;
-  if (!tg.inside) {
-    body = <Outside api={api} />;
-  } else if (boot.kind === "ready") {
-    body = <Session api={api} tg={tg} initialMe={boot.me} />;
-  } else {
-    body = (
-      <Frame
-        onBack={helpBeforeLogin ? () => setHelpBeforeLogin(false) : null}
-        onHelp={helpBeforeLogin ? null : () => setHelpBeforeLogin(true)}
-      >
-        {helpBeforeLogin ? (
-          <Help api={api} />
-        ) : boot.kind === "error" ? (
-          <AuthError error={boot.error} onRetry={login} />
-        ) : (
-          <section data-screen="loading">
-            <Heading>Чувства AI</Heading>
-            <Loading>Входим через Telegram…</Loading>
-          </section>
-        )}
-      </Frame>
-    );
-  }
+  // Новое поколение (перезапуск из запасного экрана) — новая сессия с нуля: стек, черновики, «Помощь» до входа.
+  const body = tg.inside ? <Session api={api} tg={tg} boot={boot} onRetry={login} /> : <Outside api={api} sdk={sdk} />;
 
   const restart = useCallback(() => {
-    setHelpBeforeLogin(false);
     setGeneration((g) => g + 1);
     if (tg.inside) login();
   }, [tg, login]);

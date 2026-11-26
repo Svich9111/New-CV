@@ -75,11 +75,14 @@ export function cssToken(name: string): string {
 
 const HEX = /^#[0-9a-f]{6}$/i;
 
-function safely(fn: () => void): void {
+/** Вызов SDK, который не бросает: `true` — прошёл, `false` — SDK отказал (отказ не журналируется). */
+export function safely(fn: () => void): boolean {
   try {
     fn();
+    return true;
   } catch {
-    // Отказ SDK не журналируется (консоль не используется) и не прерывает запуск.
+    // Отказ SDK не журналируется (консоль не используется) и не прерывает запуск или отрисовку.
+    return false;
   }
 }
 
@@ -109,6 +112,46 @@ export function waitForTelegramSdk(win: Window = window, timeoutMs = SDK_WAIT_MS
   });
 }
 
+/** Состояние скрипта SDK по отметке sdk-state.js: загрузился, не загрузился или ещё грузится. */
+export function sdkScriptState(win: Window = window): "loaded" | "failed" | "pending" {
+  const state = win.document.getElementById(SDK_SCRIPT_ID)?.dataset.state;
+  return state === "loaded" || state === "failed" ? state : "pending";
+}
+
+/** Скрипт SDK загрузился или упал позже срока ожидания: `cb` вызывается один раз. Возвращает отписку. */
+export function onSdkScriptSettled(win: Window, cb: () => void): () => void {
+  const script = win.document.getElementById(SDK_SCRIPT_ID);
+  if (!script) return () => undefined;
+  const done = () => {
+    off();
+    cb();
+  };
+  const off = () => {
+    script.removeEventListener("load", done);
+    script.removeEventListener("error", done);
+  };
+  script.addEventListener("load", done);
+  script.addEventListener("error", done);
+  return off;
+}
+
+/**
+ * Mini App открыт из Telegram: клиент Telegram кладёт параметры запуска в адрес (`#tgWebAppData=…`,
+ * `tgWebAppVersion`) ещё до загрузки SDK. Признак нужен, чтобы медленный telegram.org внутри Telegram не
+ * показал ложное «Открой в Telegram» (n-2). Сама строка не читается и никуда не передаётся.
+ */
+export function launchedFromTelegram(win: Window = window): boolean {
+  const has = (part: string) => {
+    const p = new URLSearchParams(part.replace(/^[#?]/, ""));
+    return p.has("tgWebAppData") || p.has("tgWebAppVersion");
+  };
+  try {
+    return has(win.location.hash) || has(win.location.search);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * API платформы для экранов. Вне Telegram (`webApp === null`) нативных кнопок нет — экраны рисуют
  * запасные кнопки в странице, а тактильный отклик молчит.
@@ -131,20 +174,63 @@ export class TelegramApi {
 
   get startParam(): string | null {
     const p = this.webApp?.initDataUnsafe?.start_param;
-    return p ? p : null;
+    return typeof p === "string" && p ? p : null;
   }
 
   get firstName(): string {
-    return this.webApp?.initDataUnsafe?.user?.first_name ?? "";
+    const name = this.webApp?.initDataUnsafe?.user?.first_name;
+    return typeof name === "string" ? name : "";
   }
 
-  /** Нативная кнопка «Назад» есть с Bot API 6.1. */
+  /**
+   * Нативная кнопка отказала (метод SDK бросил): до конца сессии экраны рисуют запасную кнопку в странице,
+   * а не пробуют нативную на каждом экране снова (A8-1.5-D6).
+   */
+  private mainBroken = false;
+  private backBroken = false;
+
+  private atLeast(version: string): boolean {
+    const wa = this.webApp;
+    if (!wa) return false;
+    try {
+      return wa.isVersionAtLeast(version) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Нативная кнопка «Назад» есть с Bot API 6.1 и пока она не отказала. */
   get nativeBack(): boolean {
-    return !!this.webApp && this.webApp.isVersionAtLeast("6.1");
+    return !this.backBroken && this.atLeast("6.1");
   }
 
+  /** Нативная MainButton есть внутри Telegram, пока она не отказала. */
   get nativeMain(): boolean {
-    return !!this.webApp;
+    return !this.mainBroken && !!this.webApp;
+  }
+
+  /**
+   * Вызвать методы нативной MainButton. Отказ любого — кнопка помечается неработающей, обработчик снят,
+   * кнопка скрыта (насколько SDK позволяет); возвращает `false` — экран рисует кнопку в странице.
+   */
+  withMain(fn: (mb: TgMainButton) => void): boolean {
+    const wa = this.webApp;
+    if (!wa || this.mainBroken) return false;
+    if (safely(() => fn(wa.MainButton))) return true;
+    this.mainBroken = true;
+    safely(() => wa.MainButton.hideProgress());
+    safely(() => wa.MainButton.hide());
+    return false;
+  }
+
+  /** То же для нативной BackButton. */
+  withBack(fn: (bb: TgBackButton) => void): boolean {
+    const wa = this.webApp;
+    if (!wa || this.backBroken) return false;
+    if (safely(() => fn(wa.BackButton))) return true;
+    this.backBroken = true;
+    safely(() => wa.BackButton.hide());
+    return false;
   }
 
   /** Тема Telegram → атрибут data-theme на <html>; токены theme.css переключаются по нему. */
@@ -152,14 +238,14 @@ export class TelegramApi {
     const wa = this.webApp;
     if (!wa) return;
     document.documentElement.dataset.theme = wa.colorScheme === "dark" ? "dark" : "light";
-    if (!wa.isVersionAtLeast("6.1")) return;
+    if (!this.atLeast("6.1")) return;
     const bg = cssToken("--bg");
     // Каждый вызов SDK — отдельно: отказ одного (старый клиент, неожиданный формат) не мешает остальным
     // и не роняет запуск приложения.
     safely(() => {
       // Цвет шапки как hex SDK принимает только с Bot API 6.9; в 6.1–6.8 — только ключ темы
       // (`bg_color` / `secondary_bg_color`), на любой другой hex он бросает WebAppHeaderColorKeyInvalid.
-      if (wa.isVersionAtLeast("6.9")) {
+      if (this.atLeast("6.9")) {
         if (HEX.test(bg)) wa.setHeaderColor?.(bg);
       } else {
         wa.setHeaderColor?.("bg_color");
@@ -190,29 +276,32 @@ export class TelegramApi {
     safely(() => wa.onEvent("themeChanged", onTheme));
     safely(() => wa.ready());
     safely(() => wa.expand());
-    return () => safely(() => wa.offEvent("themeChanged", onTheme));
+    return () => void safely(() => wa.offEvent("themeChanged", onTheme));
   }
 
+  /** Тактильный отклик — украшение: отказ SDK молча пропускается. */
   impact(style: HapticImpact = "light"): void {
-    if (this.webApp?.isVersionAtLeast("6.1")) this.webApp.HapticFeedback?.impactOccurred(style);
+    const wa = this.webApp;
+    if (wa && this.atLeast("6.1")) safely(() => wa.HapticFeedback?.impactOccurred(style));
   }
 
   notify(type: HapticNotification): void {
-    if (this.webApp?.isVersionAtLeast("6.1")) this.webApp.HapticFeedback?.notificationOccurred(type);
+    const wa = this.webApp;
+    if (wa && this.atLeast("6.1")) safely(() => wa.HapticFeedback?.notificationOccurred(type));
   }
 
-  /** Выбор чата Telegram для пересылки ссылки (t.me/share/url). */
+  /** Выбор чата Telegram для пересылки ссылки (t.me/share/url); `false` — вне Telegram или SDK отказал. */
   shareLink(url: string, text: string): boolean {
-    if (!this.webApp) return false;
+    const wa = this.webApp;
+    if (!wa) return false;
     const share = `https://t.me/share/url?url=${encodeURIComponent(url)}&text=${encodeURIComponent(text)}`;
-    this.webApp.openTelegramLink(share);
-    return true;
+    return safely(() => wa.openTelegramLink(share));
   }
 
   onActivated(cb: () => void): () => void {
     const wa = this.webApp;
-    if (!wa || !wa.isVersionAtLeast("8.0")) return () => undefined;
-    wa.onEvent("activated", cb);
-    return () => wa.offEvent("activated", cb);
+    if (!wa || !this.atLeast("8.0")) return () => undefined;
+    if (!safely(() => wa.onEvent("activated", cb))) return () => undefined;
+    return () => void safely(() => wa.offEvent("activated", cb));
   }
 }

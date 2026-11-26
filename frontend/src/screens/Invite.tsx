@@ -110,6 +110,8 @@ export function Invite() {
   function share() {
     if (!invite) return;
     if (tg.shareLink(invite.link, SHARE_TEXT)) setShared(true);
+    // Telegram не открыл выбор чата (отказ SDK) — у человека остаётся ссылка на экране и «Скопировать».
+    else setNote("Не получилось открыть выбор чата. Скопируй ссылку и отправь её партнёру.");
   }
 
   async function copy() {

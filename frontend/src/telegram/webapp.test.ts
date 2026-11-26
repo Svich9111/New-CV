@@ -169,3 +169,56 @@ describe("Telegram SDK", () => {
     });
   });
 });
+
+describe("D6: вызовы нативных кнопок и отклика защищены", () => {
+  const boom = () => {
+    throw new Error("SDK failure");
+  };
+
+  test("withMain: отказ метода — false, кнопка скрыта, дальше нативная MainButton не пробуется", () => {
+    const fake = fakeTelegram();
+    const tg = new TelegramApi(fake.webApp);
+    expect(tg.withMain((mb) => mb.show())).toBe(true);
+    expect(fake.main.visible).toBe(true);
+    expect(tg.withMain(boom)).toBe(false);
+    expect(fake.main.visible).toBe(false);
+    expect(tg.nativeMain).toBe(false);
+    let called = false;
+    expect(tg.withMain(() => (called = true))).toBe(false);
+    expect(called).toBe(false);
+  });
+
+  test("withBack: отказ метода — false, nativeBack = false; MainButton не затронута", () => {
+    const fake = fakeTelegram();
+    const tg = new TelegramApi(fake.webApp);
+    expect(tg.nativeBack).toBe(true);
+    expect(tg.withBack(boom)).toBe(false);
+    expect(tg.nativeBack).toBe(false);
+    expect(tg.nativeMain).toBe(true);
+  });
+
+  test("отклик, пересылка, activated и isVersionAtLeast бросают — методы не бросают", () => {
+    const fake = fakeTelegram();
+    fake.webApp.HapticFeedback = { impactOccurred: boom, notificationOccurred: boom, selectionChanged: boom };
+    fake.webApp.openTelegramLink = boom;
+    const tg = new TelegramApi(fake.webApp);
+    expect(() => tg.impact()).not.toThrow();
+    expect(() => tg.notify("error")).not.toThrow();
+    expect(tg.shareLink("https://t.me/x", "y")).toBe(false);
+    fake.webApp.onEvent = boom;
+    const off = tg.onActivated(() => undefined);
+    expect(() => off()).not.toThrow();
+    fake.webApp.isVersionAtLeast = boom;
+    expect(tg.nativeBack).toBe(false);
+    expect(() => tg.impact()).not.toThrow();
+    expect(() => tg.applyTheme()).not.toThrow();
+  });
+
+  test("данные запуска не того вида — пустое имя и нет startapp", () => {
+    const fake = fakeTelegram();
+    fake.webApp.initDataUnsafe = { start_param: 5, user: { first_name: {} } } as unknown as typeof fake.webApp.initDataUnsafe;
+    const tg = new TelegramApi(fake.webApp);
+    expect(tg.firstName).toBe("");
+    expect(tg.startParam).toBeNull();
+  });
+});

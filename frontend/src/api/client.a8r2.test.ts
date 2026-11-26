@@ -88,7 +88,7 @@ describe("A8 р.2 · D2: 2xx с телом не по схеме — ApiError bad
   // (`api/openapi.yaml`: 204 — только /me DELETE, /couple/leave и пути 2.x+). GET /couple 204 → `undefined`,
   // и экран приглашения показывает «Ссылки пока нет» — тот же симптом, что D2(в) р.1; GET /invites 204 роняет
   // экран (`state.invite.inviter_name`), POST /auth/telegram 204 — TypeError вместо ApiError.
-  it.fails("A8-1.5-D5: GET /couple 204 — ошибка, а не «пары нет»", async () => {
+  it("A8-1.5-D5: GET /couple 204 — ошибка, а не «пары нет»", async () => {
     const server = new FakeServer().onboarded();
     const api = apiFor(server);
     await api.login();
@@ -96,18 +96,19 @@ describe("A8 р.2 · D2: 2xx с телом не по схеме — ApiError bad
     expect((await caught(api.couple())).code).toBe("bad_response");
   });
 
-  it.fails("A8-1.5-D5: POST /auth/telegram 204 — ApiError, а не TypeError", async () => {
+  it("A8-1.5-D5: POST /auth/telegram 204 — ApiError, а не TypeError", async () => {
     const server = new FakeServer();
     server.inject("POST", "/auth/telegram", 204);
     await expect(apiFor(server).login()).rejects.toBeInstanceOf(ApiError);
   });
 
-  test("факт по D5: GET /invites/{token} 204 сейчас разрешается undefined", async () => {
+  // Факт по D5 обращён A4 (р.3) под исправление: 204 там, где контракт его не объявляет, — bad_response.
+  test("D5 исправлен: GET /invites/{token} 204 — ApiError 204 bad_response, а не undefined", async () => {
     const server = new FakeServer().onboarded();
     const api = apiFor(server);
     await api.login();
     server.inject("GET", `/invites/${"A".repeat(43)}`, 204);
-    await expect(api.invite("A".repeat(43))).resolves.toBeUndefined();
+    expect(await caught(api.invite("A".repeat(43)))).toMatchObject({ status: 204, code: "bad_response" });
   });
 });
 

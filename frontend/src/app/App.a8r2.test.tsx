@@ -109,8 +109,9 @@ describe("A8 р.2 · SDK по версиям и сбой любого метод
     expect(screen.getByRole("heading", { level: 1, name: "Твой личный агент" })).toBeInTheDocument();
   });
 
-  test("MainButton.setParams бросает один раз — запасной экран с «Помощью», «Перезапустить» возвращает", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
+  // Было (р.2): разовый отказ setParams ронял экран в «Что-то пошло не так». По D6 (поручение р.3) отказ метода
+  // нативной кнопки экран не роняет — вместо неё кнопка в странице. Ожидание обновлено A4 под это поведение.
+  test("MainButton.setParams бросает один раз — экран не падает, кнопка в странице работает, «Помощь» есть", async () => {
     const tg = fakeTelegram();
     const orig = tg.webApp.MainButton.setParams!;
     let n = 0;
@@ -119,10 +120,12 @@ describe("A8 р.2 · SDK по версиям и сбой любого метод
       orig(p);
     };
     const r = renderApp({ tg });
-    expect(await heading("Что-то пошло не так")).toBeInTheDocument();
-    expect(helpLink()).toBeInTheDocument();
-    await r.pressMain();
     expect(await heading("Твой личный агент")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Что-то пошло не так" })).toBeNull();
+    expect(helpLink()).toBeInTheDocument();
+    expect(tg.main.visible).toBe(false);
+    await r.user.click(screen.getByRole("button", { name: "Далее" }));
+    expect(await heading("Что приватно")).toBeInTheDocument();
   });
 
   // A8-1.5-D6 (р.2): вызовы MainButton (и BackButton) не защищены так же, как запуск SDK. Если метод нативной
@@ -141,7 +144,7 @@ describe("A8 р.2 · SDK по версиям и сбой любого метод
     return () => n;
   }
 
-  it.fails("A8-1.5-D6: MainButton.setParams всегда бросает — без цикла отрисовки, «Помощь» есть", async () => {
+  it("A8-1.5-D6: MainButton.setParams всегда бросает — без цикла отрисовки, «Помощь» есть", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const tg = fakeTelegram();
     const calls = stubbornSetParams(tg);
@@ -150,13 +153,22 @@ describe("A8 р.2 · SDK по версиям и сбой любого метод
     expect(calls()).toBeLessThanOrEqual(10);
   });
 
-  test("факт по D6: MainButton.setParams всегда бросает — больше 100 повторных отрисовок подряд", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
+  // Факт по D6 обращён A4 (р.3) под исправление: отказ нативной кнопки — запасная кнопка в странице, и на
+  // следующих экранах нативная кнопка заново не пробуется (вызовы SDK не растут).
+  test("D6 исправлен: setParams всегда бросает — экран на месте, кнопка в странице ведёт дальше, без повторов", async () => {
     const tg = fakeTelegram();
     const calls = stubbornSetParams(tg);
-    renderApp({ tg });
-    await screen.findByRole("button", { name: "Помощь и контакты служб поддержки" });
-    expect(calls()).toBeGreaterThan(100);
+    const r = renderApp({ tg });
+    expect(await heading("Твой личный агент")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Что-то пошло не так" })).toBeNull();
+    expect(tg.main.visible).toBe(false);
+    const n = calls();
+    expect(n).toBeGreaterThanOrEqual(1);
+    await r.user.click(screen.getByRole("button", { name: "Далее" }));
+    expect(await heading("Что приватно")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Далее" })).toBeEnabled();
+    expect(calls()).toBe(n);
+    expect(helpLink()).toBeInTheDocument();
   });
 });
 
@@ -224,7 +236,7 @@ describe("A8 р.2 · D2: 2xx не по схеме в интерфейсе (ТЗ 
   // A8-1.5-D7 (р.2): «Помощь» проверяет у записи только name и phone; description другого типа (объект)
   // роняет отрисовку. Граница ошибок показывает «Что-то пошло не так», но её «Помощь» снова грузит тот же
   // список и снова падает — экран «Помощь» с номером-ссылкой 112 недостижим (есть только текст «звони 112»).
-  it.fails("A8-1.5-D7: /help/contacts с description-объектом — «Помощь» открывается, 112 ссылкой", async () => {
+  it("A8-1.5-D7: /help/contacts с description-объектом — «Помощь» открывается, 112 ссылкой", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const server = new FakeServer();
     server.inject("GET", "/help/contacts", 200, [{ name: "A", phone: "112", description: { x: 1 }, round_the_clock: true }], undefined, 10);
@@ -235,24 +247,26 @@ describe("A8 р.2 · D2: 2xx не по схеме в интерфейсе (ТЗ 
     expect(screen.getByRole("link", { name: "112" })).toHaveAttribute("href", "tel:112");
   });
 
-  test("факт по D7: запасной экран есть, но его «Помощь» снова падает — ссылки 112 нет", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
+  // Факт по D7 обращён A4 (р.3) под исправление: запись не по схеме отброшена, «Помощь» не падает, 112 ссылкой.
+  test("D7 исправлен: description-объект — запись отброшена, запасного экрана нет, ровно одна ссылка tel:112", async () => {
     const server = new FakeServer();
     server.inject("GET", "/help/contacts", 200, [{ name: "A", phone: "112", description: { x: 1 }, round_the_clock: true }], undefined, 10);
     const r = renderApp({ server });
     await heading("Твой личный агент");
     await r.user.click(helpLink());
-    expect(await heading("Что-то пошло не так")).toBeInTheDocument();
-    expect(screen.getByText(/звони 112/)).toBeInTheDocument();
-    await r.user.click(helpLink());
+    expect(await heading("Помощь")).toBeInTheDocument();
     await new Promise((res) => setTimeout(res, 50));
-    expect(screen.queryByRole("link", { name: "112" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Что-то пошло не так" })).toBeNull();
+    expect(screen.queryByText("A")).toBeNull();
+    const links = screen.getAllByRole("link");
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveAttribute("href", "tel:112");
   });
 
   // A8-1.5-D8 (р.2): у предпросмотра приглашения проверяется только expires_at; inviter_name не строкой
   // проходит как успех: заголовок «[object Object] приглашает тебя», а после «Принять» онбординг падает
   // (`inviterName.slice`) — человек видит «Что-то пошло не так» вместо онбординга.
-  it.fails("A8-1.5-D8: inviter_name не строка — «Приглашение не работает» или онбординг без падения", async () => {
+  it("A8-1.5-D8: inviter_name не строка — «Приглашение не работает» или онбординг без падения", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const server = new FakeServer();
     server.inject("GET", `/invites/${PARTNER_TOKEN}`, 200, { inviter_name: { x: 1 }, expires_at: "2026-12-03T12:00:00Z" });
@@ -331,15 +345,23 @@ describe("A8 р.2 · D3: тема на лету у MainButton (карточка 
 describe("A8 р.2 · D4: граница ошибок (ТЗ §9.3)", () => {
   test("после «Перезапустить» в запасном экране — новый вход (POST /auth/telegram +1) и обычный экран", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // Было (р.2): сбой вызывал D8 (inviter_name объектом ронял онбординг). D8 исправлен, поэтому A4 (р.3)
+    // заменил источник сбоя: данные запуска Telegram, которые бросают при первом чтении после входа (экран
+    // сессии падает при отрисовке). Проверки границы — те же.
     const server = new FakeServer();
-    server.inject("GET", `/invites/${PARTNER_TOKEN}`, 200, { inviter_name: { x: 1 }, expires_at: "2026-12-03T12:00:00Z" });
-    const r = renderApp({ server, tg: fakeTelegram({ startParam: PARTNER_TOKEN }) });
-    await screen.findByRole("heading", { level: 1, name: /приглашает тебя/ });
-    await r.pressMain(); // «Принять» → приветствие
-    await r.pressMain();
-    await r.pressMain();
-    await r.pressMain(); // → онбординг падает на inviterName.slice
+    const tg = fakeTelegram({ startParam: PARTNER_TOKEN });
+    const unsafe = tg.webApp.initDataUnsafe;
+    let crash = true;
+    Object.defineProperty(tg.webApp, "initDataUnsafe", {
+      configurable: true,
+      get: () => {
+        if (crash) throw new Error("отрисовка упала");
+        return unsafe;
+      },
+    });
+    const r = renderApp({ server, tg });
     expect(await heading("Что-то пошло не так")).toBeInTheDocument();
+    crash = false;
     expect(helpLink()).toBeInTheDocument();
     await r.user.click(helpLink());
     expect(await heading("Помощь")).toBeInTheDocument();

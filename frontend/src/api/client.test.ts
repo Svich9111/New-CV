@@ -199,9 +199,24 @@ describe("Api — ошибки по контракту", () => {
     expect(seen[0].cache).toBe("no-store");
   });
 
-  test("ответ 204 — без разбора тела", async () => {
+  // D5 (A8, р.2): 204 — успех только там, где его объявляет контракт; у путей 1.5 его нет.
+  test("ответ 204 на пути, где контракт его не объявляет, — ApiError bad_response", async () => {
     const api = new Api({ initData: () => INIT_DATA, fetch: async () => json(204) });
-    await expect(api.helpContacts()).resolves.toBeUndefined();
+    await expect(api.helpContacts()).rejects.toMatchObject({ status: 204, code: "bad_response" });
+  });
+
+  test("ответ 204 там, где контракт его объявляет (allowNoContent), — успех без чтения тела", async () => {
+    let read = false;
+    const res = new Response(null, { status: 204 });
+    vi.spyOn(res, "text").mockImplementation(async () => {
+      read = true;
+      return "";
+    });
+    const api = new Api({ initData: () => INIT_DATA, fetch: async () => res });
+    // Таких путей в 1.5 нет (например, POST /couple/leave — задача 2.x): флаг проверяется через закрытый вызов.
+    const send = (api as unknown as { send: (m: string, p: string, o: object) => Promise<unknown> }).send.bind(api);
+    await expect(send("GET", "/help/contacts", { public: true, op: "help", allowNoContent: true })).resolves.toBeUndefined();
+    expect(read).toBe(false);
   });
 });
 
@@ -289,11 +304,11 @@ describe("Api — срок ответа, вид ответа, общий вхо�
     });
   }
 
-  test("204 без тела — успех (пустой ответ по контракту)", async () => {
+  test("204 без тела на GET /me (контракт: только 200) — ApiError bad_response (D5)", async () => {
     const { server, api } = setup();
     await api.login();
     server.inject("GET", "/me", 204);
-    await expect(api.me()).resolves.toBeUndefined();
+    await expect(api.me()).rejects.toMatchObject({ status: 204, code: "bad_response" });
   });
 
   test("m-2: одновременные 401 — один повторный вход на всех, каждый запрос повторён один раз", async () => {

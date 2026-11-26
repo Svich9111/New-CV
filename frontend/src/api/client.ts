@@ -57,6 +57,11 @@ interface RequestOptions {
   timeoutMs?: number;
   /** Проверка вида успешного ответа: тело не того вида — `ApiError` `bad_response`, а не падение экрана. */
   check?: (data: unknown) => boolean;
+  /**
+   * Контракт объявляет у пути ответ 204 без тела. Без этого флага 204 — `bad_response` (A8-1.5-D5): ни один
+   * путь задачи 1.5 204 не отдаёт.
+   */
+  allowNoContent?: boolean;
 }
 
 function isErrorBody(v: unknown): v is ApiErrorBody {
@@ -75,14 +80,64 @@ function parseRetryAfter(h: string | null): number | undefined {
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-const isStr = (v: unknown) => typeof v === "string";
+const isStr = (v: unknown): v is string => typeof v === "string";
+const isBool = (v: unknown): v is boolean => typeof v === "boolean";
+/** Необязательное поле: нет его — или он нужного вида. */
+const opt = (v: unknown, ok: (x: unknown) => boolean) => v === undefined || ok(v);
+const strOrNull = (v: unknown) => v === null || isStr(v);
 
+/** `Me` по контракту: экраны выбирают первый экран по двум булевым полям и подставляют имена в форму. */
+function isMe(v: unknown): boolean {
+  return (
+    isObject(v) &&
+    isStr(v.id) &&
+    isBool(v.onboarding_completed) &&
+    isBool(v.has_active_couple) &&
+    opt(v.name, strOrNull) &&
+    opt(v.address_form, strOrNull) &&
+    opt(v.partner_name, strOrNull) &&
+    opt(v.timezone, isStr)
+  );
+}
+
+const COUPLE_STATUS = ["pending", "active", "dissolved"];
+const MEMBER_ROLE = ["initiator", "partner"];
+
+function isCoupleMember(v: unknown): boolean {
+  return isObject(v) && isStr(v.role) && MEMBER_ROLE.includes(v.role) && isBool(v.is_me) && opt(v.name, strOrNull);
+}
+
+/**
+ * Контакт помощи по контракту (`HelpContact`): строковые `name`, непустой `phone`, `description`;
+ * `round_the_clock` — boolean или нет поля. Неверные записи экран «Помощь» отбрасывает, а не падает (A8-1.5-D7).
+ */
+export function isHelpContact(v: unknown): v is HelpContact {
+  return (
+    isObject(v) &&
+    isStr(v.name) &&
+    isStr(v.phone) &&
+    v.phone.trim().length > 0 &&
+    isStr(v.description) &&
+    opt(v.round_the_clock, isBool)
+  );
+}
+
+/** Проверки вида успешного ответа по `api/openapi.yaml` — для полей, которые читают экраны 1.5. */
 const checks = {
-  session: (v: unknown) => isObject(v) && isStr(v.access_token) && isObject(v.me),
-  me: (v: unknown) => isObject(v) && isStr(v.id),
-  couple: (v: unknown) => isObject(v) && isStr(v.status) && Array.isArray(v.members),
-  inviteCreated: (v: unknown) => isObject(v) && isStr(v.link) && isStr(v.expires_at),
-  invitePreview: (v: unknown) => isObject(v) && isStr(v.expires_at),
+  session: (v: unknown) => isObject(v) && isStr(v.access_token) && v.access_token.length > 0 && isMe(v.me),
+  me: isMe,
+  couple: (v: unknown) =>
+    isObject(v) &&
+    isStr(v.id) &&
+    isStr(v.status) &&
+    COUPLE_STATUS.includes(v.status) &&
+    Array.isArray(v.members) &&
+    v.members.length <= 2 &&
+    v.members.every(isCoupleMember),
+  inviteCreated: (v: unknown) => isObject(v) && isStr(v.couple_id) && isStr(v.link) && isStr(v.expires_at),
+  // `inviter_name` обязателен и бывает `null` (имя не указано) — но не объектом и не числом (A8-1.5-D8).
+  invitePreview: (v: unknown) => isObject(v) && "inviter_name" in v && strOrNull(v.inviter_name) && isStr(v.expires_at),
+  // Сам список — массив; отдельные записи проверяет экран «Помощь» (`isHelpContact`) и отбрасывает неверные.
   helpContacts: (v: unknown) => Array.isArray(v),
 };
 
@@ -272,8 +327,12 @@ export class Api {
     }
 
     if (res.ok) {
-      // Пустое тело по контракту — только у 204; остальные 2xx обязаны прислать JSON нужного вида.
-      if (res.status === 204) return undefined as T;
+      // Пустое тело — только у 204 и только там, где контракт его объявляет; остальные 2xx обязаны прислать
+      // JSON нужного вида.
+      if (res.status === 204) {
+        if (opts.allowNoContent) return undefined as T;
+        throw new ApiError(res.status, "bad_response", errorText("bad_response", undefined, undefined, opts.op));
+      }
       if (!parsed || (opts.check && !opts.check(data))) {
         throw new ApiError(res.status, "bad_response", errorText("bad_response", undefined, undefined, opts.op));
       }

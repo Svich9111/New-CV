@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { Api } from "../api/client";
+import { isHelpContact, type Api } from "../api/client";
 import type { HelpContact } from "../api/types";
 import { Heading } from "../ui/Heading";
 import { Loading, Notice } from "../ui/Notice";
@@ -21,9 +21,23 @@ function tel(phone: string): string {
   return "tel:" + phone.replace(/[^\d+]/g, "");
 }
 
-function valid(c: unknown): c is HelpContact {
-  const v = c as HelpContact;
-  return typeof c === "object" && c !== null && typeof v.name === "string" && typeof v.phone === "string" && v.phone.length > 0;
+const digits = (phone: string) => phone.replace(/[^\d+]/g, "");
+
+/**
+ * Список для экрана: только записи по схеме контракта (неверные отбрасываются, A8-1.5-D7), без повторов;
+ * номер 112 ссылкой есть всегда — если в списке сервера его нет, запасной контакт добавляется в конец.
+ */
+export function helpList(list: unknown): HelpContact[] {
+  const seen = new Set<string>();
+  const ok: HelpContact[] = [];
+  for (const c of Array.isArray(list) ? list : []) {
+    if (!isHelpContact(c) || digits(c.phone).length === 0) continue;
+    const key = c.name + "\u0000" + c.phone;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    ok.push(c);
+  }
+  return ok.some((c) => digits(c.phone) === "112") ? ok : [...ok, ...FALLBACK];
 }
 
 /**
@@ -40,8 +54,7 @@ export function Help({ api }: { api: Api }) {
       .helpContacts()
       .then((list) => {
         if (!alive) return;
-        const ok = Array.isArray(list) ? list.filter(valid) : [];
-        setContacts(ok.length ? ok : FALLBACK);
+        setContacts(helpList(list));
         setStatus("loaded");
       })
       .catch(() => {
@@ -70,7 +83,7 @@ export function Help({ api }: { api: Api }) {
       )}
       <ul className="contacts">
           {contacts.map((c) => (
-            <li key={c.name + c.phone} className="contact">
+            <li key={c.name + "\u0000" + c.phone} className="contact">
               <div>{c.name}</div>
               <a className="contact__phone" href={tel(c.phone)}>
                 {c.phone}
