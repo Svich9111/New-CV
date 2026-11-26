@@ -975,3 +975,644 @@ async def test_migration_roundtrip_with_refunds_and_single_head(
     alembic("check")
     heads = _alembic_heads()
     assert heads[:2] == [HEAD, "(head)"] and heads.count("(head)") == 1
+
+
+# =========================================================================== раунд 2 (0019)
+#
+# 4.4 э.1 р.2 (A8): роль платежей ``feelings_billing`` (АР-50 п.7; A8-4.4-D2, ревью MINOR-2),
+# начало периода после возврата (АР-50 п.4; A8-4.4-D1), статус после распада (ревью MINOR-3),
+# предел счетов под блокировкой (ревью MINOR-5). Роли кластера общие (CLAUDE.md): всё, что меняет
+# роли и права, — внутри откатываемой транзакции суперпользователя; временные функции —
+# в тестовой БД, удаляются в ``finally``.
+
+R2_BOT_CALLS = {
+    "precheck": "SELECT app_bot_payment_precheck(:i, :tg, 250, 'XTR')",
+    "credit": "SELECT * FROM app_bot_payment_credit(:i, :tg, 250, 'XTR', :ch)",
+    "refunded": "SELECT * FROM app_bot_payment_refunded(:ch)",
+    "lookup": "SELECT * FROM app_bot_payment_lookup(:ch)",
+}
+R2_ROLES = ("feelings_app", "feelings_api", "feelings_worker", "feelings_admin")
+ROLE_ATTRS = ("LOGIN", "INHERIT", "SUPERUSER", "CREATEROLE", "CREATEDB", "REPLICATION", "BYPASSRLS")
+
+
+async def _r2_params(sm: SM, engine: AsyncEngine) -> tuple[uuid.UUID, dict[str, Any]]:
+    a, _b, couple = await _couple(sm, engine)
+    inv = await _invoice(sm, a)
+    return couple, {"i": inv, "tg": await _tg_id(engine, a), "ch": _charge()}
+
+
+def _r2_bind(sql: str, params: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in params.items() if f":{k}" in sql}
+
+
+async def _r2_nothing_paid(engine: AsyncEngine, couple: uuid.UUID) -> None:
+    assert await _subs_count(engine, couple) == 0
+    assert (
+        await _su(
+            engine,
+            "SELECT count(*) FROM payments WHERE couple_id = :c AND status <> 'pending'",
+            c=couple,
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize("role", R2_ROLES)
+async def test_r2_superuser_set_role_other_roles_cannot_call_bot(
+    sessionmaker: SM, engine: AsyncEngine, role: str
+) -> None:
+    """Под каждой ролью приложения (SET ROLE от суперпользователя, откат) все четыре функции бота —
+    42501, в том числе с пустым ``app.user_id``; ``set_config('role', 'feelings_billing')`` под
+    этой ролью суперпользователь сделать может, поэтому здесь проверяется сама граница EXECUTE."""
+    couple, params = await _r2_params(sessionmaker, engine)
+    for name, sql in R2_BOT_CALLS.items():
+        async with engine.connect() as c:
+            tx = await c.begin()
+            await c.execute(text(f"SET LOCAL ROLE {role}"))
+            await c.execute(text("SELECT set_config('app.user_id', '', true)"))
+            with pytest.raises(DBAPIError) as ei:
+                await c.execute(text(sql), _r2_bind(sql, params))
+            assert _sqlstate(ei.value) == "42501", (role, name)
+            await tx.rollback()
+    await _r2_nothing_paid(engine, couple)
+
+
+@pytest.mark.parametrize(
+    "trick",
+    [
+        "SET LOCAL ROLE feelings_billing",
+        "SET ROLE feelings_billing",
+        "SELECT set_config('role', 'feelings_billing', true)",
+        "SELECT set_config('role', 'feelings_billing', false)",
+        "RESET ROLE; SET LOCAL ROLE feelings_billing",
+        'SET LOCAL ROLE "feelings_billing"',
+    ],
+)
+async def test_r2_user_session_cannot_become_billing(
+    sessionmaker: SM, engine: AsyncEngine, trick: str
+) -> None:
+    """Сессия приложения (роль входа ``feelings_api`` → ``feelings_app``) не становится
+    ``feelings_billing`` ни ``SET ROLE``, ни ``set_config('role', …)``, ни после ``RESET ROLE``:
+    42501 (не член роли), ничего не зачислено."""
+    couple, params = await _r2_params(sessionmaker, engine)
+    with pytest.raises(DBAPIError) as ei:
+        async with user_scope(sessionmaker, None) as s:
+            await s.execute(text("SELECT set_config('app.user_id', '', true)"))
+            for stmt in trick.split("; "):
+                await s.execute(text(stmt))
+            sql = R2_BOT_CALLS["credit"]
+            await s.execute(text(sql), _r2_bind(sql, params))
+    assert _sqlstate(ei.value) == "42501", trick
+    await _r2_nothing_paid(engine, couple)
+
+
+async def test_r2_reset_role_in_user_session_falls_back_to_login_role(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """``RESET ROLE`` в транзакции пользователя возвращает к роли входа ``feelings_api``
+    (NOINHERIT, без EXECUTE): все функции бота — 42501; роль входа не может выбрать
+    ``feelings_billing`` и после этого."""
+    couple, params = await _r2_params(sessionmaker, engine)
+    for name, sql in R2_BOT_CALLS.items():
+        async with sessionmaker() as session:
+            tx = await session.begin()
+            await session.execute(text("SET LOCAL ROLE feelings_app"))
+            await session.execute(text("RESET ROLE"))
+            who = (await session.execute(text("SELECT current_user"))).scalar_one()
+            assert who == "feelings_api"
+            with pytest.raises(DBAPIError) as ei:
+                await session.execute(text(sql), _r2_bind(sql, params))
+            assert _sqlstate(ei.value) == "42501", name
+            await tx.rollback()
+    await _r2_nothing_paid(engine, couple)
+
+
+async def test_r2_superuser_without_billing_role_is_refused_by_body(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Проверка в теле функции (``current_setting('role')``): даже суперпользователь (EXECUTE
+    есть всегда) без ``SET ROLE feelings_billing`` и после ``RESET ROLE`` — 42501
+    «billing role only»; с ролью и непустым ``app.user_id`` — 42501, с не-uuid — отказ."""
+    couple, params = await _r2_params(sessionmaker, engine)
+    for prelude in ((), ("SET LOCAL ROLE feelings_billing", "RESET ROLE")):
+        async with engine.connect() as c:
+            tx = await c.begin()
+            for stmt in prelude:
+                await c.execute(text(stmt))
+            with pytest.raises(DBAPIError) as ei:
+                sql = R2_BOT_CALLS["precheck"]
+                await c.execute(text(sql), _r2_bind(sql, params))
+            assert _sqlstate(ei.value) == "42501" and "billing role only" in str(ei.value.orig)
+            await tx.rollback()
+    for value, codes in ((str(uuid.uuid4()), {"42501"}), ("garbage", {"42501", "22P02"})):
+        async with engine.connect() as c:
+            tx = await c.begin()
+            await c.execute(text("SET LOCAL ROLE feelings_billing"))
+            await c.execute(text("SELECT set_config('app.user_id', :v, true)"), {"v": value})
+            with pytest.raises(DBAPIError) as ei:
+                sql = R2_BOT_CALLS["credit"]
+                await c.execute(text(sql), _r2_bind(sql, params))
+            assert _sqlstate(ei.value) in codes, value
+            await tx.rollback()
+    await _r2_nothing_paid(engine, couple)
+
+
+async def test_r2_owner_of_functions_is_refused_by_body(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Владелец функций (в продуктиве — владелец схемы, не суперпользователь) исполняет их
+    всегда, без GRANT. Временная роль-владелец в откатываемой транзакции: под ней вызов —
+    42501 «billing role only»; роль платежей для неё недоступна без членства."""
+    couple, params = await _r2_params(sessionmaker, engine)
+    owner = f"a8r2_owner_{uuid.uuid4().hex[:8]}"
+    async with engine.connect() as c:
+        tx = await c.begin()
+        await c.execute(text(f"CREATE ROLE {owner} NOLOGIN NOINHERIT"))
+        await c.execute(text(f"GRANT CREATE, USAGE ON SCHEMA public TO {owner}"))
+        for sig in BOT_FUNCS:
+            await c.execute(text(f"ALTER FUNCTION {sig} OWNER TO {owner}"))
+        await c.execute(text(f"SET LOCAL ROLE {owner}"))
+        for name, sql in R2_BOT_CALLS.items():
+            await c.execute(text("SAVEPOINT s"))
+            with pytest.raises(DBAPIError) as ei:
+                await c.execute(text(sql), _r2_bind(sql, params))
+            assert _sqlstate(ei.value) == "42501", name
+            assert "billing role only" in str(ei.value.orig), name
+            await c.execute(text("ROLLBACK TO SAVEPOINT s"))
+        await tx.rollback()
+    await _r2_nothing_paid(engine, couple)
+
+
+_R2_DEFINER = """
+CREATE FUNCTION a8r2_definer_lookup(p varchar) RETURNS bigint
+    LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp
+    AS $f$ SELECT count(*) FROM public.app_bot_payment_lookup(p) $f$
+"""
+_R2_INVOKER_SET_ROLE = """
+CREATE FUNCTION a8r2_invoker_lookup(p varchar) RETURNS bigint
+    LANGUAGE sql SET role = 'feelings_billing' SET search_path = public, pg_temp
+    AS $f$ SELECT count(*) FROM public.app_bot_payment_lookup(p) $f$
+"""
+_R2_DEFINER_SET_ROLE = """
+CREATE FUNCTION a8r2_definer_role_lookup(p varchar) RETURNS bigint
+    LANGUAGE sql SECURITY DEFINER SET role = 'feelings_billing' SET search_path = public, pg_temp
+    AS $f$ SELECT count(*) FROM public.app_bot_payment_lookup(p) $f$
+"""
+WRAPPERS = (
+    "a8r2_definer_lookup(varchar)",
+    "a8r2_invoker_lookup(varchar)",
+    "a8r2_definer_role_lookup(varchar)",
+)
+
+
+async def test_r2_wrapper_functions_do_not_open_billing(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Вызов функции бота из другой функции:
+
+    - SECURITY DEFINER суперпользователя (EXECUTE на функцию бота у владельца есть), вызванная
+      сессией пользователя, — 42501 «billing role only»: SECURITY DEFINER не меняет ``role``;
+    - SECURITY DEFINER с ``SET role = feelings_billing`` — PostgreSQL не даёт менять ``role``
+      внутри SECURITY DEFINER (42501 при вызове);
+    - функция вызывающего с ``SET role = feelings_billing`` — при вызове сессией пользователя
+      42501 (смена роли проверяется по членству роли сеанса).
+
+    Обёртки — во временных функциях тестовой БД, удаляются в ``finally``."""
+    couple, _params = await _r2_params(sessionmaker, engine)
+    a = await _su(
+        engine, "SELECT cm.user_id FROM couple_members cm WHERE cm.couple_id = :c LIMIT 1", c=couple
+    )
+    try:
+        async with engine.begin() as c:
+            for ddl in (_R2_DEFINER, _R2_INVOKER_SET_ROLE, _R2_DEFINER_SET_ROLE):
+                await c.execute(text(ddl))
+            for f in WRAPPERS:
+                await c.execute(text(f"REVOKE ALL ON FUNCTION {f} FROM PUBLIC"))
+                await c.execute(text(f"GRANT EXECUTE ON FUNCTION {f} TO feelings_app"))
+        for f in (w.split("(")[0] for w in WRAPPERS):
+            for uid in (a, None):
+                with pytest.raises(DBAPIError) as ei:
+                    async with user_scope(sessionmaker, uid) as s:
+                        if uid is None:
+                            await s.execute(text("SELECT set_config('app.user_id', '', true)"))
+                        await s.execute(text(f"SELECT {f}(:ch)"), {"ch": _charge()})
+                assert _sqlstate(ei.value) == "42501", (f, uid)
+    finally:
+        async with engine.begin() as c:
+            for f in WRAPPERS:
+                await c.execute(text(f"DROP FUNCTION IF EXISTS {f}"))
+    await _r2_nothing_paid(engine, couple)
+
+
+async def test_r2_catalog_billing_rights_are_exact(engine: AsyncEngine) -> None:
+    """Каталог на голове: EXECUTE на функции бота — только у ``feelings_billing`` (и владельца),
+    ни у PUBLIC, ни у ролей приложения; у ``feelings_billing`` нет EXECUTE ни на одну функцию
+    пользователя и служебную; ни одна функция схемы не задаёт ``role`` в своих настройках;
+    в ``feelings_billing`` никто из ролей приложения не входит, сама она ни в одну не входит."""
+    acl = await _su(
+        engine,
+        "SELECT string_agg(p.oid::regprocedure::text || '=' || "
+        "coalesce((SELECT string_agg(x.grantee::regrole::text, '+' ORDER BY x.grantee::regrole::text) "
+        "FROM aclexplode(p.proacl) x WHERE x.privilege_type = 'EXECUTE' "
+        "AND x.grantee <> p.proowner AND x.grantee <> 0), 'PUBLIC?'), ',' ORDER BY p.proname) "
+        "FROM pg_proc p WHERE p.proname LIKE 'app\\_bot\\_payment\\_%'",
+    )
+    assert acl.count("=feelings_billing") == 4 and "feelings_app" not in acl, acl
+    public = await _su(
+        engine,
+        "SELECT count(*) FROM pg_proc p, aclexplode(p.proacl) x WHERE p.proname LIKE "
+        "'app\\_bot\\_payment\\_%' AND x.grantee = 0",
+    )
+    assert public == 0
+    for f in USER_FUNCS + INTERNAL_FUNCS:
+        assert not await _su(
+            engine, "SELECT has_function_privilege('feelings_billing', :f, 'EXECUTE')", f=f
+        ), f
+    role_cfg = await _su(
+        engine,
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+        "WHERE n.nspname = 'public' AND EXISTS (SELECT 1 FROM unnest(p.proconfig) c "
+        "WHERE c LIKE 'role=%' OR c LIKE 'session_authorization=%')",
+    )
+    assert role_cfg == 0
+    for r in R2_ROLES:
+        assert not await _su(engine, "SELECT pg_has_role(:r, 'feelings_billing', 'MEMBER')", r=r), r
+        assert not await _su(engine, "SELECT pg_has_role('feelings_billing', :r, 'MEMBER')", r=r), r
+
+
+# --------------------------------------------------------------------------- 0019 в транзакции
+
+
+def _r2_alembic(sync_conn: Any, *args: str) -> None:
+    """Команда Alembic на **этом** соединении, внутри уже открытой транзакции (env.py берёт
+    ``config.attributes['connection']``; при внешней транзакции Alembic своей не открывает) —
+    всё откатывается вместе с транзакцией теста (роли кластера не меняются, CLAUDE.md)."""
+    import argparse
+
+    from alembic import command
+    from alembic.config import Config
+
+    # Без файла ini: env.py тогда не вызывает fileConfig — журналы процесса тестов (caplog других
+    # тестов) не перенастраиваются и не отключаются.
+    cfg = Config()
+    cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    cfg.cmd_opts = argparse.Namespace(x=[f"db_url={TEST_DATABASE_URL}"])
+    cfg.attributes["connection"] = sync_conn
+    getattr(command, args[0])(cfg, *args[1:])
+
+
+async def _r2_state(c: Any) -> tuple[str, bool, bool, str]:
+    """(версия, EXECUTE у feelings_app на все функции бота, у feelings_billing, атрибуты роли)."""
+    # По ACL функции, а не has_function_privilege: у роли с SUPERUSER он всегда true.
+    q = (
+        "SELECT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) x "
+        "WHERE p.oid = CAST(:f AS regprocedure) AND x.grantee = CAST(to_regrole(:r) AS oid) "
+        "AND x.privilege_type = 'EXECUTE')"
+    )
+    version = (await c.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+    app = all(
+        [(await c.execute(text(q), {"r": "feelings_app", "f": f})).scalar_one() for f in BOT_FUNCS]
+    )
+    bill = all(
+        [
+            (await c.execute(text(q), {"r": "feelings_billing", "f": f})).scalar_one()
+            for f in BOT_FUNCS
+        ]
+    )
+    attrs = (
+        await c.execute(
+            text(
+                "SELECT concat_ws(',', rolcanlogin, rolinherit, rolsuper, rolcreaterole, "
+                "rolcreatedb, rolreplication, rolbypassrls) FROM pg_roles "
+                "WHERE rolname = 'feelings_billing'"
+            )
+        )
+    ).scalar_one()
+    return str(version), bool(app), bool(bill), str(attrs)
+
+
+async def test_r2_rerun_0019_with_existing_role_in_transaction(engine: AsyncEngine) -> None:
+    """Роль уже есть (общая для кластера, после отката 0019 не удаляется): повторный upgrade
+    0019 проходит, роль не пересоздаётся и не меняется, права выдаются заново; дважды подряд
+    downgrade/upgrade — то же. Всё в одной откатываемой транзакции."""
+    async with engine.connect() as c:
+        tx = await c.begin()
+        oid = (await c.execute(text("SELECT to_regrole('feelings_billing')::oid"))).scalar_one()
+        assert await _r2_state(c) == (HEAD, False, True, "f,f,f,f,f,f,f")
+        for _ in range(2):
+            await c.run_sync(_r2_alembic, "downgrade", "0018")
+            assert await _r2_state(c) == ("0018", True, False, "f,f,f,f,f,f,f")
+            await c.run_sync(_r2_alembic, "upgrade", "head")
+            assert await _r2_state(c) == (HEAD, False, True, "f,f,f,f,f,f,f")
+        again = (await c.execute(text("SELECT to_regrole('feelings_billing')::oid"))).scalar_one()
+        assert again == oid
+        await tx.rollback()
+    async with engine.connect() as c:
+        assert await _r2_state(c) == (HEAD, False, True, "f,f,f,f,f,f,f")
+
+
+@pytest.mark.parametrize("attr", ROLE_ATTRS)
+async def test_r2_existing_role_with_dangerous_attribute_stops_0019(
+    engine: AsyncEngine, attr: str
+) -> None:
+    """Роль ``feelings_billing`` уже есть и имеет LOGIN / INHERIT / особые права: upgrade 0019
+    останавливается с понятной ошибкой и ничего не меняет — версия 0018, EXECUTE функций бота у
+    ``feelings_app`` как в 0018, у роли платежей прав нет, атрибут роли не снят. Откат."""
+    async with engine.connect() as c:
+        tx = await c.begin()
+        await c.run_sync(_r2_alembic, "downgrade", "0018")
+        await c.execute(text(f"ALTER ROLE feelings_billing {attr}"))
+        await c.execute(text("SAVEPOINT before_upgrade"))
+        with pytest.raises(DBAPIError) as ei:
+            await c.run_sync(_r2_alembic, "upgrade", "head")
+        assert "роль feelings_billing уже есть" in str(ei.value.orig), attr
+        await c.execute(text("ROLLBACK TO SAVEPOINT before_upgrade"))
+        version, app, bill, attrs = await _r2_state(c)
+        assert (version, app, bill) == ("0018", True, False)
+        assert attrs.split(",")[ROLE_ATTRS.index(attr)] == "t"
+        await tx.rollback()
+    async with engine.connect() as c:
+        assert await _r2_state(c) == (HEAD, False, True, "f,f,f,f,f,f,f")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="A8-4.4-D3: 0019 проверяет атрибуты существующей feelings_billing, но не членства: "
+    "если роль приложения (feelings_api/feelings_app) уже член feelings_billing, миграция "
+    "проходит, и сессия пользователя делает SET ROLE feelings_billing — граница п.7 снята",
+)
+@pytest.mark.parametrize("member", ["feelings_api", "feelings_app"])
+async def test_r2_existing_role_with_app_member_stops_0019(
+    sessionmaker: SM, engine: AsyncEngine, member: str
+) -> None:
+    """АР-50 п.7: «feelings_api не член feelings_billing» — на этом держится граница. Роль уже
+    есть, и в неё входит роль приложения: ожидается, что upgrade 0019 остановится, как при
+    LOGIN/INHERIT. Всё в откатываемой транзакции."""
+    async with engine.connect() as c:
+        tx = await c.begin()
+        await c.run_sync(_r2_alembic, "downgrade", "0018")
+        await c.execute(text(f"GRANT feelings_billing TO {member}"))
+        await c.execute(text("SAVEPOINT before_upgrade"))
+        stopped = False
+        try:
+            await c.run_sync(_r2_alembic, "upgrade", "head")
+        except DBAPIError:
+            stopped = True
+            await c.execute(text("ROLLBACK TO SAVEPOINT before_upgrade"))
+        await tx.rollback()
+    assert stopped, member
+
+
+async def test_r2_role_membership_hole_is_real(engine: AsyncEngine) -> None:
+    """К A8-4.4-D3 — что даёт членство: в откатываемой транзакции ``GRANT feelings_billing TO
+    feelings_api`` даёт роли входа API право ``SET`` на роль платежей (``pg_has_role … 'SET'``),
+    то есть ``SET LOCAL ROLE feelings_billing`` в сессии пользователя. Сам вызов сессией API здесь
+    не проверить: членство увидела бы только другая сессия после фиксации, а роли кластера
+    меняются только в откатываемых транзакциях (CLAUDE.md). После отката членства нет."""
+    async with engine.connect() as c:
+        tx = await c.begin()
+        await c.execute(text("GRANT feelings_billing TO feelings_api WITH INHERIT FALSE, SET TRUE"))
+        assert await c.scalar(text("SELECT pg_has_role('feelings_api', 'feelings_billing', 'SET')"))
+        await tx.rollback()
+    async with engine.connect() as c:
+        assert not await c.scalar(
+            text("SELECT pg_has_role('feelings_api', 'feelings_billing', 'MEMBER')")
+        )
+
+
+# --------------------------------------------------------------------------- откат с данными
+
+
+async def test_r2_downgrade_upgrade_switches_period_rule_and_keeps_dates(
+    sessionmaker: SM, engine: AsyncEngine, app_engine: AsyncEngine
+) -> None:
+    """head → 0018 → head с разрывом после возврата: под 0017-правилом (после отката) новая оплата
+    в разрыве встаёт после будущего периода, доступа нет, бот снова — ``feelings_app`` в служебном
+    контексте; после возврата к 0019 даты этого периода не меняются, разрыв остаётся, а следующая
+    оплата начинается сейчас и даёт доступ; ``feelings_app`` снова без EXECUTE; ``alembic check``."""
+    a, b, _couple_id = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    tg = await _tg_id(engine, a)
+    ch1 = _charge()
+    p1 = await _credit(sessionmaker, engine, inv, a, ch1)
+    p2 = await _credit(sessionmaker, engine, inv, b, _charge())
+    await _one(sessionmaker, None, REFUNDED, ch=ch1)
+    old_rule: dict[str, Any] = {}
+    try:
+        alembic("downgrade", "0018")
+        await engine.dispose()
+        await app_engine.dispose()
+        async with user_scope(sessionmaker, None) as s:
+            row = (
+                (
+                    await s.execute(
+                        text(CREDIT),
+                        {"i": inv, "tg": tg, "amount": 250, "cur": "XTR", "ch": _charge()},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            old_rule = dict(row)
+        assert old_rule["result"] == "credited"
+        assert old_rule["period_end"] == p2["period_end"] + timedelta(days=30)
+        assert await _call(sessionmaker, a, HAS_ACCESS) is False
+        alembic("upgrade", "head")
+        await engine.dispose()
+        await app_engine.dispose()
+    finally:
+        alembic("upgrade", "head")
+        await engine.dispose()
+        await app_engine.dispose()
+    assert await _su(
+        engine, "SELECT period_end FROM subscriptions WHERE id = :s", s=old_rule["subscription_id"]
+    ) == old_rule["period_end"]  # fmt: skip
+    assert await _call(sessionmaker, a, HAS_ACCESS) is False
+    st = await _one(sessionmaker, b, STATUS)
+    assert (st["status"], st["period_end"]) == ("canceled", p1["period_end"])
+    before = datetime.now(UTC)
+    p4 = await _credit(sessionmaker, engine, inv, b, _charge())
+    assert before + timedelta(days=30) <= p4["period_end"] <= datetime.now(UTC) + timedelta(days=30)
+    for who in (a, b):
+        assert await _call(sessionmaker, who, HAS_ACCESS) is True
+    st = await _one(sessionmaker, a, STATUS)
+    assert (st["status"], st["period_end"]) == ("active", old_rule["period_end"])
+    with pytest.raises(DBAPIError) as ei:
+        async with user_scope(sessionmaker, None) as s:
+            await s.execute(text(LOOKUP), {"ch": ch1})
+    assert _sqlstate(ei.value) == "42501"
+    alembic("check")
+
+
+# --------------------------------------------------------------------------- разрыв после возврата
+
+
+async def test_r2_refund_middle_period_new_payment_fills_gap(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """P1 [now, +30], P2 [+30, +60], P3 [+60, +90]; возврат P2: доступ до конца P1, статус —
+    ``active`` до конца P1 (цепочка обрывается на разрыве); новая оплата встаёт в конец
+    непрерывного доступа — ровно в разрыв [+30, +60] — и цепочка снова доходит до конца P3."""
+    a, b, _c = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    p1 = await _credit(sessionmaker, engine, inv, a, _charge())
+    ch2 = _charge()
+    p2 = await _credit(sessionmaker, engine, inv, a, ch2)
+    p3 = await _credit(sessionmaker, engine, inv, b, _charge())
+    assert p3["period_end"] == p1["period_end"] + timedelta(days=60)
+    await _one(sessionmaker, None, REFUNDED, ch=ch2)
+    st = await _one(sessionmaker, b, STATUS)
+    assert (st["status"], st["period_end"], st["has_access"]) == ("active", p1["period_end"], True)
+    p4 = await _credit(sessionmaker, engine, inv, b, _charge())
+    assert p4["period_end"] == p2["period_end"]
+    st = await _one(sessionmaker, a, STATUS)
+    assert (st["status"], st["period_end"]) == ("active", p3["period_end"])
+
+
+async def test_r2_refund_all_but_future_then_two_payments(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """P1, P2, P3 подряд; возврат P1 и P2 — разрыв до начала P3: доступа нет, статус по
+    последнему начавшемуся — ``canceled`` с концом P1 (не «истёк» с будущей датой); оплата —
+    сразу [now, +30], затем вторая — в оставшийся разрыв [+30, +60], цепочка до конца P3."""
+    a, b, _c = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    ch1, ch2 = _charge(), _charge()
+    p1 = await _credit(sessionmaker, engine, inv, a, ch1)
+    p2 = await _credit(sessionmaker, engine, inv, a, ch2)
+    p3 = await _credit(sessionmaker, engine, inv, a, _charge())
+    for ch in (ch1, ch2):
+        await _one(sessionmaker, None, REFUNDED, ch=ch)
+    st = await _one(sessionmaker, b, STATUS)
+    assert (st["status"], st["period_end"], st["has_access"]) == (
+        "canceled",
+        p1["period_end"],
+        False,
+    )
+    p4 = await _credit(sessionmaker, engine, inv, b, _charge())
+    assert abs(p4["period_end"] - p1["period_end"]) < timedelta(seconds=30)
+    assert (await _one(sessionmaker, a, STATUS))["period_end"] == p4["period_end"]
+    p5 = await _credit(sessionmaker, engine, inv, a, _charge())
+    assert p5["period_end"] == p4["period_end"] + timedelta(days=30)
+    st = await _one(sessionmaker, a, STATUS)
+    assert (st["status"], st["period_end"]) == ("active", p3["period_end"])
+    assert p5["period_end"] > p2["period_end"] - timedelta(seconds=30)
+
+
+# --------------------------------------------------------------------------- статус после распада
+
+
+async def test_r2_status_after_dissolution_for_both_and_new_couple(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Ревью MINOR-3 (0019): оплаченный период распавшейся пары дослуживает (§11 п.6) — у обоих
+    бывших партнёров статус ``active``, тариф и конец цепочки той пары; ``paid_by_me`` — у
+    плательщика; ``couple_*`` — текущей пары (нет — NULL). Новая ожидающая пара — статус всё
+    ещё ``active`` по старой, ``couple_status = pending``; новая активная пара с пробным — статус
+    ``trial`` текущей пары, доступ есть."""
+    a, b, old = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, a)
+    await _one(sessionmaker, a, TRIAL, d=7)
+    await _credit(sessionmaker, engine, inv, a, _charge())
+    p2 = await _credit(sessionmaker, engine, inv, a, _charge())
+    yinv = await _invoice(sessionmaker, b, plan="year", amount=2000, days=365)
+    py = await _credit(sessionmaker, engine, yinv, b, _charge(), amount=2000)
+    assert py["period_end"] == p2["period_end"] + timedelta(days=365)
+    await _call(sessionmaker, a, LEAVE)
+    for who, mine in ((a, False), (b, True)):
+        st = await _one(sessionmaker, who, STATUS)
+        assert (st["status"], st["plan"], st["period_end"], st["has_access"]) == (
+            "active", "year", py["period_end"], True,
+        ), who  # fmt: skip
+        assert st["couple_id"] is None and st["couple_status"] is None
+        assert st["paid_by_me"] is mine and st["trial_used"] is False
+    new = uuid.UUID(str(await _call(sessionmaker, a, "SELECT app_create_couple()")))
+    st = await _one(sessionmaker, a, STATUS)
+    assert (st["status"], st["plan"], st["couple_id"], st["couple_status"]) == (
+        "active", "year", new, "pending",
+    )  # fmt: skip
+    token = uuid.uuid4().bytes + uuid.uuid4().bytes
+    await _call(sessionmaker, a, "SELECT app_issue_invite(:h)", h=token)
+    c = await _user_r2(engine)
+    await _call(sessionmaker, c, ACCEPT, h=token)
+    await _one(sessionmaker, c, TRIAL, d=7)
+    st = await _one(sessionmaker, a, STATUS)
+    assert (st["status"], st["couple_id"], st["has_access"]) == ("trial", new, True)
+    assert st["trial_used"] is True
+    # Новый партнёр к оплате старой пары отношения не имеет: после конца пробного у него — без
+    # доступа (пробный здесь ещё идёт — доступ есть, но статус — пробный текущей пары).
+    st_c = await _one(sessionmaker, c, STATUS)
+    assert (st_c["status"], st_c["couple_id"]) == ("trial", new)
+    assert await _subs_count(engine, old) == 4
+
+
+async def _user_r2(engine: AsyncEngine) -> uuid.UUID:
+    from tests.test_couple_functions import _user
+
+    return await _user(engine, "Кира")
+
+
+async def test_r2_status_after_dissolution_trial_only_and_refunded(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Распад пары только с пробным — статус ``none`` (пары нет), доступа нет; распад пары, чей
+    единственный оплаченный период возвращён, — тоже ``none`` без доступа; партнёр, оставшийся
+    в распавшейся паре, видит то же."""
+    a, b, _c = await _couple(sessionmaker, engine)
+    await _one(sessionmaker, a, TRIAL, d=7)
+    await _call(sessionmaker, b, LEAVE)
+    for who in (a, b):
+        st = await _one(sessionmaker, who, STATUS)
+        assert (st["status"], st["has_access"], st["couple_id"]) == ("none", False, None), who
+    x, y, _c2 = await _couple(sessionmaker, engine)
+    inv = await _invoice(sessionmaker, x)
+    ch = _charge()
+    await _credit(sessionmaker, engine, inv, x, ch)
+    await _one(sessionmaker, None, REFUNDED, ch=ch)
+    await _call(sessionmaker, x, LEAVE)
+    for who in (x, y):
+        st = await _one(sessionmaker, who, STATUS)
+        assert (st["status"], st["has_access"]) == ("none", False), who
+
+
+# --------------------------------------------------------------------------- предел счетов залпом
+
+
+async def test_r2_invoice_limit_parallel_burst_both_partners(
+    sessionmaker: SM, engine: AsyncEngine
+) -> None:
+    """Ревью MINOR-5 (0019): 30 одновременных запросов счёта обоими партнёрами с разными условиями
+    без удержания пары — выпущено ровно 20, остальные 10 — FC002; ни одного 40P01/40001/23505.
+    Затем 10 одновременных запросов с одинаковыми условиями при 19 действующих — один новый счёт
+    на всех, остальные ``reused`` с тем же id."""
+    a, b, couple = await _couple(sessionmaker, engine)
+    res = await asyncio.gather(
+        *(
+            _one(sessionmaker, (a, b)[n % 2], INVOICE, **{**MONTH, "amount": 300 + n})
+            for n in range(30)
+        ),
+        return_exceptions=True,
+    )
+    codes = _codes(list(res))
+    assert sorted(str(c) for c in codes) == ["FC002"] * 10, codes
+    assert sum(isinstance(r, dict) for r in res) == 20
+    open_now = "SELECT count(*) FROM payments WHERE couple_id = :c AND expires_at > now()"
+    assert await _su(engine, open_now, c=couple) == 20
+    await _su(
+        engine,
+        "UPDATE payments SET expires_at = now() - interval '1 minute' WHERE couple_id = :c "
+        "AND amount = 300",
+        c=couple,
+    )
+    same = await asyncio.gather(
+        *(
+            _one(sessionmaker, (a, b)[n % 2], INVOICE, **{**MONTH, "amount": 999})
+            for n in range(10)
+        ),
+        return_exceptions=True,
+    )
+    assert _codes(list(same)) == []
+    got = [r for r in same if isinstance(r, dict)]
+    assert sorted(r["reused"] for r in got) == [False] + [True] * 9
+    assert len({r["invoice_id"] for r in got}) == 1
+    assert await _su(engine, open_now, c=couple) == 20
