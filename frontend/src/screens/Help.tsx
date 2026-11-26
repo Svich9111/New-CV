@@ -40,6 +40,26 @@ export function helpList(list: unknown): HelpContact[] {
   return ok.some((c) => digits(c.phone) === "112") ? ok : [...ok, ...FALLBACK];
 }
 
+/** Список контактов помощи: номера ссылками `tel:`, 112 есть всегда (`helpList`). */
+export function HelpContacts({ contacts }: { contacts: unknown }) {
+  return (
+    <ul className="contacts">
+      {helpList(contacts).map((c) => (
+        <li key={c.name + "\u0000" + c.phone} className="contact">
+          <div>{c.name}</div>
+          <a className="contact__phone" href={tel(c.phone)}>
+            {c.phone}
+          </a>
+          <div className="small muted">
+            {c.description}
+            {c.round_the_clock ? " Круглосуточно." : ""}
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 /**
  * Помощь (ТЗ §8, §9.3, §9.4): контакты служб, правила, документы. Доступна без входа и без подписки.
  * Запасной 112 виден сразу — не дожидаясь сервера; список с сервера заменяет его, когда придёт.
@@ -81,20 +101,7 @@ export function Help({ api }: { api: Api }) {
       {status === "failed" && (
         <Notice>Не получилось загрузить полный список. Вот номер, по которому помогут всегда.</Notice>
       )}
-      <ul className="contacts">
-          {contacts.map((c) => (
-            <li key={c.name + "\u0000" + c.phone} className="contact">
-              <div>{c.name}</div>
-              <a className="contact__phone" href={tel(c.phone)}>
-                {c.phone}
-              </a>
-              <div className="small muted">
-                {c.description}
-                {c.round_the_clock ? " Круглосуточно." : ""}
-              </div>
-            </li>
-          ))}
-      </ul>
+      <HelpContacts contacts={contacts} />
       <p className="small muted">Контакты помощи доступны всегда, даже без подписки.</p>
 
       <h2>Правила</h2>

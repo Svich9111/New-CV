@@ -26,6 +26,15 @@
   --on-accent: #ffffff;
   --disabled-bg: #d9d5d1;
   --disabled-text: #5f5a55;
+  /* Чат (ТЗ §8): своя реплика — чёрная плашка с белым текстом, реплика агента — светлая плашка. */
+  --own-bg: #111111;
+  --own-text: #ffffff;
+  --agent-bg: var(--bg-secondary);
+  --font-size-msg: 16px;
+  --font-size-meta: 12px;
+  --radius-msg: 18px;
+  --radius-msg-tail: 6px;
+  --radius-input: 22px;
 
   --font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -54,6 +63,9 @@
   --card-bg: #111111;
   --disabled-bg: #2c2c2c;
   --disabled-text: #a8a29d;
+  /* АР-18 (тёмная тема прототипа, ждёт Г1): своя реплика — белая плашка, агента — #1a1a1a. */
+  --own-bg: #ffffff;
+  --own-text: #111111;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -62,5 +74,7 @@
     --card-bg: #111111;
     --disabled-bg: #2c2c2c;
     --disabled-text: #a8a29d;
+    --own-bg: #ffffff;
+    --own-text: #111111;
   }
 }

@@ -314,6 +314,17 @@ describe("m-8: «Помощь» на каждом экране (по всем м
         return renderApp({ server });
       },
     },
+    chat: {
+      h1: "Твой агент",
+      open: async () => {
+        const server = new FakeServer().onboarded().pendingCouple();
+        server.partnerAccepts();
+        const r = renderApp({ server });
+        await heading("Вы пара");
+        await r.pressMain();
+        return r;
+      },
+    },
     underage: {
       h1: "Сервис доступен только с 18 лет",
       open: async () => {

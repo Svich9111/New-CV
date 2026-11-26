@@ -14,6 +14,8 @@ export interface Rendered {
   /** Нажать нативную MainButton (как палец в Telegram). */
   pressMain(): Promise<void>;
   pressBack(): Promise<void>;
+  /** Сдвинуть часы `Date.now` (прошло время между касаниями). */
+  advanceClock(ms: number): void;
 }
 
 export function renderApp(opts: { server?: FakeServer; tg?: FakeTelegram | null } = {}): Rendered {
@@ -42,6 +44,9 @@ export function renderApp(opts: { server?: FakeServer; tg?: FakeTelegram | null 
     },
     pressBack: async () => {
       await act(async () => tg!.back.click());
+    },
+    advanceClock: (ms: number) => {
+      offset += ms;
     },
   };
 }

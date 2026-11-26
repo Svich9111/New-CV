@@ -183,5 +183,73 @@ fieldset.field { border: 0; padding: 0; margin-left: 0; margin-right: 0; min-wid
 .rules, .steps { padding-left: 20px; margin: 0 0 12px; }
 .rules li, .steps li { margin-bottom: 6px; }
 
+/* Главный экран: карточка-ссылка */
+.card--link { display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left; color: var(--text); }
+.card__title { font-weight: 700; font-size: var(--font-size-lead); }
+
+/* Чат с агентом (стиль прототипа 0.6) */
+.chat-screen { display: flex; flex-direction: column; min-height: 100%; }
+.chat-privacy { text-align: center; margin-bottom: 16px; }
+.chat-empty { margin: 8px 0 16px; }
+.chat { list-style: none; margin: 0; padding: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 10px; }
+.msg {
+  max-width: 86%;
+  padding: 10px 14px;
+  border-radius: var(--radius-msg);
+  font-size: var(--font-size-msg);
+  overflow-wrap: anywhere;
+}
+.msg__text { white-space: pre-wrap; }
+.msg--own { align-self: flex-end; background: var(--own-bg); color: var(--own-text); border-bottom-right-radius: var(--radius-msg-tail); }
+.msg--agent { align-self: flex-start; background: var(--agent-bg); color: var(--text); border-bottom-left-radius: var(--radius-msg-tail); }
+.msg--typing { color: var(--text-muted); font-style: italic; }
+.msg--partial .msg__text { opacity: .7; }
+.msg__meta { display: block; font-size: var(--font-size-meta); opacity: .75; margin-top: 4px; }
+.msg__fail { display: flex; flex-direction: column; gap: 8px; font-size: var(--font-size-small); margin-top: 6px; }
+.msg__retry { align-self: flex-start; color: var(--own-text); border-color: var(--own-text); }
+.crisis { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+.crisis__title { font-size: var(--font-size-lead); margin: 4px 0 4px; }
+.chat-bottom {
+  position: sticky;
+  bottom: 0;
+  margin: 12px calc(-1 * var(--gutter)) -24px;
+  padding: 8px var(--gutter) max(8px, env(safe-area-inset-bottom));
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  z-index: 1;
+}
+.chat-bottom .help-link { align-self: center; }
+.composer { display: flex; gap: 8px; align-items: flex-end; }
+.composer textarea {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--tap);
+  max-height: 120px;
+  field-sizing: content; /* поле растёт с текстом (где поддерживается), дальше — прокрутка */
+  resize: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-input);
+  padding: 10px 16px;
+  background: var(--bg);
+  font-size: var(--font-size-msg);
+  line-height: 1.4;
+}
+.composer__stop { flex: 0 0 auto; }
+.composer__counter { margin: 6px 0 0; text-align: right; }
+.icon-btn {
+  flex: 0 0 auto;
+  width: var(--tap);
+  height: var(--tap);
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  display: grid;
+  place-items: center;
+}
+.icon-btn--fill { background: var(--text); color: var(--bg); border-color: var(--text); }
+.icon-btn:disabled { background: var(--disabled-bg); color: var(--disabled-text); border-color: var(--disabled-bg); cursor: not-allowed; }
+.icon-btn svg { width: 20px; height: 20px; fill: currentColor; }
+
 /* Текст в #root до запуска приложения (index.html): без встроенного style — CSP без 'unsafe-inline'. */
 .boot-placeholder { margin: 0; padding: var(--gutter); }

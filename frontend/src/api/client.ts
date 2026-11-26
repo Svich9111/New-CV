@@ -1,7 +1,12 @@
+import { BadEvent, SseParser, isChatHistory, parseEvent, type CrisisEvent, type RawEvent } from "./chat";
 import { errorText, type Op } from "./messages";
 import type {
   ApiErrorBody,
   AuthRequest,
+  ChatErrorCode,
+  ChatHistory,
+  ChatSendRequest,
+  ChatStreamDone,
   Couple,
   HelpContact,
   InviteCreated,
@@ -46,7 +51,31 @@ export interface ApiOptions {
  * по истечении человек видит причину и «Попробовать снова». Контакты помощи ждём недолго — запасной
  * 112 на экране и так виден сразу (ТЗ §9.3).
  */
-export const TIMEOUTS = { default: 20_000, login: 15_000, help: 8_000 };
+export const TIMEOUTS = {
+  default: 20_000,
+  login: 15_000,
+  help: 8_000,
+  /**
+   * Чат: до ответа сервера (заголовков потока) — сначала сохранение реплики и классификатор безопасности
+   * (АР-30), поэтому дольше обычного.
+   */
+  chatStart: 45_000,
+  /** Чат: тишина в потоке между событиями. Сервер шлёт комментарий-пинг раз в 15 с — три пропуска подряд = обрыв. */
+  chatIdle: 45_000,
+};
+
+/** Чем закончился поток ответа агента (завершающее событие контракта). */
+export type ChatOutcome =
+  | { kind: "done"; data: ChatStreamDone }
+  | { kind: "crisis"; data: CrisisEvent }
+  | { kind: "error"; code: ChatErrorCode };
+
+export interface ChatSendOptions {
+  /** Отмена человеком («Остановить»): поток закрывается, сервер отменяет вызовы модели. */
+  signal?: AbortSignal;
+  /** Очередной кусок ответа агента (`delta`). */
+  onDelta(text: string): void;
+}
 
 interface RequestOptions {
   body?: unknown;
@@ -139,9 +168,17 @@ const checks = {
   invitePreview: (v: unknown) => isObject(v) && "inviter_name" in v && strOrNull(v.inviter_name) && isStr(v.expires_at),
   // Сам список — массив; отдельные записи проверяет экран «Помощь» (`isHelpContact`) и отбрасывает неверные.
   helpContacts: (v: unknown) => Array.isArray(v),
+  chatHistory: isChatHistory,
 };
 
 class Timeout extends Error {}
+class Aborted extends Error {}
+
+interface Opened {
+  res: Response;
+  ctrl: AbortController;
+  release: () => void;
+}
 
 /**
  * Клиент API по контракту `api/openapi.yaml` (сервер `/api/v1`).
@@ -251,6 +288,189 @@ export class Api {
     });
   }
 
+  /**
+   * Страница истории личного чата (от новых к старым). Курсор — непрозрачная строка сервера; 422 по курсору
+   * (в том числе после смены ключа сервера, Б-62) разбирает вызывающий: история начинается с первой страницы.
+   */
+  chatHistory(opts: { cursor?: string | null; limit?: number } = {}): Promise<ChatHistory> {
+    const q = new URLSearchParams();
+    if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+    if (opts.cursor) q.set("cursor", opts.cursor);
+    const qs = q.toString();
+    return this.call<ChatHistory>("GET", "/chat/messages" + (qs ? `?${qs}` : ""), {
+      op: "chatHistory",
+      check: checks.chatHistory,
+    });
+  }
+
+  /**
+   * Реплика владельца и потоковый ответ агента (`POST /chat/messages`, SSE). До потока — те же правила, что у
+   * остальных запросов: 401 — один повторный вход и один повтор, 409 `conflict_retry` — один повтор (ничего не
+   * сохранено, АР-24), прочие коды — `ApiError` (429 — с `Retry-After`).
+   *
+   * После ответа 200 реплика владельца уже сохранена (контракт). Ошибки потока — `ApiError` со статусом 200:
+   * `aborted` (остановил человек), `stream_broken` (соединение закрылось без завершающего события),
+   * `stream_timeout` (тишина дольше `chatIdle`), `bad_response` (событие не по контракту). Отмена до ответа —
+   * `ApiError(0, "aborted")`: сохранена ли реплика, неизвестно.
+   */
+  async chatSend(text: string, opts: ChatSendOptions): Promise<ChatOutcome> {
+    const body: ChatSendRequest = { text };
+    const open = async () => {
+      try {
+        return await this.openStream("/chat/messages", body, opts.signal);
+      } catch (e) {
+        if (e instanceof ApiError && e.code === "conflict_retry") return this.openStream("/chat/messages", body, opts.signal);
+        throw e;
+      }
+    };
+    const tokenBefore = this.token;
+    let opened: Opened;
+    try {
+      opened = await open();
+    } catch (e) {
+      if (!(e instanceof ApiError) || e.status !== 401) throw e;
+      if (this.loginInFlight) await this.loginInFlight;
+      else if (this.token === null || this.token === tokenBefore) await this.login();
+      opened = await open();
+    }
+    return this.readStream(opened, opts);
+  }
+
+  private async openStream(path: string, body: unknown, signal?: AbortSignal): Promise<Opened> {
+    const op: Op = "chatSend";
+    if (!this.token) throw new ApiError(401, "unauthorized", errorText("unauthorized", undefined, undefined, op));
+    if (signal?.aborted) throw new ApiError(0, "aborted", errorText("aborted", undefined, undefined, op));
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+    signal?.addEventListener("abort", onAbort);
+    const release = () => signal?.removeEventListener("abort", onAbort);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_res, rej) => {
+      timer = setTimeout(() => {
+        ctrl.abort();
+        rej(new Timeout());
+      }, this.timeouts.chatStart);
+      // Отмена человеком не ждёт, послушает ли реализация fetch сигнал.
+      signal?.addEventListener("abort", () => rej(new Aborted()), { once: true });
+    });
+    deadline.catch(() => undefined);
+    let res: Response;
+    try {
+      res = await Promise.race([
+        this.fetchImpl(this.baseUrl + path, {
+          method: "POST",
+          headers: {
+            Accept: "text/event-stream",
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.token}`,
+          },
+          body: JSON.stringify(body),
+          credentials: "omit",
+          cache: "no-store",
+          signal: ctrl.signal,
+        }),
+        deadline,
+      ]);
+      if (!res.ok) {
+        const text = await Promise.race([res.text(), deadline]);
+        clearTimeout(timer);
+        release();
+        throw this.statusError(res, text, op);
+      }
+    } catch (e) {
+      clearTimeout(timer);
+      release();
+      if (e instanceof ApiError) throw e;
+      const code = signal?.aborted ? "aborted" : e instanceof Timeout || ctrl.signal.aborted ? "timeout" : "network";
+      throw new ApiError(0, code, errorText(code, undefined, undefined, op));
+    }
+    clearTimeout(timer);
+    const type = res.headers.get("Content-Type") ?? "";
+    if (!/^text\/event-stream\b/i.test(type.trim())) {
+      release();
+      ctrl.abort();
+      throw new ApiError(res.status, "bad_response", errorText("bad_response", undefined, undefined, op));
+    }
+    return { res, ctrl, release };
+  }
+
+  private async readStream({ res, ctrl, release }: Opened, opts: ChatSendOptions): Promise<ChatOutcome> {
+    const op: Op = "chatSend";
+    const fail = (code: string) => new ApiError(200, code, errorText(code, undefined, undefined, op));
+    let idle: ReturnType<typeof setTimeout> | undefined;
+    let stop: (e: Error) => void = () => undefined;
+    const stopped = new Promise<never>((_res, rej) => {
+      stop = rej;
+    });
+    stopped.catch(() => undefined);
+    const onAbort = () => stop(new Aborted());
+    opts.signal?.addEventListener("abort", onAbort);
+    const touch = () => {
+      clearTimeout(idle);
+      idle = setTimeout(() => stop(new Timeout()), this.timeouts.chatIdle);
+    };
+    const parser = new SseParser();
+    const decoder = new TextDecoder();
+    let outcome: ChatOutcome | null = null;
+    const handle = (events: RawEvent[]) => {
+      for (const raw of events) {
+        if (outcome) return;
+        const ev = parseEvent(raw, isHelpContact);
+        if (!ev) continue;
+        if (ev.event === "delta") opts.onDelta(ev.text);
+        else if (ev.event === "done") outcome = { kind: "done", data: ev.data };
+        else if (ev.event === "crisis") outcome = { kind: "crisis", data: ev.data };
+        else outcome = { kind: "error", code: ev.code };
+      }
+    };
+    const reader = res.body?.getReader() ?? null;
+    try {
+      if (opts.signal?.aborted) throw new Aborted();
+      touch();
+      if (reader) {
+        while (!outcome) {
+          const r = await Promise.race([reader.read(), stopped]);
+          if (r.done) break;
+          touch();
+          handle(parser.push(decoder.decode(r.value, { stream: true })));
+        }
+        if (!outcome) handle([...parser.push(decoder.decode()), ...parser.end()]);
+      } else {
+        // Реализация fetch без потокового тела: ответ разбирается целиком, когда соединение закроется.
+        const text = await Promise.race([res.text(), stopped]);
+        handle([...parser.push(text), ...parser.end()]);
+      }
+      if (!outcome) throw fail("stream_broken");
+      return outcome;
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      if (e instanceof BadEvent) throw fail("bad_response");
+      if (e instanceof Timeout) throw fail("stream_timeout");
+      if (e instanceof Aborted || opts.signal?.aborted) throw fail("aborted");
+      throw fail("stream_broken");
+    } finally {
+      clearTimeout(idle);
+      opts.signal?.removeEventListener("abort", onAbort);
+      release();
+      if (!outcome) ctrl.abort();
+      if (reader) void reader.cancel().catch(() => undefined);
+    }
+  }
+
+  private statusError(res: Response, text: string, op: Op): ApiError {
+    let data: unknown;
+    try {
+      data = text.length > 0 ? JSON.parse(text) : undefined;
+    } catch {
+      data = undefined;
+    }
+    const retryAfter = parseRetryAfter(res.headers.get("Retry-After"));
+    if (isErrorBody(data)) return new ApiError(res.status, data.code, errorText(data.code, data.message, retryAfter, op), retryAfter);
+    const code =
+      res.status === 401 ? "unauthorized" : res.status === 429 ? "rate_limited" : res.status >= 500 ? "internal" : "http_error";
+    return new ApiError(res.status, code, errorText(code, undefined, retryAfter, op), retryAfter);
+  }
+
   private async call<T>(method: string, path: string, opts: RequestOptions): Promise<T> {
     const tokenBefore = this.token;
     try {
@@ -338,12 +558,6 @@ export class Api {
       }
       return data as T;
     }
-    const retryAfter = parseRetryAfter(res.headers.get("Retry-After"));
-    if (isErrorBody(data)) {
-      throw new ApiError(res.status, data.code, errorText(data.code, data.message, retryAfter, opts.op), retryAfter);
-    }
-    const code =
-      res.status === 401 ? "unauthorized" : res.status === 429 ? "rate_limited" : res.status >= 500 ? "internal" : "http_error";
-    throw new ApiError(res.status, code, errorText(code, undefined, retryAfter, opts.op), retryAfter);
+    throw this.statusError(res, text, opts.op);
   }
 }

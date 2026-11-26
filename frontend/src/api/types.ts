@@ -18,3 +18,15 @@ export type InvitePreview = Json<paths["/invites/{token}"]["get"]["responses"][2
 export type AuthRequest = NonNullable<
   paths["/auth/telegram"]["post"]["requestBody"]
 >["content"]["application/json"];
+
+export type ChatMessage = Schemas["ChatMessage"];
+export type UnavailableText = Schemas["UnavailableText"];
+export type ChatHistory = Json<paths["/chat/messages"]["get"]["responses"][200]>;
+export type ChatSendRequest = NonNullable<
+  paths["/chat/messages"]["post"]["requestBody"]
+>["content"]["application/json"];
+export type ChatStreamDelta = Schemas["ChatStreamDelta"];
+export type ChatStreamDone = Schemas["ChatStreamDone"];
+export type ChatStreamCrisis = Schemas["ChatStreamCrisis"];
+export type ChatStreamError = Schemas["ChatStreamError"];
+export type ChatErrorCode = Schemas["ChatErrorCode"];

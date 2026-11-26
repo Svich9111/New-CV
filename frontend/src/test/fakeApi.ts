@@ -1,4 +1,15 @@
-import type { ApiErrorBody, Couple, HelpContact, InviteCreated, InvitePreview, Me, OnboardingRequest, Session } from "../api/types";
+import type {
+  ApiErrorBody,
+  ChatHistory,
+  ChatMessage,
+  Couple,
+  HelpContact,
+  InviteCreated,
+  InvitePreview,
+  Me,
+  OnboardingRequest,
+  Session,
+} from "../api/types";
 import { INIT_DATA } from "./fakeTelegram";
 
 /**
@@ -9,6 +20,8 @@ import { INIT_DATA } from "./fakeTelegram";
 export interface Logged {
   method: string;
   path: string;
+  /** Строка запроса (`?limit=…&cursor=…`), если есть. */
+  query: string;
   auth: string | null;
   body: unknown;
 }
@@ -97,6 +110,14 @@ export class FakeServer {
     return this;
   }
 
+  /** Следующие `times` запросов `method path` обрываются до ответа (нет связи); сервер их не получил. */
+  failNetwork(method: string, path: string, times = 1): this {
+    this.netFail.set(`${method} ${path}`, times);
+    return this;
+  }
+
+  private netFail = new Map<string, number>();
+
   expireSession(): void {
     this.token = null;
   }
@@ -111,17 +132,22 @@ export class FakeServer {
     const path = url.pathname.replace(/^\/api\/v1/, "");
     const headers = new Headers(init.headers);
     const body = typeof init.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
-    this.log.push({ method, path, auth: headers.get("Authorization"), body });
+    this.log.push({ method, path, query: url.search, auth: headers.get("Authorization"), body });
 
+    const nf = this.netFail.get(`${method} ${path}`) ?? 0;
+    if (nf > 0) {
+      this.netFail.set(`${method} ${path}`, nf - 1);
+      throw new TypeError("Failed to fetch");
+    }
     const inj = this.injected.get(`${method} ${path}`);
     if (inj) {
       if (--inj.times <= 0) this.injected.delete(`${method} ${path}`);
       return json(inj.status, inj.body, inj.headers);
     }
-    return this.route(method, path, headers.get("Authorization"), body);
+    return this.route(method, path, headers.get("Authorization"), body, url, init.signal ?? null);
   };
 
-  private route(method: string, path: string, auth: string | null, body: unknown): Response {
+  private route(method: string, path: string, auth: string | null, body: unknown, url: URL, signal: AbortSignal | null): Response {
     if (method === "POST" && path === "/auth/telegram") {
       const b = body as { init_data?: unknown };
       if (b?.init_data !== INIT_DATA) return json(401, err("invalid_init_data", "Не удалось подтвердить вход через Telegram"));
@@ -144,6 +170,8 @@ export class FakeServer {
     }
 
     if (!this.me.onboarding_completed) return json(403, err("onboarding_required", "Сначала завершите знакомство с сервисом"));
+    if (method === "GET" && path === "/chat/messages") return this.chatHistory(url.searchParams);
+    if (method === "POST" && path === "/chat/messages") return this.chatPost(body, signal);
     if (method === "GET" && path === "/couple") return this.couple ? json(200, this.couple) : json(404, err("not_found", "Не найдено"));
     if (method === "POST" && path === "/couple") {
       if (this.couple) return json(409, err("already_in_couple", "У вас уже есть пара"));
@@ -156,6 +184,190 @@ export class FakeServer {
       return json(201, this.issue());
     }
     return json(404, err("not_found", "Не найдено"));
+  }
+
+  // ------------------------------------------------------------------ личный чат (ФТ-05, контракт АР-32)
+
+  /** Личный чат «меня»: от старых к новым (сервер отдаёт от новых к старым). */
+  chat: ChatMessage[] = [];
+  /** Сценарии ответов на `POST /chat/messages` по очереди; без сценария — короткий ответ из двух кусков. */
+  chatReplies: ChatReply[] = [];
+  /** Версия ключа курсора: смена — прежние курсоры дают 422 (ротация ключа сервера, Б-62). */
+  cursorKey = 1;
+  /** Сколько потоков закрыл клиент (отмена/обрыв со стороны клиента). */
+  streamsAborted = 0;
+  private chatSeq = 0;
+
+  /** Добавить `n` реплик в историю (выдуманные тексты): чередуются владелец и агент. */
+  seedChat(n: number): this {
+    for (let i = 0; i < n; i++) this.addChat(i % 2 === 0 ? "owner" : "agent", `Реплика ${i + 1}`);
+    return this;
+  }
+
+  addChat(author: ChatMessage["author"], text: ChatMessage["text"], id?: string): ChatMessage {
+    const seq = ++this.chatSeq;
+    const m: ChatMessage = {
+      id: id ?? `00000000-0000-4000-9000-${String(seq).padStart(12, "0")}`,
+      author,
+      text,
+      created_at: new Date(Date.UTC(2026, 10, 20, 10, 0, seq)).toISOString(),
+    };
+    this.chat.push(m);
+    return m;
+  }
+
+  reply(r: ChatReply): this {
+    this.chatReplies.push(r);
+    return this;
+  }
+
+  private chatHistory(q: URLSearchParams): Response {
+    const limit = Number(q.get("limit") ?? 50);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) return json(422, err("validation_error", "Проверьте данные"));
+    const newest = [...this.chat].reverse();
+    let start = 0;
+    const cursor = q.get("cursor");
+    if (cursor !== null) {
+      const m = /^c\.(\d+)\.(\d+)$/.exec(cursor);
+      if (!m || Number(m[1]) !== this.cursorKey) return json(422, err("validation_error", "Проверьте данные"));
+      const at = newest.findIndex((x) => x.id === this.chatIdBySeq(Number(m[2])));
+      start = at < 0 ? newest.length : at + 1;
+    }
+    const items = newest.slice(start, start + limit);
+    const lastItem = items[items.length - 1];
+    const more = start + limit < newest.length;
+    const page: ChatHistory = {
+      items,
+      next_cursor: more && lastItem ? `c.${this.cursorKey}.${this.seqOf(lastItem.id)}` : null,
+    };
+    return json(200, page, { "Cache-Control": "no-store" });
+  }
+
+  private seqOf(id: string): number {
+    return this.chat.findIndex((x) => x.id === id);
+  }
+
+  private chatIdBySeq(i: number): string | undefined {
+    return this.chat[i]?.id;
+  }
+
+  private chatPost(body: unknown, signal: AbortSignal | null): Response {
+    const b = body as { text?: unknown };
+    if (typeof b?.text !== "string" || b.text.trim().length === 0 || b.text.length > 4000 || Object.keys(b).length !== 1) {
+      return json(422, err("validation_error", "Проверьте данные"));
+    }
+    const r = this.chatReplies.shift() ?? { steps: [delta("Слышу "), delta("тебя."), done()] };
+    if (r.dropResponse) {
+      // Сервер сохранил реплику, а ответ до клиента не дошёл (обрыв связи до заголовков).
+      this.addChat("owner", b.text);
+      if (r.dropResponse === "answered") this.addChat("agent", "Ответ, который не дошёл.");
+      throw new TypeError("Failed to fetch");
+    }
+    if (r.status && r.status !== 200) {
+      // 409 `conflict_retry` — ничего не сохранено; 429/402/5xx — реплика владельца уже сохранена.
+      if (r.saveOwner ?? r.status !== 409) this.addChat("owner", b.text);
+      return json(r.status, r.body, r.headers);
+    }
+    this.addChat("owner", b.text);
+    return this.stream(r, signal);
+  }
+
+  private stream(r: ChatReply, signal: AbortSignal | null): Response {
+    const enc = new TextEncoder();
+    const steps = r.steps ?? [];
+    const addChat = this.addChat.bind(this);
+    const counter = { abort: () => (this.streamsAborted += 1) };
+    let shown = "";
+    let cancelled = false;
+    // Закрытие клиентом после завершающего события — не отмена (контракт: после него соединение закрывается).
+    let terminal = false;
+    const onAbort = () => {
+      if (!cancelled && !terminal) counter.abort();
+      cancelled = true;
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    // Текст шага; сохранение ответа агента — до отправки `done`/`crisis` (контракт).
+    const segment = (st: SseStep): string | null => {
+      if ("comment" in st) return `: ${st.comment}\n\n`;
+      if ("raw" in st) return st.raw;
+      if ("saveAgent" in st) {
+        addChat("agent", st.saveAgent, st.id);
+        return null;
+      }
+      if ("event" in st) {
+        const data = st.data as Record<string, unknown>;
+        if (st.event === "delta" && typeof data?.text === "string") shown += data.text;
+        if (st.event === "done" || st.event === "crisis" || st.event === "error") terminal = true;
+        if (st.event === "done" && typeof data?.message_id === "string" && st.save !== false) addChat("agent", shown, data.message_id);
+        if (st.event === "crisis" && typeof data?.text === "string" && typeof data?.message_id === "string" && st.save !== false)
+          addChat("agent", data.text, data.message_id);
+        return `event: ${st.event}\ndata: ${typeof st.data === "string" ? st.data : JSON.stringify(st.data)}\n\n`;
+      }
+      return null;
+    };
+    const pieces = (text: string): Uint8Array[] => {
+      const bytes = enc.encode(text);
+      if (typeof r.chunk !== "number") return [bytes];
+      const out: Uint8Array[] = [];
+      for (let i = 0; i < bytes.length; i += r.chunk) out.push(bytes.slice(i, i + r.chunk));
+      return out;
+    };
+
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const fail = () => {
+          try {
+            controller.error(new DOMException("The operation was aborted.", "AbortError"));
+          } catch {
+            /* поток уже закрыт */
+          }
+        };
+        signal?.addEventListener("abort", fail, { once: true });
+        if (r.chunk === "whole") {
+          let all = "";
+          for (const st of steps) {
+            if ("wait" in st || "gate" in st) continue;
+            all += segment(st) ?? "";
+          }
+          if (!cancelled) controller.enqueue(enc.encode(all));
+        } else {
+          for (const st of steps) {
+            if (cancelled) return;
+            if ("wait" in st) {
+              await new Promise((res) => setTimeout(res, st.wait));
+              continue;
+            }
+            if ("gate" in st) {
+              await st.gate;
+              continue;
+            }
+            const text = segment(st);
+            if (text === null) continue;
+            for (const p of pieces(text)) {
+              if (cancelled) return;
+              controller.enqueue(p);
+              // Отдельные куски — отдельными чтениями у клиента.
+              await new Promise((res) => setTimeout(res, 0));
+            }
+          }
+        }
+        if (cancelled) return;
+        if (r.end === "hang") return;
+        if (r.end === "error") {
+          fail();
+          return;
+        }
+        controller.close();
+      },
+      cancel() {
+        onAbort();
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { "Content-Type": r.contentType ?? "text/event-stream; charset=utf-8", "Cache-Control": "no-store" },
+    });
   }
 
   private onboarding(b: OnboardingRequest): Response {
@@ -211,4 +423,59 @@ export class FakeServer {
 export function json(status: number, body?: unknown, headers: Record<string, string> = {}): Response {
   if (status === 204 || body === undefined) return new Response(null, { status, headers });
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
+}
+
+// ------------------------------------------------------------------ сценарии потока чата
+
+export type SseStep =
+  | { event: string; data: unknown; save?: boolean }
+  | { comment: string }
+  | { raw: string }
+  | { wait: number }
+  | { gate: Promise<void> }
+  /** Сервер сохранил ответ агента, но событие до клиента не дошло. */
+  | { saveAgent: string; id?: string };
+
+export interface ChatReply {
+  /** Реплика сохранена (и, если `answered`, — ответ агента), но ответ до клиента не дошёл. */
+  dropResponse?: true | "answered";
+  /** Ответ до потока (JSON `Error`): 409/422/429/402/5xx. */
+  status?: number;
+  body?: unknown;
+  headers?: Record<string, string>;
+  /** Сохраняет ли сервер реплику владельца при ответе `status` (по умолчанию — да, кроме 409). */
+  saveOwner?: boolean;
+  steps?: SseStep[];
+  /** Как резать поток: по шагам (по умолчанию), целиком одним куском или по N байт. */
+  chunk?: "whole" | number;
+  /** После шагов: закрыть (по умолчанию), держать открытым или оборвать с ошибкой. */
+  end?: "close" | "hang" | "error";
+  contentType?: string;
+}
+
+let agentSeq = 0;
+export const delta = (text: string): SseStep => ({ event: "delta", data: { text } });
+export function done(id?: string, suggest_draft = false): SseStep {
+  return { event: "done", data: { message_id: id ?? `a0000000-0000-4000-8000-${String(++agentSeq).padStart(12, "0")}`, suggest_draft } };
+}
+export function crisis(text: string, opts: { replace?: boolean; contacts?: unknown; id?: string | null } = {}): SseStep {
+  return {
+    event: "crisis",
+    data: {
+      message_id: opts.id === undefined ? `c0000000-0000-4000-8000-${String(++agentSeq).padStart(12, "0")}` : opts.id,
+      text,
+      replace: opts.replace ?? false,
+      contacts: opts.contacts ?? CONTACTS,
+    },
+  };
+}
+export const errorEvent = (code: string, message = "Модель недоступна"): SseStep => ({ event: "error", data: { code, message } });
+
+/** Шлюз: поток ждёт, пока тест не откроет его (`open()`). */
+export function gate(): { step: SseStep; open: () => void } {
+  let open: () => void = () => undefined;
+  const p = new Promise<void>((res) => {
+    open = res;
+  });
+  return { step: { gate: p }, open };
 }

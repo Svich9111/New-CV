@@ -234,6 +234,11 @@ export function Invite() {
         </>
       )}
 
+      <button type="button" className="btn btn--block btn--ghost" onClick={() => app.push({ name: "chat" })}>
+        Поговорить с агентом
+      </button>
+      <p className="small muted">Говорить с агентом можно уже сейчас — этот разговор видишь только ты.</p>
+
       {note && (
         <p className="small" role="status">
           {note}

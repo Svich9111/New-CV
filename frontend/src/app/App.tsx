@@ -2,7 +2,9 @@ import { Component, Fragment, useCallback, useEffect, useMemo, useRef, useState,
 import { Api, ApiError } from "../api/client";
 import { errorText } from "../api/messages";
 import type { InviteCreated, Me } from "../api/types";
+import { ChatSession } from "../chat/session";
 import { AuthError } from "../screens/AuthError";
+import { Chat } from "../screens/Chat";
 import { Help } from "../screens/Help";
 import { Incoming } from "../screens/Incoming";
 import { Invite } from "../screens/Invite";
@@ -71,6 +73,8 @@ function Screen({ route, api }: { route: Route; api: Api }) {
       return <Incoming token={route.token} />;
     case "paired":
       return <Paired />;
+    case "chat":
+      return <Chat />;
     case "underage":
       return <Underage />;
     case "help":
@@ -105,6 +109,11 @@ function Session({
   const [pendingAccept, setPendingAccept] = useState<PendingAccept | null>(null);
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [onboardingDraft, setOnboardingDraft] = useState<OnboardingDraft | null>(null);
+  const [chat] = useState(() => new ChatSession(api));
+  useEffect(() => {
+    chat.open();
+    return () => chat.close();
+  }, [chat]);
 
   // Вход завершился: первый экран по онбордингу, паре и startapp. Вычисляется при отрисовке (состояние из
   // свойства), поэтому промежуточного кадра без экрана нет. Если человек открыл «Помощь» до окончания входа,
@@ -139,12 +148,13 @@ function Session({
         setInviteError,
         onboardingDraft,
         setOnboardingDraft,
+        chat,
         push,
         reset,
         back,
         canGoBack,
       },
-    [api, me, invite, shared, pendingAccept, inviteError, onboardingDraft, push, reset, back, canGoBack],
+    [api, me, invite, shared, pendingAccept, inviteError, onboardingDraft, chat, push, reset, back, canGoBack],
   );
 
   if (!state || !route) {
@@ -173,7 +183,8 @@ function Session({
     <AppContext.Provider value={state}>
       <Frame
         onBack={canGoBack ? back : null}
-        onHelp={route.name === "help" ? null : () => push({ name: "help" })}
+        // Чат держит «Помощь» в закреплённом низу экрана, рядом с полем ввода: видна при любой длине ленты.
+        onHelp={route.name === "help" || route.name === "chat" ? null : () => push({ name: "help" })}
       >
         <Screen key={`${stack.length}-${routeKey(route)}`} route={route} api={api} />
       </Frame>

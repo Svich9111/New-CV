@@ -1,11 +1,15 @@
 import { useEffect, useState } from "react";
 import { useApp } from "../app/store";
+import { MainButton } from "../telegram/MainButton";
 import { Heading } from "../ui/Heading";
 import { Heart } from "../ui/Notice";
 
-/** Пара создана (ФТ-03). Главный экран с чатом — следующие задачи (2.2); здесь — статус пары. */
+/**
+ * Главный экран пары (ТЗ §8 «Главный»): статус пары и вход в чат с агентом (2.2). Непрочитанные сообщения
+ * партнёра — задача 3.4.
+ */
 export function Paired() {
-  const { api, me } = useApp();
+  const { api, me, push } = useApp();
   const [partner, setPartner] = useState<string | null>(me.partner_name ?? null);
 
   useEffect(() => {
@@ -39,7 +43,13 @@ export function Paired() {
         Ваши личные разговоры с агентами друг другу не видны. Между вами передаются только сообщения, которые каждый
         сам отправит кнопкой «Отправить».
       </p>
-      <p className="small muted">Скоро здесь появится чат с твоим агентом.</p>
+      <button type="button" className="card card--link" onClick={() => push({ name: "chat" })}>
+        <span className="card__title">Поговорить с агентом</span>
+        <span className="small muted">
+          Выговориться, разобраться в чувствах, подготовить сообщение. Этот разговор видишь только ты.
+        </span>
+      </button>
+      <MainButton text="Поговорить с агентом" onClick={() => push({ name: "chat" })} />
     </section>
   );
 }

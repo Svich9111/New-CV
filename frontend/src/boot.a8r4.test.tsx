@@ -42,19 +42,23 @@ const failedHeading = () => screen.queryByRole("heading", { level: 1, name: "Н�
 const loadingText = () => screen.queryByText(/Загружаем «Чувства AI»…/);
 
 describe("A8 р.4 · срок ожидания SDK по умолчанию — 15 с (n-7)", () => {
-  test("SDK_GIVE_UP_MS = 15 000; без sdkGiveUpMs «Загружаем…» держится до 15 с и сменяется причиной ровно на сроке", async () => {
+  // Обращён под Б-93 (A4, задача 2.2): раньше срок шёл после SDK_WAIT_MS (≈ 19 с вместо 15), теперь — от запуска
+  // страницы; «Загружаем…» с «Помощью» показывается сразу, без ожидания SDK_WAIT_MS.
+  test("SDK_GIVE_UP_MS = 15 000; без sdkGiveUpMs «Загружаем…» с «Помощью» — сразу, причина — ровно через 15 с от запуска", async () => {
     expect(SDK_GIVE_UP_MS).toBe(15_000);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let clock = 0;
     const server = new FakeServer();
     await act(async () => {
-      const p = boot({ container, fetch: server.fetch, sdkWaitMs: 20 });
-      await vi.advanceTimersByTimeAsync(20);
-      unmount = await p;
+      unmount = await boot({ container, fetch: server.fetch, sdkWaitMs: 4_000, now: () => clock });
     });
     expect(loadingText()).not.toBeNull();
+    expect(helpLink()).toBeInTheDocument();
+    clock = SDK_GIVE_UP_MS - 1;
     await act(async () => vi.advanceTimersByTimeAsync(SDK_GIVE_UP_MS - 1));
     expect(loadingText()).not.toBeNull();
     expect(failedHeading()).toBeNull();
+    clock = SDK_GIVE_UP_MS;
     await act(async () => vi.advanceTimersByTimeAsync(1));
     expect(failedHeading()).not.toBeNull();
     expect(screen.getByRole("button", { name: "Попробовать снова" })).toBeInTheDocument();

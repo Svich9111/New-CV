@@ -5,6 +5,7 @@ export type Route =
   | { name: "invite" }
   | { name: "incoming"; token: string }
   | { name: "paired" }
+  | { name: "chat" }
   | { name: "underage" }
   | { name: "help" };
 

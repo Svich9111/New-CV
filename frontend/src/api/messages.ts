@@ -17,7 +17,9 @@ export type Op =
   | "reissueInvite"
   | "invite"
   | "acceptInvite"
-  | "help";
+  | "help"
+  | "chatHistory"
+  | "chatSend";
 
 const INVITE_NOT_FOUND = "Приглашение не найдено. Попроси партнёра прислать новую ссылку.";
 
@@ -43,6 +45,29 @@ const BY_CODE: Record<string, string> = {
   // по контракту — исчерпан дневной лимит реплик: там нужен свой текст через переопределение операции.
   rate_limited: "Слишком много запросов подряд. Подожди немного и попробуй снова.",
   internal: "Что-то пошло не так. Попробуй ещё раз.",
+  subscription_required: "Подписка закончилась. Контакты помощи доступны и без неё.",
+  aborted: "Запрос остановлен.",
+};
+
+/**
+ * Чат: тексты по коду события `error` и по сбою потока (ТЗ §10: понятное сообщение, реплика не теряется).
+ * Сохранена ли реплика, экран говорит отдельно — по тому, что знает (200 пришёл или история её показала).
+ */
+const CHAT_SEND: Record<string, string> = {
+  validation_error: "Сообщение пустое или длиннее 4000 символов — поправь и отправь снова.",
+  conflict_retry: "Сообщение не сохранилось из-за сбоя. Отправь его ещё раз.",
+  rate_limited: "На сегодня лимит сообщений агенту исчерпан.",
+  refusal: "Агент не смог ответить на это сообщение. Попробуй сказать иначе или повтори.",
+  unavailable: "Агент сейчас недоступен. Попробуй ещё раз чуть позже.",
+  quota: "Агент временно недоступен по техническим причинам. Попробуй позже.",
+  bad_output: "Ответ агента пришёл с ошибкой. Попробуй ещё раз.",
+  internal: "Что-то пошло не так, агент не ответил. Попробуй ещё раз.",
+  bad_response: "Сервер ответил непонятно, агент не ответил. Попробуй ещё раз.",
+  stream_broken: "Связь прервалась — ответ агента не дошёл.",
+  stream_timeout: "Агент слишком долго молчит — соединение прервано.",
+  aborted: "Ответ остановлен.",
+  network: "Нет связи с сервером. Проверь интернет и попробуй ещё раз.",
+  timeout: "Сервер не ответил вовремя. Проверь интернет и попробуй ещё раз.",
 };
 
 const BY_OP: Partial<Record<Op, Record<string, string>>> = {
@@ -55,6 +80,11 @@ const BY_OP: Partial<Record<Op, Record<string, string>>> = {
     couple_not_pending: "Пара уже не ждёт партнёра — новая ссылка не нужна.",
   },
   createCouple: { couple_not_pending: "Пара уже не ждёт партнёра — новая ссылка не нужна." },
+  chatHistory: {
+    validation_error: "Не получилось загрузить более ранние сообщения. Попробуй ещё раз.",
+    bad_response: "История пришла с ошибкой. Попробуй ещё раз чуть позже.",
+  },
+  chatSend: CHAT_SEND,
 };
 
 /** Срок ожидания из `Retry-After` по-человечески: секунды, минуты или часы (с округлением вверх). */
@@ -68,4 +98,27 @@ export function errorText(code: string, serverMessage?: string, retryAfter?: num
   const base = (op && BY_OP[op]?.[code]) ?? BY_CODE[code] ?? serverMessage ?? BY_CODE.internal;
   if (code === "rate_limited" && retryAfter) return `${base.replace(/\.$/, "")} — через ${waitText(retryAfter)}`;
   return base;
+}
+
+/** Текст события `error` чата по коду; незнакомый код — как `internal` (контракт `ChatErrorCode`). */
+export function chatErrorText(code: string): string {
+  return CHAT_SEND[code] ?? CHAT_SEND.internal;
+}
+
+/**
+ * Когда снова можно писать агенту после дневного лимита (429, `Retry-After`): время на часах устройства и
+ * сколько ждать — «после 00:00 (через 3 ч.)», «завтра после 09:30 (через 12 ч.)».
+ */
+export function limitUntilText(retryAfter: number, now: number = Date.now()): string {
+  const at = new Date(now + retryAfter * 1000);
+  const today = new Date(now);
+  const time = at.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const dayDiff = Math.round(
+    (new Date(at.getFullYear(), at.getMonth(), at.getDate()).getTime() -
+      new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()) /
+      86_400_000,
+  );
+  const day =
+    dayDiff <= 0 ? "" : dayDiff === 1 ? "завтра " : `${at.toLocaleDateString("ru-RU", { day: "numeric", month: "long" })} `;
+  return `${day}после ${time} (через ${waitText(retryAfter).replace(/\.$/, "")})`;
 }
