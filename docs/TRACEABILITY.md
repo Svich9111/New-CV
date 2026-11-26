@@ -4,8 +4,8 @@
 
 | ФТ | Требование (кратко) | Задача | Тесты | Статус |
 | --- | --- | --- | --- | --- |
-| ФТ-01 | Авторизация Telegram, проверка подписи initData | 1.1 | `test_telegram_init_data.py`, `test_auth_api.py`, `test_session.py`, `test_auth_a8.py` | ✅ |
-| ФТ-02 | Онбординг, согласия, 18+ | 1.2 | `test_onboarding.py`, `test_onboarding_a8.py`, `test_contract.py` | ✅ (⚠️ АР-14) |
+| ФТ-01 | Авторизация Telegram, проверка подписи initData | 1.1 | `test_telegram_init_data.py`, `test_auth_api.py`, `test_session.py`, `test_auth_a8.py`; клиент 1.5 — `frontend/src/api/client*.test.ts`, `telegram/webapp.test.ts` | ✅ |
+| ФТ-02 | Онбординг, согласия, 18+ | 1.2 | `test_onboarding.py`, `test_onboarding_a8.py`, `test_contract.py`; клиент 1.5 — `screens/Onboarding.test.tsx`, `app/App*.test.tsx` | ✅ (⚠️ АР-14) |
 | ФТ-03 | Ссылка-приглашение 7 дней, подтверждение обеими сторонами | 0.7b, 1.3, 1.4 | `test_couple_functions*.py`, `test_couple_api*.py` | 🔄 БД, API, бот ✅; живой бот — Г2 |
 | ФТ-04 | Одна активная пара, выход, повторное создание | 0.7b, 1.3 | `test_couple_functions*.py`, `test_couple_api*.py` | ✅ |
 | ФТ-05 | Чат с потоковым выводом | 2.1, 2.2 | `test_chat_*.py` | 🔄 сервер ✅ (2.1), экран — 2.2 |
