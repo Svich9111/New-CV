@@ -147,14 +147,14 @@ describe("коды ответа сервера → понятный текст (
   // [MINOR-1] Необработанная ошибка сервера — 500 {"code":"internal"} (app/errors.py `_unhandled`); у клиента текст
   // «Сбой на сервере» есть только для кода server_error (ответ без JSON). Настоящий 500 сервера показывается
   // нейтральной строкой «Сервер ответил ошибкой (код «internal»)».
-  test.fails("[MINOR-1] 500 internal (настоящий ответ сервера) — «Сбой на сервере», а не «код internal»", () => {
+  test("[MINOR-1] 500 internal (настоящий ответ сервера) — «Сбой на сервере», а не «код internal»", () => {
     expect(errorsPy).toContain('"code": "internal"');
     expect(adminErrorText("internal", "upload")).toBe("Сбой на сервере. Повторите позже.");
   });
 
   // [MINOR-1] 409 conflict_retry (app/errors.py `_db_conflict`, АР-24) — сервер отдаёт на любом пути с БД,
   // в т.ч. загрузке и удалении; у клиента своего текста нет.
-  test.fails("[MINOR-1] 409 conflict_retry — свой текст («повторите»), а не «код conflict_retry»", () => {
+  test("[MINOR-1] 409 conflict_retry — свой текст («повторите»), а не «код conflict_retry»", () => {
     expect(errorsPy).toContain('"code": "conflict_retry"');
     expect(adminErrorText("conflict_retry", "upload")).not.toMatch(GENERIC);
   });
@@ -170,7 +170,7 @@ describe("коды ответа сервера → понятный текст (
     expect(uploadSpec).not.toMatch(/"400":/);
     expect(uploadSpec).toMatch(/rights_basis:\n\s+type: string\n\s+minLength: 1\n\s+description/);
   });
-  test.fails("[MINOR-2] 400 http_error на загрузке (поле формы больше 64 КиБ) — понятный текст", () => {
+  test("[MINOR-2] 400 http_error на загрузке (поле формы больше 64 КиБ) — понятный текст", () => {
     expect(adminErrorText("http_error", "upload")).not.toMatch(GENERIC);
   });
 });

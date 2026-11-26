@@ -11,6 +11,16 @@ export const ADMIN_PATH_PREFIX = "/admin/";
 /** Предел файла — как на сервере (`MAX_FILE_BYTES`, CHECK `source_data`). */
 export const MAX_FILE_BYTES = 20 * 1024 * 1024;
 export const KB_FORMATS = ["pdf", "epub", "docx", "txt"] as const;
+/** Предел текстового поля формы в байтах UTF-8 — как на сервере (`MAX_FIELD_BYTES`, `max_part_size`; больше — 400). */
+export const MAX_FIELD_BYTES = 64 * 1024;
+
+/**
+ * Токен кладётся в заголовок `Authorization`: допустимы только печатаемые символы ASCII без пробелов. Иначе
+ * `Headers` бросает `TypeError` до отправки (кириллица, неразрывный пробел, перевод строки) — это не «нет связи».
+ */
+export function isValidToken(token: string): boolean {
+  return /^[\x21-\x7e]+$/.test(token);
+}
 
 export const ADMIN_TIMEOUTS = { default: 20_000, upload: 180_000 };
 
@@ -172,6 +182,8 @@ export class AdminApi {
 
   async #request(method: string, path: string, body?: FormData, timeoutMs = this.#timeouts.default): Promise<Response> {
     const url = this.#baseUrl + adminPath(path);
+    // Вход проверяет токен раньше; здесь — на случай другого вызывающего: такой токен сервер всё равно не примет.
+    if (!isValidToken(this.#token)) throw new AdminApiError(401, "unauthorized");
     const ctrl = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, rej) => {

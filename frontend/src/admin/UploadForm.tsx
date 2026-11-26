@@ -1,6 +1,6 @@
 import { useRef, useState, type FormEvent } from "react";
 import { Notice } from "../ui/Notice";
-import { AdminApiError, KB_FORMATS, MAX_FILE_BYTES, type AdminApi } from "./api";
+import { AdminApiError, KB_FORMATS, MAX_FIELD_BYTES, MAX_FILE_BYTES, type AdminApi } from "./api";
 import { extensionOf, formatSize, titleFromFileName } from "./format";
 import { adminErrorText } from "./texts";
 import type { KbDocument } from "./types";
@@ -13,20 +13,37 @@ type Errors = Partial<Record<Field, string>>;
 
 const LIMITS = { title: 300, author: 200, approach: 100 } as const;
 
-/** Проверка до отправки (контракт `POST /admin/kb/documents`): файл, формат, размер, обязательные поля, длины. */
+/** Длина в символах Unicode (как `len()` в pydantic и `length()` в PostgreSQL), а не в единицах UTF-16. */
+const charCount = (s: string) => [...s].length;
+const utf8Bytes = (s: string) => new TextEncoder().encode(s).length;
+const TOO_LONG_BYTES = "слишком длинный текст: больше 64 КиБ (около 32 000 букв кириллицы) сервер не принимает.";
+
+/**
+ * Проверка до отправки (контракт `POST /admin/kb/documents`, `UploadFields` в `admin_kb.py`): файл, формат, размер,
+ * обязательные поля, длины. Длины считаются у значения после `trim()` — именно оно уходит на сервер; каждое поле —
+ * не больше 64 КиБ в UTF-8 (`max_part_size` сервера, иначе 400).
+ */
 export function validateUpload(v: { file: File | null; title: string; author: string; approach: string; rights_basis: string }): Errors {
   const errors: Errors = {};
+  const title = v.title.trim();
+  const author = v.author.trim();
+  const approach = v.approach.trim();
+  const rights = v.rights_basis.trim();
   if (!v.file) errors.file = "Выберите файл.";
   else if (!(KB_FORMATS as readonly string[]).includes(extensionOf(v.file.name)))
     errors.file = "Поддерживаются только PDF, EPUB, DOCX и TXT.";
   else if (v.file.size === 0) errors.file = "Файл пустой.";
   else if (v.file.size > MAX_FILE_BYTES) errors.file = `Файл больше 20 МиБ (${formatSize(v.file.size)}).`;
-  if (!v.title.trim()) errors.title = "Укажите название.";
-  else if (v.title.length > LIMITS.title) errors.title = `Название — не больше ${LIMITS.title} символов.`;
-  if (v.author.length > LIMITS.author) errors.author = `Автор — не больше ${LIMITS.author} символов.`;
-  if (v.approach.length > LIMITS.approach) errors.approach = `Подход — не больше ${LIMITS.approach} символов.`;
-  if (!v.rights_basis.trim())
+  if (!title) errors.title = "Укажите название.";
+  else if (charCount(title) > LIMITS.title) errors.title = `Название — не больше ${LIMITS.title} символов.`;
+  if (charCount(author) > LIMITS.author) errors.author = `Автор — не больше ${LIMITS.author} символов.`;
+  if (charCount(approach) > LIMITS.approach) errors.approach = `Подход — не больше ${LIMITS.approach} символов.`;
+  if (!rights)
     errors.rights_basis = "Укажите основание прав на использование материала — без него загрузка невозможна (ТЗ §6.4).";
+  else if (utf8Bytes(rights) > MAX_FIELD_BYTES) errors.rights_basis = `Основание прав: ${TOO_LONG_BYTES}`;
+  // Название, автор и подход по пределу символов укладываются в 64 КиБ; проверка — на случай смены пределов.
+  for (const [f, value] of [["title", title], ["author", author], ["approach", approach]] as const)
+    if (!errors[f] && utf8Bytes(value) > MAX_FIELD_BYTES) errors[f] = `Поле: ${TOO_LONG_BYTES}`;
   return errors;
 }
 

@@ -3,7 +3,8 @@
  * «Нужен токен администратора, а не вход через Telegram»; «Выйти» — забыть токен. Токен не попадает в журнал,
  * консоль (проверяет общий `src/test/setup.ts`), адрес, хранилища, cookie.
  */
-import { screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { AdminApi } from "./api";
 import { ADMIN_TOKEN, FakeAdminApi, USER_SESSION_TOKEN, makeDoc } from "./test/fakeAdminApi";
 import { expectOnlyAdminRequests, login, renderAdmin } from "./test/renderAdmin";
 
@@ -80,7 +81,7 @@ test("403 admin_only (вход сессией Mini App) — «Нужен ток�
 test("401 посреди работы (токен отозван) — поле токена, следующий запрос без старого токена не уходит", async () => {
   const fake = new FakeAdminApi();
   fake.docs = [makeDoc()];
-  const { user } = renderAdmin(fake);
+  const { user, globalFetch } = renderAdmin(fake);
   await login(user);
   await screen.findByRole("heading", { level: 1, name: "База знаний" });
   fake.inject("GET", "/admin/kb/documents", { status: 401, body: { code: "unauthorized", message: "x" } });
@@ -90,6 +91,7 @@ test("401 посреди работы (токен отозван) — поле �
   const before = fake.log.length;
   await new Promise((r) => setTimeout(r, 20));
   expect(fake.log).toHaveLength(before);
+  expectOnlyAdminRequests(fake, globalFetch);
 });
 
 test("«Выйти» — токен забыт: снова поле входа, запросов со старым токеном больше нет", async () => {
@@ -108,11 +110,38 @@ test("«Выйти» — токен забыт: снова поле входа, 
   expectOnlyAdminRequests(fake, globalFetch);
 });
 
+test.each([
+  ["кириллица", "токен-администратора"],
+  ["неразрывный пробел внутри", "adm\u00a0token"],
+  ["пробел внутри", "adm token"],
+  ["табуляция внутри", "adm\ttoken"], // перевод строки поле type=password само вырезает (стандарт HTML)
+])("токен с недопустимыми для заголовка символами (%s) — «Токен не принят», подпись у поля, запроса нет", async (_, token) => {
+  const { fake, user, globalFetch } = renderAdmin();
+  const input = screen.getByLabelText("Токен администратора");
+  // user.type превращает управляющие символы в клавиши — значение задаётся целиком.
+  fireEvent.change(input, { target: { value: token } });
+  await user.click(screen.getByRole("button", { name: "Войти" }));
+  expect(screen.getByRole("alert")).toHaveTextContent("Токен не принят. Введите токен администратора заново.");
+  expect(screen.getByText(/Токен содержит недопустимые символы/)).toBeInTheDocument();
+  expect(input).toHaveAttribute("aria-invalid", "true");
+  expect(input).toHaveValue("");
+  expect(fake.log).toEqual([]);
+  expectOnlyAdminRequests(fake, globalFetch);
+});
+
+test("клиент API сам не отправляет токен с недопустимыми символами — 401 без запроса", async () => {
+  const fake = new FakeAdminApi();
+  const api = new AdminApi({ token: "токен", fetch: fake.fetch });
+  await expect(api.listDocuments()).rejects.toMatchObject({ status: 401, code: "unauthorized" });
+  expect(fake.log).toEqual([]);
+});
+
 test("токен не попадает в DOM и не виден в поле после входа", async () => {
   const fake = new FakeAdminApi();
-  const { user } = renderAdmin(fake);
+  const { user, globalFetch } = renderAdmin(fake);
   await login(user);
   await waitFor(() => expect(fake.log).toHaveLength(1));
   expect(await screen.findByText("Материалов пока нет.")).toBeInTheDocument();
   expect(document.body.innerHTML).not.toContain(ADMIN_TOKEN);
+  expectOnlyAdminRequests(fake, globalFetch);
 });

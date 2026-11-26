@@ -5,7 +5,8 @@
  * заглушки: только `/api/v1/admin/*` (критерий RoadMap).
  */
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { MAX_FILE_BYTES } from "./api";
+import { MAX_FIELD_BYTES, MAX_FILE_BYTES } from "./api";
+import { adminErrorText } from "./texts";
 import { FakeAdminApi, deferred, makeDoc } from "./test/fakeAdminApi";
 import { expectOnlyAdminRequests, login, renderAdmin } from "./test/renderAdmin";
 
@@ -258,7 +259,9 @@ describe("загрузка", () => {
     [413, "file_too_large", "Файл больше 20 МиБ — сервер его не принимает."],
     [415, "unsupported_format", "Сервер не распознал формат. Нужен настоящий PDF, EPUB, DOCX или TXT"],
     [422, "validation_error", "Сервер не принял форму."],
-    [500, "internal", "Сервер ответил ошибкой (код «internal»)."],
+    [500, "internal", "Сбой на сервере. Повторите позже."],
+    [409, "conflict_retry", "Не получилось с первого раза: на сервере одновременно шло другое изменение. Повторите."],
+    [400, "http_error", "Сервер не принял форму: одно из полей слишком длинное (больше 64 КиБ)."],
   ])("ответ %i %s — понятный текст, форма сохранена", async (status, code, text) => {
     const { fake, user } = await open([]);
     fake.inject("POST", "/admin/kb/documents", { status, body: { code, message: "серверный текст" } });
@@ -269,6 +272,74 @@ describe("загрузка", () => {
     expect(screen.queryByText("серверный текст")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Название")).toHaveValue("Выдуманная статья");
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  });
+
+  test("длины — в символах Unicode после trim (как сервер): 300 «𝔸» и 300 букв с пробелами по краям — можно", async () => {
+    const { fake } = await open([]);
+    pick(new File(["x"], "a.pdf"));
+    fireEvent.change(screen.getByLabelText("Основание прав (обязательно)"), { target: { value: "Лицензия" } });
+    fireEvent.change(screen.getByLabelText("Название"), { target: { value: "𝔸".repeat(300) } });
+    fireEvent.change(screen.getByLabelText("Автор (необязательно)"), { target: { value: `  ${"я".repeat(200)}  ` } });
+    fireEvent.change(screen.getByLabelText("Подход (необязательно)"), { target: { value: "😀".repeat(100) } });
+    fireEvent.submit(screen.getByRole("button", { name: "Загрузить" }).closest("form")!);
+    await screen.findByText(/принят/);
+    expect(posts(fake)[0].body).toMatchObject({ title: "𝔸".repeat(300), author: "я".repeat(200), approach: "😀".repeat(100) });
+  });
+
+  test("автор 201 символ и подход 101 — подпись у поля, запроса нет", async () => {
+    const { fake } = await open([]);
+    pick(new File(["x"], "a.pdf"));
+    fireEvent.change(screen.getByLabelText("Название"), { target: { value: "Т" } });
+    fireEvent.change(screen.getByLabelText("Основание прав (обязательно)"), { target: { value: "Лицензия" } });
+    fireEvent.change(screen.getByLabelText("Автор (необязательно)"), { target: { value: "𝔸".repeat(201) } });
+    fireEvent.change(screen.getByLabelText("Подход (необязательно)"), { target: { value: "я".repeat(101) } });
+    fireEvent.submit(screen.getByRole("button", { name: "Загрузить" }).closest("form")!);
+    expect(await screen.findByText("Автор — не больше 200 символов.")).toBeInTheDocument();
+    expect(screen.getByText("Подход — не больше 100 символов.")).toBeInTheDocument();
+    expect(posts(fake)).toHaveLength(0);
+  });
+
+  test("основание прав: предел сервера 64 КиБ в UTF-8 — ровно можно, на байт больше нельзя", async () => {
+    const { fake } = await open([]);
+    pick(new File(["x"], "a.pdf"));
+    fireEvent.change(screen.getByLabelText("Название"), { target: { value: "Т" } });
+    const rights = screen.getByLabelText("Основание прав (обязательно)");
+    // «п» — 2 байта UTF-8: 32 768 букв = 65 536 байт, ровно предел; плюс «x» — 65 537.
+    fireEvent.change(rights, { target: { value: "п".repeat(MAX_FIELD_BYTES / 2) + "x" } });
+    fireEvent.submit(rights.closest("form")!);
+    expect(await screen.findByText(/Основание прав: слишком длинный текст: больше 64 КиБ/)).toBeInTheDocument();
+    expect(rights).toHaveAttribute("aria-invalid", "true");
+    expect(rights).toHaveFocus();
+    expect(posts(fake)).toHaveLength(0);
+    fireEvent.change(rights, { target: { value: "п".repeat(MAX_FIELD_BYTES / 2) } });
+    fireEvent.submit(rights.closest("form")!);
+    await screen.findByText(/принят/);
+    expect(posts(fake)).toHaveLength(1);
+  });
+
+  test("срок загрузки вышел — подсказка обновить список (сервер мог принять материал)", () => {
+    expect(adminErrorText("timeout", "upload")).toBe(
+      "Сервер не ответил вовремя. Материал мог быть принят — обновите список, прежде чем загружать снова.",
+    );
+    expect(adminErrorText("timeout", "list")).toBe("Сервер не ответил вовремя. Повторите.");
+  });
+
+  test("ответ списка, начатый до загрузки, не затирает принятый материал; опрос индексации не встаёт", async () => {
+    const { fake } = await open([makeDoc({ title: "Старый" })], 30);
+    const held = deferred();
+    fake.inject("GET", "/admin/kb/documents", { status: 200, body: [...fake.docs], hold: held.hold });
+    fireEvent.click(screen.getByRole("button", { name: "Обновить" }));
+    pick(new File(["x"], "a.txt"));
+    fireEvent.change(screen.getByLabelText("Название"), { target: { value: "Новый" } });
+    fireEvent.change(screen.getByLabelText("Основание прав (обязательно)"), { target: { value: "Лицензия" } });
+    fireEvent.submit(screen.getByRole("button", { name: "Загрузить" }).closest("form")!);
+    await screen.findByText(/Материал «Новый» принят/);
+    held.release();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Обновить" })).not.toHaveAttribute("aria-disabled"));
+    expect(screen.getByRole("rowheader", { name: "Новый" })).toBeInTheDocument();
+    const gets = fake.requests("GET").length;
+    await waitFor(() => expect(fake.requests("GET").length).toBeGreaterThan(gets)); // «Новый» ждёт индексации — опрос идёт
+    expect(screen.getByRole("rowheader", { name: "Новый" })).toBeInTheDocument();
   });
 
   test("413 от прокси без JSON — текст по статусу", async () => {
@@ -378,6 +449,35 @@ describe("удаление", () => {
     hold.release();
     await screen.findByText(/удалён вместе с фрагментами/);
     expect(fake.requests("DELETE")).toHaveLength(1);
+  });
+
+  test.each([
+    [500, "internal", "Не удалось удалить. Сбой на сервере. Повторите позже."],
+    [409, "conflict_retry", "Не удалось удалить. Не получилось с первого раза"],
+  ])("удаление: %i %s — понятный текст, строка на месте", async (status, code, text) => {
+    const d = makeDoc({ title: "Т" });
+    const { fake, user } = await open([d]);
+    fake.inject("DELETE", `/admin/kb/documents/${d.id}`, { status, body: { code, message: "серверный текст" } });
+    await user.click(screen.getByRole("button", { name: "Удалить «Т»" }));
+    await user.click(screen.getByRole("button", { name: "Удалить навсегда" }));
+    expect(await within(row("Т")).findByRole("alert")).toHaveTextContent(text);
+    expect(screen.queryByText("серверный текст")).not.toBeInTheDocument();
+  });
+
+  test("ответ списка, начатый до удаления, не возвращает удалённый материал", async () => {
+    const d = makeDoc({ title: "Т" });
+    const { fake, user } = await open([d, makeDoc({ title: "Другая" })]);
+    const held = deferred();
+    fake.inject("GET", "/admin/kb/documents", { status: 200, body: [...fake.docs], hold: held.hold });
+    await user.click(screen.getByRole("button", { name: "Обновить" }));
+    await user.click(screen.getByRole("button", { name: "Удалить «Т»" }));
+    await user.click(screen.getByRole("button", { name: "Удалить навсегда" }));
+    await screen.findByText("Материал «Т» удалён вместе с фрагментами.");
+    held.release();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Обновить" })).not.toHaveAttribute("aria-disabled"));
+    expect(screen.queryByRole("rowheader", { name: "Т" })).not.toBeInTheDocument();
+    expect(screen.getByRole("rowheader", { name: "Другая" })).toBeInTheDocument();
+    expect(fake.requests("GET")).toHaveLength(3); // вход, устаревший (отброшен), повтор
   });
 
   test("удаление: 403 admin_only — поле токена", async () => {

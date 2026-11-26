@@ -142,7 +142,7 @@ export class FakeAdminApi {
     const file = raw.get("file");
     const title = raw.get("title");
     const rights = raw.get("rights_basis");
-    if (!(file instanceof Blob) || typeof title !== "string" || !title.trim() || title.length > 300) return json(422, err("validation_error", "Проверьте данные"));
+    if (!(file instanceof Blob) || typeof title !== "string" || !title.trim() || [...title].length > 300) return json(422, err("validation_error", "Проверьте данные"));
     if (typeof rights !== "string" || !rights.trim()) return json(422, err("validation_error", "Проверьте данные"));
     if (file.size > MAX) return json(413, err("file_too_large", "Файл больше 20 МиБ"));
     const name = (file as File).name ?? "";

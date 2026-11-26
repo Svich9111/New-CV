@@ -27,6 +27,11 @@ export function KbScreen({ api, onAuthError, pollMs = POLL_MS }: { api: AdminApi
   const [notice, setNotice] = useState<string | null>(null);
   const alive = useRef(true);
   const inFlight = useRef(false);
+  /**
+   * Номер изменения списка (принятая загрузка, удаление). Ответ `GET`, начатого до изменения, устарел: он затёр бы
+   * только что загруженный материал или вернул удалённый. Такой ответ отбрасывается, и список запрашивается снова.
+   */
+  const changes = useRef(0);
 
   useEffect(() => {
     alive.current = true;
@@ -40,8 +45,13 @@ export function KbScreen({ api, onAuthError, pollMs = POLL_MS }: { api: AdminApi
     inFlight.current = true;
     setLoading(true);
     try {
-      const list = await api.listDocuments();
-      if (!alive.current) return;
+      let list: KbDocument[];
+      for (;;) {
+        const started = changes.current;
+        list = await api.listDocuments();
+        if (!alive.current) return;
+        if (started === changes.current) break;
+      }
       setDocs(list);
       setLoadError(null);
       setUpdatedAt(new Date());
@@ -84,6 +94,7 @@ export function KbScreen({ api, onAuthError, pollMs = POLL_MS }: { api: AdminApi
     try {
       const r = await api.deleteDocument(doc.id);
       if (!alive.current) return;
+      changes.current += 1;
       setDocs((prev) => prev?.filter((d) => d.id !== doc.id) ?? prev);
       setRow(doc.id, null);
       setNotice(r === "deleted" ? `Материал «${doc.title}» удалён вместе с фрагментами.` : `Материал «${doc.title}» уже был удалён.`);
@@ -98,6 +109,7 @@ export function KbScreen({ api, onAuthError, pollMs = POLL_MS }: { api: AdminApi
   };
 
   const onUploaded = (doc: KbDocument) => {
+    changes.current += 1;
     setNotice(null);
     setDocs((prev) => [doc, ...(prev ?? []).filter((d) => d.id !== doc.id)]);
   };
