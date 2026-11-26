@@ -1,0 +1,66 @@
+/* Админ-панель (АР-52): стиль прототипа 0.6, простая вёрстка под компьютер. Только токены theme.css
+   (проверяет src/admin/adminPage.test.ts). Красный --accent — только главное действие (.admin-primary);
+   ошибки — подписью и значком «!», не цветом (ТЗ §8). */
+
+.admin, .admin-login {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 24px var(--gutter) 48px;
+}
+.admin-login { max-width: 480px; padding-top: 48px; }
+
+.admin-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.admin-header h1 { margin-bottom: 4px; }
+.admin-header__name { margin: 0; font-size: var(--font-size-small); color: var(--text-muted); }
+
+.admin-primary {
+  min-height: var(--tap);
+  padding: 10px 24px;
+  border: 0;
+  border-radius: var(--radius-main);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+  font-size: var(--font-size);
+}
+.admin-primary[aria-disabled="true"] { background: var(--disabled-bg); color: var(--disabled-text); cursor: progress; }
+
+.admin-form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0 16px; }
+.admin-field-error { margin: 6px 0 0; font-weight: 600; color: var(--text); }
+
+.admin-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+.admin-toolbar h2 { margin: 28px 0 10px; }
+
+.admin-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+.admin-table { width: 100%; border-collapse: collapse; font-size: var(--font-size-small); }
+.admin-table th, .admin-table td { text-align: left; vertical-align: top; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.admin-table thead th { background: var(--bg-secondary); font-weight: 600; white-space: nowrap; }
+.admin-table tbody tr:last-child th, .admin-table tbody tr:last-child td { border-bottom: 0; }
+.admin-table__title { font-weight: 600; min-width: 180px; overflow-wrap: anywhere; }
+.admin-table__rights { min-width: 160px; overflow-wrap: anywhere; }
+.admin-table__num { white-space: nowrap; }
+.admin-table__actions { min-width: 140px; }
+.admin-table__actions .btn { margin: 0 6px 6px 0; }
+
+.admin-status { display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; font-weight: 600; }
+.admin-status__mark {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--text);
+  font-size: var(--font-size-meta);
+}
+.admin-status--uploaded .admin-status__mark, .admin-status--indexing .admin-status__mark { border-style: dashed; }
+.admin-status__reason { margin: 6px 0 0; }
+.admin-code { font-family: var(--font-mono); font-size: var(--font-size-meta); color: var(--text-muted); }
+.admin-confirm p { margin-bottom: 8px; }
