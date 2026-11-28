@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "«Чувства AI» — сервер"
 requires-python = ">=3.12"
 dependencies = [
-  "fastapi>=0.115",
+  "fastapi>=0.165",  # tests: fastapi.routing.iter_route_contexts (с 0.137.2), ревью 4.3 р.2 MINOR-C
   "uvicorn[standard]>=0.32",
   "pydantic>=2.9",
   "pydantic-settings>=2.6",

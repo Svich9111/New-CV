@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -70,7 +72,7 @@ from tests._isolation_kit import (
     su,
 )
 from tests._isolation_set import ISOLATION_MIN
-from tests.conftest import BACKEND_DIR, TEST_FP, isolation_set_problems
+from tests.conftest import BACKEND_DIR, TEST_FP, isolation_need, isolation_set_problems
 from tests.test_chat_a8 import KEYS, _pmsg
 from tests.test_chat_api_a8 import call, stream_ok
 from tests.test_notify_worker import NEW_MESSAGE_TEXT, FakeTg, chat_of, nworker
@@ -733,6 +735,7 @@ async def _nobody_sees(sessionmaker: SM, world: World, table: str) -> None:
 # =============================================================== страж шага CI (§9.2 п.4)
 
 PROBE = "A8_ISOLATION_GUARD_PROBE"
+GUARD_PROBE_ID = "tests/test_isolation_release.py::test_guard_probe"
 
 
 def test_guard_probe() -> None:
@@ -754,8 +757,17 @@ if os.environ.get(PROBE) in ("xfail_lax", "xfail_strict"):
     )(test_guard_probe)
 
 
+# Переменные, которыми окружение разработчика меняет сбор или запуск pytest в подпроцессе
+# (``PYTEST_ADDOPTS="-k chat"`` — ложный красный; ревью 4.3 р.2 MINOR-B), и проба стража.
+_SUBPROCESS_DROP = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", PROBE)
+
+
+def _clean_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in _SUBPROCESS_DROP}
+
+
 def _run_release(*args: str, probe: str | None = None) -> subprocess.CompletedProcess[str]:
-    env_ = {k: v for k, v in os.environ.items() if k != PROBE}
+    env_ = _clean_env()
     if probe is not None:
         env_[PROBE] = probe
     return subprocess.run(  # noqa: S603 — фиксированная команда теста
@@ -770,7 +782,7 @@ def _run_release(*args: str, probe: str | None = None) -> subprocess.CompletedPr
     [
         (("--isolation-min=1",), None, 0, "пропущено 0, xfail 0"),
         (("--isolation-min=1",), "skip", 1, "ПРОПУЩЕН (сборка красная)"),
-        (("--isolation-min=2",), None, 4, "нужно не меньше 2"),
+        (("--isolation-min=auto",), None, 4, f"нужно не меньше {ISOLATION_MIN}"),
         (("--isolation-min=1",), "xfail_lax", 4, "xfail без strict=True"),
         (("--isolation-min=1",), "xfail_call", 1, "pytest.xfail() без strict (сборка красная)"),
         (("--isolation-min=1",), "xfail_strict", 0, "пропущено 0, xfail 1"),
@@ -784,21 +796,40 @@ def _run_release(*args: str, probe: str | None = None) -> subprocess.CompletedPr
         "strict_xfail_is_counted",
     ],
 )
-def test_release_step_guard(args: tuple[str, ...], probe: str | None, code: int, says: str) -> None:
+def test_release_step_guard(
+    args: tuple[str, ...], probe: str | None, code: int, says: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Карточка п.1, ТЗ §9.2 п.4: шаг CI ``pytest -m isolation --isolation-min=N`` красный, если
     хоть один тест набора пропущен (skip), собрано меньше N, есть xfail без ``strict=True`` или
     ``pytest.xfail()`` в теле; строгий xfail (известный дефект) — считается и печатается; без
-    пропусков — зелёный. (0 собранных — штатный код pytest 5, тоже красный.)"""
+    пропусков — зелёный. (0 собранных — штатный код pytest 5, тоже красный.) ``auto`` — N из
+    ``ISOLATION_MIN`` (ревью р.2 MINOR-D). ``PYTEST_ADDOPTS`` разработчика (здесь — снять пробу
+    с выбора) в подпроцесс не попадает, иначе ложный красный (ревью р.2 MINOR-B)."""
+    monkeypatch.setenv("PYTEST_ADDOPTS", f"--deselect {GUARD_PROBE_ID}")
+    monkeypatch.setenv(PROBE, "xfail_lax")  # чужое значение пробы тоже не наследуется
+    assert "PYTEST_ADDOPTS" not in _clean_env() and PROBE not in _clean_env()
     r = _run_release(*args, probe=probe)
     out = r.stdout + r.stderr
     assert r.returncode == code, out[-2000:]
     assert says in out, out[-2000:]
+    if code == 4:  # ревью 4.3 р.2 MINOR-A: при прерванном сборе нет ложного «собрано 0»
+        assert "(минимум" not in out, out[-2000:]  # итоговая строка «собрано … (минимум N)»
+        assert "isolation: сбор прерван" in out, out[-2000:]
 
 
 def test_isolation_set_size_is_fixed() -> None:
-    """Число N в шаге CI совпадает с зафиксированным в ``tests/_isolation_set.py`` (карточка)."""
+    """N шага CI — из одного места (ревью 4.3 р.2 MINOR-D): шаг передаёт
+    ``--isolation-min=auto``, и ``conftest`` берёт ``ISOLATION_MIN`` из ``tests/_isolation_set.py``;
+    числа в ``ci.yml`` нет."""
     ci = (BACKEND_DIR.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert f"--isolation-min={ISOLATION_MIN}" in ci
+    steps = [ln for ln in ci.splitlines() if "pytest -m isolation" in ln and "run:" in ln]
+    assert len(steps) == 1, steps
+    assert "--isolation-min=auto" in steps[0], steps
+    assert not re.search(r"--isolation-min[= ]+\d", ci), "N в ci.yml дублирует ISOLATION_MIN"
+    opt = SimpleNamespace(getoption=lambda _name: "auto")
+    assert isolation_need(opt) == ISOLATION_MIN  # type: ignore[arg-type]
+    with pytest.raises(pytest.UsageError, match="число или auto"):
+        isolation_need(SimpleNamespace(getoption=lambda _name: "abc"))  # type: ignore[arg-type]
 
 
 def test_isolation_set_matches_full_collection() -> None:
@@ -809,7 +840,8 @@ def test_isolation_set_matches_full_collection() -> None:
     r = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
          "-m", "isolation"],
-        cwd=BACKEND_DIR, capture_output=True, text=True, timeout=300, check=False,
+        cwd=BACKEND_DIR, env=_clean_env(), capture_output=True, text=True, timeout=300,
+        check=False,
     )  # fmt: skip
     assert r.returncode == 0, (r.stdout + r.stderr)[-2000:]
     ids = [line.strip() for line in r.stdout.splitlines() if "::" in line]

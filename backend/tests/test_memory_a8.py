@@ -297,17 +297,94 @@ async def extract_for(
     return await mem_ai.run_extraction(sm, KEYS, fp, models_of(m), claim, embedder=emb)
 
 
+_PARKED: list[tuple[uuid.UUID, dict[uuid.UUID, tuple[Any, ...]]]] = []
+
+
 async def release_others(engine: AsyncEngine, keep: P) -> None:
-    """Чужие агенты прошлых тестов не мешают захвату: их аренды «заняты» надолго."""
+    """Чужие агенты прошлых тестов не мешают захвату: доступные захвату (без аренды **или** с
+    истёкшей/истекающей арендой — Б-102) «заняты» надолго общим токеном парковки. Активные аренды
+    (дольше часа) не трогаются. Прежнее состояние запоминается, ``_restore_parked`` возвращает его
+    после теста — истёкшие аренды других модулей снова достаются своим тестам (Б-71)."""
+    park = uuid.uuid4()
     async with engine.begin() as c:
+        rows = (
+            await c.execute(
+                text(
+                    "WITH old AS (SELECT id, memory_lease_token, memory_lease_kind, "
+                    "memory_lease_at, memory_lease_until FROM agents WHERE id <> :a AND "
+                    "(memory_lease_token IS NULL OR memory_lease_until < now() + interval '1 hour') "
+                    "FOR UPDATE) "
+                    "UPDATE agents g SET memory_lease_token = :p, memory_lease_kind = 'extract', "
+                    "memory_lease_at = now(), memory_lease_until = now() + interval '1 day' "
+                    "FROM old WHERE g.id = old.id RETURNING old.*"
+                ),
+                {"a": keep.agent, "p": park},
+            )
+        ).all()
+    _PARKED.append((park, {r[0]: tuple(r[1:]) for r in rows}))
+
+
+async def unpark(engine: AsyncEngine) -> None:
+    """Вернуть припаркованным агентам состояние до ``release_others`` — только тем, чью аренду
+    с тех пор никто не перехватил (токен парковки на месте)."""
+    while _PARKED:
+        park, before = _PARKED.pop()
+        async with engine.begin() as c:
+            for agent, (tok, kind, at_, until) in before.items():
+                await c.execute(
+                    text(
+                        "UPDATE agents SET memory_lease_token = :t, memory_lease_kind = :k, "
+                        "memory_lease_at = :at, memory_lease_until = :u "
+                        "WHERE id = :i AND memory_lease_token = :p"
+                    ),
+                    {"t": tok, "k": kind, "at": at_, "u": until, "i": agent, "p": park},
+                )
+
+
+@pytest.fixture(autouse=True)
+async def _restore_parked(request: pytest.FixtureRequest) -> AsyncIterator[None]:
+    yield
+    if _PARKED:  # тесты без БД не тянут фикстуру engine
+        await unpark(request.getfixturevalue("engine"))
+
+
+async def test_release_others_parks_expired_leases_and_restores(
+    engine: AsyncEngine, sessionmaker: SM
+) -> None:
+    """Б-102 (самопроверка хелпера): агент другого модуля с **истёкшей** арендой и необработанной
+    сессией не достаётся воркеру этого теста; после теста его аренда — как была."""
+    async with engine.begin() as c:
+        mine = await person(c, "СвояПарковка")
+        await say(c, mine, "owner", "СВОЙТЕКСТb102", ago(10))
+        other = await person(c, "ЧужаяПарковка")
+        await say(c, other, "owner", "ЧУЖОЙТЕКСТb102", ago(10))
+        old_tok = uuid.uuid4()
         await c.execute(
             text(
-                "UPDATE agents SET memory_lease_token = gen_random_uuid(), memory_lease_kind = "
-                "'extract', memory_lease_at = now(), memory_lease_until = now() + interval '1 day' "
-                "WHERE id <> :a AND memory_lease_token IS NULL"
+                "UPDATE agents SET memory_lease_token = :t, memory_lease_kind = 'extract', "
+                "memory_lease_at = now() - interval '2 hours', "
+                "memory_lease_until = now() - interval '1 hour' WHERE id = :a"
             ),
-            {"a": keep.agent},
+            {"t": old_tok, "a": other.agent},
         )
+        before = (await c.execute(text(f"SELECT {_LEASE} FROM agents WHERE id = :a"),
+                                  {"a": other.agent})).one()  # fmt: skip
+    await release_others(engine, mine)
+    m = MemModel(items=["свой факт"])
+    await worker(engine, sessionmaker, m).run_once()
+    sent = m.dump()
+    assert "СВОЙТЕКСТb102" in sent and "ЧУЖОЙТЕКСТb102" not in sent
+    assert await memory_of(engine, other) == []
+    await unpark(engine)
+    async with engine.connect() as c:
+        after = (await c.execute(text(f"SELECT {_LEASE} FROM agents WHERE id = :a"),
+                                 {"a": other.agent})).one()  # fmt: skip
+    assert tuple(after) == tuple(before) and after[0] == old_tok
+    # снова доступен захвату — как до парковки
+    assert await claim_for(engine, other) is not None
+
+
+_LEASE = "memory_lease_token, memory_lease_kind, memory_lease_at, memory_lease_until"
 
 
 # =============================================================== 1. Отпечаток

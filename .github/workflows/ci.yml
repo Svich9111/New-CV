@@ -42,12 +42,12 @@ jobs:
       - run: make backend-lint
       # ТЗ §9.2 п.4 (задача 4.3): изоляция агентов и устойчивость к инструкциям — отдельной
       # строкой сборки, на каждый PR и push в main. Красный, если собрано меньше N тестов набора
-      # (N — tests/_isolation_set.py, ISOLATION_MIN), 0 собранных (код pytest 5) или хоть один
+      # (N — ISOLATION_MIN в tests/_isolation_set.py, флаг auto читает его оттуда), 0 собранных (код pytest 5) или хоть один
       # пропущен (skip: «нет БД» ≠ зелёный). Перечень тестов — tests/_isolation_set.py.
       # xfail — только strict=True (нестрогий маркер или pytest.xfail() в теле — красный).
       - name: Isolation release set (pytest -m isolation)
         id: isolation
-        run: cd backend && uv run --locked pytest -m isolation -q --isolation-min=354
+        run: cd backend && uv run --locked pytest -m isolation -q --isolation-min=auto
       # Полный прогон — и при красном наборе изоляции (другие падения видны в той же сборке);
       # не идёт, если раньше упал линтер или запуск БД (шаг набора тогда пропущен). Итог задачи
       # красный, если красен любой шаг.

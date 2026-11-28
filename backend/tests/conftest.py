@@ -98,7 +98,7 @@ def _encryption_keys_env(monkeypatch: pytest.MonkeyPatch) -> None:
 # их файлов); новые ``test_isolation_release*.py`` помечены сами. ``--isolation-min=N`` — режим
 # шага CI (ТЗ §9.2 п.4): собрано меньше N тестов набора или хоть один пропущен (skip) — сборка
 # красная; xfail — только ``strict=True`` маркером (нестрогий маркер и ``pytest.xfail()`` в теле
-# или фикстуре — красный).
+# или фикстуре — красный). В CI — ``--isolation-min=auto``: N берётся из ``ISOLATION_MIN``.
 #
 # Сверка перечня (запись собрала ровно своё число тестов, всего — ``ISOLATION_MIN``) — только в
 # режиме выпуска, где собирается весь каталог: в обычном режиме выборочный запуск (id теста,
@@ -110,10 +110,26 @@ def _encryption_keys_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--isolation-min",
-        type=int,
         default=None,
-        help="4.3: не меньше N тестов с маркером isolation и ни одного пропуска",
+        help="4.3: не меньше N тестов с маркером isolation и ни одного пропуска; "
+        "auto — N из tests/_isolation_set.py (ISOLATION_MIN, шаг CI)",
     )
+
+
+def isolation_need(config: pytest.Config) -> int | None:
+    """N режима выпуска: ``--isolation-min=auto`` — ``ISOLATION_MIN`` (одно место, ревью 4.3 р.2
+    MINOR-D); число — как задано (самопроверка стража); без флага — ``None``."""
+    raw = config.getoption("--isolation-min")
+    if raw is None:
+        return None
+    if raw == "auto":
+        from tests._isolation_set import ISOLATION_MIN
+
+        return ISOLATION_MIN
+    try:
+        return int(raw)
+    except ValueError:
+        raise pytest.UsageError(f"--isolation-min: число или auto, получено {raw!r}") from None
 
 
 _ISOLATION_STATS: dict[str, list[str]] = {
@@ -170,18 +186,18 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         raise pytest.UsageError(
             "tests/_isolation_set.py не совпадает со сбором: " + "; ".join(problems)
         )
-    lax = [i.nodeid for i in marked if _lax_xfail(i)]
     if lax:
         raise pytest.UsageError(f"набор isolation: xfail без strict=True: {lax}")
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
-    need = session.config.getoption("--isolation-min")
+    need = isolation_need(session.config)
     if need is None or _ISOLATION_STATS["aborted"]:
         return
     selected = [i.nodeid for i in session.items if i.get_closest_marker("isolation")]
     _ISOLATION_STATS["selected"] = selected
     if len(selected) < need or len(selected) != len(session.items):
+        _ISOLATION_STATS["aborted"] = ["yes"]
         raise pytest.UsageError(
             f"набор isolation: собрано {len(selected)} из {len(session.items)} выбранных, "
             f"нужно не меньше {need} и только тесты набора (-m isolation)"
@@ -216,8 +232,11 @@ def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pyte
     if config.getoption("--isolation-min") is None:
         return
     s = _ISOLATION_STATS
+    if s["aborted"]:  # причина уже выведена ошибкой сбора; «собрано 0» ввело бы в заблуждение
+        terminalreporter.write_line("isolation: сбор прерван (сборка красная)", red=True)
+        return
     terminalreporter.write_line(
-        f"isolation: собрано {len(s['selected'])} (минимум {config.getoption('--isolation-min')}), "
+        f"isolation: собрано {len(s['selected'])} (минимум {isolation_need(config)}), "
         f"пропущено {len(s['skipped'])}, xfail {len(s['xfailed'])}"
     )
     for nodeid in s["skipped"]:
