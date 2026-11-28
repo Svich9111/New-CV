@@ -98,7 +98,7 @@ describe("A8 · Б-99 · копии слабой проверки дат вне 
     created_at: "2026-11-20T10:00:00Z",
   };
   test("контроль: годный документ принимается", () => expect(toKbDocument(doc)).not.toBeNull());
-  test("toKbDocument отвергает created_at «Nov 5» (ожидаемо по контракту; сейчас принимает)", () =>
+  test("toKbDocument отвергает created_at «Nov 5» (по контракту; Б-105)", () =>
     expect(toKbDocument({ ...doc, created_at: "Nov 5" })).toBeNull(),
   );
 });
