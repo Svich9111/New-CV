@@ -6,7 +6,7 @@
  * Тексты здесь только проверяются — никуда не пишутся и не журналируются.
  */
 import { isExportText } from "./chat";
-import { isDateTime } from "./memory";
+import { isDateTime } from "./datetime";
 import type { CoupleFeed, Draft, DraftCrisis, HelpContact, MessageOriginal, PartnerMessage } from "./types";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

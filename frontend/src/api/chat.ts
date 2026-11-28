@@ -7,6 +7,7 @@
  * больше `delta`, затем ровно одно из `done`, `crisis`, `error`.
  * Тексты реплик здесь только разбираются — никуда не пишутся и не журналируются.
  */
+import { isDateTime } from "./datetime";
 import type { ChatErrorCode, ChatHistory, ChatMessage, ChatStreamDone, HelpContact } from "./types";
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -25,7 +26,7 @@ export function isExportText(v: unknown): boolean {
 const idOrNull = (v: unknown): boolean => v === null || nonEmpty(v);
 
 /**
- * `ChatMessage`: id, автор из перечня, текст или отметка недоступности, время создания — разбираемая дата;
+ * `ChatMessage`: id, автор из перечня, текст или отметка недоступности, время создания — дата-время RFC 3339 (Б-99);
  * связь реплик (АР-51): `client_message_id`, `reply_to` — непустая строка или `null`, `crisis` — булево, все три
  * обязательны. По контракту ключ бывает только у реплики владельца, связь и кризисный флаг — только у ответа агента.
  */
@@ -36,8 +37,7 @@ export function isChatMessage(v: unknown): v is ChatMessage {
       nonEmpty(v.id) &&
       (v.author === "owner" || v.author === "agent") &&
       isExportText(v.text) &&
-      isStr(v.created_at) &&
-      !Number.isNaN(Date.parse(v.created_at)) &&
+      isDateTime(v.created_at) &&
       idOrNull(v.client_message_id) &&
       idOrNull(v.reply_to) &&
       typeof v.crisis === "boolean"
