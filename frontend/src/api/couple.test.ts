@@ -17,7 +17,9 @@ import {
   isPartnerMessage,
   parseDraftOutcome,
 } from "./couple";
-import { CRISIS_BLOCKS, crisisBlocks } from "../couple/crisis";
+import { CRISIS_BLOCKS, CRISIS_BLOCK_NAMES, crisisBlocks, serverCrisisBlocks, withheldCrisisBlocks } from "../couple/crisis";
+import { SERVER_CRISIS_CASES } from "../test/crisisCases";
+import type { PartnerMessage } from "./types";
 import { CONTACTS, FakeServer } from "../test/fakeApi";
 import { INIT_DATA } from "../test/fakeTelegram";
 
@@ -269,12 +271,71 @@ describe("Протокол помощи под остановленным соо
     expect(crisisBlocks(null)).toEqual(["not_sent", "author_safety"]);
     expect(crisisBlocks(undefined)).toEqual(["not_sent", "author_safety"]);
   });
-  test("блоков, которые crisis.respond запрещает при смешанном наборе, на клиенте нет вовсе", () => {
+  test("на клиенте ровно 9 блоков перечня контракта withheld_crisis_blocks", () => {
+    const yaml = readFileSync(join(__dirname, "../../../api/openapi.yaml"), "utf8");
+    const m = /withheld_crisis_blocks:[\s\S]*?items:[\s\S]*?enum: \[([^\]]+)\]/.exec(yaml);
+    const contract = m![1].split(",").map((x) => x.trim());
+    expect(contract).toHaveLength(9);
+    expect([...CRISIS_BLOCK_NAMES].sort()).toEqual([...contract].sort());
+  });
+  test("консервативный набор не содержит блоков, которые crisis.respond запрещает при смешанном наборе", () => {
     // violence («вина не на тебе»), life_threat («твоя жизнь в опасности») — при угрозе от автора; полный
     // outgoing_threat / outgoing_threat_mixed («вернёмся к разговору») — при self_harm (R2-MAJOR-1, R5-MAJOR-1).
-    for (const name of ["violence", "life_threat", "outgoing_threat", "outgoing_threat_mixed"]) expect(name in CRISIS_BLOCKS).toBe(false);
-    const all = Object.values(CRISIS_BLOCKS).join("\n");
-    for (const phrase of ["Вина за это не на тебе", "Твоя жизнь сейчас в опасности", "вернёмся к разговору", "подумаем, как сказать"])
-      expect(all).not.toContain(phrase);
+    for (const kind of [...WITHHELD_CRISES, null, undefined]) {
+      const blocks: string[] = crisisBlocks(kind);
+      for (const name of ["violence", "life_threat", "outgoing_threat", "outgoing_threat_mixed"]) expect(blocks).not.toContain(name);
+      const all = blocks.map((b) => CRISIS_BLOCKS[b as keyof typeof CRISIS_BLOCKS]).join("\n");
+      for (const phrase of ["Вина за это не на тебе", "Твоя жизнь сейчас в опасности", "вернёмся к разговору", "подумаем, как сказать"])
+        expect(all).not.toContain(phrase);
+    }
+  });
+});
+
+describe("Набор блоков сервера withheld_crisis_blocks (АР-57)", () => {
+  const withheld = (patch: Partial<PartnerMessage> & Record<string, unknown>) =>
+    ({ ...msg, status: "withheld", withheld_reason: "safety", withheld_crisis: "threat_outgoing", ...patch }) as PartnerMessage;
+
+  test.each(SERVER_CRISIS_CASES.map((c) => [`${c.types.join("+")}@${c.main}`, c] as const))("%s — ровно набор сервера по порядку", (_n, c) => {
+    const m = withheld({ withheld_crisis: c.main, withheld_crisis_blocks: [...c.blocks] });
+    expect(isPartnerMessage(m)).toBe(true);
+    expect(withheldCrisisBlocks(m)).toEqual({ blocks: c.blocks, source: "server" });
+  });
+
+  test("null или нет поля (сообщения до 0021) — консервативный набор по withheld_crisis", () => {
+    for (const kind of [...WITHHELD_CRISES, null]) {
+      expect(withheldCrisisBlocks(withheld({ withheld_crisis: kind, withheld_crisis_blocks: null }))).toEqual({
+        blocks: crisisBlocks(kind),
+        source: "conservative",
+      });
+      expect(withheldCrisisBlocks(strip(withheld({ withheld_crisis: kind, withheld_crisis_blocks: undefined })) as PartnerMessage)).toEqual({
+        blocks: crisisBlocks(kind),
+        source: "conservative",
+      });
+    }
+  });
+
+  test.each([
+    ["неизвестный блок", ["not_sent", "violence", "underage"]],
+    ["вариант личного чата", ["outgoing_threat_chat"]],
+    ["пустой массив", []],
+    ["повтор", ["not_sent", "self_harm", "self_harm"]],
+    ["не массив", "violence"],
+    ["не строка", ["not_sent", 1]],
+    ["имя из прототипа", ["toString"]],
+  ])("нарушение контракта (%s) — откат на консервативный набор, лента по схеме, помощь есть", (_n, bad) => {
+    const m = withheld({ withheld_crisis: "self_harm", withheld_crisis_blocks: bad as never });
+    expect(serverCrisisBlocks(bad)).toBeNull();
+    expect(isPartnerMessage(m)).toBe(true);
+    expect(isCoupleFeed({ items: [m], next_cursor: null })).toBe(true);
+    expect(withheldCrisisBlocks(m)).toEqual({ blocks: ["not_sent", "self_harm", "author_safety"], source: "conservative" });
+  });
+
+  test("у полученного и при другой причине блоки не показываются никогда", () => {
+    const blocks = ["not_sent", "violence"];
+    const incoming = { ...msg, direction: "incoming", status: "delivered", withheld_crisis_blocks: blocks } as PartnerMessage;
+    expect(isPartnerMessage(incoming)).toBe(true);
+    expect(withheldCrisisBlocks(incoming).blocks).toEqual([]);
+    expect(withheldCrisisBlocks(withheld({ withheld_reason: "model_refusal", withheld_crisis: null, withheld_crisis_blocks: blocks as never })).blocks).toEqual([]);
+    expect(withheldCrisisBlocks({ ...msg, withheld_crisis_blocks: blocks } as PartnerMessage).blocks).toEqual([]);
   });
 });

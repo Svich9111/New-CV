@@ -3,7 +3,7 @@ import { ApiError } from "../api/client";
 import { errorText } from "../api/messages";
 import type { ExportText, HelpContact, PartnerMessage } from "../api/types";
 import { useApp } from "../app/store";
-import { CRISIS_BLOCKS, crisisBlocks } from "../couple/crisis";
+import { CRISIS_BLOCKS, withheldCrisisBlocks } from "../couple/crisis";
 import type { CoupleSession } from "../couple/session";
 import { useTelegram } from "../telegram/context";
 import { formatMoment } from "../ui/format";
@@ -100,6 +100,8 @@ function markRead(couple: CoupleSession, api: ReturnType<typeof useApp>["api"], 
 function Outgoing({ m, contacts, onHelp, onChat }: { m: PartnerMessage; contacts: HelpContact[] | null; onHelp: () => void; onChat: () => void }) {
   const text = plain(m.text);
   const reason = m.status === "withheld" ? (m.withheld_reason ?? null) : null;
+  // Набор блоков сервера по всем признакам (АР-57), иначе — консервативный по главному типу (`src/couple/crisis.ts`).
+  const protocol = withheldCrisisBlocks(m);
   return (
     <li className="feed__item feed__item--out" data-direction="outgoing" data-id={m.id} data-status={m.status}>
       <div className="sent">
@@ -116,8 +118,13 @@ function Outgoing({ m, contacts, onHelp, onChat }: { m: PartnerMessage; contacts
         <div className="feed__withheld small" data-withheld={reason ?? "unknown"}>
           <p>{withheldText(reason)}</p>
           {reason === "safety" && (
-            <section className="crisis" aria-label="Контакты помощи" data-crisis={m.withheld_crisis ?? "general"}>
-              {crisisBlocks(m.withheld_crisis).map((b) => (
+            <section
+              className="crisis"
+              aria-label="Контакты помощи"
+              data-crisis={m.withheld_crisis ?? "general"}
+              data-protocol={protocol.source}
+            >
+              {protocol.blocks.map((b) => (
                 <p key={b} className="crisis__text">
                   {CRISIS_BLOCKS[b]}
                 </p>

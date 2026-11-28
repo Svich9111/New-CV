@@ -691,6 +691,7 @@ export class FakeServer {
       status: "delivered",
       withheld_reason: null,
       withheld_crisis: null,
+      withheld_crisis_blocks: null,
       reply_to_id: null,
       draft_id: null,
       sent_at: new Date(Date.UTC(2026, 10, 25, 19, 0, seq)).toISOString(),
@@ -718,8 +719,18 @@ export class FakeServer {
   }
 
   /** Конвейер остановил моё сообщение. */
-  withhold(id: string, reason: FeedRow["withheld_reason"], crisis: FeedRow["withheld_crisis"] = null): void {
-    Object.assign(this.feed.find((f) => f.id === id)!, { status: "withheld", withheld_reason: reason, withheld_crisis: crisis });
+  withhold(
+    id: string,
+    reason: FeedRow["withheld_reason"],
+    crisis: FeedRow["withheld_crisis"] = null,
+    blocks: FeedRow["withheld_crisis_blocks"] = null,
+  ): void {
+    Object.assign(this.feed.find((f) => f.id === id)!, {
+      status: "withheld",
+      withheld_reason: reason,
+      withheld_crisis: crisis,
+      withheld_crisis_blocks: blocks,
+    });
   }
 
   /** Оба направления, все статусы, адаптированное и нет, нерасшифрованное (выдуманные тексты). */
@@ -742,10 +753,13 @@ export class FakeServer {
       status: r.status,
       withheld_reason: mine && r.status === "withheld" ? r.withheld_reason : null,
       withheld_crisis: mine && r.status === "withheld" && r.withheld_reason === "safety" ? r.withheld_crisis : null,
+      // Набор блоков протокола (АР-57) — только автору при `safety`; null — сообщение до 0021.
+      withheld_crisis_blocks: mine && r.status === "withheld" && r.withheld_reason === "safety" ? r.withheld_crisis_blocks : null,
       reply_to_id: r.reply_to_id,
       sent_at: r.sent_at,
       read_at: r.read_at,
-    };
+      ...(r.extra ?? {}),
+    } as PartnerMessage;
   }
 
   /** Видно ли «мне» сообщение в ленте текущей пары (АР-11, АР-44). */
@@ -870,6 +884,10 @@ export interface FeedRow {
   status: PartnerMessage["status"];
   withheld_reason: NonNullable<PartnerMessage["withheld_reason"]> | null;
   withheld_crisis: NonNullable<PartnerMessage["withheld_crisis"]> | null;
+  /** Имена блоков протокола сервера (`crisis.plan` по всему набору признаков, АР-57); null — до 0021. */
+  withheld_crisis_blocks: NonNullable<PartnerMessage["withheld_crisis_blocks"]> | null;
+  /** Поля ответа поверх вида по контракту — для проверок нарушений контракта сервером. */
+  extra?: Record<string, unknown>;
   reply_to_id: string | null;
   draft_id: string | null;
   sent_at: string;

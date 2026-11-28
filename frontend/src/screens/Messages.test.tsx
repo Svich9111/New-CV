@@ -3,7 +3,8 @@
  * непрочитанных — на заглушке API по контракту. Тексты выдуманные.
  */
 import { screen, waitFor, within } from "@testing-library/react";
-import { CRISIS_BLOCKS } from "../couple/crisis";
+import { CRISIS_BLOCKS, type CrisisBlock } from "../couple/crisis";
+import { SERVER_CRISIS_CASES } from "../test/crisisCases";
 import { FakeServer, type FeedRow } from "../test/fakeApi";
 import { heading, renderApp, type Rendered } from "../test/renderApp";
 import { unreadText } from "./Paired";
@@ -61,7 +62,7 @@ describe("Отправленные — свой оригинал и статус
 });
 
 describe("Не доставлено — причина подписью (АР-44, Б-86)", () => {
-  // Консервативный набор по главному типу (ревью 3.4 MAJOR-1): клиент не знает остальных признаков.
+  // Консервативный набор по главному типу (ревью 3.4 MAJOR-1): набора блоков сервера нет (сообщения до 0021, АР-57).
   const CRISES = [
     ["threat_outgoing", ["not_sent", "outgoing_threat_brief", "author_safety"]],
     ["violence", ["not_sent", "author_safety"]],
@@ -124,6 +125,87 @@ describe("Не доставлено — причина подписью (АР-44
     const row = server.addFeed({ author: "me", status: "withheld", withheld_reason: "couple_ended" });
     await openFeed(server);
     expect(item(row.id)).toBeNull();
+  });
+});
+
+describe("Не доставлено: safety — ровно набор блоков сервера (withheld_crisis_blocks, АР-57)", () => {
+  const texts = (help: HTMLElement) => Array.from(help.querySelectorAll(".crisis__text")).map((p) => p.textContent);
+  const pick = (types: string, main: string) => SERVER_CRISIS_CASES.find((c) => c.types.join("+") === types && c.main === main)!;
+  // Показательные сочетания из backend/tests/test_crisis_blocks.py: правило «А» со смешанным набором, «А» с
+  // самоповреждением, вторичная угроза жизни в «Б» и в «А», одиночные строки.
+  const CASES = [
+    pick("threat_outgoing+violence", "threat_outgoing"),
+    pick("threat_outgoing+self_harm", "threat_outgoing"),
+    pick("violence+life_threat", "violence"),
+    pick("self_harm+life_threat", "self_harm"),
+    pick("threat_outgoing+violence+life_threat", "violence"),
+    pick("threat_outgoing+violence+self_harm+life_threat", "threat_outgoing"),
+    pick("threat_outgoing", "threat_outgoing"),
+    pick("violence", "violence"),
+  ];
+  for (const c of CASES) {
+    test(`${c.types.join("+")}@${c.main}: блоки ${c.blocks.join(", ")} по порядку, под ними контакты и 112`, async () => {
+      const server = pairedServer();
+      const row = server.addFeed({
+        author: "me",
+        original: "Остановленное",
+        status: "withheld",
+        withheld_reason: "safety",
+        withheld_crisis: c.main,
+        withheld_crisis_blocks: [...c.blocks],
+      });
+      const r = await openFeed(server);
+      const li = item(row.id);
+      expect(li).toHaveTextContent("Не отправлено");
+      const help = within(li).getByRole("region", { name: "Контакты помощи" });
+      expect(help).toHaveAttribute("data-protocol", "server");
+      expect(texts(help)).toEqual(c.blocks.map((b) => CRISIS_BLOCKS[b]));
+      // Блоков вне набора нет ни одного (в том числе «вина не на тебе», «вернёмся к разговору» не из набора).
+      for (const b of Object.keys(CRISIS_BLOCKS) as CrisisBlock[])
+        if (!c.blocks.includes(b)) expect(li).not.toHaveTextContent(CRISIS_BLOCKS[b]);
+      // Контакты и 112 — после блоков.
+      const tel = await within(help).findByRole("link", { name: "112" });
+      expect(tel).toHaveAttribute("href", "tel:112");
+      const last = help.querySelectorAll(".crisis__text")[c.blocks.length - 1];
+      expect(last.compareDocumentPosition(tel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      await waitFor(() => expect(r.server.calls("GET", "/help/contacts")).toHaveLength(1));
+    });
+  }
+
+  test("неизвестный блок — лента показана, протокол этого сообщения — консервативный набор, 112 есть", async () => {
+    const server = pairedServer();
+    const ok = server.addFeed({ author: "me", original: "Другое", status: "delivered" });
+    const row = server.addFeed({
+      author: "me",
+      original: "Остановленное",
+      status: "withheld",
+      withheld_reason: "safety",
+      withheld_crisis: "threat_outgoing",
+      extra: { withheld_crisis_blocks: ["not_sent", "violence", "unknown_block"] },
+    });
+    await openFeed(server);
+    expect(item(ok.id)).not.toBeNull();
+    const help = within(item(row.id)).getByRole("region", { name: "Контакты помощи" });
+    expect(help).toHaveAttribute("data-protocol", "conservative");
+    expect(texts(help)).toEqual(["not_sent", "outgoing_threat_brief", "author_safety"].map((b) => CRISIS_BLOCKS[b as CrisisBlock]));
+    expect(item(row.id)).not.toHaveTextContent("Вина за это не на тебе");
+    expect(await within(help).findByRole("link", { name: "112" })).toHaveAttribute("href", "tel:112");
+  });
+
+  test("блоки у сообщения партнёра (нарушение контракта) игнорируются: протокола в карточке нет", async () => {
+    const server = pairedServer();
+    const row = server.addFeed({
+      author: "partner",
+      original: "Привет",
+      status: "delivered",
+      extra: { withheld_crisis_blocks: ["not_sent", "violence"] },
+    });
+    await openFeed(server);
+    const li = item(row.id);
+    expect(li).toHaveTextContent("Привет");
+    expect(within(li).queryByRole("region", { name: "Контакты помощи" })).toBeNull();
+    expect(li).not.toHaveTextContent(CRISIS_BLOCKS.violence);
+    expect(li).not.toHaveTextContent(CRISIS_BLOCKS.not_sent);
   });
 });
 
