@@ -7,7 +7,8 @@
  * - В `src/admin/` — только `.ts`, `.tsx`, `.css`; файлы `.js/.jsx/.mjs/.cjs/…` тоже разбираются (ревью A6 р.2,
  *   MAJOR-2), но уже само их наличие — нарушение.
  * - Импорт только своих модулей, сгенерированных типов контракта (`../api/schema`, только `import type`), общих
- *   стилей и плашки `../ui/Notice`; спецификатор — только строковый литерал (ни шаблона, ни выражения в `import()`),
+ *   стилей, плашки `../ui/Notice` и строгих проверок дат `../api/datetime` (Б-105, A8-0021-3: чистые функции без сети,
+ *   хранилищ и импортов — разбирается теми же правилами транзитивно, любой его импорт вне перечня — нарушение); спецификатор — только строковый литерал (ни шаблона, ни выражения в `import()`),
  *   без `require`, `import.meta` (`glob`, `new URL(…, import.meta.url)`). Разрешённые модули вне `src/admin`
  *   проверяются по тем же правилам, транзитивно: всё, что они тянут, — тоже из перечня (ревью A6 р.2, MAJOR-1).
  * - Строки, похожие на путь, — по перечню разрешённого (allowlist): `/admin/…` и `/api/v1`; склейка вида
@@ -56,7 +57,8 @@ const extensionViolations = (names: string[]) => names.filter((n) => !ALLOWED_EX
 
 const SCHEMA = join(srcDir, "api/schema.d.ts");
 /** Разрешённые модули вне `src/admin` (после разрешения пути). */
-const ALLOWED_OUTSIDE = new Set([SCHEMA, join(srcDir, "ui/Notice.tsx"), join(srcDir, "theme.css"), join(srcDir, "app.css")]);
+const DATETIME = join(srcDir, "api/datetime.ts");
+const ALLOWED_OUTSIDE = new Set([SCHEMA, join(srcDir, "ui/Notice.tsx"), DATETIME, join(srcDir, "theme.css"), join(srcDir, "app.css")]);
 const CODE_PACKAGES = new Set(["react", "react-dom/client"]);
 /** Помощникам тестов и тестам — ещё testing-library; тестам сборки и статическим тестам — node:*, vite, компилятор. */
 const HELPER_PACKAGE = (spec: string) => spec.startsWith("@testing-library/");
@@ -330,7 +332,7 @@ test.each(code.filter(isTest).map((p) => [relative(root, p), p]))("тест %s �
 test("модули вне src/admin, которые тянет панель, — только из перечня и по тем же правилам (транзитивно)", () => {
   const { visited, found } = outsideViolations();
   expect(found).toEqual([]);
-  expect(visited).toEqual(expect.arrayContaining(["ui/Notice.tsx", "api/schema.d.ts"]));
+  expect(visited).toEqual(expect.arrayContaining(["ui/Notice.tsx", "api/schema.d.ts", "api/datetime.ts"]));
   for (const v of visited) expect(ALLOWED_OUTSIDE.has(join(srcDir, v)), v).toBe(true);
 });
 
@@ -408,6 +410,15 @@ describe("страж падает на нарушениях (ревью A6 р.1,
     expect(outsideViolations(withText('export { SseParser, parseEvent } from "../api/chat";')).found.join("\n")).toMatch(/\.\.\/ui\/Notice\.tsx:\d+: импорт «\.\.\/api\/chat» вне src\/admin/);
     expect(outsideViolations(withText('export * from "./format";')).found.join("\n")).toMatch(/импорт «\.\/format» вне src\/admin/);
     expect(outsideViolations(withText('export const leak = () => fetch("/api/v1/memory");')).found.join("\n")).toMatch(/fetch\(\) вне api\.ts/);
+  });
+
+  test("транзитивно: datetime.ts с импортом модуля Mini App, fetch или хранилищем — нарушение (Б-105)", () => {
+    const withText = (extra: string) => (p: string) => (p === DATETIME ? `${read(p)}\n${extra}\n` : read(p));
+    expect(outsideViolations(withText('export { SseParser } from "./chat";')).found.join("\n")).toMatch(/\.\.\/api\/datetime\.ts:\d+: импорт «\.\/chat» вне src\/admin/);
+    expect(outsideViolations(withText('import { api } from "./client";')).found.join("\n")).toMatch(/импорт «\.\/client» вне src\/admin/);
+    expect(outsideViolations(withText('import "@telegram-apps/sdk";')).found.join("\n")).toMatch(/пакет «@telegram-apps\/sdk»/);
+    expect(outsideViolations(withText('export const leak = () => fetch("/api/v1/memory");')).found.join("\n")).toMatch(/fetch\(\) вне api\.ts/);
+    expect(outsideViolations(withText('export const t = () => localStorage.getItem("t");')).found.join("\n")).toMatch(/localStorage/);
   });
 
   test("комментарии и регулярные выражения не дают ложных срабатываний и не прячут код", () => {

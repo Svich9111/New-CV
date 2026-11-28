@@ -5,6 +5,7 @@
  * Токен хранится только в памяти вкладки — в закрытом поле объекта клиента, который держит экран; он не пишется
  * ни в хранилища браузера, ни в cookie (`credentials: "omit"`), ни в адрес, ни в журнал. Ошибки не содержат токена.
  */
+import { isDateTime } from "../api/datetime";
 import type { KbDocument, KbUploadFields } from "./types";
 
 export const ADMIN_PATH_PREFIX = "/admin/";
@@ -75,8 +76,8 @@ function fallbackCode(status: number): string {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const optStr = (v: unknown) => v === undefined || v === null || typeof v === "string";
-const isDate = (v: unknown) => typeof v === "string" && !Number.isNaN(Date.parse(v));
-const optDate = (v: unknown) => v === undefined || v === null || isDate(v);
+/** `format: date-time` контракта — строгая RFC 3339 из общего модуля (A8-0021-3, Б-105): `Date.parse` принимает «Nov 5». */
+const optDate = (v: unknown) => v === undefined || v === null || isDateTime(v);
 
 /**
  * Строгая проверка `KbDocument` и копия только известных полей: неизвестные поля ответа (если сервер когда-нибудь
@@ -103,7 +104,7 @@ export function toKbDocument(v: unknown): KbDocument | null {
   )
     return null;
   if (!(sha256 === undefined || sha256 === null || (typeof sha256 === "string" && /^[0-9a-f]{64}$/.test(sha256)))) return null;
-  if (!isDate(v.created_at) || !optDate(v.indexed_at)) return null;
+  if (!isDateTime(v.created_at) || !optDate(v.indexed_at)) return null;
   return {
     id,
     title,

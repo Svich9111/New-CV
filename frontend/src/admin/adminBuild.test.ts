@@ -38,6 +38,9 @@ function allowedModule(id: string): boolean {
   if (virtual) return false;
   if (path === ADMIN_HTML) return true;
   if (path === join(root, "src/ui/Notice.tsx")) return true;
+  // Б-105 (A8-0021-3): строгие проверки дат — чистые функции без импортов, сети и хранилищ; что он тянет, проверяет
+  // этот же перечень (любой другой модуль `src/api/*` — красный).
+  if (path === join(root, "src/api/datetime.ts")) return true;
   if (path === join(root, "src/theme.css") || path === join(root, "src/app.css")) return true;
   const admin = join(root, "src/admin") + "/";
   return path.startsWith(admin) && !path.startsWith(join(admin, "test") + "/") && !/\.test\.[a-z]+$/.test(path) && /\.(ts|tsx|css)$/.test(path);
@@ -133,10 +136,10 @@ test("перечень разрешённых путей сборки — не �
 });
 
 test("перечень модулей сборки — не пустой страж", () => {
-  for (const ok of ["src/admin/api.ts", "src/admin/admin.css", "src/ui/Notice.tsx", "src/theme.css", "admin.html"]) expect(allowedModule(join(root, ok)), ok).toBe(true);
+  for (const ok of ["src/admin/api.ts", "src/admin/admin.css", "src/ui/Notice.tsx", "src/api/datetime.ts", "src/theme.css", "admin.html"]) expect(allowedModule(join(root, ok)), ok).toBe(true);
   for (const ok of ["\0vite/preload-helper.js", "\0/x/node_modules/react/index.js?commonjs-module", "/x/node_modules/scheduler/index.js"])
     expect(allowedModule(ok), ok).toBe(true);
-  for (const bad of ["src/api/chat.ts", "src/api/client.ts", "src/ui/format.ts", "src/admin/zzz.js", "src/admin/test/fakeAdminApi.ts", "src/admin/api.test.ts", "src/main.tsx"])
+  for (const bad of ["src/api/chat.ts", "src/api/client.ts", "src/api/datetime.test.ts", "src/api/datetime.a8.test.ts", "src/ui/format.ts", "src/admin/zzz.js", "src/admin/test/fakeAdminApi.ts", "src/admin/api.test.ts", "src/main.tsx"])
     expect(allowedModule(join(root, bad)), bad).toBe(false);
   for (const bad of ["\0/x/src/api/chat.ts?commonjs-proxy", "/x/node_modules/@telegram-apps/sdk/index.js", "\0other-virtual.js"]) expect(allowedModule(bad), bad).toBe(false);
 });
@@ -147,6 +150,7 @@ test("перечень модулей сборки — не пустой стр�
  */
 const MAIN = join(root, "src/admin/main.tsx");
 const NOTICE = join(root, "src/ui/Notice.tsx");
+const DATETIME = join(root, "src/api/datetime.ts");
 const append = (file: string, code: string): Plugin => ({
   name: `mut-append-${file}`,
   enforce: "pre",
@@ -179,6 +183,11 @@ describe("страж сборки падает (ревью A6 р.2, MAJOR-1)", (
     [
       "m6: файл .js в src/admin переэкспортирует модуль Mini App",
       [virtualAdminFile("zzz.js", 'export { SseParser } from "../api/chat.ts";'), append(MAIN, `import { SseParser } from "./zzz.js";\n${LEAK} = new SseParser();`)],
+      /модуль src\/api\/chat\.ts/,
+    ],
+    [
+      "Б-105: модуль Mini App переэкспортом через datetime.ts",
+      [append(DATETIME, 'export { SseParser } from "./chat";'), append(MAIN, `import { SseParser } from "../api/datetime";\n${LEAK} = SseParser;`)],
       /модуль src\/api\/chat\.ts/,
     ],
     [

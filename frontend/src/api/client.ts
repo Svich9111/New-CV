@@ -1,5 +1,6 @@
 import { BadEvent, SseParser, isChatHistory, parseEvent, type AcceptedEvent, type CrisisEvent, type RawEvent } from "./chat";
 import { isCoupleFeed, isDraft, isMessageOriginal, isPartnerMessage, parseDraftOutcome, type DraftResult } from "./couple";
+import { isDateTime } from "./datetime";
 import { isMemoryList } from "./memory";
 import { errorText, type Op } from "./messages";
 import type {
@@ -180,9 +181,9 @@ const checks = {
     Array.isArray(v.members) &&
     v.members.length <= 2 &&
     v.members.every(isCoupleMember),
-  inviteCreated: (v: unknown) => isObject(v) && isStr(v.couple_id) && isStr(v.link) && isStr(v.expires_at),
+  inviteCreated: (v: unknown) => isObject(v) && isStr(v.couple_id) && isStr(v.link) && isDateTime(v.expires_at),
   // `inviter_name` обязателен и бывает `null` (имя не указано) — но не объектом и не числом (A8-1.5-D8).
-  invitePreview: (v: unknown) => isObject(v) && "inviter_name" in v && strOrNull(v.inviter_name) && isStr(v.expires_at),
+  invitePreview: (v: unknown) => isObject(v) && "inviter_name" in v && strOrNull(v.inviter_name) && isDateTime(v.expires_at),
   // Сам список — массив; отдельные записи проверяет экран «Помощь» (`isHelpContact`) и отбрасывает неверные.
   helpContacts: (v: unknown) => Array.isArray(v),
   chatHistory: isChatHistory,
