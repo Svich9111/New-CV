@@ -153,6 +153,102 @@ async def test_b103_life_threat_primary_by_code(
     assert pw.crisis_type(notice.primary, (*notice.types, *delivery.safety_events)) == DB[main]
 
 
+def _old_plan(types: list[str], primary: str | None) -> crisis.CrisisPlan:
+    """Порядок правила «Б» до Б-103 (эталон, ревью 0021 MAJOR-1): экстренный, блок главной,
+    остальные по ``PRIORITY``."""
+    p = crisis.plan(types, primary=primary, withheld=True)
+    if "outgoing_threat" in (p.primary, *p.secondary):
+        return p
+    present = (p.primary, *p.secondary)
+    seq = [t for t in ("life_threat",) if t in present]
+    seq += [t for t in (p.primary, *p.secondary) if t not in ("life_threat", "underage")]
+    return crisis.CrisisPlan(p.primary, p.secondary, ("not_sent", *seq), p.actions)
+
+
+SAFETY_CATS = ("none", "threat_or_insult", "violence", "self_harm", "life_threat", "underage")
+
+
+def _all_verdicts() -> list[tuple[str, tuple[str, ...]]]:
+    """Все ответы классификатора: категория × любое подмножество прочих, **в любом порядке**
+    вторичных (порядок от модели не должен влиять)."""
+    out = []
+    for cat in SAFETY_CATS:
+        rest = [c for c in SAFETY_CATS[1:] if c != cat]
+        for n in range(len(rest) + 1):
+            for sec in itertools.permutations(rest, n):
+                out.append((cat, sec))
+    return out
+
+
+@pytest.mark.parametrize("prompt_set", [V0, V2], ids=["V0", "V2"])
+async def test_b103_keeps_blocks_and_order_for_every_verdict(prompt_set: Any) -> None:
+    """Б-103 не меняет кризисный ответ (АР-57 п.4, ревью 0021 MAJOR-1, вариант «б»): для каждого
+    ответа классификатора (с любым порядком вторичных) блоки, их порядок, действия и текст —
+    как до Б-103, когда главной была категория модели; меняются только главная строка и тип
+    события. Лента по хранимому набору (``ordered_types``) даёт те же блоки."""
+    seen_lead = False
+    for cat, sec in _all_verdicts():
+        cats = [c for c in (cat, *sec) if c != "none"]
+        raw = [pipeline.MESSAGE_CRISIS[c] for c in cats if c in pipeline.MESSAGE_CRISIS]
+        if not raw:
+            continue
+
+        def answer(role: str, payload: dict[str, Any], c: str = cat, s: tuple = sec) -> Any:
+            if role == "safety":
+                return {"category": c, "secondary": list(s)}
+            return honest(role, payload)
+
+        delivery = await pipeline.process(
+            _models(answer), pipeline.approve("Выдуманный текст", confirmed=True),
+            prompt_set=prompt_set,
+        )  # fmt: skip
+        notice = delivery.author_notice
+        assert notice is not None, (cat, sec)
+        old = crisis.respond(
+            raw, primary=pipeline.MESSAGE_CRISIS.get(cat), prompt_set=prompt_set, withheld=True
+        )
+        assert (
+            notice.blocks == old.blocks == _old_plan(raw, pipeline.MESSAGE_CRISIS.get(cat)).blocks
+        )
+        assert (notice.text, notice.actions) == (old.text, old.actions), (cat, sec)
+        assert set(notice.types) == set(old.types)
+        if "life_threat" in raw:
+            assert notice.primary == "life_threat", (cat, sec)
+        # Лента: набор в БД — ordered_types (первая — как есть, остальные по перечислению).
+        first, *others = pw.crisis_types(notice.ordered_types)
+        stored = [first, *sorted(others, key=list(DB.values()).index)]
+        assert crisis_blocks(DB[notice.primary], stored) == notice.blocks, (cat, sec)
+        seen_lead |= notice.lead is not None
+    assert seen_lead  # исключение Б-103 действительно встречается
+
+
+def test_b103_lead_only_when_promoted() -> None:
+    """Порядок входа значим только при главной ``life_threat`` и первой строке ``violence`` /
+    ``self_harm`` (категория модели): чат (агент ставит главную первой) и черновики (главной
+    нет) — как прежде, по набору."""
+    vhl = ["self_harm", "violence", "life_threat"]
+    assert crisis.plan(vhl, primary="life_threat", withheld=True).blocks == (
+        "not_sent", "life_threat", "self_harm", "violence",
+    )  # fmt: skip
+    assert crisis.plan(vhl, primary="self_harm", withheld=True).blocks == (
+        "not_sent", "life_threat", "self_harm", "violence",
+    )  # fmt: skip
+    for types, primary in [
+        (["life_threat", "self_harm", "violence"], "life_threat"),
+        (vhl, None),
+        (["violence", "self_harm", "life_threat"], "life_threat"),
+    ]:
+        assert crisis.plan(types, primary=primary).blocks == (
+            "life_threat", "violence", "self_harm",
+        ), (types, primary)  # fmt: skip
+    # Правило «А» от порядка не зависит.
+    a = ["self_harm", "outgoing_threat", "life_threat"]
+    assert (
+        crisis.plan(a, primary="life_threat", withheld=True).blocks
+        == crisis.plan(sorted(a), primary="life_threat", withheld=True).blocks
+    )
+
+
 def _models(answer: Any) -> Any:
     from app.ai.models import AgentModels
 
@@ -255,7 +351,8 @@ async def test_unknown_set_is_null_and_other_reasons_have_no_blocks(env: Env) ->
 async def test_function_normalizes_and_rejects_bad_sets(env: Env) -> None:
     """``pipeline_withhold_leased`` (0021): набор — только при ``safety``, непустой, без NULL и
     ``underage``, с главным типом (иначе 22023, сообщение не меняется); дубли схлопываются,
-    порядок — перечисления; набор только из типов (колонка ``safety_event_type[]``)."""
+    первая строка — как передана, остальные — по перечислению; набор только из типов (колонка
+    ``safety_event_type[]``)."""
     anna, _igor, _olga = await _trio(env)
     mid = await send(env, anna, env.mark("fn"))
     c = await helpers.claim(env.engine, mid)
@@ -311,7 +408,8 @@ async def test_function_normalizes_and_rejects_bad_sets(env: Env) -> None:
                 )
             )
         ).scalar_one()
-    assert (row.main, row.types) == ("self_harm", ["violence", "threat_outgoing", "self_harm"])
+    # Первая — как передана (строка порядка блоков, Б-103), остальные — по перечислению.
+    assert (row.main, row.types) == ("self_harm", ["self_harm", "violence", "threat_outgoing"])
     assert col == "_safety_event_type"  # массив перечисления: текста в колонке быть не может
 
 
@@ -451,7 +549,14 @@ ORDER BY 1
 """
 
 
-async def _state(engine: AsyncEngine) -> tuple[list[tuple[Any, ...]], list[str]]:
+# Ограничения таблицы (ревью MINOR-5): имя, вид, определение, проверено ли.
+_CONSTRAINTS = """
+SELECT conname::text, contype::text, pg_get_constraintdef(oid), convalidated
+FROM pg_constraint WHERE conrelid = 'public.partner_messages'::regclass ORDER BY 1
+"""
+
+
+async def _state(engine: AsyncEngine) -> tuple[list[tuple[Any, ...]], list[str], list[Any]]:
     async with engine.connect() as c:
         fns = [tuple(r) for r in await c.execute(text(_FN_STATE))]
         cols = [
@@ -463,7 +568,8 @@ async def _state(engine: AsyncEngine) -> tuple[list[tuple[Any, ...]], list[str]]
                 )
             )
         ]
-    return fns, cols
+        cons = [tuple(r) for r in await c.execute(text(_CONSTRAINTS))]
+    return fns, cols, cons
 
 
 async def test_migration_0021_upgrade_downgrade_upgrade(
@@ -473,7 +579,7 @@ async def test_migration_0021_upgrade_downgrade_upgrade(
     downgrade 0021 функции остановки и ленты (тело, права, SECURITY DEFINER, ``search_path``,
     владелец) и колонки ``partner_messages`` совпадают с ним точно; главный тип остановленного
     сохраняется; снова upgrade — состояние головы точно, набор — NULL (как до 0021), блоков нет;
-    ``alembic check`` чист."""
+    ``alembic check`` чист. Сверяются и ограничения ``partner_messages`` (ревью MINOR-5)."""
     anna, _igor, _olga = await _trio(env)
     await _stopped(env, anna, types=["violence", "self_harm"], main="violence")
     head = await _state(engine)
@@ -484,7 +590,11 @@ async def test_migration_0021_upgrade_downgrade_upgrade(
         "safety_event_type,safety_event_type[])",
     ]
 
-    async def move(*steps: str) -> tuple[list[tuple[Any, ...]], list[str]]:
+    names = {c[0]: c for c in head[2]}
+    ck = names["ck_partner_messages_withheld_crisis_types_safety"]
+    assert ck[1] == "c" and ck[3] is True  # NOT VALID + VALIDATE: ограничение проверено
+
+    async def move(*steps: str) -> tuple[list[tuple[Any, ...]], list[str], list[Any]]:
         for step in steps:
             alembic(*step.split())
         await engine.dispose()
@@ -498,6 +608,7 @@ async def test_migration_0021_upgrade_downgrade_upgrade(
         at20 = await move("downgrade 0020")
         assert at20 == ref
         assert "withheld_crisis_types" not in at20[1]
+        assert not any("withheld_crisis_types" in c[0] for c in at20[2])
         assert [f[0] for f in at20[0]][1].endswith("safety_event_type[],safety_event_type)")
         assert all(f[3] is True and "search_path=public, pg_temp" in str(f[4]) for f in at20[0])
         assert await move("upgrade head") == head

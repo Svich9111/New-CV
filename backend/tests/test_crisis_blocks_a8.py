@@ -21,14 +21,22 @@
 - **миграция**: downgrade 0021 → 0020 даёт **весь** каталог (функции, права, ограничения,
   колонки, индексы, триггеры, политики, перечисления) таким же, как чистая сборка base → 0020.
 
+Раунд 2 (решение «б» по ревью MAJOR-1 / A8-0021-1): Б-103 не меняет ни блоков, ни их порядка ни
+при одном ответе классификатора с любым порядком вторичных — сверка с эталоном до Б-103
+(``BEFORE_B103``, снят с ``1df7495~1``); любой порядок хранимого массива даёт только прежние
+ответы; функция 0021 сохраняет первую строку; страж клиента сверяет и 4 строки с иной первой;
+пустой набор — NULL (MINOR-2).
+
 Данные выдуманные. Дефекты — ``xfail(strict=True)``."""
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 import re
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -65,19 +73,38 @@ MESSAGE_TYPES: tuple[crisis.CrisisType, ...] = (
 CASES_TS = BACKEND_DIR.parent / "frontend" / "src" / "test" / "crisisCases.ts"
 
 
-def server_table() -> set[tuple[tuple[str, ...], str, tuple[str, ...]]]:
-    """Таблица сервера в обозначениях БД/контракта: (набор по возрастанию, главная, блоки)."""
-    out = set()
+Row = tuple[tuple[str, ...], str, str, tuple[str, ...]]
+
+
+async def server_table() -> set[Row]:
+    """Таблица сервера в обозначениях БД/контракта: (набор по возрастанию, главная, первая строка
+    хранимого набора, блоки ленты). 32 сочетания «набор × главная» с главной первой и (раунд 2,
+    Б-103) все хранимые наборы с иной первой строкой, которые пишет конвейер (``ordered_types``
+    по всем 651 ответу классификатора); блоки — ``crisis_blocks`` ленты по хранимому массиву."""
+    out: set[Row] = set()
     for n in range(1, 5):
         for combo in itertools.combinations(MESSAGE_TYPES, n):
             for main in combo:
-                blocks = crisis.plan(combo, primary=main, withheld=True).blocks
-                out.add((tuple(sorted(DB[t] for t in combo)), DB[main], blocks))
+                stored = [DB[main], *(DB[t] for t in combo if t != main)]
+                blocks = couple_messages.crisis_blocks(DB[main], stored)
+                assert blocks == crisis.plan(combo, primary=main, withheld=True).blocks
+                out.add((tuple(sorted(stored)), DB[main], DB[main], blocks))
+    for cat, sec in VERDICT_ORDERS:
+        notice = (await _notice(cat, sec)).author_notice
+        if notice is None:
+            continue
+        stored = _stored(notice.ordered_types)
+        main_db = DB[notice.primary]
+        if stored[0] != main_db:
+            blocks = couple_messages.crisis_blocks(main_db, stored)
+            assert blocks == notice.blocks
+            out.add((tuple(sorted(stored)), main_db, stored[0], blocks))
     return out
 
 
 _ROW = re.compile(
     r"\{\s*types:\s*\[(?P<types>[^\]]*)\],\s*main:\s*\"(?P<main>\w+)\",\s*"
+    r"(?:first:\s*\"(?P<first>\w+)\",\s*)?"
     r"blocks:\s*\[(?P<blocks>[^\]]*)\]\s*\}"
 )
 
@@ -86,11 +113,16 @@ def _names(raw: str) -> tuple[str, ...]:
     return tuple(x.strip().strip('"') for x in raw.split(",") if x.strip())
 
 
-def client_table(source: str) -> list[tuple[tuple[str, ...], str, tuple[str, ...]]]:
-    rows = [
-        (tuple(sorted(_names(m["types"]))), m["main"], _names(m["blocks"]))
-        for m in _ROW.finditer(source)
-    ]
+def client_table(source: str) -> list[Row]:
+    rows = []
+    for m in _ROW.finditer(source):
+        types, main, first = _names(m["types"]), m["main"], m["first"] or m["main"]
+        if m["first"] is not None:
+            # Строка с иной первой: ``types`` — в порядке хранения, первая — ``first``, не главная;
+            # блоки ленты по этому массиву — те, что в таблице (иначе таблица противоречит себе).
+            assert types[0] == first != main, m.group(0)
+            assert couple_messages.crisis_blocks(main, list(types)) == _names(m["blocks"])
+        rows.append((tuple(sorted(types)), main, first, _names(m["blocks"])))
     # Ни одной строки, которую регулярное выражение пропустило бы молча.
     starts = len(re.findall(r"^\s*\{\s*types:", source, flags=re.M))
     assert len(rows) == starts, "строка crisisCases.ts не разобрана"
@@ -100,33 +132,54 @@ def client_table(source: str) -> list[tuple[tuple[str, ...], str, tuple[str, ...
 # =========================================================================== страж клиента
 
 
-def test_frontend_crisis_cases_match_server_table() -> None:
-    """Страж расхождения (A8): ``crisisCases.ts`` — ровно таблица ``crisis.plan`` сервера. При
-    правке правил «А»/«Б» без пересборки файла клиента (или наоборот) — красный."""
+async def test_frontend_crisis_cases_match_server_table() -> None:
+    """Страж расхождения (A8): ``crisisCases.ts`` — ровно таблица сервера: 32 сочетания
+    «набор × главная» и (раунд 2, Б-103) 4 хранимых набора с первой строкой — категорией модели
+    при главной ``life_threat``. При правке правил «А»/«Б» или порядка хранения без пересборки
+    файла клиента (или наоборот) — красный."""
     rows = client_table(CASES_TS.read_text(encoding="utf-8"))
-    assert len(rows) == len(set(rows)) == 32, "повтор или не все 32 сочетания"
-    assert set(rows) == server_table()
-    # Главная — всегда в наборе, ``underage`` и варианты чата в таблице не встречаются.
-    for types, main, blocks in rows:
-        assert main in types and "underage" not in types
+    assert len(rows) == len(set(rows)) == 36, "повтор или не все 36 строк"
+    assert sum(1 for r in rows if r[1] == r[2]) == 32
+    assert set(rows) == await server_table()
+    # Главная и первая — всегда в наборе, ``underage`` и варианты чата в таблице не встречаются.
+    for types, main, first, blocks in rows:
+        assert main in types and first in types and "underage" not in types
         assert not any(b.endswith("_chat") or b == "underage" for b in blocks)
 
 
-def test_guard_detects_divergence() -> None:
-    """Самопроверка стража: подмена одного блока, лишняя или пропавшая строка — видны."""
+async def test_guard_detects_divergence() -> None:
+    """Самопроверка стража: подмена одного блока, пропавшая строка, пропавшая строка Б-103 или
+    ``first`` — видны; противоречивая строка с ``first`` — ошибка разбора."""
     source = CASES_TS.read_text(encoding="utf-8")
+    server = await server_table()
     good = set(client_table(source))
     swapped = source.replace(
         'main: "violence", blocks: ["outgoing_threat_mixed", "author_safety"]',
         'main: "violence", blocks: ["not_sent", "violence"]',
         1,
     )
-    assert swapped != source and set(client_table(swapped)) != server_table()
+    assert swapped != source and set(client_table(swapped)) != server
     dropped = "\n".join(
         line for line in source.splitlines() if '"life_threat"], main: "life_threat"' not in line
     )
-    assert set(client_table(dropped)) != server_table()
-    assert good == server_table()
+    assert set(client_table(dropped)) != server
+    lead = (
+        '{ types: ["self_harm", "violence", "life_threat"], main: "life_threat", first: "self_harm"'
+    )
+    assert lead in source
+    no_lead = "\n".join(line for line in source.splitlines() if lead not in line)
+    assert set(client_table(no_lead)) != server
+    no_first = source.replace(lead, lead.replace(', first: "self_harm"', ""), 1)
+    assert set(client_table(no_first)) != server
+    wrong_order = source.replace(
+        'first: "self_harm", blocks: ["not_sent", "life_threat", "self_harm", "violence"]',
+        'first: "self_harm", blocks: ["not_sent", "life_threat", "violence", "self_harm"]',
+        1,
+    )
+    assert wrong_order != source
+    with pytest.raises(AssertionError):
+        client_table(wrong_order)
+    assert good == server
 
 
 # =========================================================================== весь путь воркера
@@ -752,7 +805,7 @@ _SNAPSHOT = {
                coalesce(p.proconfig::text, ''), pg_get_userbyid(p.proowner),
                coalesce((SELECT string_agg(pg_get_userbyid(a.grantee) || ':' || a.privilege_type,
                                            ',' ORDER BY 1)
-                         FROM aclexplode(p.proacl) a), 'default')
+                         FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a), '')
         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = 'public' AND p.prokind IN ('f', 'p')
           AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')
@@ -775,11 +828,16 @@ _SNAPSHOT = {
         SELECT tablename, policyname, permissive, roles::text, cmd, coalesce(qual, ''),
                coalesce(with_check, '')
         FROM pg_policies WHERE schemaname = 'public' ORDER BY 1, 2""",
+    # ACL: NULL (права владельца по умолчанию) приводится к явному ``acldefault`` — иначе
+    # ``alembic_version`` и другие объекты, чьи права хоть раз меняли, отличаются по истории БД
+    # (свежая база ↔ переиспользованная), а не по ревизии. Сравнение остаётся точным.
     "table_acl": """
         SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
                coalesce((SELECT string_agg(pg_get_userbyid(a.grantee) || ':' || a.privilege_type,
                                            ',' ORDER BY 1)
-                         FROM aclexplode(c.relacl) a), 'default')
+                         FROM aclexplode(coalesce(c.relacl, acldefault(
+                             CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END::"char", c.relowner))) a),
+                        '')
         FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace
           AND c.relkind IN ('r', 'v', 'm', 'S') ORDER BY 1""",
     "column_acl": """
@@ -885,15 +943,191 @@ async def test_five_argument_call_stores_null_set(env: Env) -> None:
     assert mine[str(mid)]["withheld_crisis_blocks"] is None
 
 
+# =========================================================================== Б-103: порядок (р.2)
+
+# Эталон **до Б-103** — блоки автору при наборе признаков (значения БД, по возрастанию) и главной
+# прежнего конвейера (категория модели, иначе первая по ``PRIORITY``). Снят A8 независимо от
+# текущего кода: ``crisis.respond`` из ``git show 1df7495~1:backend/app/ai/crisis.py`` на всех 651
+# ответах классификатора (категория × любое подмножество вторичных в любом порядке) — совпали
+# текст, действия и версия шаблона ответа текущего конвейера. Закреплён литералом, чтобы тест не
+# зависел от истории git (АР-57 п.4, решение «б»: Б-103 блоки и их порядок не меняет).
+BEFORE_B103: dict[tuple[tuple[str, ...], str], tuple[str, ...]] = {
+    (("life_threat",), "life_threat"): ("not_sent", "life_threat"),
+    (("life_threat", "self_harm"), "life_threat"): ("not_sent", "life_threat", "self_harm"),
+    (("life_threat", "self_harm"), "self_harm"): ("not_sent", "life_threat", "self_harm"),
+    (("life_threat", "self_harm", "threat_outgoing"), "life_threat"): (
+        "not_sent",
+        "author_safety_life",
+        "self_harm",
+        "outgoing_threat_brief",
+    ),
+    (("life_threat", "self_harm", "threat_outgoing"), "self_harm"): (
+        "not_sent",
+        "author_safety_life",
+        "self_harm",
+        "outgoing_threat_brief",
+    ),
+    (("life_threat", "self_harm", "threat_outgoing"), "threat_outgoing"): (
+        "not_sent",
+        "author_safety_life",
+        "self_harm",
+        "outgoing_threat_brief",
+    ),
+    (("life_threat", "self_harm", "threat_outgoing", "violence"), "life_threat"): (
+        "not_sent",
+        "author_safety_life",
+        "self_harm",
+        "outgoing_threat_brief",
+    ),
+    (("life_threat", "self_harm", "threat_outgoing", "violence"), "self_harm"): (
+        "not_sent",
+        "author_safety_life",
+        "self_harm",
+        "outgoing_threat_brief",
+    ),
+    (("life_threat", "self_harm", "threat_outgoing", "violence"), "threat_outgoing"): (
+        "not_sent",
+        "author_safety_life",
+        "self_harm",
+        "outgoing_threat_brief",
+    ),
+    (("life_threat", "self_harm", "threat_outgoing", "violence"), "violence"): (
+        "not_sent",
+        "author_safety_life",
+        "self_harm",
+        "outgoing_threat_brief",
+    ),
+    (("life_threat", "self_harm", "violence"), "life_threat"): (
+        "not_sent",
+        "life_threat",
+        "violence",
+        "self_harm",
+    ),
+    (("life_threat", "self_harm", "violence"), "self_harm"): (
+        "not_sent",
+        "life_threat",
+        "self_harm",
+        "violence",
+    ),
+    (("life_threat", "self_harm", "violence"), "violence"): (
+        "not_sent",
+        "life_threat",
+        "violence",
+        "self_harm",
+    ),
+    (("life_threat", "threat_outgoing"), "life_threat"): (
+        "author_safety_life",
+        "outgoing_threat_mixed",
+    ),
+    (("life_threat", "threat_outgoing"), "threat_outgoing"): (
+        "author_safety_life",
+        "outgoing_threat_mixed",
+    ),
+    (("life_threat", "threat_outgoing", "violence"), "life_threat"): (
+        "author_safety_life",
+        "outgoing_threat_mixed",
+    ),
+    (("life_threat", "threat_outgoing", "violence"), "threat_outgoing"): (
+        "author_safety_life",
+        "outgoing_threat_mixed",
+    ),
+    (("life_threat", "threat_outgoing", "violence"), "violence"): (
+        "author_safety_life",
+        "outgoing_threat_mixed",
+    ),
+    (("life_threat", "violence"), "life_threat"): ("not_sent", "life_threat", "violence"),
+    (("life_threat", "violence"), "violence"): ("not_sent", "life_threat", "violence"),
+    (("self_harm",), "self_harm"): ("not_sent", "self_harm"),
+    (("self_harm", "threat_outgoing"), "self_harm"): (
+        "not_sent",
+        "self_harm",
+        "outgoing_threat_brief",
+    ),
+    (("self_harm", "threat_outgoing"), "threat_outgoing"): (
+        "not_sent",
+        "self_harm",
+        "outgoing_threat_brief",
+    ),
+    (("self_harm", "threat_outgoing", "violence"), "self_harm"): (
+        "not_sent",
+        "self_harm",
+        "outgoing_threat_brief",
+        "author_safety",
+    ),
+    (("self_harm", "threat_outgoing", "violence"), "threat_outgoing"): (
+        "not_sent",
+        "self_harm",
+        "outgoing_threat_brief",
+        "author_safety",
+    ),
+    (("self_harm", "threat_outgoing", "violence"), "violence"): (
+        "not_sent",
+        "self_harm",
+        "outgoing_threat_brief",
+        "author_safety",
+    ),
+    (("self_harm", "violence"), "self_harm"): ("not_sent", "self_harm", "violence"),
+    (("self_harm", "violence"), "violence"): ("not_sent", "violence", "self_harm"),
+    (("threat_outgoing",), "threat_outgoing"): ("outgoing_threat",),
+    (("threat_outgoing", "violence"), "threat_outgoing"): (
+        "outgoing_threat_mixed",
+        "author_safety",
+    ),
+    (("threat_outgoing", "violence"), "violence"): ("outgoing_threat_mixed", "author_safety"),
+    (("violence",), "violence"): ("not_sent", "violence"),
+}
+# Порядок строк до Б-103 при главной не от модели (``crisis.PRIORITY`` без ``underage``).
+OLD_PRIORITY = ("life_threat", "violence", "self_harm", "outgoing_threat")
+# Порядок перечисления ``safety_event_type`` в БД без ``underage``.
+ENUM_ORDER = ("violence", "threat_outgoing", "self_harm", "life_threat")
+
+
+def _old_main(cat: str, raw: Sequence[str]) -> str:
+    main: str = pipeline.MESSAGE_CRISIS.get(cat) or next(t for t in OLD_PRIORITY if t in raw)
+    return DB[main]
+
+
+def _verdict_orders() -> list[tuple[str, tuple[str, ...]]]:
+    """Все ответы классификатора с **любым порядком** вторичных (порядок даёт модель)."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for cat in CATEGORIES:
+        rest = [c for c in NON_NONE if c != cat]
+        for n in range(len(rest) + 1):
+            out.extend((cat, sec) for sec in itertools.permutations(rest, n))
+    return out
+
+
+VERDICT_ORDERS = _verdict_orders()  # 326 (none) + 5 × 65 = 651
+
+
+def _stored(ordered: tuple[str, ...]) -> list[str]:
+    """Как функция 0021 записывает набор: первая — как передана, остальные без повторов по
+    перечислению ``safety_event_type``."""
+    first, *rest = [DB[t] for t in ordered]
+    return [first, *sorted({r for r in rest if r != first}, key=ENUM_ORDER.index)]
+
+
+# Сочетания, где хранимая первая строка ≠ главной (Б-103: главная повышена до ``life_threat``,
+# первой — категория модели): (набор, главная до Б-103) — первая строка равна ей.
+LEAD_KEYS = {
+    (("life_threat", "violence"), "violence"),
+    (("life_threat", "self_harm"), "self_harm"),
+    (("life_threat", "self_harm", "violence"), "violence"),
+    (("life_threat", "self_harm", "violence"), "self_harm"),
+}
+
+
 def _b103_diff() -> dict[tuple[str, tuple[str, ...]], tuple[tuple[str, ...], tuple[str, ...]]]:
-    """Блоки ответа автору до Б-103 (главная — категория модели) и после (``message_primary``)
-    для всех ответов классификатора с кризисным признаком."""
+    """Блоки ``crisis.plan`` при главной до Б-103 (категория модели) и после
+    (``message_primary``) — по набору в порядке конвейера (категория модели первой)."""
     out = {}
-    for cat, sec in VERDICTS:
+    for cat, sec in VERDICT_ORDERS:
         cats = [c for c in (cat, *sec) if c != "none"]
         types = [pipeline.MESSAGE_CRISIS[c] for c in cats if c in pipeline.MESSAGE_CRISIS]
         if not types:
             continue
+        if cat not in pipeline.MESSAGE_CRISIS:
+            types = list(crisis.order(types))
         before = crisis.plan(types, primary=pipeline.MESSAGE_CRISIS.get(cat), withheld=True)
         after = crisis.plan(types, primary=pipeline.message_primary(cat, types), withheld=True)
         if before.blocks != after.blocks:
@@ -901,38 +1135,252 @@ def _b103_diff() -> dict[tuple[str, tuple[str, ...]], tuple[tuple[str, ...], tup
     return out
 
 
-def test_b103_changes_block_order_for_exactly_one_set() -> None:
-    """Факт (ревью MAJOR-1): Б-103 меняет порядок блоков только при наборе
-    {violence, self_harm, life_threat} и категории модели ``self_harm`` (с ``underage`` в
-    вторичных или без): поддержка при самоповреждении уходит после блока о насилии; набор блоков
-    и действия те же."""
-    diff = _b103_diff()
-    assert {(c, tuple(s for s in sec if s != "underage")) for c, sec in diff} == {
-        ("self_harm", ("violence", "life_threat"))
-    }
-    for before, after in diff.values():
-        assert before == ("not_sent", "life_threat", "self_harm", "violence")
-        assert after == ("not_sent", "life_threat", "violence", "self_harm")
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-0021-1 (MAJOR, = ревью MAJOR-1): АР-57 п.4 — «блоки ответа от этого не меняются»; "
-    "при {violence, self_harm, life_threat} и категории self_harm порядок меняется",
-)
 def test_b103_does_not_change_blocks_as_decision_says() -> None:
+    """АР-57 п.4: смена главной на ``life_threat`` не меняет блоков ни при одном ответе."""
     assert _b103_diff() == {}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A8-0021-2 (MINOR, = ревью MINOR-2): пустой набор признаков записывается как известный "
-    "набор из главного типа, а не NULL (АР-57 п.3: неизвестно → консервативный набор)",
+async def test_b103_no_block_change_for_any_verdict_in_any_order() -> None:
+    """Раунд 2 (решение «б», ревью MAJOR-1 / A8-0021-1). Заменяет тест раунда 1
+    ``test_b103_changes_block_order_for_exactly_one_set``, который закреплял ошибочное поведение.
+
+    Все 651 ответ классификатора (категория × любые вторичные × **любой порядок** вторичных)
+    через настоящий конвейер: блоки автору — ровно эталон до Б-103 (``BEFORE_B103``); меняется
+    только главная (``life_threat`` при этом признаке). Лента: набор, как его запишет функция
+    0021 (``_stored(ordered_types)``), при **любом** порядке остальных строк даёт те же блоки.
+    Хранимая первая ≠ главной ровно в 4 сочетаниях Б-103 и равна категории модели."""
+    leads: set[tuple[tuple[tuple[str, ...], str], str]] = set()
+    withheld = 0
+    for cat, sec in VERDICT_ORDERS:
+        delivery = await _notice(cat, sec)
+        cats = [c for c in (cat, *sec) if c != "none"]
+        raw = [pipeline.MESSAGE_CRISIS[c] for c in cats if c in pipeline.MESSAGE_CRISIS]
+        notice = delivery.author_notice
+        if not raw:
+            assert notice is None, (cat, sec)
+            continue
+        withheld += 1
+        assert notice is not None, (cat, sec)
+        key = (tuple(sorted({DB[t] for t in raw})), _old_main(cat, raw))
+        want = BEFORE_B103[key]
+        assert notice.blocks == want, (cat, sec)
+        main = DB[notice.primary]
+        assert main == ("life_threat" if "life_threat" in raw else key[1]), (cat, sec)
+        stored = _stored(notice.ordered_types)
+        assert tuple(sorted(stored)) == key[0] and main in stored, (cat, sec)
+        for perm in itertools.permutations(stored[1:]):
+            got = couple_messages.crisis_blocks(main, [stored[0], *perm])
+            assert got == want, (cat, sec, perm)
+        if stored[0] != main:
+            leads.add((key, stored[0]))
+    assert (len(VERDICT_ORDERS), withheld) == (651, 648)
+    assert leads == {(k, k[1]) for k in LEAD_KEYS}
+
+
+def test_any_stored_order_gives_only_pre_b103_answers() -> None:
+    """Новых путей нет. Для **любого** набора, главной из него и **любого** порядка хранимого
+    массива (в том числе такого, какого конвейер не пишет) лента даёт ответ из эталона до Б-103:
+    ``BEFORE_B103[(набор, главная)]``, а при главной ``life_threat`` без угрозы отправителя и
+    первой ``violence``/``self_harm`` — ``BEFORE_B103[(набор, первая)]``. То есть порядок
+    массива выбирает лишь между ответами, которые прежний конвейер уже давал на этот набор."""
+    for n in range(1, 5):
+        for combo in itertools.combinations(MESSAGE_TYPES, n):
+            db_set = tuple(sorted(DB[t] for t in combo))
+            for main in combo:
+                for perm in itertools.permutations(combo):
+                    got = couple_messages.crisis_blocks(DB[main], [DB[t] for t in perm])
+                    promoted = (
+                        main == "life_threat"
+                        and "outgoing_threat" not in combo
+                        and perm[0] in ("violence", "self_harm")
+                    )
+                    assert got == BEFORE_B103[(db_set, DB[perm[0] if promoted else main])], (
+                        combo,
+                        main,
+                        perm,
+                    )
+
+
+def test_chat_and_drafts_order_is_not_significant() -> None:
+    """Исключение Б-103 не задевает чат и черновики (``withheld=False``): там главная либо не
+    задана (порядок входа не значим вовсе), либо стоит первой (агент: ``crisis_type``, затем
+    вторичные и классификатор) — ``lead`` пуст, блоки = по упорядоченному набору. Включая
+    ``underage`` (в чате это строка протокола)."""
+    for n in range(1, 6):
+        for combo in itertools.combinations(crisis.CRISIS_TYPES, n):
+            canon = crisis.plan(crisis.order(combo)).blocks
+            for perm in itertools.permutations(combo):
+                assert crisis.plan(perm).blocks == canon, perm
+                p = crisis.plan(perm, primary=perm[0])
+                assert p.lead is None, perm
+                want = crisis.plan((perm[0], *crisis.order(perm[1:])), primary=perm[0])
+                assert p.blocks == want.blocks, perm
+
+
+async def test_worker_stores_lead_first_and_feed_matches(
+    sessionmaker: Any, engine: AsyncEngine, pair: Any
+) -> None:
+    """Через настоящий воркер и БД — по одному ответу классификатора на каждый различный
+    хранимый набор (порядок важен): массив в БД **ровно** ``_stored(ordered_types)`` (первая —
+    как передана, остальные по перечислению; CHECK его принимает), лента автора даёт эталон
+    до Б-103, получатель ничего не видит."""
+    anna, igor, _ = pair
+    picked: dict[tuple[tuple[str, ...], str], tuple[str, tuple[str, ...], tuple[str, ...]]] = {}
+    for cat, sec in VERDICT_ORDERS:
+        notice = (await _notice(cat, sec)).author_notice
+        if notice is None:
+            continue
+        cats = [c for c in (cat, *sec) if c != "none"]
+        raw = [pipeline.MESSAGE_CRISIS[c] for c in cats if c in pipeline.MESSAGE_CRISIS]
+        want = BEFORE_B103[(tuple(sorted({DB[t] for t in raw})), _old_main(cat, raw))]
+        stored = tuple(_stored(notice.ordered_types))
+        picked.setdefault((stored, DB[notice.primary]), (cat, sec, want))
+    assert len(picked) == 24
+    by_tag: dict[str, tuple[str, tuple[str, ...]]] = {}
+    ids: dict[uuid.UUID, tuple[tuple[tuple[str, ...], str], tuple[str, ...]]] = {}
+    for n, (k, (cat, sec, want)) in enumerate(picked.items()):
+        tag = f"[ord-{n}]"
+        by_tag[tag] = (cat, sec)
+        body = f"{tag} {INJECTION}" if n % 3 == 0 else f"{tag} Выдуманное сообщение."
+        ids[await worker_send(sessionmaker, anna, body)] = (k, want)
+
+    def answer(role: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if role == "safety":
+            cat, sec = by_tag[payload["text"].split(" ", 1)[0]]
+            return {"category": cat, "secondary": list(sec)}
+        return honest(role, payload)
+
+    w = worker(engine, Model(answer), batch=25)
+    done = 0
+    for _ in range(5):
+        out = await w.run_once()
+        if not out:
+            break
+        assert all(o.status == "withheld" for o in out), out
+        done += len(out)
+    assert done == len(picked)
+    async with engine.connect() as c:
+        rows = {
+            r.id: r
+            for r in await c.execute(
+                text(
+                    "SELECT id, withheld_crisis::text AS main, "
+                    "withheld_crisis_types::text[] AS ct FROM partner_messages "
+                    "WHERE id = ANY(:ids)"
+                ),
+                {"ids": list(ids)},
+            )
+        }
+    items, _ = await couple_messages.read_page(sessionmaker, KEYS, anna.user_id, limit=100)
+    mine = {i.id: i for i in items}
+    for mid, ((stored, main), want) in ids.items():
+        assert (tuple(rows[mid].ct), rows[mid].main) == (stored, main), mid
+        assert mine[mid].withheld_crisis == main
+        assert mine[mid].withheld_crisis_blocks == want, (stored, main)
+    seen, _ = await couple_messages.read_page(sessionmaker, KEYS, igor.user_id, limit=100)
+    assert not any(i.id in ids for i in seen if i.status == "withheld")
+    assert all(i.withheld_crisis_blocks is None for i in seen)
+
+
+@pytest.mark.parametrize(
+    ("main", "ct", "stored", "key"),
+    [
+        # Повтор первой строки дальше по массиву — схлопывается, первая остаётся первой.
+        (
+            "life_threat",
+            "{self_harm,violence,self_harm,life_threat,self_harm}",
+            ["self_harm", "violence", "life_threat"],
+            (("life_threat", "self_harm", "violence"), "self_harm"),
+        ),
+        # Первая — не строка порядка (угроза отправителю): правило «А», порядок не значим.
+        (
+            "life_threat",
+            "{threat_outgoing,life_threat,violence}",
+            ["threat_outgoing", "violence", "life_threat"],
+            (("life_threat", "threat_outgoing", "violence"), "life_threat"),
+        ),
+        # Первая — главная: как обычно.
+        (
+            "life_threat",
+            "{life_threat,self_harm,violence}",
+            ["life_threat", "violence", "self_harm"],
+            (("life_threat", "self_harm", "violence"), "life_threat"),
+        ),
+        # Главная не life_threat — первая строка порядок не меняет.
+        (
+            "violence",
+            "{self_harm,violence}",
+            ["self_harm", "violence"],
+            (("self_harm", "violence"), "violence"),
+        ),
+    ],
 )
-async def test_empty_types_is_unknown_set(env: Env) -> None:
-    _anna, mid = await _processing(env)
+async def test_function_keeps_first_as_passed(
+    env: Env, main: str, ct: str, stored: list[str], key: tuple[tuple[str, ...], str]
+) -> None:
+    """Функция 0021 под ``feelings_worker``: первая строка — как передана, остальные без повторов
+    по перечислению; CHECK принимает; лента автора — ответ из эталона до Б-103."""
+    anna, mid = await _processing(env)
+    c = await helpers.claim(env.engine, mid)
+    assert c is not None
+    async with env.engine.connect() as conn, conn.begin():
+        await conn.execute(text("SET LOCAL ROLE feelings_worker"))
+        ok = await conn.execute(
+            text(CALL6), {"m": mid, "t": c.token, "r": "safety", "c": main, "ct": ct}
+        )
+        assert ok.scalar_one() is True
+    row = await _row(env.engine, mid)
+    assert (row.main, row.ct) == (main, stored)
+    mine = {i["id"]: i for i in (await feed(env, anna, limit=100))["items"]}
+    assert mine[str(mid)]["withheld_crisis_blocks"] == list(BEFORE_B103[key])
+
+
+# =========================================================================== MINOR-2
+
+
+@pytest.mark.parametrize("types", [(), ("underage",), ("underage", "a8_unknown")])
+async def test_empty_types_is_unknown_set(env: Env, types: tuple[str, ...]) -> None:
+    """Ревью MINOR-2 / A8-0021-2: пустой набор или набор без известных строк — набор
+    неизвестен: в БД NULL, в ленте автора ``withheld_crisis_blocks: null`` (клиент показывает
+    консервативный набор по ``withheld_crisis``), главный тип записан."""
+    anna, mid = await _processing(env)
     c = await helpers.claim(env.engine, mid)
     assert c is not None
     sm = async_sessionmaker(env.engine)
-    assert await pw.withhold(sm, c, "safety", ("violence",), "violence", ()) is True
-    assert (await _row(env.engine, mid)).ct is None
+    assert await pw.withhold(sm, c, "safety", ("violence",), "violence", types) is True
+    row = await _row(env.engine, mid)
+    assert (row.main, row.ct) == ("violence", None)
+    mine = {i["id"]: i for i in (await feed(env, anna, limit=100))["items"]}
+    assert mine[str(mid)]["withheld_crisis"] == "violence"
+    assert mine[str(mid)]["withheld_crisis_blocks"] is None
+
+
+async def test_worker_without_notice_passes_unknown_set(
+    sessionmaker: Any, engine: AsyncEngine, pair: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-2, путь воркера: остановка безопасностью без ``author_notice`` (сейчас недостижима —
+    подменяется конвейер) передаёт набор ``None`` → в БД NULL, в ленте ``null``; главный тип —
+    по событиям."""
+    anna, _igor, _ = pair
+    mid = await worker_send(sessionmaker, anna, "Выдуманное сообщение без ответа протокола.")
+    real = pipeline.process
+
+    async def no_notice(*a: Any, **k: Any) -> pipeline.Delivery:
+        d = await real(*a, **k)
+        assert d.author_notice is not None
+        return dataclasses.replace(d, author_notice=None)
+
+    monkeypatch.setattr(pipeline, "process", no_notice)
+
+    def answer(role: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if role == "safety":
+            return {"category": "violence", "secondary": ["self_harm"]}
+        return honest(role, payload)
+
+    [o] = await worker(engine, Model(answer)).run_once()
+    assert (o.status, o.reason) == ("withheld", "safety")
+    row = await _row(engine, mid)
+    assert (row.main, row.ct) == ("violence", None)
+    items, _ = await couple_messages.read_page(sessionmaker, KEYS, anna.user_id, limit=100)
+    [mine] = [i for i in items if i.id == mid]
+    assert mine.withheld_crisis == "violence" and mine.withheld_crisis_blocks is None

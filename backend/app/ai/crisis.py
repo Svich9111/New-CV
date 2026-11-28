@@ -111,10 +111,20 @@ class CrisisResponse:
     template_version: str  # версия шаблона и, если были, блоки из других версий
     # Имена блоков шаблона в порядке показа (без ответа агента) — ``plan().blocks``.
     blocks: tuple[str, ...] = ()
+    # Строка, задающая порядок блоков в правиле «Б» (``plan().lead``; ``None`` — главная).
+    lead: CrisisType | None = None
 
     @property
     def types(self) -> tuple[CrisisType, ...]:
         return (self.primary, *self.secondary)
+
+    @property
+    def ordered_types(self) -> tuple[CrisisType, ...]:
+        """Набор признаков, первой — строка порядка ``lead`` (Б-103): ``plan(ordered_types,
+        primary=primary)`` даёт те же блоки. Так набор хранится в БД (0021), лента считает по
+        нему."""
+        first = self.lead or self.primary
+        return (first, *(t for t in self.types if t != first))
 
 
 def order(types: Iterable[str]) -> tuple[CrisisType, ...]:
@@ -145,6 +155,9 @@ class CrisisPlan:
     secondary: tuple[CrisisType, ...]
     blocks: tuple[str, ...]
     actions: frozenset[str]
+    # Строка, чей блок в правиле «Б» идёт сразу после экстренного (обычно — главная; Б-103 —
+    # категория модели при главной ``life_threat``, см. ``plan``).
+    lead: CrisisType | None = None
 
 
 def respond(
@@ -159,8 +172,12 @@ def respond(
     строкой и не порядком вторичных (ревью 0.5 R4-MAJOR-1). Главная строка (``primary`` от
     агента, иначе по ``PRIORITY``; ``underage`` — всегда главная; у остановленного сообщения
     конвейер передаёт ``life_threat`` главной при этом признаке — Б-103) идёт в событие и в
-    правиле «Б» задаёт блок после экстренного. Блоки и действия считает ``plan`` (без
-    текстов), текст — блоки шаблона ``prompt_set``.
+    правиле «Б» задаёт блок после экстренного. Исключение (Б-103, АР-57 п.4): если главная —
+    ``life_threat``, а **первой** в ``types`` стоит иная строка правила «Б» (``violence``,
+    ``self_harm`` — категория модели, поставленная конвейером первой), блок после экстренного —
+    её: повышение главной до ``life_threat`` кодом не меняет ответ (как до Б-103, когда главной
+    была категория модели). Блоки и действия считает ``plan`` (без текстов), текст — блоки
+    шаблона ``prompt_set``.
 
     Контекст: ``withheld = True`` — остановлено одобренное сообщение; ``False`` — личный чат
     (сообщения не было: ни «не отправлено», ни действия ``not_sent``).
@@ -189,7 +206,8 @@ def respond(
                            5. ``underage``, если U — последним.
     Б   нет T              0. ``not_sent``, если сообщение;
                            1. ``life_threat``, если L — первым (§9.3 стр. 4);
-                           2. блок главной строки (если не L и не U);
+                           2. блок строки порядка (главная; Б-103 — первая в ``types``
+                              при главной L), если не L и не U;
                            3. остальные строки по ``PRIORITY``;
                            4. ``underage`` — последним, чтобы ответ не начинался с отказа.
     ==  =================  =====================================================================
@@ -210,6 +228,7 @@ def respond(
         actions=p.actions,
         template_version=label,
         blocks=p.blocks,
+        lead=p.lead,
     )
 
 
@@ -217,14 +236,22 @@ def plan(types: Iterable[str], *, primary: str | None = None, withheld: bool = F
     """План ответа по протоколу §9.3 без текстов: главная и вторичные строки, имена блоков по
     порядку и действия — по таблице правил ``respond`` (там же — контекст ``withheld``). Лента
     пары вызывает ``plan`` с набором признаков и главным типом остановленного сообщения из БД
-    (0021): те же блоки, что ``respond`` показал автору в конвейере."""
-    ordered = order([*(types or ()), *([primary] if primary else [])])
+    (0021, набор — ``CrisisResponse.ordered_types``): те же блоки, что ``respond`` показал
+    автору в конвейере. Порядок ``types`` значим только в исключении Б-103 (см. ``respond``)."""
+    given = list(types or ())
+    ordered = order([*given, *([primary] if primary else [])])
     if not ordered:
         raise ValueError("нет строки кризисного протокола")
     main: CrisisType = ordered[0]
     if primary in CRISIS_TYPES and "underage" not in ordered:
         main = next(t for t in ordered if t == primary)
     rest = tuple(t for t in ordered if t != main)
+    lead: CrisisType = main
+    # Б-103: главная повышена до life_threat кодом — порядок блоков задаёт первая строка набора.
+    if primary == "life_threat" and main == "life_threat" and "outgoing_threat" not in ordered:
+        first = given[0] if given else None
+        if first in ("violence", "self_harm"):
+            lead = next(t for t in ordered if t == first)
     present = set(ordered)
     names: list[str] = []
     actions: frozenset[str]
@@ -256,7 +283,8 @@ def plan(types: Iterable[str], *, primary: str | None = None, withheld: bool = F
         sequence: list[CrisisType] = []
         if "life_threat" in present:
             sequence.append("life_threat")
-        sequence += [t for t in (main, *rest) if t not in ("underage", "life_threat")]
+        tail = (lead, *(t for t in (main, *rest) if t != lead))
+        sequence += [t for t in tail if t not in ("underage", "life_threat")]
         if "underage" in present:
             sequence.append("underage")
         names = list(sequence)
@@ -266,4 +294,10 @@ def plan(types: Iterable[str], *, primary: str | None = None, withheld: bool = F
             actions |= NOT_SENT_ACTIONS
     if not withheld:
         actions -= {"not_sent"}
-    return CrisisPlan(primary=main, secondary=rest, blocks=tuple(names), actions=actions)
+    return CrisisPlan(
+        primary=main,
+        secondary=rest,
+        blocks=tuple(names),
+        actions=actions,
+        lead=None if lead == main else lead,
+    )

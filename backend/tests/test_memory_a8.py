@@ -302,8 +302,9 @@ _PARKED: list[tuple[uuid.UUID, dict[uuid.UUID, tuple[Any, ...]]]] = []
 
 async def release_others(engine: AsyncEngine, keep: P) -> None:
     """Чужие агенты прошлых тестов не мешают захвату: доступные захвату (без аренды **или** с
-    истёкшей/истекающей арендой — Б-102) «заняты» надолго общим токеном парковки. Активные аренды
-    (дольше часа) не трогаются. Прежнее состояние запоминается, ``_restore_parked`` возвращает его
+    истёкшей арендой — Б-102) «заняты» надолго общим токеном парковки. Действующие аренды не
+    трогаются — их держит чужой воркер (например, параллельный прогон на той же базе; ревью 0021
+    MINOR-6). Прежнее состояние запоминается, ``_restore_parked`` возвращает его
     после теста — истёкшие аренды других модулей снова достаются своим тестам (Б-71)."""
     park = uuid.uuid4()
     async with engine.begin() as c:
@@ -312,7 +313,7 @@ async def release_others(engine: AsyncEngine, keep: P) -> None:
                 text(
                     "WITH old AS (SELECT id, memory_lease_token, memory_lease_kind, "
                     "memory_lease_at, memory_lease_until FROM agents WHERE id <> :a AND "
-                    "(memory_lease_token IS NULL OR memory_lease_until < now() + interval '1 hour') "
+                    "(memory_lease_token IS NULL OR memory_lease_until < now()) "
                     "FOR UPDATE) "
                     "UPDATE agents g SET memory_lease_token = :p, memory_lease_kind = 'extract', "
                     "memory_lease_at = now(), memory_lease_until = now() + interval '1 day' "
@@ -382,6 +383,51 @@ async def test_release_others_parks_expired_leases_and_restores(
     assert tuple(after) == tuple(before) and after[0] == old_tok
     # снова доступен захвату — как до парковки
     assert await claim_for(engine, other) is not None
+
+
+async def test_release_others_keeps_active_foreign_leases(engine: AsyncEngine) -> None:
+    """Ревью 0021 MINOR-6 (самопроверка хелпера): **действующие** чужие аренды — и долгие, и
+    истекающие через минуту — ``release_others`` не трогает (их держит чужой воркер, например
+    параллельный прогон на той же базе): токен, вид, начало и срок — как были, и ``unpark`` их
+    тоже не меняет. Истёкшая аренда и агент без аренды паркуются и возвращаются как были."""
+    async with engine.begin() as c:
+        mine = await person(c, "СвояАренда")
+        agents: dict[str, P] = {}
+        for tag, at_, until in (
+            ("long", "now() - interval '1 minute'", "now() + interval '3 hours'"),
+            ("soon", "now() - interval '9 minutes'", "now() + interval '1 minute'"),
+            ("expired", "now() - interval '2 hours'", "now() - interval '1 second'"),
+            ("free", None, None),
+        ):
+            p = await person(c, f"ЧужаяАренда-{tag}")
+            agents[tag] = p
+            if at_ is not None:
+                await c.execute(
+                    text(
+                        "UPDATE agents SET memory_lease_token = :t, memory_lease_kind = 'extract', "
+                        f"memory_lease_at = {at_}, memory_lease_until = {until} WHERE id = :a"
+                    ),
+                    {"t": uuid.uuid4(), "a": p.agent},
+                )
+
+    async def lease(p: P) -> tuple[Any, ...]:
+        async with engine.connect() as c:
+            row = (
+                await c.execute(text(f"SELECT {_LEASE} FROM agents WHERE id = :a"), {"a": p.agent})
+            ).one()
+        return tuple(row)
+
+    before = {tag: await lease(p) for tag, p in agents.items()}
+    await release_others(engine, mine)
+    parked = {tag: await lease(p) for tag, p in agents.items()}
+    assert parked["long"] == before["long"]
+    assert parked["soon"] == before["soon"]
+    park = _PARKED[-1][0]
+    assert parked["expired"][0] == park and parked["free"][0] == park
+    assert agents["long"].agent not in _PARKED[-1][1]
+    assert agents["soon"].agent not in _PARKED[-1][1]
+    await unpark(engine)
+    assert {tag: await lease(p) for tag, p in agents.items()} == before
 
 
 _LEASE = "memory_lease_token, memory_lease_kind, memory_lease_at, memory_lease_until"

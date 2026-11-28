@@ -23,14 +23,19 @@ Create Date: 2026-11-28 12:00:00
    функция остановки у воркера; вызов с 5 аргументами — набор NULL). SECURITY DEFINER,
    ``search_path = public, pg_temp``, EXECUTE только ``feelings_worker`` (как 0014). Проверки
    0014 и ещё: набор — только при ``safety`` (иначе 22023), непустой, одномерный, без NULL и
-   ``underage``, содержит ``p_crisis`` (иначе 22023; NULL — набор неизвестен). Записывается без повторов, по порядку
-   перечисления. Блокировки — как 0013/0014 (АР-13, АР-38, Б-45): автор ``FOR KEY SHARE`` →
+   ``underage``, содержит ``p_crisis`` (иначе 22023; NULL — набор неизвестен). Записывается без
+   повторов: первая строка — как передана (строка порядка блоков ``CrisisResponse.ordered_types``,
+   Б-103, АР-57 п.4), остальные — по порядку перечисления. Блокировки — как 0013/0014 (АР-13, АР-38, Б-45): автор ``FOR KEY SHARE`` →
    пара ``FOR KEY SHARE`` → сообщение ``FOR NO KEY UPDATE``; строка сообщения меняется один раз.
 3. ``app_couple_feed_page`` — последний столбец ``withheld_crisis_types`` (только автору, как
    ``withheld_crisis``; получателю NULL). Тип результата меняется — функция пересоздаётся, права
    те же (EXECUTE только ``feelings_app``).
 
 RLS и права таблицы не меняются (запись — только функциями воркера, чтение — функцией ленты).
+
+Выкладка (ревью MINOR-4): миграция **строго до** запуска нового кода — новый воркер на схеме 0020
+получает 42883, новая лента — 42703; старый код на схеме 0021 работает (5-аргументный вызов —
+набор NULL, лента выбирает столбцы по именам). Откат кода без отката схемы допустим.
 
 Downgrade: 6-аргументная функция удаляется, 5-аргументная (с правами 0014: ``REVOKE ALL … FROM
 PUBLIC``, ``GRANT EXECUTE … TO feelings_worker``) и лента — тела 0014, CHECK и колонка удаляются
@@ -75,8 +80,13 @@ TYPES_CHECK = (
 
 SCHEMA = (
     "ALTER TABLE partner_messages ADD COLUMN withheld_crisis_types safety_event_type[]",
+    # NOT VALID + VALIDATE (ревью MINOR-4): проверка существующих строк — отдельной командой под
+    # SHARE UPDATE EXCLUSIVE. В одной транзакции Alembic блокировка ADD COLUMN всё равно держится
+    # до конца; строки до 0021 — NULL, проверка проходит.
     "ALTER TABLE partner_messages ADD CONSTRAINT ck_partner_messages_withheld_crisis_types_safety "
-    f"CHECK ({TYPES_CHECK})",
+    f"CHECK ({TYPES_CHECK}) NOT VALID",
+    "ALTER TABLE partner_messages VALIDATE CONSTRAINT "
+    "ck_partner_messages_withheld_crisis_types_safety",
 )
 
 DROP_SCHEMA = (
@@ -112,7 +122,11 @@ CREATE FUNCTION pipeline_withhold_leased(p_message uuid, p_token uuid, p_reason 
                OR array_position(p_crisis_types, p_crisis) IS NULL THEN
                 RAISE EXCEPTION 'bad crisis types' USING ERRCODE = '22023';
             END IF;
-            v_types := ARRAY(SELECT DISTINCT e FROM unnest(p_crisis_types) AS e ORDER BY e);
+            -- Первая строка — как передана (строка порядка блоков, Б-103), остальные — без
+            -- повторов по порядку перечисления.
+            v_types := ARRAY[p_crisis_types[array_lower(p_crisis_types, 1)]]
+                || ARRAY(SELECT DISTINCT e FROM unnest(p_crisis_types) AS e
+                          WHERE e <> p_crisis_types[array_lower(p_crisis_types, 1)] ORDER BY e);
         END IF;@LOCK_LEASED@
         -- Кризис сильнее распада пары (О-3): причина safety и тип — для помощи автору (§9.3).
         UPDATE public.partner_messages

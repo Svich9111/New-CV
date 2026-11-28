@@ -2,7 +2,7 @@
  * A8, связка 0021 / АР-57 (задача 3.4, раунд 3 клиента): независимая проверка `src/couple/crisis.ts` и таблицы
  * `src/test/crisisCases.ts` (ТЗ §9.3; ФТ-11; АР-45, АР-57).
  *
- * - таблица клиента — все 32 сочетания «набор × главная», без повторов; правила §9.3, проверяемые без кода сервера
+ * - таблица клиента — все 32 сочетания «набор × главная», без повторов, и 4 строки Б-103 с иной первой строкой набора; правила §9.3, проверяемые без кода сервера
  *   (сверка с `crisis.plan` — серверный страж `backend/tests/test_crisis_blocks_a8.py`);
  * - любое нарушение контракта в `withheld_crisis_blocks` — откат на консервативный набор этого сообщения;
  * - у полученного, у не остановленного и при другой причине блоков нет никогда.
@@ -37,13 +37,40 @@ describe("A8 · таблица crisisCases.ts — полнота и правил
       const set = TYPES.filter((_, i) => mask & (1 << i));
       for (const main of set) want.add(`${[...set].sort().join("+")}@${main}`);
     }
-    const got = SERVER_CRISIS_CASES.map((c) => `${[...c.types].sort().join("+")}@${c.main}`);
+    const got = SERVER_CRISIS_CASES.filter((c) => c.first === undefined).map((c) => `${[...c.types].sort().join("+")}@${c.main}`);
     expect(got).toHaveLength(32);
     expect(new Set(got).size).toBe(32);
     expect(new Set(got)).toEqual(want);
   });
 
-  test.each(SERVER_CRISIS_CASES.map((c) => [`${c.types.join("+")}@${c.main}`, c] as const))(
+  test("Б-103 (раунд 2): 4 строки с первой — категорией модели при главной life_threat; блоки те же, после экстренного — блок первой", () => {
+    const lead = SERVER_CRISIS_CASES.filter((c) => c.first !== undefined);
+    expect(lead.map((c) => `${c.types.join("+")}@${c.main}`).sort()).toEqual(
+      [
+        "self_harm+life_threat@life_threat",
+        "self_harm+violence+life_threat@life_threat",
+        "violence+life_threat@life_threat",
+        "violence+self_harm+life_threat@life_threat",
+      ].sort(),
+    );
+    for (const c of lead) {
+      expect(c.main).toBe("life_threat");
+      expect(c.types[0]).toBe(c.first);
+      expect(c.types).not.toContain("threat_outgoing");
+      // §9.3 стр. 4: «звони» — сразу после «не отправлено»; затем — блок категории модели.
+      expect(c.blocks.slice(0, 3)).toEqual(["not_sent", "life_threat", c.first]);
+      // Те же блоки, что у строки «набор × главная»: меняется только порядок.
+      const base = SERVER_CRISIS_CASES.find(
+        (b) => b.first === undefined && b.main === c.main && [...b.types].sort().join() === [...c.types].sort().join(),
+      )!;
+      expect([...c.blocks].sort()).toEqual([...base.blocks].sort());
+    }
+    // Различный первый элемент одного набора — различный порядок блоков на экране.
+    const vsl = lead.filter((c) => c.types.length === 3).map((c) => c.blocks.join());
+    expect(new Set(vsl).size).toBe(2);
+  });
+
+  test.each(SERVER_CRISIS_CASES.map((c) => [`${c.types.join("+")}@${c.main}${c.first ? `^${c.first}` : ""}`, c] as const))(
     "%s — правила §9.3",
     (_n, c) => {
       const has = (t: (typeof TYPES)[number]) => c.types.includes(t);

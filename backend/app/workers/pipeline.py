@@ -428,13 +428,16 @@ class PipelineWorker:
         # 5. Исход — одна транзакция на сообщение.
         if not delivery.delivered:
             # Весь набор признаков (0021, АР-45, дополнение 3.4; Б-103): по нему лента покажет
-            # автору ровно протокол ``crisis.respond``, главный тип не теряет вторичные.
-            types = delivery.author_notice.types if delivery.author_notice else ()
+            # автору ровно протокол ``crisis.respond``, главный тип не теряет вторичные. Первой —
+            # строка порядка блоков (``ordered_types``, Б-103). Ответа нет — набор неизвестен
+            # (NULL, консервативный набор у клиента; ревью 0021 MINOR-2).
+            notice = delivery.author_notice
+            types = notice.ordered_types if notice else None
             return await self._withhold(
                 c,
                 "safety",
                 delivery.safety_events,
-                pw.crisis_type(delivery.safety_event, (*types, *delivery.safety_events)),
+                pw.crisis_type(delivery.safety_event, (*(types or ()), *delivery.safety_events)),
                 types,
             )
         if delivery.shown is None or delivery.tone is None:  # не бывает у доставленного

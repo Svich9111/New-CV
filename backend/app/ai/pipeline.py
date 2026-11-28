@@ -106,7 +106,9 @@ def message_primary(category: str, types: list[crisis.CrisisType]) -> crisis.Cri
     """Главная строка §9.3 остановленного сообщения (Б-103): при признаке угрозы жизни —
     ``life_threat`` кодом, а не только по промпту (``safety.v2``: «underage, затем life_threat»;
     ``underage`` у сообщения не строка конвейера); иначе — категория классификатора, если она
-    строка конвейера (``None`` — главная по ``crisis.PRIORITY``)."""
+    строка конвейера (``None`` — главная по ``crisis.PRIORITY``). Блоки ответа от этого не
+    меняются (АР-57 п.4): категория модели стоит в ``types`` первой, и ``crisis.plan`` при
+    главной ``life_threat`` ставит её блок после экстренного, как до Б-103."""
     if "life_threat" in types:
         return "life_threat"
     return MESSAGE_CRISIS.get(category)
@@ -417,6 +419,10 @@ async def _process(models: AgentModels, original: str, prompt_set: PromptSet) ->
     # п.3 — безопасность: ошибка модели здесь — сообщение не уходит (LLMError вызывающему).
     verdict: SafetyVerdict = await classify(models, "message", original, log, prompt_set)
     types = [MESSAGE_CRISIS[c] for c in verdict.categories if c in MESSAGE_CRISIS]
+    if verdict.category not in MESSAGE_CRISIS:
+        # Категория модели — не строка конвейера: порядок вторичных от модели не значим
+        # (первая строка набора задаёт порядок блоков только как категория модели, Б-103).
+        types = list(crisis.order(types))
     if types:
         notice = crisis.respond(
             types,

@@ -193,15 +193,17 @@ async def withhold(
     ``crisis`` — главный тип кризиса (crisis-тип или значение перечисления) только при
     ``safety``; не задан — по событиям и набору (``crisis_type``). ``types`` — весь набор
     признаков (``CrisisResponse.types``, 0021): по нему и главному типу лента отдаёт автору
-    блоки протокола (``crisis.plan``); главный тип в набор входит всегда. ``None`` — набор
-    неизвестен (в БД NULL, клиент показывает консервативный набор)."""
+    блоки протокола (``crisis.plan``); главный тип в набор входит всегда; порядок передачи
+    сохраняется для первой строки (``CrisisResponse.ordered_types``, Б-103). ``None``, пустой
+    набор или набор без известных строк — набор неизвестен (в БД NULL, клиент показывает
+    консервативный набор; ревью 0021 MINOR-2)."""
     if reason != "safety" and (crisis is not None or types is not None):
         raise ValueError("тип кризиса — только у остановки безопасностью")
     cr = crisis_type(crisis, (*(types or ()), *events)) if reason == "safety" else None
     ct: list[str] | None = None
-    if reason == "safety" and types is not None:
-        ct = crisis_types(types)
-        if cr not in ct:
+    if reason == "safety" and types:
+        ct = crisis_types(types) or None
+        if ct is not None and cr not in ct:
             ct.append(str(cr))
     async with worker_scope(sm) as s:
         value = (
