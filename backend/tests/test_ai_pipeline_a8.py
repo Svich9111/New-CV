@@ -1891,7 +1891,10 @@ async def test_r3_sender_template_without_victim_blocks(
         forbid=("tone", "adapt", "meaning"),
     )
     notice = delivery.author_notice
-    assert notice is not None and notice.primary == "outgoing_threat"
+    # Б-103 (3.4, A1/A3): при признаке угрозы жизни главная — life_threat (код, не только
+    # промпт safety.v2); блоки (правило «А») от главной не зависят — проверка ниже та же.
+    main = "life_threat" if "life_threat" in secondary else "outgoing_threat"
+    assert notice is not None and notice.primary == main
     # Раунд 3 (A3, R3-MAJOR-1): при вторичных violence/life_threat помощь не выбрасывается —
     # смешанный блок отправителю и нейтральный author_safety (crisis.v2) с help_contacts и
     # emergency_services; действий пострадавшему (name_it, no_tolerate) нет.
@@ -1959,7 +1962,10 @@ async def test_r4_mixed_message_full_text_and_actions(
     low = notice.text.casefold()
     assert VICTIM_PHRASE not in low and SUGGEST_WORDS not in low
     assert low.count("не отправлено") == 1
-    assert delivery.safety_event == "outgoing_threat"
+    # Б-103: при признаке угрозы жизни главная — life_threat (код); блоки от главной не зависят.
+    assert delivery.safety_event == (
+        "life_threat" if "life_threat" in secondary else "outgoing_threat"
+    )
     late = [n for n in expected if n not in crisis.CRISIS_TYPES]
     assert notice.template_version == "v0" + "".join(
         f"+{n}@{'v1' if n == 'not_sent' else 'v2'}" for n in late

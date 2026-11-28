@@ -434,6 +434,17 @@ class PartnerMessage(Base):
             "AND withheld_crisis <> 'underage')",
             name="withheld_crisis_safety",
         ),
+        # 0021 (АР-45, дополнение 3.4): набор признаков — только типы, при главном типе, без
+        # underage и NULL, главный тип входит в набор.
+        CheckConstraint(
+            "withheld_crisis_types IS NULL OR (withheld_crisis IS NOT NULL "
+            "AND array_ndims(withheld_crisis_types) = 1 "
+            "AND cardinality(withheld_crisis_types) BETWEEN 1 AND 4 "
+            "AND array_position(withheld_crisis_types, NULL) IS NULL "
+            "AND array_position(withheld_crisis_types, 'underage') IS NULL "
+            "AND withheld_crisis = ANY (withheld_crisis_types))",
+            name="withheld_crisis_types_safety",
+        ),
         CheckConstraint("work_attempts >= 0", name="work_attempts_nonnegative"),
         # 0013: очередь конвейера (processing) и очередь уведомлений получателю (Б-47).
         Index(
@@ -494,6 +505,9 @@ class PartnerMessage(Base):
     withheld_reason: Mapped[str | None] = mapped_column(String(32))
     # 0014: главный тип кризиса при withheld_reason = safety — протокол автору (§9.3).
     withheld_crisis: Mapped[str | None] = mapped_column(SafetyEventType)
+    # 0021: весь набор признаков кризиса (только типы, без текста) — по нему лента отдаёт автору
+    # имена блоков протокола §9.3 (``crisis.plan``); NULL — неизвестен (до 0021).
+    withheld_crisis_types: Mapped[list[str] | None] = mapped_column(ARRAY(SafetyEventType))
     work_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     work_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     work_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sa_text("0"))

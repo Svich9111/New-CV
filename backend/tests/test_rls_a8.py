@@ -951,7 +951,7 @@ PIPELINE_FUNCS = [
     "pipeline_notify_done(uuid, uuid)",  # 0013
     "pipeline_release(uuid, uuid, interval, boolean)",  # 0014, раунд 1 задачи 3.2 (АР-45)
     "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[], "
-    "safety_event_type)",  # 0014: с типом кризиса
+    "safety_event_type, safety_event_type[])",  # 0014: с типом кризиса; 0021: с набором
     "pipeline_notify_release(uuid, uuid, interval, boolean)",  # 0015, раунд 1 задачи 3.5
 ]
 # Б-83, 0016 (АР-48): функции конвейера без проверки аренды и 4-аргументная обёртка сняты.
@@ -1017,7 +1017,7 @@ async def test_definer_functions_executable_only_by_intended_roles(engine: Async
 
 async def test_unleased_pipeline_functions_removed(engine: AsyncEngine) -> None:
     """Б-83, 0016 (АР-48): функций конвейера без проверки аренды нет (обхода «ровно один раз» и
-    одобрения Б-48 не осталось); `pipeline_withhold_leased` — только 5-аргументная. Взамен роли
+    одобрения Б-48 не осталось); `pipeline_withhold_leased` — одна (с 0021 — 6 аргументов). Взамен роли
     ничего не получили: прав воркера на таблицу сообщений нет, полный набор SECURITY DEFINER и их
     права сверяет `test_definer_functions_executable_only_by_intended_roles`."""
     async with engine.connect() as conn:

@@ -10,8 +10,9 @@
 Лента — от новых к старым, курсор непрозрачный (позиция + HMAC, привязан к владельцу; чужой или
 испорченный — 422). Автору — его оригинал (версию для получателя автор не видит, АР-25 п.3),
 получателю — версия для получателя с пометкой `is_adapted`; недоставленное получателю не видно.
-Автору у остановленного — причина `withheld_reason` и тип кризиса `withheld_crisis` (какой
-протокол помощи показать, ТЗ §9.3; АР-44, АР-45); получателю и в других статусах — null.
+Автору у остановленного — причина `withheld_reason`, тип кризиса `withheld_crisis` и имена блоков
+протокола `withheld_crisis_blocks` (ровно ответ `crisis.respond` по всему набору признаков, ТЗ
+§9.3; АР-44, АР-45, дополнение 3.4); получателю и в других статусах — null.
 Нерасшифрованный текст не скрывается: в `text` — `UnavailableText` с кодом причины (контракт —
 `ExportText`, АР-40); в журнал — код причины и колонка.
 
@@ -50,6 +51,20 @@ WithheldReason = Literal[
     "safety", "model_refusal", "pipeline_error", "attempts_exhausted", "couple_ended"
 ]
 WithheldCrisis = Literal["violence", "threat_outgoing", "self_harm", "life_threat"]
+# Имена блоков ``prompts/crisis.v2.md``, которые ``crisis.plan(..., withheld=True)`` даёт при
+# наборах признаков сообщения (без ``underage`` и вариантов личного чата ``*_chat``); полнота —
+# тест ``test_crisis_blocks.py``.
+CrisisBlock = Literal[
+    "not_sent",
+    "life_threat",
+    "violence",
+    "self_harm",
+    "outgoing_threat",
+    "outgoing_threat_mixed",
+    "outgoing_threat_brief",
+    "author_safety",
+    "author_safety_life",
+]
 
 
 class PartnerMessage(BaseModel):
@@ -63,6 +78,9 @@ class PartnerMessage(BaseModel):
     # статусах — null.
     withheld_reason: WithheldReason | None = None
     withheld_crisis: WithheldCrisis | None = None
+    # 0021 (АР-45, дополнение 3.4): блоки протокола §9.3 по порядку — только автору при
+    # ``safety``; null — набор признаков неизвестен (сообщения до 0021) или не ``safety``.
+    withheld_crisis_blocks: list[CrisisBlock] | None = None
     reply_to_id: uuid.UUID | None
     sent_at: datetime
     read_at: datetime | None
@@ -154,6 +172,9 @@ async def feed(
                 read_at=r.read_at,
                 withheld_reason=r.withheld_reason,
                 withheld_crisis=r.withheld_crisis,
+                withheld_crisis_blocks=(
+                    None if r.withheld_crisis_blocks is None else list(r.withheld_crisis_blocks)
+                ),
             )
             for r in rows
         ],

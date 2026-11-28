@@ -61,7 +61,7 @@ NEW_WORKER_FUNCS = (
     "pipeline_read(uuid, uuid)",
     "pipeline_deliver_leased(uuid, uuid, bytea, boolean, smallint, boolean, safety_event_type[])",
     "pipeline_withhold_leased(uuid, uuid, character varying, safety_event_type[], "
-    "safety_event_type)",  # 0014 (4-аргументная 0013 снята в 0016)
+    "safety_event_type, safety_event_type[])",  # 0014/0021 (4-аргументная 0013 снята в 0016)
     "pipeline_claim_notify(interval, integer, integer)",
     "pipeline_notify_done(uuid, uuid)",
 )

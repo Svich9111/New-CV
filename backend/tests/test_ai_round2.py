@@ -82,7 +82,9 @@ async def test_author_acts_gets_only_sender_template(
         models_of(p), pipeline.approve(TEXT, confirmed=True), prompt_set=prompt_set
     )
     notice = delivery.author_notice
-    assert notice is not None and notice.primary == "outgoing_threat"
+    # Б-103: при признаке угрозы жизни главная — life_threat (код); блоки от главной не зависят.
+    main = "life_threat" if "life_threat" in secondary else "outgoing_threat"
+    assert notice is not None and notice.primary == main
     # Полный текст ответа — блок отправителю (смешанный вариант) и нейтральная помощь, дословно
     # (раунд 3, R3-MAJOR-1): без текста пострадавшему, но и без потери помощи.
     safety = "author_safety_life" if "life_threat" in secondary else "author_safety"  # раунд 4
@@ -95,8 +97,8 @@ async def test_author_acts_gets_only_sender_template(
     assert not {"name_it", "no_tolerate"} & notice.actions
     assert {"help_contacts", "emergency_services"} <= notice.actions
     assert {"not_sent", "no_softening", "explain_reason", "return_to_talk"} <= notice.actions
-    assert set(secondary) <= set(notice.secondary)  # строки остаются для события
-    assert delivery.safety_event == "outgoing_threat"
+    assert {*secondary, "outgoing_threat"} == set(notice.types)  # строки остаются для события
+    assert delivery.safety_event == main
 
 
 async def test_victim_primary_still_gets_victim_block() -> None:

@@ -109,6 +109,8 @@ class CrisisResponse:
     text: str
     actions: frozenset[str]
     template_version: str  # версия шаблона и, если были, блоки из других версий
+    # Имена блоков шаблона в порядке показа (без ответа агента) — ``plan().blocks``.
+    blocks: tuple[str, ...] = ()
 
     @property
     def types(self) -> tuple[CrisisType, ...]:
@@ -133,6 +135,18 @@ THREAT_BLOCKS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class CrisisPlan:
+    """Что показать автору по протоколу — без текстов: главная и вторичные строки, имена блоков
+    шаблона в порядке показа и действия. Тексты блоков — ``respond`` (или клиент по именам,
+    АР-45, дополнение 3.4: лента отдаёт автору остановленного сообщения ``blocks``)."""
+
+    primary: CrisisType
+    secondary: tuple[CrisisType, ...]
+    blocks: tuple[str, ...]
+    actions: frozenset[str]
+
+
 def respond(
     types: Iterable[str],
     agent_reply: str | None = None,
@@ -143,8 +157,10 @@ def respond(
 ) -> CrisisResponse:
     """Ответ по протоколу §9.3. Текст определяется **набором** строк и контекстом, а не главной
     строкой и не порядком вторичных (ревью 0.5 R4-MAJOR-1). Главная строка (``primary`` от
-    агента, иначе по ``PRIORITY``; ``underage`` — всегда главная) идёт в событие и в правиле «Б»
-    задаёт блок после экстренного.
+    агента, иначе по ``PRIORITY``; ``underage`` — всегда главная; у остановленного сообщения
+    конвейер передаёт ``life_threat`` главной при этом признаке — Б-103) идёт в событие и в
+    правиле «Б» задаёт блок после экстренного. Блоки и действия считает ``plan`` (без
+    текстов), текст — блоки шаблона ``prompt_set``.
 
     Контекст: ``withheld = True`` — остановлено одобренное сообщение; ``False`` — личный чат
     (сообщения не было: ни «не отправлено», ни действия ``not_sent``).
@@ -181,6 +197,27 @@ def respond(
     Действия: объединение действий показанных строк; в «А» при V или L — ещё ``help_contacts`` и
     ``emergency_services``, при H или U — без ``return_to_talk``; для сообщения —
     ``not_sent`` и ``explain_reason``; в чате ``not_sent`` нет никогда."""
+    p = plan(types, primary=primary, withheld=withheld)
+    version = prompt_set.version("crisis")
+    used: dict[str, str] = {}
+    parts = [agent_reply.strip()] if agent_reply and agent_reply.strip() else []
+    parts += [_block(version, n, used) for n in p.blocks]
+    label = version + "".join(f"+{n}@{v}" for n, v in used.items())
+    return CrisisResponse(
+        primary=p.primary,
+        secondary=p.secondary,
+        text="\n\n".join(parts),
+        actions=p.actions,
+        template_version=label,
+        blocks=p.blocks,
+    )
+
+
+def plan(types: Iterable[str], *, primary: str | None = None, withheld: bool = False) -> CrisisPlan:
+    """План ответа по протоколу §9.3 без текстов: главная и вторичные строки, имена блоков по
+    порядку и действия — по таблице правил ``respond`` (там же — контекст ``withheld``). Лента
+    пары вызывает ``plan`` с набором признаков и главным типом остановленного сообщения из БД
+    (0021): те же блоки, что ``respond`` показал автору в конвейере."""
     ordered = order([*(types or ()), *([primary] if primary else [])])
     if not ordered:
         raise ValueError("нет строки кризисного протокола")
@@ -189,8 +226,6 @@ def respond(
         main = next(t for t in ordered if t == primary)
     rest = tuple(t for t in ordered if t != main)
     present = set(ordered)
-    version = prompt_set.version("crisis")
-    used: dict[str, str] = {}
     names: list[str] = []
     actions: frozenset[str]
     chat = "" if withheld else "_chat"
@@ -231,13 +266,4 @@ def respond(
             actions |= NOT_SENT_ACTIONS
     if not withheld:
         actions -= {"not_sent"}
-    parts = [agent_reply.strip()] if agent_reply and agent_reply.strip() else []
-    parts += [_block(version, n, used) for n in names]
-    label = version + "".join(f"+{n}@{v}" for n, v in used.items())
-    return CrisisResponse(
-        primary=main,
-        secondary=rest,
-        text="\n\n".join(parts),
-        actions=actions,
-        template_version=label,
-    )
+    return CrisisPlan(primary=main, secondary=rest, blocks=tuple(names), actions=actions)

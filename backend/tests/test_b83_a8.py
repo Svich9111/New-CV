@@ -100,7 +100,10 @@ async def _messages_digest(engine: AsyncEngine) -> tuple[int, str]:
         row = (
             await c.execute(
                 text(
-                    "SELECT count(*), coalesce(md5(string_agg(t::text, '|' ORDER BY id)), '') "
+                    # 0021 добавила колонку набора признаков кризиса — вне 0015/0016, её нет
+                    # на 0015; сравниваются все прочие колонки.
+                    "SELECT count(*), coalesce(md5(string_agg("
+                    "(to_jsonb(t) - 'withheld_crisis_types')::text, '|' ORDER BY id)), '') "
                     "FROM partner_messages t"
                 )
             )
@@ -136,15 +139,16 @@ OLD_CALLS = (
 
 async def test_no_unleased_function_under_any_name_or_schema(engine: AsyncEngine) -> None:
     """Б-83, АР-48: функций ``pipeline_original``/``pipeline_deliver``/``pipeline_withhold`` нет
-    ни с какой сигнатурой и ни в какой схеме; ``pipeline_withhold_leased`` — одна, 5 аргументов;
-    ни одна роль не может исполнить снятое (его просто нет)."""
+    ни с какой сигнатурой и ни в какой схеме; ``pipeline_withhold_leased`` — одна: 5 аргументов
+    (0014), с 0021 — 6 (набор признаков кризиса, DEFAULT NULL); ни одна роль не может исполнить
+    снятое (его просто нет)."""
     async with engine.connect() as c:
         names = (
             await c.execute(
                 text(
                     "SELECT p.oid::regprocedure::text FROM pg_proc p "
                     "WHERE p.proname = ANY(:n) OR p.proname ILIKE 'pipeline_original%' "
-                    "OR (p.proname = 'pipeline_withhold_leased' AND p.pronargs <> 5)"
+                    "OR (p.proname = 'pipeline_withhold_leased' AND p.pronargs <> 6)"
                 ),
                 {"n": list(OLD_NAMES)},
             )

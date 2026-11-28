@@ -350,6 +350,7 @@ async def send_draft(
         # 202 — сообщение только что создано в ``processing``: причины остановки ещё нет.
         withheld_reason=None,
         withheld_crisis=None,
+        withheld_crisis_blocks=None,
     )
     return JSONResponse(out.model_dump(mode="json"), status_code=202, headers=NO_STORE)
 

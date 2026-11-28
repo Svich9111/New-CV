@@ -47,11 +47,13 @@ _DELIVER = (
     "SELECT pipeline_deliver_leased(:m, :t, :b, :ad, CAST(:tone AS smallint), :h, "
     "CAST(CAST(:ev AS text[]) AS safety_event_type[]))"
 )
-# 0014: 5 аргументов — тип кризиса для автора (``safety`` требует его, прочие причины — NULL).
+# 0021: 6 аргументов — главный тип кризиса для автора (``safety`` требует его, прочие причины —
+# NULL) и весь набор признаков (протокол §9.3 автору на чтении ленты; АР-45, дополнение 3.4).
 _WITHHOLD = (
     "SELECT pipeline_withhold_leased(:m, :t, :r, "
     "CAST(CAST(:ev AS text[]) AS safety_event_type[]), "
-    "CAST(CAST(:cr AS text) AS safety_event_type))"
+    "CAST(CAST(:cr AS text) AS safety_event_type), "
+    "CAST(CAST(:ct AS text[]) AS safety_event_type[]))"
 )
 _RELEASE = "SELECT pipeline_release(:m, :t, CAST(CAST(:after AS text) AS interval), :count)"
 MAX_RETRY_AFTER = timedelta(days=1)  # предел pipeline_release (22023 больше)
@@ -97,16 +99,28 @@ def event_types(events: Iterable[str]) -> list[str]:
 
 
 def crisis_type(primary: str | None, events: Iterable[str]) -> str:
-    """Тип кризиса для автора (АР-45 п.3; шаблон отправителя при ``threat_outgoing``, §9.3):
-    главный тип, иначе первый известный не-``underage`` из событий. Неизвестно ничего —
-    ``life_threat`` с предупреждением: самый осторожный протокол (экстренные службы), остановка
-    не срывается (MINOR-6; при ``MESSAGE_CRISIS`` ⊂ ``SAFETY_EVENT_TYPES`` недостижимо)."""
-    for e in (primary, *events):
-        db = _db_type(e)
-        if db is not None and db != "underage":
-            return db
+    """Главный тип кризиса для автора (АР-45 п.3; шаблон отправителя при ``threat_outgoing``,
+    §9.3). Б-103: признак угрозы жизни среди ``primary`` и ``events`` — ``life_threat`` (главная
+    по ``safety.v2`` и ``crisis.PRIORITY``, гарантирует код); иначе главный тип, иначе первый
+    известный не-``underage`` из событий (``underage`` не затирает известный признак: в
+    ``events`` воркер передаёт и весь набор признаков ``CrisisResponse.types``). Неизвестно
+    ничего — ``life_threat`` с предупреждением: самый осторожный протокол (экстренные службы),
+    остановка не срывается (MINOR-6; при ``MESSAGE_CRISIS`` ⊂ ``SAFETY_EVENT_TYPES``
+    недостижимо)."""
+    known = [db for e in (primary, *events) if (db := _db_type(e)) not in (None, "underage")]
+    if "life_threat" in known:
+        return "life_threat"
+    if known:
+        return known[0]
     logger.warning("pipeline: crisis type unknown, cautious protocol used")
     return "life_threat"
+
+
+def crisis_types(types: Iterable[str]) -> list[str]:
+    """Набор признаков остановленного сообщения → значения ``safety_event_type`` без повторов,
+    без ``underage`` (у сообщения не строка конвейера) и без неизвестных (предупреждение — только
+    код, без текста). Только типы — текста сообщения в наборе нет (§7, §9.3)."""
+    return list(dict.fromkeys(t for t in event_types(types) if t != "underage"))
 
 
 async def claim(
@@ -172,14 +186,23 @@ async def withhold(
     reason: WithholdReason,
     events: Sequence[str] = (),
     crisis: str | None = None,
+    types: Sequence[str] | None = None,
 ) -> bool:
     """Остановка по токену с причиной (видна автору в ленте); ``False`` — как ``lost`` (аренду
     перехватили, сообщения нет или исход уже записан — запись по токену идемпотентна, 0014).
-    ``crisis`` — тип кризиса (crisis-тип или значение перечисления) только при ``safety``; не
-    задан — по событиям (``crisis_type``)."""
-    if reason != "safety" and crisis is not None:
+    ``crisis`` — главный тип кризиса (crisis-тип или значение перечисления) только при
+    ``safety``; не задан — по событиям и набору (``crisis_type``). ``types`` — весь набор
+    признаков (``CrisisResponse.types``, 0021): по нему и главному типу лента отдаёт автору
+    блоки протокола (``crisis.plan``); главный тип в набор входит всегда. ``None`` — набор
+    неизвестен (в БД NULL, клиент показывает консервативный набор)."""
+    if reason != "safety" and (crisis is not None or types is not None):
         raise ValueError("тип кризиса — только у остановки безопасностью")
-    cr = crisis_type(crisis, events) if reason == "safety" else None
+    cr = crisis_type(crisis, (*(types or ()), *events)) if reason == "safety" else None
+    ct: list[str] | None = None
+    if reason == "safety" and types is not None:
+        ct = crisis_types(types)
+        if cr not in ct:
+            ct.append(str(cr))
     async with worker_scope(sm) as s:
         value = (
             await s.execute(
@@ -190,6 +213,7 @@ async def withhold(
                     "r": reason,
                     "ev": event_types(events) or None,
                     "cr": cr,
+                    "ct": ct,
                 },
             )
         ).scalar_one()

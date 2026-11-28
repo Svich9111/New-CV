@@ -2191,10 +2191,23 @@ export interface components {
              *     какой протокол помощи показать (ТЗ §9.3, АР-28): `threat_outgoing` — шаблон для
              *     отправителя («объяснить причину, вернуться к разговору»), `self_harm` — круглосуточная
              *     помощь, `life_threat` — экстренные службы, `violence` — помощь пострадавшему. null —
-             *     тип неизвестен (сообщения до 0014) — показывать общий протокол.
+             *     тип неизвестен (сообщения до 0014) — показывать общий протокол. Если есть
+             *     `withheld_crisis_blocks`, протокол берётся из него; поле оставлено для совместимости.
              * @enum {string|null}
              */
             withheld_crisis?: "violence" | "threat_outgoing" | "self_harm" | "life_threat" | null;
+            /**
+             * @description Только автору и только при `withheld_reason: safety` (АР-45, дополнение 3.4): имена
+             *     блоков кризисного протокола (ТЗ §9.3) в порядке показа — ровно те, что сервер
+             *     (`crisis.respond`) показал бы автору по **всему** набору признаков сообщения (правила
+             *     «А»/«Б»), а не по одному главному типу. Тексты блоков — `prompts/crisis.v2.md` (блок
+             *     с тем же именем); ниже блоков — контакты помощи и 112 (`GET /help/contacts`), как
+             *     всегда при кризисе. Текста сообщения в поле нет. null — набор признаков неизвестен
+             *     (сообщения до 0021) или причина не `safety`: тогда клиент показывает консервативный
+             *     набор по `withheld_crisis` (задача 3.4, «Заметки A4 (раунд 2)»). Получателю — null
+             *     всегда.
+             */
+            withheld_crisis_blocks?: ("not_sent" | "life_threat" | "violence" | "self_harm" | "outgoing_threat" | "outgoing_threat_mixed" | "outgoing_threat_brief" | "author_safety" | "author_safety_life")[] | null;
             /** Format: uuid */
             reply_to_id?: string | null;
             /** Format: date-time */

@@ -23,8 +23,9 @@
 
    - доставлено/адаптировано/оригинал с предупреждением → ``pipeline_deliver_leased`` (версия для
      получателя шифруется с контекстом ``partner_messages|adapted_enc|<id>``; события — типом);
-   - кризис (АР-28) → ``pipeline_withhold_leased('safety', события, тип кризиса)`` — тип нужен
-     экрану 3.4 для протокола §9.3 (шаблон отправителя при ``threat_outgoing``, АР-45 п.3);
+   - кризис (АР-28) → ``pipeline_withhold_leased('safety', события, тип кризиса, набор
+     признаков)`` — экрану 3.4 для протокола §9.3: главный тип (АР-45 п.3) и весь набор
+     (0021): лента отдаёт автору имена блоков ``crisis.plan`` — ровно то, что показал бы сервер;
    - отказ модели (АР-20, АР-27) → ``model_refusal``: одобрение израсходовано, автоповтора нет;
    - ``bad_request`` (ошибка в коде), шифротекст не открылся, текст не проходит ``approve`` →
      ``pipeline_error``;
@@ -358,8 +359,11 @@ class PipelineWorker:
         reason: WithholdReason,
         events: tuple[str, ...] = (),
         crisis: str | None = None,
+        types: tuple[str, ...] | None = None,
     ) -> PipelineOutcome:
-        ok, failed = await self._write(lambda: pw.withhold(self.sm, c, reason, events, crisis))
+        ok, failed = await self._write(
+            lambda: pw.withhold(self.sm, c, reason, events, crisis, types)
+        )
         return self._done(c, "withheld" if ok else "lost", failed, reason=reason)
 
     async def _release(
@@ -423,11 +427,15 @@ class PipelineWorker:
         self._resume()
         # 5. Исход — одна транзакция на сообщение.
         if not delivery.delivered:
+            # Весь набор признаков (0021, АР-45, дополнение 3.4; Б-103): по нему лента покажет
+            # автору ровно протокол ``crisis.respond``, главный тип не теряет вторичные.
+            types = delivery.author_notice.types if delivery.author_notice else ()
             return await self._withhold(
                 c,
                 "safety",
                 delivery.safety_events,
-                pw.crisis_type(delivery.safety_event, delivery.safety_events),
+                pw.crisis_type(delivery.safety_event, (*types, *delivery.safety_events)),
+                types,
             )
         if delivery.shown is None or delivery.tone is None:  # не бывает у доставленного
             return await self._withhold(c, "pipeline_error")

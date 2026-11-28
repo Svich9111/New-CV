@@ -8,8 +8,9 @@
   получателю — версия для получателя; ``processing``/``withheld`` получателю не видны. После
   выхода из пары или её распада лента пуста (ТЗ §4.5 п.2). Предел функции — 100 строк: при
   ``limit = 100`` полная страница даёт курсор, следующая может оказаться пустой (Б-80). Автору у
-  остановленного (``withheld``) — причина ``withheld_reason`` и тип кризиса ``withheld_crisis``
-  (0013/0014, АР-44, АР-45; получателю функция отдаёт NULL);
+  остановленного (``withheld``) — причина ``withheld_reason``, тип кризиса ``withheld_crisis``
+  и набор признаков (0013/0014/0021, АР-44, АР-45; получателю функция отдаёт NULL); по набору —
+  имена блоков протокола §9.3 ``withheld_crisis_blocks`` (``crisis.plan``, как в конвейере);
 - ``app_read_original`` — оригинал: получателю доставленного — с фиксацией просмотра
   ``original_viewed_at``, автору — без неё; сообщение должно быть из текущей пары (иначе ``Gone``
   — 404, как в ленте). Не расшифровался — транзакция откатывается вместе с отметкой (просмотр
@@ -24,6 +25,7 @@ id."""
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -31,9 +33,11 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.ai import crisis
 from app.core import crypto
 from app.core.crypto import Keyring
 from app.db import user_scope
+from app.repositories.chat import SAFETY_EVENT_TYPES
 from app.repositories.texts import open_row
 
 FEED_BATCH = 100  # предел одного вызова app_couple_feed (LEAST(..., 100))
@@ -42,7 +46,8 @@ DELIVERED = ("delivered", "read", "answered")
 _FEED_PAGE = (
     "SELECT id, couple_id, outgoing, text_enc, is_adapted, harsh_tone_warning, "
     "status::text AS status, reply_to_id, draft_id, sent_at, read_at, "
-    "withheld_reason, withheld_crisis::text AS withheld_crisis "
+    "withheld_reason, withheld_crisis::text AS withheld_crisis, "
+    "withheld_crisis_types::text[] AS withheld_crisis_types "
     "FROM app_couple_feed_page(:l, :ba, :bi)"
 )
 _CURRENT_COUPLE = (
@@ -77,6 +82,9 @@ class FeedItem:
     # АР-45): причина остановки и тип кризиса — какой протокол помощи показать (§9.3).
     withheld_reason: str | None = None
     withheld_crisis: str | None = None
+    # 0021 (АР-45, дополнение 3.4): имена блоков протокола §9.3 в порядке показа — ровно
+    # ``crisis.plan`` по набору признаков и главному типу; ``None`` — набор неизвестен (до 0021).
+    withheld_crisis_blocks: tuple[str, ...] | None = None
 
 
 class Gone(Exception):
@@ -104,6 +112,24 @@ def _open(keys: Keyring, r: Any) -> tuple[str | None, str | None]:
     return open_row(keys, crypto.MESSAGE_ORIGINAL, draft, m["text_enc"])
 
 
+# Значение ``safety_event_type`` → строка §9.3 (``crisis``); обратное ``SAFETY_EVENT_TYPES``.
+_CRISIS_OF_DB = {db: t for t, db in SAFETY_EVENT_TYPES.items()}
+
+
+def crisis_blocks(primary: str | None, types: Sequence[str] | None) -> tuple[str, ...] | None:
+    """Имена блоков протокола автору остановленного сообщения — тот же ``crisis.plan``, что
+    строит ответ ``crisis.respond`` в конвейере (``withheld=True``), по набору признаков и
+    главному типу из БД. ``None`` — набора нет (до 0021) или он не читается: клиент показывает
+    консервативный набор. Только имена — текста сообщения здесь нет."""
+    if primary is None or not types:
+        return None
+    found = [_CRISIS_OF_DB[t] for t in types if t in _CRISIS_OF_DB and t != "underage"]
+    main = _CRISIS_OF_DB.get(primary)
+    if main is None or main == "underage" or main not in found:
+        return None
+    return crisis.plan(found, primary=main, withheld=True).blocks
+
+
 def _withheld(r: Any) -> dict[str, str | None]:
     """Причина и тип кризиса — только своему ``withheld`` (функция уже обнуляет их получателю;
     здесь — вторая граница: у входящих и не остановленных полей нет)."""
@@ -114,6 +140,13 @@ def _withheld(r: Any) -> dict[str, str | None]:
         "withheld_reason": reason,
         "withheld_crisis": r.withheld_crisis if reason == "safety" else None,
     }
+
+
+def _blocks(r: Any) -> tuple[str, ...] | None:
+    """Блоки протокола — только своему ``withheld`` по безопасности (та же вторая граница)."""
+    if not r.outgoing or r.status != "withheld" or r.withheld_reason != "safety":
+        return None
+    return crisis_blocks(r.withheld_crisis, r.withheld_crisis_types)
 
 
 async def read_page(
@@ -158,6 +191,7 @@ async def read_page(
                 read_at=r.read_at,
                 unavailable=reason,
                 **_withheld(r),
+                withheld_crisis_blocks=_blocks(r),
             )
         )
     # Предел функции — 100: при limit = 100 полная страница означает «возможно, есть ещё»

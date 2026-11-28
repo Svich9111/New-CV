@@ -101,6 +101,17 @@ MESSAGE_CRISIS: dict[str, crisis.CrisisType] = {
     "life_threat": "life_threat",
 }
 
+
+def message_primary(category: str, types: list[crisis.CrisisType]) -> crisis.CrisisType | None:
+    """Главная строка §9.3 остановленного сообщения (Б-103): при признаке угрозы жизни —
+    ``life_threat`` кодом, а не только по промпту (``safety.v2``: «underage, затем life_threat»;
+    ``underage`` у сообщения не строка конвейера); иначе — категория классификатора, если она
+    строка конвейера (``None`` — главная по ``crisis.PRIORITY``)."""
+    if "life_threat" in types:
+        return "life_threat"
+    return MESSAGE_CRISIS.get(category)
+
+
 WARNING_HARSH_TONE = "Сообщение написано в резком тоне."
 MARK_ADAPTED = "адаптировано"
 
@@ -409,7 +420,7 @@ async def _process(models: AgentModels, original: str, prompt_set: PromptSet) ->
     if types:
         notice = crisis.respond(
             types,
-            primary=MESSAGE_CRISIS.get(verdict.category),
+            primary=message_primary(verdict.category, types),
             prompt_set=prompt_set,
             withheld=True,
         )

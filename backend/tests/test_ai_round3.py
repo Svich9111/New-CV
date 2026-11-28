@@ -63,7 +63,9 @@ async def test_mixed_message_keeps_help(prompt_set: prompts.PromptSet, victim: s
     p = scripted(safety={"category": "threat_or_insult", "secondary": [victim]})
     delivery = await process(p, prompt_set)
     notice = delivery.author_notice
-    assert notice is not None and notice.primary == "outgoing_threat"
+    # Б-103: при признаке угрозы жизни главная — life_threat (код); блоки от главной не зависят.
+    main = "life_threat" if victim == "life_threat" else "outgoing_threat"
+    assert notice is not None and notice.primary == main
     safety = "author_safety_life" if victim == "life_threat" else "author_safety"  # раунд 4
     pair = [block("outgoing_threat_mixed"), block(safety)]
     if victim == "life_threat":  # раунд 5: «немедленно звони» — первым (R5-MINOR-2)
